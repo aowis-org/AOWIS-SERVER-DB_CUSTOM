@@ -50,7 +50,7 @@ endif()
 # Canonical AOWIS Model serialization is owned by this repository.
 # It depends on AOWIS-SERVER-MODEL and Qt Core, never on the SQL database.
 # The standalone byte/object store can still build without Qt.
-option(AOWIS_NATIVE_WITH_MODEL_CODEC "Build the native-owned V5 model codec and persistence API" ON)
+option(AOWIS_NATIVE_WITH_MODEL_CODEC "Build native model serialization and hydraulic persistence" ON)
 if(AOWIS_NATIVE_WITH_MODEL_CODEC)
     find_package(Qt6 QUIET COMPONENTS Core)
     if(Qt6Core_FOUND)
@@ -64,7 +64,7 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
             add_subdirectory("${AOWIS_NATIVE_MODEL_SOURCE_DIR}"
                 "${CMAKE_CURRENT_BINARY_DIR}/aowis-server-model")
         endif()
-        # Check all current Model fields against the explicitly maintained V5
+        # Check all current Model fields against the explicitly maintained canonical model
         # schema contract. A new field must never be silently ignored.
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
         execute_process(
@@ -77,9 +77,9 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
             OUTPUT_VARIABLE AOWIS_NATIVE_CODEC_SCHEMA_OUTPUT
             ERROR_VARIABLE AOWIS_NATIVE_CODEC_SCHEMA_ERROR)
         if(NOT AOWIS_NATIVE_CODEC_SCHEMA_RESULT EQUAL 0)
-            message(FATAL_ERROR "Native Model V5 codec schema mismatch:\n${AOWIS_NATIVE_CODEC_SCHEMA_ERROR}")
+            message(FATAL_ERROR "Native model serializer schema mismatch:\n${AOWIS_NATIVE_CODEC_SCHEMA_ERROR}")
         endif()
-        message(STATUS "Native V5 codec: ${AOWIS_NATIVE_CODEC_SCHEMA_OUTPUT}")
+        message(STATUS "Native model serializer: ${AOWIS_NATIVE_CODEC_SCHEMA_OUTPUT}")
         add_library(aowis-native-model-codec STATIC
             src/model_codec.cpp
             src/model_validation.cpp)
@@ -90,36 +90,37 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
         target_link_libraries(aowis-native-model-codec PUBLIC
             AOWIS::Model Qt6::Core)
 
-        add_library(aowis-native-v5-codec STATIC
+        add_library(aowis-native-hydraulic STATIC
             src/model_codec_adapter.cpp
             src/hydraulic_network_persistence.cpp)
-        target_compile_features(aowis-native-v5-codec PUBLIC cxx_std_20)
-        target_include_directories(aowis-native-v5-codec PUBLIC
+        add_library(AOWIS::NativeHydraulic ALIAS aowis-native-hydraulic)
+        target_compile_features(aowis-native-hydraulic PUBLIC cxx_std_20)
+        target_include_directories(aowis-native-hydraulic PUBLIC
             "${CMAKE_CURRENT_SOURCE_DIR}/include")
-        target_link_libraries(aowis-native-v5-codec PUBLIC
+        target_link_libraries(aowis-native-hydraulic PUBLIC
             aowis-native-store AOWIS::NativeModelCodec)
-        add_executable(aowis-native-v5-model-benchmark
+        add_executable(aowis-native-hydraulic-model-benchmark
             benchmarks/v5_model_benchmark.cpp)
-        target_link_libraries(aowis-native-v5-model-benchmark PRIVATE aowis-native-v5-codec)
+        target_link_libraries(aowis-native-hydraulic-model-benchmark PRIVATE aowis-native-hydraulic)
         add_executable(aowis-native-hydraulic-edit-benchmark
             benchmarks/hydraulic_edit_benchmark.cpp)
-        target_link_libraries(aowis-native-hydraulic-edit-benchmark PRIVATE aowis-native-v5-codec)
+        target_link_libraries(aowis-native-hydraulic-edit-benchmark PRIVATE aowis-native-hydraulic)
         if(BUILD_TESTING)
-            add_executable(aowis-native-v5-codec-tests tests/v5_codec_tests.cpp)
-            target_link_libraries(aowis-native-v5-codec-tests PRIVATE aowis-native-v5-codec)
-            add_test(NAME aowis-native-v5-codec-tests COMMAND aowis-native-v5-codec-tests)
-            set_tests_properties(aowis-native-v5-codec-tests PROPERTIES LABELS "aowis")
+            add_executable(aowis-native-model-codec-tests tests/v5_codec_tests.cpp)
+            target_link_libraries(aowis-native-model-codec-tests PRIVATE aowis-native-hydraulic)
+            add_test(NAME aowis-native-model-codec-tests COMMAND aowis-native-model-codec-tests)
+            set_tests_properties(aowis-native-model-codec-tests PROPERTIES LABELS "aowis")
             add_executable(aowis-native-hydraulic-network-tests
                 tests/hydraulic_network_persistence_tests.cpp)
-            target_link_libraries(aowis-native-hydraulic-network-tests PRIVATE aowis-native-v5-codec)
+            target_link_libraries(aowis-native-hydraulic-network-tests PRIVATE aowis-native-hydraulic)
             add_test(NAME aowis-native-hydraulic-network-tests COMMAND aowis-native-hydraulic-network-tests)
             set_tests_properties(aowis-native-hydraulic-network-tests PROPERTIES LABELS "aowis")
-            add_dependencies(aowis-db-tests aowis-native-v5-codec-tests aowis-native-hydraulic-network-tests)
+            add_dependencies(aowis-db-tests aowis-native-model-codec-tests aowis-native-hydraulic-network-tests)
         endif()
-        message(STATUS "Native-owned canonical V5 model codec enabled (no SQL dependency)")
+        message(STATUS "Native model serializer and hydraulic persistence enabled")
     else()
-        message(STATUS "Native-owned V5 codec disabled: Qt6 Core development package not found")
+        message(STATUS "Native model serialization disabled: Qt6 Core development package not found")
     endif()
 else()
-    message(STATUS "Native-owned V5 codec disabled by configuration")
+    message(STATUS "Native model serialization disabled by configuration")
 endif()

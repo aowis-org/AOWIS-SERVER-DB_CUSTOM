@@ -1,7 +1,7 @@
 #pragma once
 
-// Optional Qt/V5 adapter for a complete NetworkHydraulic aggregate. The
-// authoritative entity bytes are encoded by the native-owned canonical ModelCodec V5;
+// Optional Qt/hydraulic persistence adapter for a complete NetworkHydraulic aggregate. The
+// authoritative entity bytes are encoded by the native-owned canonical ModelCodec;
 // ordered network membership is stored as bounded, individually versioned chunks.
 #include "aowis/native/model_codec_adapter.h"
 
@@ -12,13 +12,13 @@
 #include <variant>
 #include <vector>
 
-namespace aowis::native::v5 {
+namespace aowis::native::hydraulic {
 
 inline constexpr std::uint16_t hydraulicNetworkKind = 100;
 
 // Replaces one complete hydraulic network inside the branch in ONE atomic
 // model commit. Other networks in the branch are unaffected. All 18 top-level
-// entity lists are stored as individually addressable canonical V5 records.
+// entity lists are stored as individually addressable canonical model records.
 // Validation is the native canonical hydraulic-model validator, including typed refs.
 // Throws std::runtime_error on validation, ownership, or storage failures.
 Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
@@ -97,15 +97,63 @@ struct HydraulicEditDiagnostics {
     bool indexedScalarFastPath = false;
     bool indexedTopologyFastPath = false;
     bool indexedMembershipFastPath = false;
+    bool indexedCatalogueFastPath = false;
+    bool indexedPhysicalFastPath = false;
+    bool indexedDependentUpdateFastPath = false;
     std::size_t validatedEntities = 0; // changed payloads decoded on fast path
 };
 
+// A user may select a side for a genuinely conflicting canonical model field.
+// `field` is an exact name from the merge conflict diagnostic, including
+// nested metadata fields (e.g. "metadata.description"). Nonconflicting or
+// unknown names are rejected, not silently ignored.
+enum class HydraulicMergeSide { Target, Source };
+struct HydraulicFieldChoice {
+    QUuid entityUuid;
+    QString field;
+    HydraulicMergeSide side = HydraulicMergeSide::Target;
+};
+struct HydraulicObjectChoice {
+    QUuid entityUuid;
+    // Selects one complete existing/deleted record from a genuinely divergent
+    // UUID conflict. A deleted side means deletion; a kept side may fail the
+    // whole-network validation if membership changes are incompatible.
+    HydraulicMergeSide side = HydraulicMergeSide::Target;
+};
+struct HydraulicMergeSelections {
+    // Required together when choices are supplied. They pin the previewed
+    // branch tips, preventing a stale GUI dialog from merging newer changes.
+    std::optional<Hash> expectedTargetHead;
+    std::optional<Hash> expectedSourceHead;
+    std::vector<HydraulicFieldChoice> fields;
+    std::vector<HydraulicObjectChoice> objects;
+};
+
+// Three-way merge with canonical model field reconciliation and full candidate
+// hydraulic validation before publication. Field choices resolve only actual
+// same-field conflicts of unchanged-reference existing entities. Whole-object
+// choices may select either version of a divergent entity (including deletion),
+// subject to complete network and membership validation. Automatic structural
+// reconciliation remains conservative: incompatible combinations are conflicts.
+// The default native object merge is unaffected. Invalid or stale choices
+// throw without changing either branch or appending pack objects.
+MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,
+                                   std::string_view source,
+                                   const HydraulicMergeSelections& selections = {});
+
 // Incremental *write* path for one existing network. Each change is encoded
 // individually; unchanged entities and membership chunks are not rewritten.
-// Existing scalar-only edits and eligible pipe rewires use bounded indexed
-// validation. Addition of junctions, pipes, and map labels, or deletion of
-// independent map labels, uses typed indexed validation and touches only the
-// affected bounded membership chunk and, when its descriptor changes, root.
+// Existing scalar-only edits, eligible pipe rewires, whitelisted
+// reservoir/tank/pump/valve physical parameters, and existing demand-point /
+// simple-control / rule-control relationship updates use bounded indexed validation.
+// Addition and deletion of junctions, pipes, reservoirs, tanks, pumps, valves,
+// demand points, simple/rule controls, catalogues and map labels uses typed
+// indexed validation when references are locally provable. Demand point pipe
+// allocation is checked against actual pipe endpoints. New nodes and links may refer to one another in a batch.
+// Deleting a pipe and its dependent junction together is supported when no
+// surviving entity or network metadata refers to either removed UUID.
+// These edits touch only affected bounded membership chunks and, when a
+// chunk descriptor changes, the root.
 // Other edits use full canonical validation and cost O(network size).
 // Both paths commit atomically with an expected-head check.
 // Empty or semantically unchanged batches do not create a new revision.
@@ -114,4 +162,4 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
                               const std::vector<HydraulicEntityChange>& changes,
                               HydraulicEditDiagnostics* diagnostics = nullptr);
 
-} // namespace aowis::native::v5
+} // namespace aowis::native::hydraulic

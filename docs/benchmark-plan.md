@@ -53,13 +53,13 @@ and audit semantics must be equivalent or deviations must be stated.
 `aowis-native-model-benchmark` uses two hydraulic-shaped entity categories
 (junction-shaped records and pipe-shaped records with endpoint UUIDs), but the
 payload bytes remain synthetic placeholders. It measures atomic reference
-validation and a typed binary envelope, NOT the full ModelCodec V5 or hydraulic
+validation and a typed binary envelope, NOT the full ModelCodec or hydraulic
 constraint validation. Results are not SQL model-performance comparisons.
 See [model-records.md](model-records.md) for limitations.
 
-## Canonical V5 model-codec integration (optional stage 4)
+## Canonical model-codec integration (optional stage 4)
 
-`aowis-native-v5-model-benchmark` now uses the native-owned canonical V5 codec; it measures real AOWIS
+`aowis-native-hydraulic-model-benchmark` now uses the native-owned canonical model codec; it measures real AOWIS
 `HydraulicNodeJunction` and `HydraulicLinkPipe` payloads and decodes them on
 scan. It separates serialization from native storage time. This closes the
 placeholder-payload gap **only for these two entity categories**. Complete

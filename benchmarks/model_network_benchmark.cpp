@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 #ifdef __linux__
 #include <sys/resource.h>
@@ -33,7 +34,7 @@ Key keyFor(std::uint8_t kind, std::uint64_t number) {
 }
 
 // A unique, deterministic opaque placeholder for the shared AOWIS ModelCodec
-// output. This is NOT the SQL V5 model serialization; benchmark only the
+// output. This is NOT canonical model serialization; benchmark only the
 // native record envelope, reference validation and topology operations.
 Bytes payloadFor(std::uint64_t number, std::uint64_t revision, std::size_t size) {
     Bytes result(size);
@@ -69,7 +70,7 @@ double elapsed(std::chrono::steady_clock::time_point start) {
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
         std::cerr << "Usage: aowis-native-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10] [block]\n"
-                  << "Synthetic network-shaped typed-model fixture, NOT a SQL V5 codec benchmark.\n";
+                  << "Synthetic network-shaped typed-model fixture, NOT a canonical model codec benchmark.\n";
         return 2;
     }
     try {
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
                 ModelRecord{4, {keyFor(1, i), keyFor(1, i + 1)}, payloadFor(i, 0, 192)}});
         }
         const std::chrono::steady_clock::time_point importing = std::chrono::steady_clock::now();
-        repository->commitModel("main", initial);
+        repository->commitModel("main", std::move(initial));
         const double importMs = elapsed(importing);
         const std::chrono::steady_clock::time_point checkingReferences = std::chrono::steady_clock::now();
         const Key indexedNode = keyFor(1, 0);
@@ -128,7 +129,7 @@ int main(int argc, char** argv) {
                 changes.push_back({keyFor(2, pipe), ModelRecord{4,
                     {keyFor(1, pipe), keyFor(1, pipe + 1)}, payloadFor(pipe, revision, 192)}});
             }
-            repository->commitModel("main", changes);
+            repository->commitModel("main", std::move(changes));
         }
         const double revisionMs = elapsed(revising);
         const std::chrono::steady_clock::time_point comparing = std::chrono::steady_clock::now();
@@ -162,7 +163,7 @@ int main(int argc, char** argv) {
         const double verifyMs = elapsed(verifying);
         std::cout << (blocks ? "engine=native-experimental-blocks\n" : "engine=native-v0\n")
                   << "fixture=synthetic-hydraulic-topology\n"
-                  << "codec=placeholder-not-sql-v5\n"
+                  << "codec=synthetic-not-serialized\n"
                   << "pipes=" << pipes << "\nnodes=" << pipes + 1
                   << "\nobjects=" << checked << "\nrevisions=" << revisions
                   << "\nedits_per_revision=" << edits << "\nopen_ms=" << openMs

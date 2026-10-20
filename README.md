@@ -2,13 +2,13 @@
 
 A native C++ versioned model database whose authoritative data is stored in
 persistent, content-addressed trees and binary object packs. This repository
-owns its canonical V5 model codec and hydraulic reference validation. The only
+owns its canonical model codec and hydraulic reference validation. The only
 external AOWIS project dependency is the pinned `AOWIS-SERVER-MODEL` submodule;
 there is no SQLite, PostgreSQL, or other database-repository dependency.
 
-The physical storage and model-persistence APIs are implemented, but the full
-authentication, distributed synchronization, multi-user server, and conflict
-resolution capabilities are not yet implemented.
+Native history, branch merging, hydraulic field reconciliation and explicit
+conflict choices are implemented. Authentication, distributed synchronization
+and the multi-user server remain to be implemented.
 
 ## Initialize the Model submodule
 
@@ -37,16 +37,28 @@ be changed to a GitHub URL your environment can access before registration.
 The low-level object store builds without Qt or the Model library. Typed
 model persistence requires the pinned Model submodule and Qt Core.
 
+## Public API names
+
+* `aowis::native` — native storage, revisions, history and branch merging.
+* `aowis::native::ModelCodec<T>` — canonical typed model serializer.
+* `aowis::native::hydraulic` — hydraulic network persistence, indexed editing
+  and validated hydraulic merging.
+
+Build integration exposes `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraulic`.
+Internal binary-format version markers (such as the `ANX5` manifest marker)
+are **not** public API namespaces. They are retained so existing object bytes,
+content hashes and revisions remain unchanged.
+
 ## Full hydraulic model persistence
 
-The optional canonical V5 adapter now saves and loads a complete
+The optional canonical hydraulic persistence adapter now saves and loads a complete
 `NetworkHydraulic` aggregate on both native backends, with all 18 top-level
 entity collections stored individually, typed reference validation, ordered
 network membership, atomic replacement and branch-specific reopening. This
-is separate from the earlier junction/pipe-only microbenchmarks. See
+is separate from the junction/pipe storage microbenchmark. See
 [complete network persistence](docs/native-hydraulic-network.md) for API,
 format and remaining limitations. It uses this repository's native-owned
-canonical V5 `ModelCodec` and hydraulic model validator.
+canonical model `ModelCodec` and hydraulic model validator.
 
 ## Build and test (Linux)
 
@@ -104,8 +116,8 @@ Compare the two physical implementations with fresh directories:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-db-custom-compare.XXXXXXXX)"
-./build-linux/aowis-native-v5-model-benchmark "$run_root/stage7" 100000 20 10
-./build-linux/aowis-native-v5-model-benchmark "$run_root/blocks" 100000 20 10 block
+./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/stage7" 100000 20 10
+./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/blocks" 100000 20 10 block
 ```
 
 The `block` argument opts in to experimental block storage; omit it for the
@@ -128,7 +140,13 @@ within the native database, not complete end-user workloads.
   form, instead of appending intermediate roots on initial import.
 - Canonical prefix encoding: the same key/value map produces the same Merkle
   root independently of insertion order and batch boundaries.
-- Persistent single-parent revisions and independent branch heads.
+- Immutable one- and two-parent revisions, independent branch heads and
+  object-level three-way branch merging with explicit UUID conflicts.
+- Readable historical revisions with paginated first-parent history, immutable
+  raw and typed lookups, historical reverse-reference queries, Merkle diffs
+  between revision IDs, and branch creation from a retained ancestor. See
+  [revision history](docs/native-revision-history.md) and
+  [branch merging](docs/native-branch-merging.md).
 - Atomic ref publication after flushing appended data; orphan content is safe.
 - Repository-wide cross-process lock for read/write coordination.
 - Key lookup, sorted enumeration, insert/update/delete and Merkle-aware diff.
@@ -154,9 +172,11 @@ within the native database, not complete end-user workloads.
   garbage collection, memory cache or compression yet.
 - Each `commit` writes a revision immediately; staged, uncommitted working
   transactions and undo/redo need additional design.
-- No merge computation or merge-parent publication, typed hydraulic/network
-  membership indexes, complete hydraulic validation, authentication, project isolation
-  or HTTP API yet.
+- Generic object-level merging and hydraulic-aware field merging with explicit
+  per-field and conservative whole-object structural choices are implemented;
+  arbitrary coordinated topology/membership conflict resolution
+  and solver feasibility checking remain open. No user authentication, project
+  isolation, authorization or HTTP API yet.
 - No independent remote synchronization or replication yet.
 - Only simple ASCII branch names (letters, digits, `_` and `-`).
 - Disk formats are **experimental and intentionally not migration-stable**.
@@ -165,7 +185,7 @@ within the native database, not complete end-user workloads.
   fresh paths and do not attempt to open Stage 4 repositories using Stage 5.
 
 Native model-record benchmark (synthetic junction/pipe topology; **NOT** the
-native-owned AOWIS V5 codec):
+native-owned AOWIS model codec):
 
 ```bash
 ./compile_linux.sh
@@ -178,10 +198,10 @@ See [docs/architecture.md](docs/architecture.md),
 [docs/benchmark-plan.md](docs/benchmark-plan.md).
 
 
-## Native-owned canonical V5 model codec
+## Native-owned canonical model codec
 
 With Qt6 Core and the pinned Model submodule available, CMake builds
-`aowis-native-v5-model-benchmark`, `aowis-native-v5-codec-tests`, and
+`aowis-native-hydraulic-model-benchmark`, `aowis-native-model-codec-tests`, and
 `aowis-native-hydraulic-network-tests`. Serialization, field-merging helpers
 and hydraulic validation are implemented and compiled from this repository.
 The field-layout checker covers all 68 persisted Model structures.
@@ -192,7 +212,7 @@ See [docs/native-serialization.md](docs/native-serialization.md) and
 
 `editHydraulicNetwork()` can now atomically upsert or remove any of the 18
 canonical top-level hydraulic entity types from an existing network. Changed
-entity payloads are V5-encoded individually, and an unchanged member list does
+entity payloads are canonically encoded individually, and an unchanged member list does
 not rewrite the network manifest. New entities append to their collection,
 and deletions update membership and root dependencies atomically. The complete
 native hydraulic validator is used before commit, with expected-head concurrency
@@ -202,7 +222,7 @@ protection and reverse-reference maintenance. See
 The API intentionally leaves validation as a full-network read: *writing* is
 incremental, but validation is not yet incremental. This stage adds no new
 physical storage format or incompatibility. The `aowis-native-hydraulic-network-tests`
-target checks the edit API when Qt6 and the native V5 codec are available.
+target checks the edit API when Qt6 and the native model codec are available.
 
 ## Stage 6 — Git-inspired persistent pack index
 
@@ -222,7 +242,7 @@ To benchmark the native engine with a fresh temporary repository:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-db-custom-stage6.XXXXXXXX)"
-./build-linux/aowis-native-v5-model-benchmark "$run_root/repository" 100000 20 10
+./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/repository" 100000 20 10
 ```
 
 Report `reopen_ms`, `verify_ms`, `index_bytes`, `pack_bytes`, and the complete
@@ -252,7 +272,7 @@ claimed. The tools refuse to create a new repository accidentally.
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-db-custom-stage16.XXXXXXXX)"
-./build-linux/aowis-native-v5-model-benchmark \
+./build-linux/aowis-native-hydraulic-model-benchmark \
   "$run_root/blocks" 100000 20 10 block
 ./build-linux/aowis-native-compact "$run_root/blocks"
 ./build-linux/aowis-native-verify "$run_root/blocks"
@@ -289,7 +309,7 @@ expected** because audit-worthy revisions are deliberately retained.
 ./compile_linux_tests.sh --both
 ./compile_linux.sh
 run_root="$(mktemp -d /tmp/aowis-db-custom-stage7.XXXXXXXX)"
-./build-linux/aowis-native-v5-model-benchmark "$run_root/repository" 100000 20 10
+./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/repository" 100000 20 10
 ./build-linux/aowis-native-compact "$run_root/repository"
 ./build-linux/aowis-native-verify "$run_root/repository"
 ```
@@ -326,3 +346,42 @@ run_root="$(mktemp -d /tmp/aowis-db-custom-stage10.XXXXXXXX)"
 The last command performs indexed SHA-256 reads, commits a batch, reopens and
 verifies all objects. It **modifies only the candidate directory**; keep
 repository roots and candidate directories separate.
+
+## Indexed hydraulic deletion (Stage 26)
+
+The native hydraulic editor can atomically delete independent pipes/junctions
+and batches where all surviving incoming references are removed together
+(e.g. a pipe and its only incident junction). Indexed deletion checks stored
+reference edges, network ownership, canonical payload references and the
+network's embedded report/MSX references. Unsafe deletions continue through
+full canonical validation. The hydraulic edit benchmark reports
+`indexed_membership_delete_pipe_junction_batch_ms` alongside insertion and
+map-label deletion timing.
+
+
+Native hydraulic catalogue entities (pipe materials, time patterns, six curve
+kinds) support bounded indexed updates and independent insertion/deletion,
+with reverse-reference protection for in-use entries. See
+[`docs/native-hydraulic-network.md`](docs/native-hydraulic-network.md).
+
+Existing reservoir heads, tank levels/geometry, pump operating parameters and
+valve settings also support bounded indexed updates with unchanged typed
+relationships (Stage 28). Unsupported reference or metadata changes still use
+full canonical validation. The hydraulic edit benchmark reports
+`indexed_physical_update_batch_mean_ms` for four entities changed atomically.
+
+Indexed structural insertion and dependency-safe deletion for reservoirs, tanks, pumps and valves (including references to new members in the same atomic batch) are documented in [native hydraulic persistence](docs/native-hydraulic-network.md).
+
+Indexed membership edits now cover all 18 canonical top-level hydraulic entity
+collections, including demand points, simple controls and rule controls. Demand
+points with assigned-junction pipe attachments are checked against actual pipe
+endpoints; control premises and actions require the appropriate node/link types.
+Atomic insert/delete batches may contain interdependent new or removed entities.
+Existing demand points, simple controls and rule controls also support bounded
+indexed reference-changing updates with typed targets and pipe endpoint checks
+(Stage 31). Unsupported mixed edits continue through full canonical validation.
+See [hydraulic persistence and indexed editing](docs/native-hydraulic-network.md).
+
+### Hydraulic-aware branch merging
+
+For branches storing hydraulic networks, use `aowis::native::hydraulic::mergeHydraulicBranches()` instead of the generic merge. It reconciles non-overlapping canonical model fields on the same existing entity (when references are unchanged), supports explicit target/source choices for genuinely conflicting fields or whole records (including deletion and rewiring), with revision-head pinning, and validates the complete prospective hydraulic networks and persisted reference edges **before publishing**. See [hydraulic merge documentation](docs/native-hydraulic-merging.md).

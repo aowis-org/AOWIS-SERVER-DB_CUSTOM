@@ -1,0 +1,95 @@
+# Hydraulic-aware three-way branch merges
+
+`aowis::native::hydraulic::mergeHydraulicBranches(repository, target, source)` builds
+on the native two-parent revision/merge API while validating the combined
+hydraulic model **before any bytes are appended or the target branch ref moves**.
+The operation returns `MergeStatus::Conflicts` with diagnostics on rejected
+merges. It never changes the source branch.
+
+For independently modified fields of the **same** canonical hydraulic entity,
+all three historical model records are decoded and compared field by field. A
+field changed on only one side is taken from that side. Identical changes on
+both sides are accepted. Different changes to the same field are reported with
+field names. Nested structs/lists remain atomic merge fields, except the
+canonical seven-field metadata merge already defined by `ModelCodec`.
+
+## Explicit conflict resolution
+
+In the examples, `namespace hydraulic = aowis::native::hydraulic;`.
+
+The optional third argument, `HydraulicMergeSelections`, allows the AOWIS UI to
+resolve individual fields after previewing a conflict:
+
+```cpp
+hydraulic::HydraulicMergeSelections selections;
+selections.expectedTargetHead = preview.targetBefore;
+selections.expectedSourceHead = preview.sourceHead;
+selections.fields.push_back({pipeUuid, QStringLiteral("diameter_mm"),
+    hydraulic::HydraulicMergeSide::Source});
+const native::MergeResult result =
+    hydraulic::mergeHydraulicBranches(repository, "main", "feature", selections);
+```
+
+Each selection identifies a canonical entity UUID, an **exact conflicting field
+name** and whether to take the target or source branch's value. Unspecified
+non-conflicting edits still merge automatically; unspecified conflicting fields
+are reported, not guessed. A conflict on `metadata.description` can be selected
+independently from other metadata fields.
+
+With any explicit choices, **both previewed branch head hashes are required**.
+The native repository checks them inside the same lock as publication. If either
+branch has advanced, the operation throws without modifying the repository;
+re-preview and obtain new conflict diagnostics before choosing again. Duplicate,
+unknown, non-conflicting, or unconsumed selections also throw before any
+pack objects are written, including attempts to replay selections after a
+successful merge or to pass selections to a fast-forward merge.
+
+### Explicit whole-object / structural choices
+
+For a genuine concurrent change to the same UUID, including deletion versus
+modification and incompatible topology rewires, AOWIS may instead choose one
+**complete object** from either branch:
+
+```cpp
+hydraulic::HydraulicMergeSelections choices;
+choices.expectedTargetHead = preview.targetBefore;
+choices.expectedSourceHead = preview.sourceHead;
+choices.objects.push_back({pipeUuid, hydraulic::HydraulicMergeSide::Source});
+const native::MergeResult merged =
+    hydraulic::mergeHydraulicBranches(repository, "main", "feature", choices);
+```
+
+An object choice deliberately discards the other side's changes to *that one
+UUID*, but does not select a whole branch: changes to other UUIDs are still
+merged. It never applies automatically. Whole-object and field choices for the
+same UUID are mutually exclusive. Duplicate, stale, irrelevant and unused
+choices are rejected without writing objects.
+
+Choosing a deleted side means deletion. A choice that keeps an entity deleted
+on the other branch can require restoring the entity's membership chunk, too.
+The API **does not implicitly restore or invent chunks**. If the resulting
+snapshot contains an unowned object, missing member, dangling reference,
+invalid typed relationship or otherwise invalid network, it reports a conflict
+and leaves the branch and pack unchanged. Correcting mutually inconsistent
+membership or topology changes remains a separate resolution operation. This
+first structural step is deliberately conservative.
+
+Field selections still only resolve true same-field conflicts of existing
+entities with unchanged kinds and outgoing UUID-reference sets. Structural
+selections are whole-record decisions; they do not merge different fields.
+
+## Publication safety and limitations
+
+Before publishing a divergent merge, the callback traverses the proposed
+copy-on-write model snapshot without invoking repository APIs, reconstructs
+every hydraulic network from its chunks, checks identities and canonical model
+bytes, detects cross-network ownership collisions and orphaned records, revalidates network rules
+(including pipe-assigned demand endpoints), and compares stored reference edges
+against canonically extracted model dependencies. Any failure blocks publication.
+
+The plain `Repository::mergeBranches()` remains a Qt-free generic object merge
+with no hydraulic validation. AOWIS should use the hydraulic-specific API for
+branches containing hydraulic networks. Fast-forwards and up-to-date merges
+adopt already immutable source history and do not validate a new combined
+snapshot. This API does not implement recursive merge-base synthesis, arbitrary
+multi-object topology/membership reconciliation, or solver feasibility validation.

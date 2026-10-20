@@ -847,8 +847,8 @@ void testExperimentalBlockRevisionPublication() {
     const std::filesystem::path loosePath = test.directory / "loose";
     const std::filesystem::path blocksPath = test.directory / "blocks";
     const Key nodeA = key(20), nodeB = key(21), pipe = key(22);
-    const ModelRecord junction{1, {}, value("node-v5-opaque")};
-    const ModelRecord link{4, {nodeA, nodeB}, value("pipe-v5-opaque")};
+    const ModelRecord junction{1, {}, value("node-model-opaque")};
+    const ModelRecord link{4, {nodeA, nodeB}, value("pipe-model-opaque")};
     const std::vector<ModelChange> initial{
         {pipe, link}, {nodeA, junction}, {nodeB, junction}
     };
@@ -961,6 +961,58 @@ void testExperimentalBlockRevisionPublication() {
     expect(missingMarkerRejected, "missing block commit marker was silently reconstructed");
 }
 
+// Large canonical model batches must produce identical content-addressed roots
+// whether the caller lends or transfers ownership of its encoded payloads.
+// Raw commits must continue to accept repeated keys with last-write-wins.
+void testMoveAwareModelAndRawCommits() {
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo test("move-aware-commits");
+        Repository repository(test.directory, physical);
+        repository.createBranch("borrowed");
+        repository.createBranch("moved");
+        repository.createBranch("raw-duplicate");
+        repository.createBranch("raw-canonical");
+
+        std::vector<aowis::native::ModelChange> changes;
+        changes.reserve(2048);
+        const Bytes nodeValue(96, static_cast<std::uint8_t>('n'));
+        const Bytes linkValue(96, static_cast<std::uint8_t>('l'));
+        for (std::uint64_t id = 1; id <= 1024; ++id) {
+            changes.push_back({key(id), aowis::native::ModelRecord{1, {}, nodeValue}});
+            changes.push_back({key(id + 4096),
+                aowis::native::ModelRecord{4, {key(id), key(id)}, linkValue}});
+        }
+        std::reverse(changes.begin(), changes.end());
+        const Revision borrowed = repository.commitModel("borrowed", changes);
+        expect(changes.size() == 2048 && changes.front().record.has_value() &&
+               changes.front().record->payload == linkValue,
+               "borrowed model changes were modified by commit");
+        const Revision moved = repository.commitModel("moved", std::move(changes));
+        expect(borrowed.root == moved.root &&
+               borrowed.referencesRoot == moved.referencesRoot,
+               "move-aware model import changed canonical model or index roots");
+        expect(repository.referencingModel("moved", key(31)) == std::vector<Key>({key(4127)}),
+               "move-aware model import lost or duplicated reverse references");
+        expect(repository.getModel("moved", key(4127))->payload == linkValue,
+               "move-aware import modified canonical payload bytes");
+
+        repository.commit("raw-duplicate", {
+            {key(7), value("old")}, {key(8), value("eight")},
+            {key(7), value("new")}, {key(8), std::nullopt},
+            {key(8), value("final")}
+        });
+        repository.commit("raw-canonical", {
+            {key(7), value("new")}, {key(8), value("final")}
+        });
+        expect(repository.head("raw-duplicate").root ==
+               repository.head("raw-canonical").root,
+               "raw duplicate-key semantics changed under zero-copy sorting");
+        repository.verifyPack();
+    }
+}
+
 void testModelExpectedBranchHead() {
     for (const aowis::native::PhysicalStore physical :
          {aowis::native::PhysicalStore::Stage7Pack,
@@ -991,7 +1043,568 @@ void testModelExpectedBranchHead() {
     }
 }
 
+// Historical APIs operate on immutable revision IDs rather than branch heads.
+// Exercise both physical stores and verify that compaction retains old roots.
+void testHistoricalRevisionApis() {
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo test("historical-revision-api");
+        Hash initial{};
+        Hash first{};
+        Hash second{};
+        Hash featureOnly{};
+        Hash indexed{};
+        Hash indexedNext{};
+        {
+            Repository repository(test.directory, physical);
+            repository.createBranch("main");
+            initial = repository.head("main").id;
+            first = repository.commit("main", {{key(1), value("old")},
+                                               {key(2), value("two")}}).id;
+            second = repository.commit("main", {{key(1), value("new")},
+                                                {key(2), std::nullopt}}).id;
+            repository.createBranch("feature", "main");
+            featureOnly = repository.commit("feature", {{key(3), value("feature")}}).id;
+            expect(repository.revision(first).id == first &&
+                   repository.revision(first).parents == std::vector<Hash>{initial},
+                   "historical revision metadata missing");
+            expect(repository.getAtRevision(first, key(1)) == value("old") &&
+                   repository.getAtRevision(second, key(1)) == value("new") &&
+                   repository.getAtRevision(first, key(2)) == value("two") &&
+                   !repository.getAtRevision(second, key(2)),
+                   "historical raw lookup returned moving branch content");
+            expect(!repository.getAtRevision(initial, key(1)),
+                   "empty first revision unexpectedly contains object");
+
+            const std::vector<Revision> firstPage = repository.history("main", 2);
+            expect(firstPage.size() == 2 && firstPage[0].id == second &&
+                   firstPage[1].id == first, "first history page incorrect");
+            const std::vector<Revision> lastPage = repository.history("main", 2, first);
+            expect(lastPage.size() == 1 && lastPage[0].id == initial &&
+                   repository.history("main", 2, initial).empty(),
+                   "history cursor pagination did not reach initial revision");
+            expect(repository.history("main", 0).empty(), "zero-sized history page failed");
+            expect(repository.history("feature", 2)[0].id == featureOnly,
+                   "branch histories are not independent");
+            bool rejected = false;
+            try { (void)repository.history("main", 3, featureOnly); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "history accepted a cursor from an unrelated branch");
+            rejected = false;
+            try { (void)repository.history("main", 1001); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "unbounded history page accepted");
+            rejected = false;
+            try { (void)repository.revision(Hash{}); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "zero revision was accepted");
+            rejected = false;
+            try { (void)repository.revision(aowis::native::sha256(value("not-a-revision"))); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "unknown revision was accepted");
+            const std::vector<Difference> difference = repository.diffRevisions(first, second);
+            expect(difference.size() == 2 && difference[0].key == key(1) &&
+                   difference[0].before && difference[0].after &&
+                   difference[1].key == key(2) && difference[1].before &&
+                   !difference[1].after && repository.diffRevisions(first, first).empty(),
+                   "historical Merkle diff incorrect");
+            repository.createBranchAtRevision("recovered", "main", first);
+            expect(repository.head("recovered").id == first &&
+                   repository.get("recovered", key(1)) == value("old") &&
+                   repository.head("main").id == second,
+                   "historical branch creation changed source branch");
+            const Hash recoveredCommit = repository.commit("recovered", {
+                {key(2), value("restored")}
+            }).id;
+            expect(repository.revision(recoveredCommit).parents == std::vector<Hash>{first} &&
+                   repository.getAtRevision(first, key(2)) == value("two"),
+                   "editing new branch mutated immutable revision");
+            rejected = false;
+            try { repository.createBranchAtRevision("invalid", "main", featureOnly); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "branch from non-ancestor revision was accepted");
+            rejected = false;
+            try { repository.createBranchAtRevision("recovered", "main", first); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "historical branch name reused");
+
+            repository.createBranch("models");
+            const aowis::native::ModelRecord source{11, {}, value("source")};
+            const aowis::native::ModelRecord dependent{12, {key(101)}, value("child")};
+            indexed = repository.commitModel("models", {{key(101), source},
+                                                       {key(102), dependent}}).id;
+            indexedNext = repository.commitModel("models", {{key(102), std::nullopt}}).id;
+            const std::optional<aowis::native::ModelRecord> saved =
+                repository.getModelAtRevision(indexed, key(102));
+            expect(saved && saved->kind == 12 && saved->payload == value("child") &&
+                   saved->references == std::vector<Key>{key(101)} &&
+                   !repository.getModelAtRevision(indexedNext, key(102)),
+                   "historical typed model lookup incorrect");
+            expect(repository.referencingModelAtRevision(indexed, key(101)) ==
+                       std::vector<Key>{key(102)} &&
+                   repository.referencingModelAtRevision(indexedNext, key(101)).empty(),
+                   "historical reverse-reference index incorrect");
+            rejected = false;
+            try { (void)repository.getModelAtRevision(first, key(1)); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "typed historical lookup accepted raw revision");
+            rejected = false;
+            try { (void)repository.referencingModelAtRevision(first, key(101)); }
+            catch (const std::runtime_error&) { rejected = true; }
+            expect(rejected, "historical reverse index accepted raw revision");
+            repository.verifyPack();
+        }
+        {
+            Repository reopened(test.directory, physical);
+            expect(reopened.history("main", 3).size() == 3 &&
+                   reopened.getAtRevision(first, key(1)) == value("old") &&
+                   reopened.referencingModelAtRevision(indexed, key(101)) ==
+                       std::vector<Key>{key(102)},
+                   "historical APIs failed after repository reopening");
+            reopened.compact();
+            expect(reopened.getAtRevision(first, key(1)) == value("old") &&
+                   reopened.getModelAtRevision(indexed, key(102)).has_value() &&
+                   reopened.diffRevisions(first, second).size() == 2 &&
+                   reopened.revision(indexedNext).parents == std::vector<Hash>{indexed},
+                   "compaction discarded retained historical data");
+            reopened.verifyPack();
+        }
+    }
+}
+
 } // namespace
+
+void testThreeWayBranchMerges() {
+    using aowis::native::MergeStatus;
+    using aowis::native::ModelChange;
+    using aowis::native::ModelRecord;
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo test("branch-merging");
+        Hash firstMerge{};
+        Hash sourceOnly{};
+        {
+            Repository repository(test.directory, physical);
+            repository.createBranch("main");
+            const Revision base = repository.commit("main", {
+                {key(1), value("base")}, {key(2), value("stable")},
+                {key(3), value("deleted")}
+            });
+            repository.createBranch("feature", "main");
+            const Revision mainTip = repository.commit("main", {
+                {key(1), value("main edit")}, {key(3), std::nullopt}
+            });
+            const Revision featureTip = repository.commit("feature", {
+                {key(2), value("feature edit")}, {key(4), value("feature add")}
+            });
+            sourceOnly = featureTip.id;
+            const aowis::native::MergeResult merged = repository.mergeBranches("main", "feature");
+            expect(merged.status == MergeStatus::Merged && merged.base == base.id &&
+                   merged.targetBefore == mainTip.id && merged.sourceHead == featureTip.id &&
+                   merged.conflicts.empty() &&
+                   merged.revision.parents == std::vector<Hash>({mainTip.id, featureTip.id}),
+                   "raw three-way merge did not record correct ancestry");
+            firstMerge = merged.revision.id;
+            expect(repository.get("main", key(1)) == value("main edit") &&
+                   repository.get("main", key(2)) == value("feature edit") &&
+                   !repository.get("main", key(3)) &&
+                   repository.get("main", key(4)) == value("feature add") &&
+                   repository.get("feature", key(1)) == value("base"),
+                   "raw three-way merge lost independent values or changed source branch");
+            expect(repository.history("main", 2).size() == 2 &&
+                   repository.history("main", 2)[1].id == mainTip.id,
+                   "merge altered first-parent history");
+            expect(repository.mergeBranches("main", "feature").status == MergeStatus::UpToDate &&
+                   repository.head("main").id == firstMerge,
+                   "repeated merge should be up to date through second parent");
+            const Revision followup = repository.commit("feature", {
+                {key(5), value("follow up")}
+            });
+            const aowis::native::MergeResult again = repository.mergeBranches("main", "feature");
+            expect(again.status == MergeStatus::Merged && again.base == featureTip.id &&
+                   again.revision.parents == std::vector<Hash>({firstMerge, followup.id}) &&
+                   repository.get("main", key(5)) == value("follow up"),
+                   "repeated merge did not follow both sides of revision graph");
+            repository.verifyPack();
+        }
+        {
+            Repository reopened(test.directory, physical);
+            expect(reopened.revision(firstMerge).parents.size() == 2 &&
+                   reopened.getAtRevision(firstMerge, key(4)) == value("feature add") &&
+                   reopened.getAtRevision(sourceOnly, key(1)) == value("base"),
+                   "reopening lost a merge parent or historical snapshot");
+            (void)reopened.compact();
+            expect(reopened.revision(firstMerge).parents.size() == 2 &&
+                   reopened.revision(sourceOnly).id == sourceOnly,
+                   "compaction did not retain both parents of a merge");
+            reopened.verifyPack();
+        }
+    }
+}
+
+void testMergeConflictsAndFastForward() {
+    using aowis::native::MergeStatus;
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo test("merge-conflicts");
+        Repository repository(test.directory, physical);
+        repository.createBranch("main");
+        repository.commit("main", {{key(1), value("initial")}});
+        repository.createBranch("feature", "main");
+        const Revision main = repository.commit("main", {{key(1), value("main")}});
+        repository.commit("feature", {{key(1), value("feature")}});
+        const std::uint64_t bytesBefore = repository.packSize();
+        const aowis::native::MergeResult rejected = repository.mergeBranches("main", "feature");
+        expect(rejected.status == MergeStatus::Conflicts && rejected.conflicts.size() == 1 &&
+               rejected.conflicts[0].key == key(1) && rejected.conflicts[0].base &&
+               rejected.conflicts[0].target && rejected.conflicts[0].source &&
+               repository.head("main").id == main.id &&
+               repository.packSize() == bytesBefore,
+               "overlapping divergent edit was not rejected atomically");
+        repository.createBranch("deleted", "main");
+        repository.createBranch("modified", "main");
+        repository.commit("deleted", {{key(1), std::nullopt}});
+        repository.commit("modified", {{key(1), value("modified")}});
+        const aowis::native::MergeResult deleteVsUpdate =
+            repository.mergeBranches("deleted", "modified");
+        expect(deleteVsUpdate.status == MergeStatus::Conflicts &&
+               deleteVsUpdate.conflicts.size() == 1 &&
+               deleteVsUpdate.conflicts[0].key == key(1),
+               "delete versus update must not silently discard either edit");
+        repository.createBranch("new", "main");
+        const Revision advanced = repository.commit("new", {{key(10), value("advanced")}});
+        const aowis::native::MergeResult fast = repository.mergeBranches("main", "new");
+        expect(fast.status == MergeStatus::FastForward && fast.revision.id == advanced.id &&
+               repository.head("main").id == advanced.id &&
+               repository.get("main", key(10)) == value("advanced"),
+               "fast-forward merge unnecessarily recreated a revision");
+        repository.createBranch("empty", "main");
+        expect(repository.mergeBranches("main", "empty").status == MergeStatus::UpToDate,
+               "equal-head merge must leave branch untouched");
+
+        // Identical edits made independently still need a merge parent, even
+        // when the resulting content root is already equal to the target.
+        repository.createBranch("same-left", "main");
+        repository.createBranch("same-right", "main");
+        const Revision sameLeft = repository.commit("same-left", {
+            {key(20), value("identical")}
+        });
+        repository.commit("same-right", {{key(20), value("temporary")}});
+        const Revision sameRight = repository.commit("same-right", {
+            {key(20), value("identical")}
+        });
+        const aowis::native::MergeResult convergent =
+            repository.mergeBranches("same-left", "same-right");
+        expect(convergent.status == MergeStatus::Merged &&
+               convergent.revision.root == sameLeft.root &&
+               convergent.revision.parents == std::vector<Hash>({sameLeft.id, sameRight.id}),
+               "convergent changes lost their explicit merge ancestry");
+        // Do not pick an arbitrary merge base in a criss-cross DAG.
+        repository.createBranch("left", "main");
+        repository.createBranch("right", "main");
+        repository.commit("left", {{key(21), value("left")}});
+        repository.commit("right", {{key(22), value("right")}});
+        repository.createBranch("left-copy", "left");
+        expect(repository.mergeBranches("left", "right").status == MergeStatus::Merged &&
+               repository.mergeBranches("right", "left-copy").status == MergeStatus::Merged,
+               "criss-cross fixture could not create independent merge parents");
+        const Hash beforeAmbiguous = repository.head("left").id;
+        bool ambiguousRejected = false;
+        try { (void)repository.mergeBranches("left", "right"); }
+        catch (const std::runtime_error&) { ambiguousRejected = true; }
+        expect(ambiguousRejected && repository.head("left").id == beforeAmbiguous,
+               "criss-cross merge chose an arbitrary common ancestor");
+    }
+}
+
+void testIndexedModelMerges() {
+    using aowis::native::MergeStatus;
+    using aowis::native::ModelRecord;
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo test("indexed-model-merge");
+        Repository repository(test.directory, physical);
+        repository.createBranch("main");
+        repository.commitModel("main", {
+            {key(1), ModelRecord{1, {}, value("node")}},
+            {key(2), ModelRecord{2, {key(1)}, value("first dependent")}},
+            {key(3), ModelRecord{3, {}, value("independent")}}
+        });
+        repository.createBranch("feature", "main");
+        repository.commitModel("main", {
+            {key(3), ModelRecord{3, {}, value("edited independent")}}
+        });
+        repository.commitModel("feature", {
+            {key(4), ModelRecord{2, {key(1)}, value("second dependent")}}
+        });
+        const aowis::native::MergeResult merged = repository.mergeBranches("main", "feature");
+        expect(merged.status == MergeStatus::Merged && merged.revision.modelIndexed &&
+               merged.revision.parents.size() == 2 &&
+               repository.referencingModel("main", key(1)) ==
+                   std::vector<Key>({key(2), key(4)}) &&
+               repository.getModel("main", key(3))->payload == value("edited independent") &&
+               repository.getModel("main", key(4))->payload == value("second dependent") &&
+               repository.referencingModelAtRevision(merged.revision.id, key(1)) ==
+                   std::vector<Key>({key(2), key(4)}),
+               "model merge did not merge reference indexes and independent edits");
+        repository.verifyPack();
+
+        repository.createBranch("delete-branch", "main");
+        repository.createBranch("new-dependent", "main");
+        repository.commitModel("delete-branch", {
+            {key(2), std::nullopt}, {key(4), std::nullopt}, {key(1), std::nullopt}
+        });
+        repository.commitModel("new-dependent", {
+            {key(5), ModelRecord{2, {key(1)}, value("new dependency")}}
+        });
+        const Hash unchanged = repository.head("delete-branch").id;
+        const std::uint64_t bytesBefore = repository.packSize();
+        const aowis::native::MergeResult dependency =
+            repository.mergeBranches("delete-branch", "new-dependent");
+        expect(dependency.status == MergeStatus::Conflicts &&
+               !dependency.conflicts.empty() &&
+               repository.head("delete-branch").id == unchanged &&
+               repository.packSize() == bytesBefore,
+               "cross-branch reference conflict was not rejected without writes");
+
+        repository.createBranch("edit-left", "main");
+        repository.createBranch("edit-right", "main");
+        repository.commitModel("edit-left", {
+            {key(3), ModelRecord{3, {}, value("left")}}
+        });
+        repository.commitModel("edit-right", {
+            {key(3), ModelRecord{3, {}, value("right")}}
+        });
+        const aowis::native::MergeResult sameKey =
+            repository.mergeBranches("edit-left", "edit-right");
+        expect(sameKey.status == MergeStatus::Conflicts &&
+               sameKey.conflicts.size() == 1 && sameKey.conflicts[0].key == key(3),
+               "conflicting typed model payloads were overwritten");
+
+        // Both branches can activate model indexing from the same empty base.
+        repository.createBranch("fresh");
+        repository.createBranch("fresh-other", "fresh");
+        repository.commitModel("fresh", {{key(11), ModelRecord{1, {}, value("one")}}});
+        repository.commitModel("fresh-other", {{key(12), ModelRecord{1, {}, value("two")}}});
+        const aowis::native::MergeResult fromEmpty =
+            repository.mergeBranches("fresh", "fresh-other");
+        expect(fromEmpty.status == MergeStatus::Merged && fromEmpty.revision.modelIndexed &&
+               repository.getModel("fresh", key(11)) &&
+               repository.getModel("fresh", key(12)),
+               "model merge from empty raw ancestor was rejected");
+        repository.verifyPack();
+    }
+}
+
+void testMergeHooksAndSemanticPreflight() {
+    using aowis::native::MergeStatus;
+    using aowis::native::MergeOptions;
+    using aowis::native::MergeResolution;
+    using aowis::native::ModelRecord;
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo fixture("merge-candidate-hooks");
+        Repository repository(fixture.directory, physical);
+        repository.createBranch("main");
+        repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("base")}},
+                                        {key(2), ModelRecord{2, {key(1)}, value("dependent")}}});
+        repository.createBranch("feature", "main");
+        repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("left")}}});
+        repository.commitModel("feature", {{key(1), ModelRecord{1, {}, value("right")}}});
+        const Hash before = repository.head("main").id;
+        const std::uint64_t bytesBefore = repository.packSize();
+        MergeOptions options;
+        int resolverCalls = 0;
+        int validationCalls = 0;
+        options.resolve = [&resolverCalls](const Key& identity, const ModelRecord& base,
+                                             const ModelRecord& left, const ModelRecord& right) {
+            ++resolverCalls;
+            expect(identity == key(1) && base.payload == value("base") &&
+                   left.payload == value("left") && right.payload == value("right"),
+                   "merge resolver received wrong snapshots");
+            return MergeResolution{ModelRecord{1, {}, value("merged")}, {}};
+        };
+        options.validate = [&validationCalls](const aowis::native::MergeCandidate& candidate)
+            -> std::optional<std::string> {
+            ++validationCalls;
+            expect(candidate.get(key(1))->payload == value("merged") &&
+                   candidate.get(key(2))->references == std::vector<Key>{key(1)} &&
+                   !candidate.get(key(99)), "merge snapshot lookup is incorrect");
+            std::vector<Key> keys;
+            candidate.forEach([&keys](const Key& identity, const ModelRecord&) {
+                keys.push_back(identity);
+            });
+            expect(keys == std::vector<Key>({key(1), key(2)}),
+                   "merge snapshot enumeration incorrect");
+            return std::string("semantic model constraint failed");
+        };
+        // Optimistic head checks happen under the merge lock, and no choice
+        // verifier may be bypassed by the normal merge publication path.
+        options.expectedTargetHead = repository.head("feature").id;
+        bool staleRejected = false;
+        try { (void)repository.mergeBranches("main", "feature", options); }
+        catch (const std::runtime_error&) { staleRejected = true; }
+        expect(staleRejected && repository.head("main").id == before &&
+               repository.packSize() == bytesBefore,
+               "stale merge target unexpectedly changed repository");
+        options.expectedTargetHead = before;
+        options.expectedSourceHead = repository.head("feature").id;
+        options.checkSelections = []() -> std::optional<std::string> {
+            return std::string("unused user selections");
+        };
+        bool unusedRejected = false;
+        try { (void)repository.mergeBranches("main", "feature", options); }
+        catch (const std::runtime_error&) { unusedRejected = true; }
+        expect(unusedRejected && repository.head("main").id == before &&
+               repository.packSize() == bytesBefore,
+               "unused selections unexpectedly changed repository");
+        options.checkSelections = {};
+        resolverCalls = 0;
+        validationCalls = 0;
+        const aowis::native::MergeResult rejected = repository.mergeBranches("main", "feature", options);
+        expect(rejected.status == MergeStatus::Conflicts && !rejected.conflicts.empty() &&
+               rejected.conflicts.front().reason == "semantic model constraint failed" &&
+               repository.head("main").id == before && repository.packSize() == bytesBefore &&
+               resolverCalls == 1 && validationCalls == 1,
+               "semantic preflight did not reject merge before writing");
+        options.validate = [](const aowis::native::MergeCandidate&) -> std::optional<std::string> {
+            return std::nullopt;
+        };
+        const aowis::native::MergeResult merged = repository.mergeBranches("main", "feature", options);
+        expect(merged.status == MergeStatus::Merged && merged.revision.parents.size() == 2 &&
+               repository.getModel("main", key(1))->payload == value("merged") &&
+               repository.referencingModel("main", key(1)) == std::vector<Key>{key(2)},
+               "resolved typed model merge failed");
+        repository.verifyPack();
+        options.expectedTargetHead = merged.revision.id;
+        options.checkSelections = []() -> std::optional<std::string> {
+            return std::string("stale selection on already merged heads");
+        };
+        const std::uint64_t alreadyMergedBytes = repository.packSize();
+        bool upToDateRejected = false;
+        try { (void)repository.mergeBranches("main", "feature", options); }
+        catch (const std::runtime_error&) { upToDateRejected = true; }
+        expect(upToDateRejected && repository.packSize() == alreadyMergedBytes,
+               "up-to-date merge bypassed selection verification");
+
+        repository.createBranch("left", "main");
+        repository.createBranch("right", "main");
+        repository.commitModel("left", {{key(1), ModelRecord{1, {}, value("left2")}}});
+        repository.commitModel("right", {{key(1), ModelRecord{1, {}, value("right2")}}});
+        const Hash unchanged = repository.head("left").id;
+        MergeOptions unresolved;
+        unresolved.resolve = [](const Key&, const ModelRecord&, const ModelRecord&,
+                                const ModelRecord&) {
+            return MergeResolution{std::nullopt, {"diameter_mm", "node_uuid_from"}};
+        };
+        const aowis::native::MergeResult conflict = repository.mergeBranches("left", "right", unresolved);
+        expect(conflict.status == MergeStatus::Conflicts && conflict.conflicts.size() == 1 &&
+               conflict.conflicts[0].reason.find("diameter_mm") != std::string::npos &&
+               repository.head("left").id == unchanged,
+               "merge field diagnostics missing or target changed");
+    }
+}
+
+
+void testWholeObjectMergeChoices() {
+    using aowis::native::MergeChoiceSide;
+    using aowis::native::MergeOptions;
+    using aowis::native::MergeStatus;
+    using aowis::native::ModelRecord;
+    for (const aowis::native::PhysicalStore physical :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo temporary("merge-object-choices");
+        {
+            Repository repository(temporary.directory, physical);
+            repository.createBranch("main");
+            repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("base")}},
+                                            {key(2), ModelRecord{2, {}, value("other")}}});
+            repository.createBranch("choose-source", "main");
+            repository.createBranch("choose-target", "main");
+            repository.createBranch("other-source", "main");
+            repository.commitModel("choose-source", {{key(1), ModelRecord{1, {}, value("left")}}});
+            repository.commitModel("other-source", {{key(1), ModelRecord{1, {}, value("right")}}});
+            repository.commitModel("choose-target", {{key(1), ModelRecord{1, {}, value("left")}}});
+            const Hash targetBefore = repository.head("choose-source").id;
+            const Hash sourceBefore = repository.head("other-source").id;
+            const std::uint64_t bytesBefore = repository.packSize();
+            expect(repository.mergeBranches("choose-source", "other-source").status ==
+                       MergeStatus::Conflicts && repository.packSize() == bytesBefore,
+                   "unresolved concurrent edit was silently selected");
+            std::size_t chosenCount = 0;
+            MergeOptions sourceChoice;
+            sourceChoice.expectedTargetHead = targetBefore;
+            sourceChoice.expectedSourceHead = sourceBefore;
+            sourceChoice.chooseConflict = [&chosenCount](const aowis::native::MergeConflict& conflict)
+                -> std::optional<MergeChoiceSide> {
+                expect(conflict.key == key(1) && conflict.base && conflict.target && conflict.source,
+                       "unexpected whole-object conflict keys");
+                ++chosenCount;
+                return MergeChoiceSide::Source;
+            };
+            sourceChoice.checkSelections = [&chosenCount]() -> std::optional<std::string> {
+                if (chosenCount != 1) return std::string("object choice unused");
+                return std::nullopt;
+            };
+            const aowis::native::MergeResult merged =
+                repository.mergeBranches("choose-source", "other-source", sourceChoice);
+            expect(merged.status == MergeStatus::Merged && merged.revision.parents ==
+                       std::vector<Hash>({targetBefore, sourceBefore}) &&
+                   repository.getModel("choose-source", key(1))->payload == value("right") &&
+                   repository.getModel("other-source", key(1))->payload == value("right"),
+                   "source whole-record choice did not preserve ancestry/branch isolation");
+
+            MergeOptions targetChoice;
+            targetChoice.chooseConflict = [](const aowis::native::MergeConflict& conflict)
+                -> std::optional<MergeChoiceSide> {
+                return conflict.key == key(1) ? std::optional<MergeChoiceSide>{MergeChoiceSide::Target}
+                                              : std::nullopt;
+            };
+            expect(repository.mergeBranches("choose-target", "other-source", targetChoice).status ==
+                       MergeStatus::Merged &&
+                   repository.getModel("choose-target", key(1))->payload == value("left"),
+                   "target whole-record selection failed");
+
+            repository.createBranch("deleted", "main");
+            repository.createBranch("modified", "main");
+            repository.commitModel("deleted", {{key(1), std::nullopt}});
+            repository.commitModel("modified", {{key(1), ModelRecord{1, {}, value("modified")}}});
+            const Hash deletedHead = repository.head("deleted").id;
+            const std::uint64_t oldBytes = repository.packSize();
+            expect(repository.mergeBranches("deleted", "modified").status == MergeStatus::Conflicts &&
+                   repository.head("deleted").id == deletedHead &&
+                   repository.packSize() == oldBytes,
+                   "delete-versus-modify must require explicit choice");
+            MergeOptions deleteChoice;
+            deleteChoice.chooseConflict = [](const aowis::native::MergeConflict& conflict)
+                -> std::optional<MergeChoiceSide> {
+                if (conflict.key == key(1) && !conflict.target && conflict.source)
+                    return MergeChoiceSide::Target;
+                return std::nullopt;
+            };
+            const aowis::native::MergeResult deletedMerge =
+                repository.mergeBranches("deleted", "modified", deleteChoice);
+            expect(deletedMerge.status == MergeStatus::Merged &&
+                   !repository.getModel("deleted", key(1)) &&
+                   repository.getModel("modified", key(1))->payload == value("modified"),
+                   "explicit delete selection did not retain deletion");
+            repository.verifyPack();
+        }
+        {
+            Repository reopened(temporary.directory, physical);
+            expect(!reopened.getModel("deleted", key(1)) &&
+                   reopened.getModel("choose-source", key(1))->payload == value("right"),
+                   "structural merge choice was lost on reopening");
+            reopened.verifyPack();
+        }
+    }
+}
 
 int main() {
     try {
@@ -1013,6 +1626,13 @@ int main() {
         testExperimentalBlockRevisionPublication();
         testLargeBlockCommitAndPublicationFailure();
         testModelExpectedBranchHead();
+        testMoveAwareModelAndRawCommits();
+        testHistoricalRevisionApis();
+        testThreeWayBranchMerges();
+        testMergeConflictsAndFastForward();
+        testIndexedModelMerges();
+        testMergeHooksAndSemanticPreflight();
+        testWholeObjectMergeChoices();
         std::cout << "AOWIS native storage tests: passed\n";
         return 0;
     } catch (const std::exception& failure) {

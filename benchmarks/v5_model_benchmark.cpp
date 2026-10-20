@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 #ifdef __linux__
 #include <sys/resource.h>
@@ -23,7 +24,7 @@ using aowis::native::Bytes;
 using aowis::native::ModelRecord;
 using aowis::native::ModelChange;
 using aowis::native::Repository;
-namespace v5 = aowis::native::v5;
+namespace hydraulic = aowis::native::hydraulic;
 
 QUuid uuidFor(std::uint8_t kind, std::uint64_t ordinal) {
     Key key{};
@@ -33,7 +34,7 @@ QUuid uuidFor(std::uint8_t kind, std::uint64_t ordinal) {
     for (unsigned i = 0; i < 6; ++i) {
         key[15 - i] = static_cast<std::uint8_t>(ordinal >> (8U * i));
     }
-    return v5::uuidFromKey(key);
+    return hydraulic::uuidFromKey(key);
 }
 
 HydraulicNodeJunction junctionFor(std::uint64_t ordinal) {
@@ -74,8 +75,8 @@ double elapsed(const std::chrono::steady_clock::time_point start) {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     if (argc < 2 || argc > 6) {
-        std::cerr << "Usage: aowis-native-v5-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10] [block]\n"
-                  << "Real native V5 codec bytes. Still NOT a full SQL-vs-native model-persistence comparison.\n";
+        std::cerr << "Usage: aowis-native-hydraulic-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10] [block]\n"
+                  << "Real native model codec bytes and content-addressed native model storage.\n";
         return 2;
     }
     try {
@@ -98,26 +99,23 @@ int main(int argc, char** argv) {
         store->createBranch("main");
         const double openMs = elapsed(starting);
 
-        // Measure serialization separately from durable storage. SQL benchmarks
-        // can reuse the same canonical payloads and account for codec cost.
+        // Measure canonical serialization separately from durable native storage.
         const std::chrono::steady_clock::time_point preparing = std::chrono::steady_clock::now();
         std::vector<ModelChange> initial;
         initial.reserve(static_cast<std::size_t>(2 * pipes + 1));
         for (std::uint64_t i = 0; i <= pipes; ++i) {
-            initial.push_back(v5::changeFor(junctionFor(i)));
+            initial.push_back(hydraulic::changeFor(junctionFor(i)));
         }
         for (std::uint64_t i = 0; i < pipes; ++i) {
-            initial.push_back(v5::changeFor(pipeFor(i, 0)));
+            initial.push_back(hydraulic::changeFor(pipeFor(i, 0)));
         }
         const double prepareMs = elapsed(preparing);
         const std::chrono::steady_clock::time_point importing = std::chrono::steady_clock::now();
-        store->commitModel("main", initial);
+        store->commitModel("main", std::move(initial));
         const double importMs = elapsed(importing);
-        initial.clear();
-        initial.shrink_to_fit();
         const std::chrono::steady_clock::time_point checkingReferences =
             std::chrono::steady_clock::now();
-        const Key indexedNode = v5::keyFromUuid(junctionFor(0).uuid);
+        const Key indexedNode = hydraulic::keyFromUuid(junctionFor(0).uuid);
         const std::size_t incomingReferences = store->referencingModel("main", indexedNode).size();
         const double referenceLookupMs = elapsed(checkingReferences);
         const std::chrono::steady_clock::time_point checkingDeletion =
@@ -137,9 +135,9 @@ int main(int argc, char** argv) {
             changes.reserve(static_cast<std::size_t>(edits));
             for (std::uint64_t j = 0; j < edits; ++j) {
                 const std::uint64_t index = (j * 101ULL + revision * 17ULL) % pipes;
-                changes.push_back(v5::changeFor(pipeFor(index, revision)));
+                changes.push_back(hydraulic::changeFor(pipeFor(index, revision)));
             }
-            store->commitModel("main", changes);
+            store->commitModel("main", std::move(changes));
         }
         const double revisionMs = elapsed(revising);
         const std::chrono::steady_clock::time_point comparing = std::chrono::steady_clock::now();
@@ -149,24 +147,24 @@ int main(int argc, char** argv) {
         std::uint64_t count = 0;
         for (const std::pair<Key, Bytes>& pair : store->scan("main")) {
             const ModelRecord record = aowis::native::decodeModelRecord(pair.second);
-            const QByteArray bytes = v5::qByteArrayFromBytes(record.payload);
-            if (record.kind == v5::junctionKind) {
+            const QByteArray bytes = hydraulic::qByteArrayFromBytes(record.payload);
+            if (record.kind == hydraulic::junctionKind) {
                 const std::optional<HydraulicNodeJunction> junction =
                     aowis::native::ModelCodec<HydraulicNodeJunction>::decode(bytes);
-                if (!junction || v5::keyFromUuid(junction->uuid) != pair.first) {
-                    throw std::runtime_error("junction V5 payload/key mismatch");
+                if (!junction || hydraulic::keyFromUuid(junction->uuid) != pair.first) {
+                    throw std::runtime_error("junction model payload/key mismatch");
                 }
-            } else if (record.kind == v5::pipeKind) {
+            } else if (record.kind == hydraulic::pipeKind) {
                 const std::optional<HydraulicLinkPipe> pipe =
                     aowis::native::ModelCodec<HydraulicLinkPipe>::decode(bytes);
-                if (!pipe || v5::keyFromUuid(pipe->uuid) != pair.first || record.references.size() != 2) {
-                    throw std::runtime_error("pipe V5 payload/key/reference mismatch");
+                if (!pipe || hydraulic::keyFromUuid(pipe->uuid) != pair.first || record.references.size() != 2) {
+                    throw std::runtime_error("pipe model payload/key/reference mismatch");
                 }
-                std::vector<Key> required{v5::keyFromUuid(pipe->node_uuid_from),
-                                          v5::keyFromUuid(pipe->node_uuid_to)};
+                std::vector<Key> required{hydraulic::keyFromUuid(pipe->node_uuid_from),
+                                          hydraulic::keyFromUuid(pipe->node_uuid_to)};
                 std::sort(required.begin(), required.end());
                 if (record.references != required) {
-                    throw std::runtime_error("pipe dependency list diverged from V5 endpoints");
+                    throw std::runtime_error("pipe dependency list diverged from encoded pipe endpoints");
                 }
             } else {
                 throw std::runtime_error("unknown record kind");
@@ -188,7 +186,7 @@ int main(int argc, char** argv) {
         const double verifyMs = elapsed(verifying);
 
         std::cout << (blocks ? "engine=native-experimental-blocks\n" : "engine=native-v0\n")
-                  << "fixture=v5-hydraulic-topology\ncodec=sql-v5-canonical\n"
+                  << "fixture=model-hydraulic-topology\ncodec=native-model-canonical\n"
                   << "pipes=" << pipes << "\nnodes=" << pipes + 1
                   << "\nobjects=" << 2 * pipes + 1 << "\nrevisions=" << revisions
                   << "\nedits_per_revision=" << edits
@@ -217,7 +215,7 @@ int main(int argc, char** argv) {
 #endif
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "Native V5 benchmark error: " << error.what() << '\n';
+        std::cerr << "Native hydraulic model benchmark error: " << error.what() << '\n';
         return 1;
     }
 }

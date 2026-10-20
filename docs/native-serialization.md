@@ -1,14 +1,14 @@
 # Native-owned model serialization
 
-The native database is the authoritative owner of its Model V5 serializer,
+The native database is the authoritative owner of its model serializer,
 reference validation and typed field-merge helpers. They are built from
 `src/model_codec.cpp` and `src/model_validation.cpp` with Qt Core and the pinned
 AOWIS Model definitions. **No SQL database repository is required.**
 
-This stage migrates the exact field-wise encoding and decoding logic previously
-used by the standalone native adapter. It does not introduce a new on-disk
-format or alter the serialized type envelope, magic, stream version, or field
-order. Existing native revisions retain their content identities.
+The serializer maintains a documented, schema-versioned binary format. Its
+field-wise encoding, type envelope, magic, stream version and field order are
+independent of the public C++ API naming. Renaming the API does not change
+existing native revision identities.
 
 The schema check at CMake configure compares every persisted field in all 68
 reachable Model structures against `docs/model_codec_fields.json` and checks
@@ -18,7 +18,7 @@ native serializer deliberately; otherwise configuration fails.
 Public interfaces are `aowis/native/model_codec.h`,
 `aowis/native/model_validation.h`, and `aowis/native/model_field_merge.h`.
 Their implementations live in this repository. The Model submodule contains
-only the types and other model utilities; it is not modified by this patch.
+only the types and other model utilities; it contains the model type definitions.
 
 The native byte store can be built independently of Qt. To access typed
 AOWIS model serialization and full hydraulic network persistence, Qt Core

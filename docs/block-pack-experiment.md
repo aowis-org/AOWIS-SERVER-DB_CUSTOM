@@ -29,12 +29,12 @@ repository's Stage 7 pack and index.
 
 ## Repeatable comparison
 
-After `./compile_linux.sh`, run the usual native V5 benchmark with a random
+After `./compile_linux.sh`, run the usual native model benchmark with a random
 path and then run the experiment against the resulting repository:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-db-custom-block.XXXXXXXX)"
-./build-linux/aowis-native-v5-model-benchmark \
+./build-linux/aowis-native-hydraulic-model-benchmark \
   "$run_root/repository" 100000 20 10
 ./build-linux/aowis-native-pack-experiment \
   "$run_root/repository" "$run_root/candidate" 65536
@@ -166,13 +166,13 @@ branch-enabled repository. Tests ensure hashes and results agree between
 Stage-7 and block modes and that an intentionally obstructed ref publication
 preserves the old branch head across reopening.
 
-To compare canonical V5 payloads on a development machine:
+To compare canonical model payloads on a development machine:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-db-custom-publish.XXXXXXXX)"
-./build-linux/aowis-native-v5-model-benchmark \
+./build-linux/aowis-native-hydraulic-model-benchmark \
   "$run_root/stage7" 100000 20 10
-./build-linux/aowis-native-v5-model-benchmark \
+./build-linux/aowis-native-hydraulic-model-benchmark \
   "$run_root/blocks" 100000 20 10 block
 ```
 
@@ -193,7 +193,7 @@ revision objects can be moved into staging rather than copied. Reusable block
 buffers reduce allocation churn.
 
 No pack, index, marker, tree, or revision encoding was changed. Measure with
-identical canonical V5 workloads and alternate benchmark order to limit cache
+identical canonical model workloads and alternate benchmark order to limit cache
 and background-load bias. The synthetic import comparison is useful for
 isolating physical-store behavior, but it is not a SQL-versus-native result.
 

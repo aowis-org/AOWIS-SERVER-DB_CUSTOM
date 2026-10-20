@@ -17,7 +17,7 @@ using aowis::native::Bytes;
 using aowis::native::Key;
 using aowis::native::ModelChange;
 using aowis::native::Repository;
-namespace v5 = aowis::native::v5;
+namespace hydraulic = aowis::native::hydraulic;
 
 void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -31,11 +31,11 @@ QUuid fixedUuid(std::uint8_t kind, std::uint64_t ordinal) {
     for (unsigned i = 0; i < 6; ++i) {
         key[15 - i] = static_cast<std::uint8_t>(ordinal >> (8U * i));
     }
-    return v5::uuidFromKey(key);
+    return hydraulic::uuidFromKey(key);
 }
 
 std::filesystem::path uniqueDirectory() {
-    std::string pattern = (std::filesystem::temp_directory_path() / "aowis-native-v5-test-XXXXXX").string();
+    std::string pattern = (std::filesystem::temp_directory_path() / "aowis-native-codec-test-XXXXXX").string();
     std::vector<char> name(pattern.begin(), pattern.end());
     name.push_back('\0');
     char* directory = ::mkdtemp(name.data());
@@ -65,55 +65,55 @@ void testCanonicalCodecAndRepository() {
         pipe.length_measured_m = 123.125;
         pipe.diameter_mm = 90.625;
         pipe.roughness_darcy_weisbach_mm = 0.025;
-        const Bytes expectedA = v5::bytesFromQByteArray(
+        const Bytes expectedA = hydraulic::bytesFromQByteArray(
             aowis::native::ModelCodec<HydraulicNodeJunction>::encode(a));
-        expect(!expectedA.empty(), "native V5 codec returned empty junction");
-        expect(v5::qByteArrayFromBytes(expectedA) ==
+        expect(!expectedA.empty(), "native model codec returned empty junction");
+        expect(hydraulic::qByteArrayFromBytes(expectedA) ==
                aowis::native::ModelCodec<HydraulicNodeJunction>::encode(a),
                "canonical codec bytes changed on roundtrip");
-        expect(v5::uuidFromKey(v5::keyFromUuid(idA)) == idA,
+        expect(hydraulic::uuidFromKey(hydraulic::keyFromUuid(idA)) == idA,
                "UUID key transform inconsistent");
         {
             Repository store(path);
             store.createBranch("main");
-            const std::vector<ModelChange> changes{v5::changeFor(a), v5::changeFor(b), v5::changeFor(pipe)};
+            const std::vector<ModelChange> changes{hydraulic::changeFor(a), hydraulic::changeFor(b), hydraulic::changeFor(pipe)};
             store.commitModel("main", changes);
-            const std::optional<aowis::native::ModelRecord> stored = store.getModel("main", v5::keyFromUuid(idA));
-            expect(stored.has_value() && stored->kind == v5::junctionKind &&
-                   stored->payload == expectedA, "native store modified canonical native V5 bytes");
+            const std::optional<aowis::native::ModelRecord> stored = store.getModel("main", hydraulic::keyFromUuid(idA));
+            expect(stored.has_value() && stored->kind == hydraulic::junctionKind &&
+                   stored->payload == expectedA, "native store modified canonical native model bytes");
             QString error;
             const std::optional<HydraulicNodeJunction> readA =
-                v5::readJunction(store, "main", v5::keyFromUuid(idA), &error);
+                hydraulic::readJunction(store, "main", hydraulic::keyFromUuid(idA), &error);
             expect(readA.has_value() && readA->id == a.id && readA->elevation_m == a.elevation_m,
-                   "native-to-V5 junction roundtrip failed");
+                   "native model junction roundtrip failed");
             const std::optional<HydraulicLinkPipe> readPipe =
-                v5::readPipe(store, "main", v5::keyFromUuid(pipe.uuid), &error);
+                hydraulic::readPipe(store, "main", hydraulic::keyFromUuid(pipe.uuid), &error);
             expect(readPipe.has_value() && readPipe->node_uuid_from == idA &&
                    readPipe->node_uuid_to == idB && readPipe->diameter_mm == pipe.diameter_mm,
-                   "native-to-V5 pipe roundtrip failed");
-            expect(!v5::readJunction(store, "main", v5::keyFromUuid(pipe.uuid), &error),
+                   "native model pipe roundtrip failed");
+            expect(!hydraulic::readJunction(store, "main", hydraulic::keyFromUuid(pipe.uuid), &error),
                    "reading a pipe as a junction must fail");
             store.createBranch("other", "main");
             pipe.diameter_mm = 112.75;
-            store.commitModel("other", {v5::changeFor(pipe)});
-            expect(v5::readPipe(store, "main", v5::keyFromUuid(pipe.uuid))->diameter_mm == 90.625,
+            store.commitModel("other", {hydraulic::changeFor(pipe)});
+            expect(hydraulic::readPipe(store, "main", hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 90.625,
                    "branch isolation failed");
-            expect(v5::readPipe(store, "other", v5::keyFromUuid(pipe.uuid))->diameter_mm == 112.75,
+            expect(hydraulic::readPipe(store, "other", hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 112.75,
                    "branch update failed");
             expect(store.diff("main", "other").size() == 1,
                    "codec-level branch diff failed");
             bool rejected = false;
             try {
-                store.commitModel("other", {{v5::keyFromUuid(idA), std::nullopt}});
+                store.commitModel("other", {{hydraulic::keyFromUuid(idA), std::nullopt}});
             } catch (const std::exception&) { rejected = true; }
             expect(rejected, "referenced junction deletion was accepted");
         }
         {
             Repository reopened(path);
             const std::optional<HydraulicLinkPipe> stored =
-                v5::readPipe(reopened, "other", v5::keyFromUuid(pipe.uuid));
+                hydraulic::readPipe(reopened, "other", hydraulic::keyFromUuid(pipe.uuid));
             expect(stored.has_value() && stored->diameter_mm == 112.75,
-                   "reopened canonical V5 pipe missing");
+                   "reopened canonical model pipe missing");
         }
     } catch (...) {
         std::error_code ignored;
@@ -129,10 +129,10 @@ int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
         testCanonicalCodecAndRepository();
-        std::cout << "Canonical native V5 model codec/native repository test passed\n";
+        std::cout << "Canonical native model codec/native repository test passed\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "Canonical native V5 model codec/native repository test failed: "
+        std::cerr << "Canonical native model codec/native repository test failed: "
                   << error.what() << '\n';
         return 1;
     }

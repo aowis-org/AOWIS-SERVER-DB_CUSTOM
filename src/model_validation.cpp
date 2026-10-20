@@ -4,6 +4,7 @@
 #include <QSet>
 
 #include <cmath>
+#include <utility>
 
 namespace aowis::native
 {
@@ -21,12 +22,16 @@ using UuidSet = QSet<QUuid>;
 class NetworkReferenceValidator final
 {
 public:
-    explicit NetworkReferenceValidator(const NetworkHydraulic &network)
-        : network_(network)
+    enum class CollectionMode { None, Diagnostic, Compact };
+
+    explicit NetworkReferenceValidator(const NetworkHydraulic &network,
+                                       CollectionMode mode = CollectionMode::None)
+        : network_(network), mode_(mode)
     {
     }
 
-    QVector<HydraulicReference> references() const { return this->references_; }
+    QVector<HydraulicReference> takeReferences() { return std::move(this->references_); }
+    QVector<HydraulicDependency> takeDependencies() { return std::move(this->dependencies_); }
 
     ModelValidationReport validate()
     {
@@ -202,7 +207,12 @@ private:
     void check(const QUuid &uuid, const UuidSet &valid, const QString &path, const QString &field)
     {
         if (!uuid.isNull())
-            this->references_.append({this->current_source_, uuid, path + QStringLiteral(".") + field});
+        {
+            if (this->mode_ == CollectionMode::Diagnostic)
+                this->references_.append({this->current_source_, uuid, path + QStringLiteral(".") + field});
+            else if (this->mode_ == CollectionMode::Compact)
+                this->dependencies_.append({this->current_source_, uuid});
+        }
         if (!uuid.isNull() && !valid.contains(uuid))
             issue(path + QStringLiteral(".") + field, QStringLiteral("Dangling or wrong-type reference to %1").arg(uuid.toString()));
     }
@@ -281,6 +291,8 @@ private:
     const NetworkHydraulic &network_;
     ModelValidationReport result_;
     QVector<HydraulicReference> references_;
+    QVector<HydraulicDependency> dependencies_;
+    CollectionMode mode_;
     QUuid current_source_;
     UuidSet nodes_, junctions_, pipes_, pumps_, valves_, links_;
     UuidSet patterns_, materials_, tank_curves_, pump_curves_, efficiency_curves_, headloss_curves_, characteristic_curves_, generic_curves_;
@@ -294,9 +306,19 @@ ModelValidationReport validateHydraulicNetwork(const NetworkHydraulic &network)
 
 QVector<HydraulicReference> hydraulicReferences(const NetworkHydraulic &network)
 {
-    NetworkReferenceValidator validator(network);
+    NetworkReferenceValidator validator(network, NetworkReferenceValidator::CollectionMode::Diagnostic);
     validator.validate(); // Same traversal as canonical reference validation.
-    return validator.references();
+    return validator.takeReferences();
+}
+
+HydraulicDependencyValidation validateHydraulicNetworkWithDependencies(
+    const NetworkHydraulic &network)
+{
+    NetworkReferenceValidator validator(network, NetworkReferenceValidator::CollectionMode::Compact);
+    HydraulicDependencyValidation result;
+    result.report = validator.validate();
+    result.dependencies = validator.takeDependencies();
+    return result;
 }
 
 } // namespace aowis::native

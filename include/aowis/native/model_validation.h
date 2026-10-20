@@ -33,6 +33,24 @@ struct HydraulicReference
 
 QVector<HydraulicReference> hydraulicReferences(const NetworkHydraulic &network);
 
+// Compact dependency edges for persistence. Unlike HydraulicReference these
+// carry no diagnostic field strings, and are produced during the *same*
+// canonical validation pass. Keep hydraulicReferences() for diagnostic users.
+struct HydraulicDependency
+{
+    QUuid source_uuid;
+    QUuid target_uuid;
+};
+
+struct HydraulicDependencyValidation
+{
+    ModelValidationReport report;
+    QVector<HydraulicDependency> dependencies;
+};
+
+HydraulicDependencyValidation validateHydraulicNetworkWithDependencies(
+    const NetworkHydraulic &network);
+
 // Validates present (non-null) UUID references and graph relationships.
 // Deliberately permits NULL references while constructing incomplete drafts.
 // Does not perform hydraulic solver feasibility or attachment file validation.

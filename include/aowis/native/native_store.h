@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -50,6 +51,54 @@ struct Difference {
     std::optional<Hash> after;
 };
 
+// A merge never overwrites conflicting edits. Conflicts leave both refs intact.
+enum class MergeStatus { UpToDate, FastForward, Merged, Conflicts };
+
+struct MergeConflict {
+    Key key{};
+    std::optional<Hash> base;
+    std::optional<Hash> target;
+    std::optional<Hash> source;
+    std::string reason;
+};
+
+// Optional typed-record reconciliation. Callbacks execute while the repository
+// lock is held: they must be pure, must not call Repository methods, and must
+// not retain a candidate lookup beyond the callback.
+struct MergeResolution {
+    std::optional<ModelRecord> record; // nullopt = unresolved
+    std::vector<std::string> conflictingFields;
+};
+struct MergeCandidate {
+    // Proposed merged snapshot, including pending additions/deletions.
+    std::function<std::optional<ModelRecord>(const Key&)> get;
+    // Visits records in UUID order without retaining all decoded payloads.
+    std::function<void(const std::function<void(const Key&, const ModelRecord&)>&)> forEach;
+};
+// An explicit whole-record selection is allowed only for a genuine same-UUID
+// divergence (including delete-versus-modify). Model-specific callers must
+// still validate the complete selected snapshot before publication.
+enum class MergeChoiceSide { Target, Source };
+struct MergeOptions {
+    // This callback is only invoked for concurrently changed, different UUID
+    // records on a model-indexed branch, before field-level reconciliation.
+    // Returning nullopt preserves the normal conflict/field resolver behavior.
+    std::function<std::optional<MergeChoiceSide>(const MergeConflict&)> chooseConflict;
+    std::function<MergeResolution(const Key&, const ModelRecord&, const ModelRecord&,
+                                  const ModelRecord&)> resolve;
+    // Optional optimistic concurrency pins for UI-driven conflict resolution.
+    // Checked under the same repository lock as merge publication.
+    std::optional<Hash> expectedTargetHead;
+    std::optional<Hash> expectedSourceHead;
+    // Verify that every user-supplied choice was actually consumed by this
+    // merge. Called before any pack writes, including fast-forward publication.
+    // Must be pure with respect to the Repository; cannot call its methods.
+    std::function<std::optional<std::string>()> checkSelections;
+    // Return a nonempty diagnostic on semantic failure. Invoked before any
+    // object bytes or branch refs are written; cannot call Repository methods.
+    std::function<std::optional<std::string>(const MergeCandidate&)> validate;
+};
+
 struct CompactionStats {
     std::uint64_t objectsBefore = 0;
     std::uint64_t objectsAfter = 0;
@@ -65,6 +114,15 @@ struct Revision {
     Hash referencesRoot{}; // persistent UUID -> incoming-referrer UUID set index
     bool modelIndexed = false;
     std::vector<Hash> parents;
+};
+
+struct MergeResult {
+    MergeStatus status = MergeStatus::UpToDate;
+    Hash base{};
+    Hash targetBefore{};
+    Hash sourceHead{};
+    Revision revision; // resulting target head, also on conflict
+    std::vector<MergeConflict> conflicts;
 };
 
 // Linux/POSIX prototype. All operations on one instance are thread-safe;
@@ -86,20 +144,44 @@ public:
 
     void createBranch(std::string_view name, std::optional<std::string_view> from = std::nullopt);
     Revision head(std::string_view branch);
+    // Immutable history: newest first along the first-parent chain. `after`
+    // is an exclusive pagination cursor and must belong to this branch's
+    // first-parent history. A branch advancing between pages is harmless.
+    std::vector<Revision> history(std::string_view branch, std::size_t maxCount = 100,
+                                  std::optional<Hash> after = std::nullopt);
+    // Lookup by immutable SHA-256 revision identity, including older revisions.
+    // These low-level APIs do not implement authorization or branch scoping.
+    Revision revision(const Hash& revisionId);
+    // Create a new branch from any ancestor (including merge parents) of
+    // sourceBranch, without changing sourceBranch or writing a new revision.
+    void createBranchAtRevision(std::string_view name, std::string_view sourceBranch,
+                                const Hash& revisionId);
+    // Three-way object-level merge. Both branch tips are read under one lock;
+    // a conflicting merge leaves both heads and the pack unchanged. A normal
+    // merge writes a two-parent revision, preserving source branch history.
+    // Same-UUID divergent edits are conflicts unless an optional pure resolver
+    // reconciles them. Semantic preflight may reject a tentative merged snapshot.
+    MergeResult mergeBranches(std::string_view target, std::string_view source,
+                              const MergeOptions& options = {});
     Revision commit(std::string_view branch, const std::vector<Change>& changes);
     // Validates reference existence and deletion safety under the SAME
     // repository lock as publication. No TOCTOU window with other writers.
     // If expectedHead is supplied, reject concurrent branch changes before
     // touching durable model/index objects (optimistic branch-head check).
-    Revision commitModel(std::string_view branch, const std::vector<ModelChange>& changes,
+    Revision commitModel(std::string_view branch, std::vector<ModelChange> changes,
                          std::optional<Hash> expectedHead = std::nullopt);
     std::optional<ModelRecord> getModel(std::string_view branch, const Key& key);
+    // Historical reads use the revision's own roots, not the moving branch head.
+    std::optional<Bytes> getAtRevision(const Hash& revisionId, const Key& key);
+    std::optional<ModelRecord> getModelAtRevision(const Hash& revisionId, const Key& key);
+    std::vector<Key> referencingModelAtRevision(const Hash& revisionId, const Key& key);
     // Sorted IDs of entities referring to key; O(log N + inbound references).
     // Available on branches created through commitModel, not raw commit.
     std::vector<Key> referencingModel(std::string_view branch, const Key& key);
     std::optional<Bytes> get(std::string_view branch, const Key& key);
     std::vector<std::pair<Key, Bytes>> scan(std::string_view branch);
     std::vector<Difference> diff(std::string_view from, std::string_view to);
+    std::vector<Difference> diffRevisions(const Hash& fromRevision, const Hash& toRevision);
     std::uint64_t packSize();
     std::uint64_t objectCount();
     // Full SHA-256 verification of every physical object. Normal reopening
@@ -161,6 +243,7 @@ private:
     Hash store(const Bytes& bytes);
     Hash store(Bytes&& bytes);
     Revision readRevision(const Hash& hash);
+    bool revisionReachableFrom(const Hash& tip, const Hash& candidate);
     Hash branchHead(std::string_view name);
     void publishRef(std::string_view branch, const Hash& commitHash, bool mustBeAbsent);
     TreeNode readNode(const Hash& hash);
@@ -174,7 +257,11 @@ private:
     void listHashes(const Hash& root, std::vector<std::pair<Key, Hash>>& output);
     void diffHashes(const Hash& from, const Hash& to, std::vector<Difference>& output);
     Revision commitLocked(std::string_view branch, const std::vector<Change>& changes,
-                          std::optional<Hash> referencesRoot = std::nullopt);
+                          std::optional<Hash> referencesRoot = std::nullopt,
+                          std::optional<Hash> mergeParent = std::nullopt);
+    Revision commitModelLocked(std::string_view branch, std::vector<ModelChange> changes,
+                               std::optional<Hash> expectedHead,
+                               std::optional<Hash> mergeParent);
     std::vector<Key> readReferrers(const Hash& root, const Key& target);
     void syncPack();
 };

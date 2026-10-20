@@ -1,6 +1,7 @@
 #include "aowis/native/hydraulic_network_persistence.h"
 
 #include <aowis/native/model_validation.h>
+#include <aowis/native/model_field_merge.h>
 
 #include <QDataStream>
 #include <QCryptographicHash>
@@ -9,19 +10,22 @@
 #include <QSet>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
+#include <functional>
 #include <limits>
+#include <initializer_list>
 #include <set>
 #include <map>
 #include <type_traits>
 #include <stdexcept>
 #include <utility>
 
-namespace aowis::native::v5 {
+namespace aowis::native::hydraulic {
 namespace {
 
-// Keep the SQL hydraulic entity-kind catalog's 18 types, but use native numeric
-// kind IDs for the experimental engine. The original Stage 4 junction/pipe
+// Persist all 18 canonical hydraulic entity types using native numeric
+// kind IDs for the experimental engine. The original junction/pipe
 // values MUST remain unchanged. These are NOT public stable wire type tags.
 #define AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(X) \
     X(pipe_materials, HydraulicPipeMaterial, 8) \
@@ -260,40 +264,59 @@ void buildChunks(Manifest& manifest, std::vector<ModelChange>& changes) {
 // demand patterns, pipe material, controls, and MSX references. Nested MSX
 // entities are *inside* the network metadata and must not become external
 // object dependencies; only top-level persisted model members are indexed.
-QHash<QUuid, QSet<QUuid>> outgoingReferences(const NetworkHydraulic& network,
-                                            const std::set<Key>& members) {
-    QHash<QUuid, QSet<QUuid>> references;
-    for (const aowis::native::HydraulicReference& reference : aowis::native::hydraulicReferences(network)) {
-        if (reference.source_uuid.isNull() || reference.target_uuid.isNull()) continue;
-        if (reference.source_uuid != network.uuid &&
-            members.contains(keyFromUuid(reference.source_uuid)) &&
-            members.contains(keyFromUuid(reference.target_uuid))) {
-            references[reference.source_uuid].insert(reference.target_uuid);
-        }
+// Sort fixed-size UUID edges instead of maintaining one Qt hash/set allocation
+// per source. This is particularly important for 100k+ pipe imports. The
+// canonical validator has already checked all edges in this graph.
+using Dependency = std::pair<Key, Key>;
+using DependencyIndex = std::vector<Dependency>;
+
+DependencyIndex indexedDependencies(
+    const QVector<aowis::native::HydraulicDependency>& dependencies,
+    const std::set<Key>& members) {
+    DependencyIndex result;
+    result.reserve(static_cast<std::size_t>(dependencies.size()));
+    for (const aowis::native::HydraulicDependency& dependency : dependencies) {
+        if (dependency.source_uuid.isNull() || dependency.target_uuid.isNull()) continue;
+        const Key source = keyFromUuid(dependency.source_uuid);
+        const Key target = keyFromUuid(dependency.target_uuid);
+        if (members.contains(source) && members.contains(target))
+            result.emplace_back(source, target);
     }
-    return references;
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+std::vector<Key> entityReferences(const DependencyIndex& references, const Key& source) {
+    const Dependency first{source, Key{}};
+    DependencyIndex::const_iterator it = std::lower_bound(references.begin(), references.end(), first);
+    std::vector<Key> result;
+    while (it != references.end() && it->first == source) {
+        result.push_back(it->second);
+        ++it;
+    }
+    return result;
 }
 
 template<typename T>
 void addEntities(const QList<T>& entities, std::uint16_t kind,
-                 QList<QUuid>& ids, const QHash<QUuid, QSet<QUuid>>& references,
+                 const DependencyIndex& references,
                  std::vector<ModelChange>& changes) {
     for (const T& entity : entities) {
-        ids.append(entity.uuid);
         ModelRecord record;
         record.kind = kind;
         record.payload = bytesFromQByteArray(aowis::native::ModelCodec<T>::encode(entity));
         if (record.payload.empty()) throw std::runtime_error("cannot encode hydraulic model entity");
-        const QSet<QUuid> dependencies = references.value(entity.uuid);
-        for (const QUuid& dependency : dependencies) record.references.push_back(keyFromUuid(dependency));
-        changes.push_back(ModelChange{keyFromUuid(entity.uuid), std::move(record)});
+        const Key key = keyFromUuid(entity.uuid);
+        record.references = entityReferences(references, key);
+        changes.push_back(ModelChange{key, std::move(record)});
     }
 }
 
 template<typename T>
 void restoreEntities(Repository& repository, std::string_view branch,
                      const QList<QUuid>& ids, std::uint16_t kind,
-                     QList<T>& output, QHash<QUuid, QSet<QUuid>>& storedReferences) {
+                     QList<T>& output, std::vector<std::pair<Key, Key>>& storedReferences) {
     for (const QUuid& uuid : ids) {
         const std::optional<ModelRecord> record = repository.getModel(branch, keyFromUuid(uuid));
         if (!record || record->kind != kind) {
@@ -305,7 +328,8 @@ void restoreEntities(Repository& repository, std::string_view branch,
             throw std::runtime_error("invalid hydraulic entity payload: " + uuid.toString().toStdString() +
                                      " " + error.toStdString());
         }
-        for (const Key& key : record->references) storedReferences[uuid].insert(uuidFromKey(key));
+        for (const Key& target : record->references)
+            storedReferences.emplace_back(keyFromUuid(uuid), target);
         output.append(std::move(*entity));
     }
 }
@@ -365,7 +389,7 @@ void applyEntityChange(NetworkHydraulic& network, const HydraulicEntityChange& c
 
 // The same canonical codec and model reference extraction as full saves.
 ModelChange encodeChangedEntity(const HydraulicEntityChange& change,
-                                const QHash<QUuid, QSet<QUuid>>& references) {
+                                const DependencyIndex& references) {
     ModelChange result;
     result.key = keyFromUuid(change.uuid);
     if (!change.value) return result;
@@ -382,9 +406,7 @@ ModelChange encodeChangedEntity(const HydraulicEntityChange& change,
         record.payload = bytesFromQByteArray(aowis::native::ModelCodec<T>::encode(entity));
     }, *change.value);
     if (record.payload.empty()) throw std::runtime_error("cannot encode changed hydraulic entity");
-    for (const QUuid& dependency : references.value(change.uuid)) {
-        record.references.push_back(keyFromUuid(dependency));
-    }
+    record.references = entityReferences(references, result.key);
     // The persisted ModelRecord's reference list is canonicalized by
     // commitModel(). Match that ordering before testing for no-op changes.
     std::sort(record.references.begin(), record.references.end());
@@ -468,6 +490,397 @@ std::vector<Key> scalarReferences(const HydraulicEntity& entity) {
     std::sort(references.begin(), references.end());
     references.erase(std::unique(references.begin(), references.end()), references.end());
     return references;
+}
+
+// The first eight collections are reference-free catalogue entries. The
+// canonical hydraulic validator only registers their UUIDs and checks typed
+// references *from other entities*. Their own fields never affect structural
+// validation; incoming references are unchanged by an in-place update.
+// Decode the old record before trusting this invariant on the indexed path.
+bool validCatalogueRecord(const ModelRecord& record, const QUuid& uuid) {
+    if (record.kind < 8 || record.kind > 15 || !record.references.empty()) return false;
+    const QByteArray bytes = qByteArrayFromBytes(record.payload);
+    switch (record.kind) {
+#define CHECK_CATALOG(name, type, kind) \
+        case kind: { \
+            const std::optional<type> decoded = ModelCodec<type>::decode(bytes); \
+            return decoded && decoded->uuid == uuid; \
+        }
+        CHECK_CATALOG(pipe_materials, HydraulicPipeMaterial, 8)
+        CHECK_CATALOG(patterns_time, HydraulicPatternTime, 9)
+        CHECK_CATALOG(curves_tank_volume, HydraulicCurveTankVolume, 10)
+        CHECK_CATALOG(curves_pump_head, HydraulicCurvePumpHead, 11)
+        CHECK_CATALOG(curves_pump_efficiency, HydraulicCurvePumpEfficiency, 12)
+        CHECK_CATALOG(curves_valve_headloss, HydraulicCurveValveHeadloss, 13)
+        CHECK_CATALOG(curves_valve_characteristic, HydraulicCurveValveCharacteristic, 14)
+        CHECK_CATALOG(curves_generic, HydraulicCurveGeneric, 15)
+#undef CHECK_CATALOG
+        default: return false;
+    }
+}
+
+// For existing reservoirs, tanks, pumps and valves, the canonical validator
+// currently inspects UUID identity and typed outgoing references only. Permit
+// an explicit set of physical/operating scalar fields to change without
+// rebuilding the full network. Canonical byte comparison guarantees that any
+// other field (including newly added Model fields) triggers full validation.
+// In particular, link endpoints, curves, patterns and quality-source links
+// must remain exactly as they were in the previously validated model.
+bool physicalOnlyChange(const HydraulicEntity& proposed, const ModelRecord& old,
+                        const QUuid& uuid) {
+    if (const HydraulicNodeReservoir* changed = std::get_if<HydraulicNodeReservoir>(&proposed)) {
+        if (old.kind != 2) return false;
+        const std::optional<HydraulicNodeReservoir> prior = ModelCodec<HydraulicNodeReservoir>::decode(
+            qByteArrayFromBytes(old.payload));
+        if (!prior || prior->uuid != uuid) return false;
+        HydraulicNodeReservoir expected = *prior;
+        expected.hydraulic_head_m = changed->hydraulic_head_m;
+        expected.terrain_elevation_m = changed->terrain_elevation_m;
+        expected.hydraulic_head_offset_m = changed->hydraulic_head_offset_m;
+        expected.initial_chemical_concentration_mg_per_l = changed->initial_chemical_concentration_mg_per_l;
+        expected.initial_water_age_h = changed->initial_water_age_h;
+        return ModelCodec<HydraulicNodeReservoir>::encode(expected) ==
+               ModelCodec<HydraulicNodeReservoir>::encode(*changed);
+    }
+    if (const HydraulicNodeTank* changed = std::get_if<HydraulicNodeTank>(&proposed)) {
+        if (old.kind != 3) return false;
+        const std::optional<HydraulicNodeTank> prior = ModelCodec<HydraulicNodeTank>::decode(
+            qByteArrayFromBytes(old.payload));
+        if (!prior || prior->uuid != uuid) return false;
+        HydraulicNodeTank expected = *prior;
+        expected.bottom_elevation_m = changed->bottom_elevation_m;
+        expected.terrain_elevation_m = changed->terrain_elevation_m;
+        expected.bottom_offset_m = changed->bottom_offset_m;
+        expected.water_level_initial_m = changed->water_level_initial_m;
+        expected.water_level_minimum_m = changed->water_level_minimum_m;
+        expected.water_level_maximum_m = changed->water_level_maximum_m;
+        expected.diameter_m = changed->diameter_m;
+        expected.cross_section_area_m2 = changed->cross_section_area_m2;
+        expected.volume_at_maximum_level_m3 = changed->volume_at_maximum_level_m3;
+        expected.minimum_volume_m3 = changed->minimum_volume_m3;
+        expected.mixing_fraction = changed->mixing_fraction;
+        return ModelCodec<HydraulicNodeTank>::encode(expected) ==
+               ModelCodec<HydraulicNodeTank>::encode(*changed);
+    }
+    if (const HydraulicLinkPump* changed = std::get_if<HydraulicLinkPump>(&proposed)) {
+        if (old.kind != 5) return false;
+        const std::optional<HydraulicLinkPump> prior = ModelCodec<HydraulicLinkPump>::decode(
+            qByteArrayFromBytes(old.payload));
+        if (!prior || prior->uuid != uuid) return false;
+        HydraulicLinkPump expected = *prior;
+        expected.constant_power_kw = changed->constant_power_kw;
+        expected.initial_speed_ratio = changed->initial_speed_ratio;
+        expected.constant_efficiency_percent = changed->constant_efficiency_percent;
+        expected.energy_price_per_kw_h = changed->energy_price_per_kw_h;
+        return ModelCodec<HydraulicLinkPump>::encode(expected) ==
+               ModelCodec<HydraulicLinkPump>::encode(*changed);
+    }
+    if (const HydraulicLinkValve* changed = std::get_if<HydraulicLinkValve>(&proposed)) {
+        if (old.kind != 6) return false;
+        const std::optional<HydraulicLinkValve> prior = ModelCodec<HydraulicLinkValve>::decode(
+            qByteArrayFromBytes(old.payload));
+        if (!prior || prior->uuid != uuid) return false;
+        HydraulicLinkValve expected = *prior;
+        expected.setting_pressure_head_m = changed->setting_pressure_head_m;
+        expected.setting_flow_m3_per_h = changed->setting_flow_m3_per_h;
+        expected.setting_loss_coefficient = changed->setting_loss_coefficient;
+        expected.setting_position_percent = changed->setting_position_percent;
+        expected.diameter_mm = changed->diameter_mm;
+        expected.minor_loss_coefficient = changed->minor_loss_coefficient;
+        return ModelCodec<HydraulicLinkValve>::encode(expected) ==
+               ModelCodec<HydraulicLinkValve>::encode(*changed);
+    }
+    return false;
+}
+
+// Verify the stored outgoing-reference index against the canonical validator's
+// extraction before reusing that index for a bounded physical edit.
+std::vector<Key> physicalReferences(const HydraulicEntity& entity) {
+    std::vector<Key> references;
+    const auto append = [&references](const QUuid& id) {
+        if (!id.isNull()) references.push_back(keyFromUuid(id));
+    };
+    if (const HydraulicNodeReservoir* item = std::get_if<HydraulicNodeReservoir>(&entity)) {
+        append(item->head_pattern_uuid);
+        append(item->quality_source.pattern_uuid);
+    } else if (const HydraulicNodeTank* item = std::get_if<HydraulicNodeTank>(&entity)) {
+        append(item->volume_curve_uuid);
+        append(item->quality_source.pattern_uuid);
+    } else if (const HydraulicLinkPump* item = std::get_if<HydraulicLinkPump>(&entity)) {
+        append(item->node_uuid_from);
+        append(item->node_uuid_to);
+        append(item->head_curve_uuid);
+        append(item->speed_pattern_uuid);
+        append(item->efficiency_curve_uuid);
+        append(item->price_pattern_uuid);
+    } else if (const HydraulicLinkValve* item = std::get_if<HydraulicLinkValve>(&entity)) {
+        append(item->node_uuid_from);
+        append(item->node_uuid_to);
+        append(item->head_loss_curve_uuid);
+        append(item->characteristic_curve_uuid);
+    }
+    std::sort(references.begin(), references.end());
+    references.erase(std::unique(references.begin(), references.end()), references.end());
+    return references;
+}
+
+// Mirror the canonical validator's outgoing references for demand points and
+// hydraulic controls. Only fields inspected by NetworkReferenceValidator are
+// indexed: unrelated UUID-valued metadata is not a hydraulic reference.
+std::vector<Key> dependentReferences(const HydraulicEntity& entity) {
+    std::vector<Key> references;
+    const auto append = [&references](const QUuid& id) {
+        if (!id.isNull()) references.push_back(keyFromUuid(id));
+    };
+    if (const HydraulicDemandPoint* point = std::get_if<HydraulicDemandPoint>(&entity)) {
+        for (const HydraulicDemand& demand : point->demands) append(demand.pattern_uuid);
+        if (point->attachment.type == HydraulicDemandPointAttachmentType::Pipe) {
+            append(point->attachment.pipe_uuid);
+            if (point->attachment.pipe_allocation_mode ==
+                HydraulicDemandPointPipeAllocationMode::AssignedJunction)
+                append(point->attachment.pipe_assigned_junction_uuid);
+        } else if (point->attachment.type == HydraulicDemandPointAttachmentType::Junction) {
+            append(point->attachment.junction_uuid);
+        }
+    } else if (const HydraulicControlSimple* control = std::get_if<HydraulicControlSimple>(&entity)) {
+        append(control->link_uuid);
+        append(control->trigger_node_uuid);
+    } else if (const HydraulicControlRule* rule = std::get_if<HydraulicControlRule>(&entity)) {
+        for (const HydraulicControlRulePremise& premise : rule->premises) {
+            if (premise.object == HydraulicControlRuleObject::Node ||
+                premise.object == HydraulicControlRuleObject::Link)
+                append(premise.object_uuid);
+        }
+        for (const HydraulicControlRuleAction& action : rule->actions_then) append(action.link_uuid);
+        for (const HydraulicControlRuleAction& action : rule->actions_else) append(action.link_uuid);
+    }
+    std::sort(references.begin(), references.end());
+    references.erase(std::unique(references.begin(), references.end()), references.end());
+    return references;
+}
+
+// Preserve the exact canonical validator reference sets across indexed edits.
+std::vector<Key> membershipReferences(const HydraulicEntity& entity) {
+    if (std::holds_alternative<HydraulicNodeReservoir>(entity) ||
+        std::holds_alternative<HydraulicNodeTank>(entity) ||
+        std::holds_alternative<HydraulicLinkPump>(entity) ||
+        std::holds_alternative<HydraulicLinkValve>(entity)) return physicalReferences(entity);
+    if (std::holds_alternative<HydraulicDemandPoint>(entity) ||
+        std::holds_alternative<HydraulicControlSimple>(entity) ||
+        std::holds_alternative<HydraulicControlRule>(entity)) return dependentReferences(entity);
+    return scalarReferences(entity);
+}
+
+// Existing demand points and controls may change their references without
+// touching membership. Verify the old canonical reference index before relying
+// on it, and validate *all* proposed targets against the same typed rules used
+// by NetworkReferenceValidator. Unsupported/mixed batches fall back to a full
+// network validation rather than committing a partially validated subset.
+std::optional<Revision> tryIndexedDependentUpdates(
+    Repository& repository, std::string_view branch, const QUuid& networkUuid,
+    const std::vector<HydraulicEntityChange>& changes, const Revision& starting,
+    HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    const auto validTarget = [&](const QUuid& id,
+                                 std::initializer_list<std::uint16_t> accepted) -> bool {
+        if (id.isNull()) return true; // Same policy as the canonical validator.
+        const Key key = keyFromUuid(id);
+        const std::optional<ModelRecord> target = repository.getModel(branch, key);
+        if (!target || std::find(accepted.begin(), accepted.end(), target->kind) == accepted.end())
+            return false;
+        return ownerChunk(repository, branch, networkUuid, key).has_value();
+    };
+    const auto nodeTarget = [&](const QUuid& id) {
+        return validTarget(id, {junctionKind, 2, 3});
+    };
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception() ||
+            (!std::holds_alternative<HydraulicDemandPoint>(*change.value) &&
+             !std::holds_alternative<HydraulicControlSimple>(*change.value) &&
+             !std::holds_alternative<HydraulicControlRule>(*change.value)) ||
+            std::visit([](const auto& entity) { return entity.uuid; }, *change.value) != change.uuid)
+            return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second || !ownerChunk(repository, branch, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old = repository.getModel(branch, key);
+        if (!old) return std::nullopt;
+        std::optional<HydraulicEntity> previous;
+        const QByteArray oldBytes = qByteArrayFromBytes(old->payload);
+        if (std::holds_alternative<HydraulicDemandPoint>(*change.value) && old->kind == 7) {
+            const std::optional<HydraulicDemandPoint> decoded = ModelCodec<HydraulicDemandPoint>::decode(oldBytes);
+            if (decoded && decoded->uuid == change.uuid) previous = HydraulicEntity{*decoded};
+        } else if (std::holds_alternative<HydraulicControlSimple>(*change.value) && old->kind == 16) {
+            const std::optional<HydraulicControlSimple> decoded = ModelCodec<HydraulicControlSimple>::decode(oldBytes);
+            if (decoded && decoded->uuid == change.uuid) previous = HydraulicEntity{*decoded};
+        } else if (std::holds_alternative<HydraulicControlRule>(*change.value) && old->kind == 17) {
+            const std::optional<HydraulicControlRule> decoded = ModelCodec<HydraulicControlRule>::decode(oldBytes);
+            if (decoded && decoded->uuid == change.uuid) previous = HydraulicEntity{*decoded};
+        }
+        if (!previous || old->references != dependentReferences(*previous)) return std::nullopt;
+
+        if (const HydraulicDemandPoint* point = std::get_if<HydraulicDemandPoint>(&*change.value)) {
+            for (const HydraulicDemand& demand : point->demands)
+                if (!validTarget(demand.pattern_uuid, {9})) return std::nullopt;
+            if (point->attachment.type == HydraulicDemandPointAttachmentType::Pipe) {
+                const QUuid pipeUuid = point->attachment.pipe_uuid;
+                if (!validTarget(pipeUuid, {pipeKind}) ||
+                    !std::isfinite(point->attachment.pipe_position) ||
+                    point->attachment.pipe_position < 0.0 || point->attachment.pipe_position > 1.0)
+                    return std::nullopt;
+                if (point->attachment.pipe_allocation_mode ==
+                    HydraulicDemandPointPipeAllocationMode::AssignedJunction) {
+                    const QUuid junctionUuid = point->attachment.pipe_assigned_junction_uuid;
+                    if (!validTarget(junctionUuid, {junctionKind})) return std::nullopt;
+                    if (!pipeUuid.isNull() && !junctionUuid.isNull()) {
+                        const std::optional<ModelRecord> pipeRecord =
+                            repository.getModel(branch, keyFromUuid(pipeUuid));
+                        if (!pipeRecord || pipeRecord->kind != pipeKind) return std::nullopt;
+                        const std::optional<HydraulicLinkPipe> pipe = ModelCodec<HydraulicLinkPipe>::decode(
+                            qByteArrayFromBytes(pipeRecord->payload));
+                        if (!pipe || pipe->uuid != pipeUuid ||
+                            pipeRecord->references != scalarReferences(HydraulicEntity{*pipe}) ||
+                            (pipe->node_uuid_from != junctionUuid && pipe->node_uuid_to != junctionUuid))
+                            return std::nullopt;
+                    }
+                }
+            } else if (point->attachment.type == HydraulicDemandPointAttachmentType::Junction) {
+                if (!validTarget(point->attachment.junction_uuid, {junctionKind})) return std::nullopt;
+            } else if (point->attachment.type != HydraulicDemandPointAttachmentType::None) {
+                return std::nullopt;
+            }
+        } else if (const HydraulicControlSimple* control =
+                   std::get_if<HydraulicControlSimple>(&*change.value)) {
+            if (!validTarget(control->link_uuid, {pipeKind, 5, 6}) ||
+                !nodeTarget(control->trigger_node_uuid)) return std::nullopt;
+        } else if (const HydraulicControlRule* rule =
+                   std::get_if<HydraulicControlRule>(&*change.value)) {
+            for (const HydraulicControlRulePremise& premise : rule->premises) {
+                if (premise.object == HydraulicControlRuleObject::Node &&
+                    !nodeTarget(premise.object_uuid)) return std::nullopt;
+                if (premise.object == HydraulicControlRuleObject::Link &&
+                    !validTarget(premise.object_uuid, {pipeKind, 5, 6})) return std::nullopt;
+            }
+            for (const HydraulicControlRuleAction& action : rule->actions_then)
+                if (!validTarget(action.link_uuid, {pipeKind, 5, 6})) return std::nullopt;
+            for (const HydraulicControlRuleAction& action : rule->actions_else)
+                if (!validTarget(action.link_uuid, {pipeKind, 5, 6})) return std::nullopt;
+        }
+
+        ModelRecord updated = *old;
+        std::visit([&updated](const auto& entity) {
+            using T = std::decay_t<decltype(entity)>;
+            updated.payload = bytesFromQByteArray(ModelCodec<T>::encode(entity));
+        }, *change.value);
+        if (updated.payload.empty()) return std::nullopt;
+        updated.references = dependentReferences(*change.value);
+        if (updated.payload != old->payload || updated.references != old->references)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    Revision result;
+    if (pending.empty()) {
+        if (repository.head(branch).id != starting.id)
+            throw std::runtime_error("branch head changed during hydraulic dependent edit");
+        result = starting;
+    } else {
+        result = repository.commitModel(branch, std::move(pending), starting.id);
+    }
+    if (diagnostics) {
+        diagnostics->indexedDependentUpdateFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
+// All changes in a batch must satisfy the whitelist before publishing *any*
+// changes. Existing membership chunks and network metadata remain untouched.
+std::optional<Revision> tryIndexedPhysicalUpdates(
+    Repository& repository, std::string_view branch, const QUuid& networkUuid,
+    const std::vector<HydraulicEntityChange>& changes, const Revision& starting,
+    HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception() ||
+            std::visit([](const auto& entity) { return entity.uuid; }, *change.value) != change.uuid)
+            return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second || !ownerChunk(repository, branch, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old = repository.getModel(branch, key);
+        if (!old || !physicalOnlyChange(*change.value, *old, change.uuid) ||
+            old->references != physicalReferences(*change.value)) return std::nullopt;
+        ModelRecord updated = *old;
+        std::visit([&updated](const auto& entity) {
+            using T = std::decay_t<decltype(entity)>;
+            updated.payload = bytesFromQByteArray(ModelCodec<T>::encode(entity));
+        }, *change.value);
+        if (updated.payload.empty()) return std::nullopt;
+        if (updated.payload != old->payload)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    Revision result;
+    if (pending.empty()) {
+        if (repository.head(branch).id != starting.id)
+            throw std::runtime_error("branch head changed during hydraulic physical edit");
+        result = starting;
+    } else {
+        result = repository.commitModel(branch, std::move(pending), starting.id);
+    }
+    if (diagnostics) {
+        diagnostics->indexedPhysicalFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
+// Catalogue payload updates need no other model reads. A single modified
+// catalogue cannot invalidate typed references to that same UUID and kind.
+std::optional<Revision> tryIndexedCatalogueUpdates(
+    Repository& repository, std::string_view branch, const QUuid& networkUuid,
+    const std::vector<HydraulicEntityChange>& changes, const Revision& starting,
+    HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception() || change.value->index() >= 8 ||
+            std::visit([](const auto& entity) { return entity.uuid; }, *change.value) != change.uuid)
+            return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second || !ownerChunk(repository, branch, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old = repository.getModel(branch, key);
+        if (!old || old->kind != 8 + change.value->index() ||
+            !validCatalogueRecord(*old, change.uuid)) return std::nullopt;
+        ModelRecord updated = *old;
+        std::visit([&updated](const auto& entity) {
+            using T = std::decay_t<decltype(entity)>;
+            updated.payload = bytesFromQByteArray(ModelCodec<T>::encode(entity));
+        }, *change.value);
+        if (updated.payload.empty()) return std::nullopt;
+        if (updated.payload != old->payload)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    Revision result;
+    if (pending.empty()) {
+        if (repository.head(branch).id != starting.id)
+            throw std::runtime_error("branch head changed during hydraulic catalogue edit");
+        result = starting;
+    } else {
+        result = repository.commitModel(branch, std::move(pending), starting.id);
+    }
+    if (diagnostics) {
+        diagnostics->indexedCatalogueFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
 }
 
 // A rewire changes the set of outgoing references and therefore cannot use the
@@ -556,7 +969,7 @@ std::optional<Revision> tryIndexedPipeRewires(
             throw std::runtime_error("branch head changed during hydraulic topology edit");
         result = starting;
     } else {
-        result = repository.commitModel(branch, pending, starting.id);
+        result = repository.commitModel(branch, std::move(pending), starting.id);
     }
     if (diagnostics) {
         diagnostics->indexedTopologyFastPath = true;
@@ -566,12 +979,11 @@ std::optional<Revision> tryIndexedPipeRewires(
 }
 
 // A carefully limited indexed membership path. The canonical validator's
-// relevant checks for newly added junctions/pipes/labels are UUID uniqueness
-// and typed outgoing references. Map labels have no incoming dependencies in
-// the canonical model or in network metadata, so independent labels may also
-// be deleted. Deleting nodes/pipes is NOT safe here: the network's embedded
-// report and multi-species settings may refer to them without an individual
-// ModelRecord reverse-reference edge.
+// relevant checks for supported new entities are UUID uniqueness and typed
+// outgoing references. Existing members of those kinds may be removed if
+// every object that refers to them is removed in the SAME batch.
+// References in the network's embedded report and multi-species options are
+// checked separately: they do not appear in the model reverse-reference index.
 //
 // Bounded membership chunks allow edits without scanning existing members.
 std::optional<Revision> tryIndexedMembershipEdits(
@@ -585,9 +997,18 @@ std::optional<Revision> tryIndexedMembershipEdits(
     if (manifest.metadata.uuid != networkUuid) return std::nullopt;
     checkRoot(manifest, *networkRoot);
 
+    static constexpr std::array<std::uint16_t, collectionCount> kinds = {
+#define MEMBER_KIND(name, type, kind) static_cast<std::uint16_t>(kind),
+        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
+#undef MEMBER_KIND
+    };
     std::set<Key> seen;
     std::map<Key, const HydraulicEntityChange*> insertions;
-    std::map<Key, Key> removals; // member -> owning chunk
+    struct Removal {
+        Key owner;
+        std::size_t collection;
+    };
+    std::map<Key, Removal> removals;
     for (const HydraulicEntityChange& change : changes) {
         if (change.uuid.isNull() || change.uuid == networkUuid ||
             !seen.insert(keyFromUuid(change.uuid)).second) return std::nullopt;
@@ -596,55 +1017,223 @@ std::optional<Revision> tryIndexedMembershipEdits(
             if (change.value->valueless_by_exception() ||
                 std::visit([](const auto& entity) { return entity.uuid; }, *change.value) != change.uuid)
                 return std::nullopt;
-            if (!std::holds_alternative<HydraulicNodeJunction>(*change.value) &&
+            if (change.value->index() >= 8 &&
+                !std::holds_alternative<HydraulicNodeReservoir>(*change.value) &&
+                !std::holds_alternative<HydraulicNodeJunction>(*change.value) &&
+                !std::holds_alternative<HydraulicNodeTank>(*change.value) &&
                 !std::holds_alternative<HydraulicLinkPipe>(*change.value) &&
+                !std::holds_alternative<HydraulicLinkPump>(*change.value) &&
+                !std::holds_alternative<HydraulicLinkValve>(*change.value) &&
+                !std::holds_alternative<HydraulicDemandPoint>(*change.value) &&
+                !std::holds_alternative<HydraulicControlSimple>(*change.value) &&
+                !std::holds_alternative<HydraulicControlRule>(*change.value) &&
                 !std::holds_alternative<HydraulicMapLabel>(*change.value)) return std::nullopt;
             if (repository.getModel(branch, key)) return std::nullopt;
             insertions.emplace(key, &change);
         } else {
             const std::optional<ModelRecord> old = repository.getModel(branch, key);
-            if (!old || old->kind != 18) return std::nullopt;
-            const std::optional<Key> owning = ownerChunk(repository, branch, networkUuid, key);
-            if (!owning || !manifest.chunks[static_cast<std::size_t>(HydraulicEntityType::MapLabel)]
-                                .contains(uuidFromKey(*owning))) return std::nullopt;
-            const std::vector<Key> incoming = repository.referencingModel(branch, key);
-            if (incoming.size() != 1 || incoming.front() != *owning) return std::nullopt;
+            if (!old) return std::nullopt;
+            std::size_t collection = 0;
+            std::optional<HydraulicEntity> decoded;
             QString error;
-            const std::optional<HydraulicMapLabel> decoded =
-                ModelCodec<HydraulicMapLabel>::decode(qByteArrayFromBytes(old->payload), &error);
-            if (!decoded || decoded->uuid != change.uuid ||
-                old->references != scalarReferences(HydraulicEntity{*decoded})) return std::nullopt;
-            removals.emplace(key, *owning);
+            if (old->kind >= 8 && old->kind <= 15) {
+                collection = old->kind - 8;
+                if (!validCatalogueRecord(*old, change.uuid)) return std::nullopt;
+            } else if (old->kind == 2 || old->kind == 3 ||
+                       old->kind == 5 || old->kind == 6) {
+                // Decode the previous record before trusting its outgoing
+                // reference index. A corrupt index must never authorize a
+                // deletion based on incomplete incoming dependencies.
+                switch (old->kind) {
+#define DECODE_PHYSICAL(type, expectedKind, ordinal) \
+                    case expectedKind: { \
+                        const std::optional<type> value = ModelCodec<type>::decode( \
+                            qByteArrayFromBytes(old->payload), &error); \
+                        if (!value || value->uuid != change.uuid) return std::nullopt; \
+                        collection = static_cast<std::size_t>(ordinal); \
+                        decoded = HydraulicEntity{*value}; \
+                        break; \
+                    }
+                    DECODE_PHYSICAL(HydraulicNodeReservoir, 2, HydraulicEntityType::Reservoir)
+                    DECODE_PHYSICAL(HydraulicNodeTank, 3, HydraulicEntityType::Tank)
+                    DECODE_PHYSICAL(HydraulicLinkPump, 5, HydraulicEntityType::Pump)
+                    DECODE_PHYSICAL(HydraulicLinkValve, 6, HydraulicEntityType::Valve)
+#undef DECODE_PHYSICAL
+                    default: return std::nullopt;
+                }
+            } else if (old->kind == junctionKind) {
+                collection = static_cast<std::size_t>(HydraulicEntityType::Junction);
+                const std::optional<HydraulicNodeJunction> value =
+                    ModelCodec<HydraulicNodeJunction>::decode(qByteArrayFromBytes(old->payload), &error);
+                if (!value || value->uuid != change.uuid) return std::nullopt;
+                decoded = HydraulicEntity{*value};
+            } else if (old->kind == pipeKind) {
+                collection = static_cast<std::size_t>(HydraulicEntityType::Pipe);
+                const std::optional<HydraulicLinkPipe> value =
+                    ModelCodec<HydraulicLinkPipe>::decode(qByteArrayFromBytes(old->payload), &error);
+                if (!value || value->uuid != change.uuid) return std::nullopt;
+                decoded = HydraulicEntity{*value};
+            } else if (old->kind == 7 || old->kind == 16 || old->kind == 17 || old->kind == 18) {
+                switch (old->kind) {
+#define DECODE_DEPENDENT(type, expectedKind, ordinal) \
+                    case expectedKind: { \
+                        const std::optional<type> value = ModelCodec<type>::decode( \
+                            qByteArrayFromBytes(old->payload), &error); \
+                        if (!value || value->uuid != change.uuid) return std::nullopt; \
+                        collection = static_cast<std::size_t>(ordinal); \
+                        decoded = HydraulicEntity{*value}; \
+                        break; \
+                    }
+                    DECODE_DEPENDENT(HydraulicDemandPoint, 7, HydraulicEntityType::DemandPoint)
+                    DECODE_DEPENDENT(HydraulicControlSimple, 16, HydraulicEntityType::SimpleControl)
+                    DECODE_DEPENDENT(HydraulicControlRule, 17, HydraulicEntityType::RuleControl)
+                    DECODE_DEPENDENT(HydraulicMapLabel, 18, HydraulicEntityType::MapLabel)
+#undef DECODE_DEPENDENT
+                    default: return std::nullopt;
+                }
+            } else return std::nullopt;
+            const std::optional<Key> owning = ownerChunk(repository, branch, networkUuid, key);
+            if (!owning || !manifest.chunks[collection].contains(uuidFromKey(*owning)) ||
+                (decoded && old->references != membershipReferences(*decoded))) return std::nullopt;
+            removals.emplace(key, Removal{*owning, collection});
         }
     }
 
-    const auto validTarget = [&](const QUuid& id, bool material, bool pattern) -> bool {
+    // Metadata references do not use persisted outgoing entity references.
+    // Extract them with the SAME canonical reference walker as full validation;
+    // this includes report selections and embedded multi-species relationships.
+    QSet<QUuid> metadataReferences;
+    if (!removals.empty()) {
+        for (const aowis::native::HydraulicReference& reference :
+             aowis::native::hydraulicReferences(manifest.metadata)) {
+            if (reference.source_uuid == networkUuid && !reference.target_uuid.isNull())
+                metadataReferences.insert(reference.target_uuid);
+        }
+    }
+    for (const std::pair<const Key, Removal>& removal : removals) {
+        if (metadataReferences.contains(uuidFromKey(removal.first))) return std::nullopt;
+        const std::vector<Key> incoming = repository.referencingModel(branch, removal.first);
+        if (std::find(incoming.begin(), incoming.end(), removal.second.owner) == incoming.end())
+            return std::nullopt;
+        for (const Key& referring : incoming) {
+            if (referring != removal.second.owner && !removals.contains(referring))
+                return std::nullopt;
+        }
+    }
+
+    // Every inserted reference is validated against the exact accepted kinds,
+    // regardless of whether the target already exists or is another insertion
+    // in this same atomic batch. A reference into this batch's removals is
+    // always illegal. Null references are allowed by the canonical validator.
+    const auto validTarget = [&](const QUuid& id,
+                                 std::initializer_list<std::uint16_t> accepted) -> bool {
         if (id.isNull()) return true;
         const Key key = keyFromUuid(id);
+        if (removals.contains(key)) return false;
         const std::map<Key, const HydraulicEntityChange*>::const_iterator added = insertions.find(key);
-        if (added != insertions.end())
-            return !material && !pattern &&
-                   std::holds_alternative<HydraulicNodeJunction>(*added->second->value);
+        if (added != insertions.end()) {
+            const std::size_t index = added->second->value->index();
+            return std::find(accepted.begin(), accepted.end(), kinds[index]) != accepted.end();
+        }
         const std::optional<ModelRecord> target = repository.getModel(branch, key);
-        if (!target) return false;
-        if (material ? target->kind != 8 :
-            pattern ? target->kind != 9 :
-            (target->kind != junctionKind && target->kind != 2 && target->kind != 3)) return false;
+        if (!target || std::find(accepted.begin(), accepted.end(), target->kind) == accepted.end())
+            return false;
         return ownerChunk(repository, branch, networkUuid, key).has_value();
+    };
+    const auto nodeTarget = [&](const QUuid& id) {
+        return validTarget(id, {junctionKind, 2, 3});
+    };
+    const auto patternTarget = [&](const QUuid& id) {
+        return validTarget(id, {9});
     };
     for (const std::pair<const Key, const HydraulicEntityChange*>& entry : insertions) {
         const HydraulicEntityChange& change = *entry.second;
         if (const HydraulicNodeJunction* node = std::get_if<HydraulicNodeJunction>(&*change.value)) {
             for (const HydraulicDemand& demand : node->demands)
-                if (!validTarget(demand.pattern_uuid, false, true)) return std::nullopt;
-            if (!validTarget(node->quality_source.pattern_uuid, false, true)) return std::nullopt;
+                if (!patternTarget(demand.pattern_uuid)) return std::nullopt;
+            if (!patternTarget(node->quality_source.pattern_uuid)) return std::nullopt;
+        } else if (const HydraulicNodeReservoir* reservoir =
+                   std::get_if<HydraulicNodeReservoir>(&*change.value)) {
+            if (!patternTarget(reservoir->head_pattern_uuid) ||
+                !patternTarget(reservoir->quality_source.pattern_uuid)) return std::nullopt;
+        } else if (const HydraulicNodeTank* tank = std::get_if<HydraulicNodeTank>(&*change.value)) {
+            if (!validTarget(tank->volume_curve_uuid, {10}) ||
+                !patternTarget(tank->quality_source.pattern_uuid)) return std::nullopt;
         } else if (const HydraulicLinkPipe* pipe = std::get_if<HydraulicLinkPipe>(&*change.value)) {
-            if (!validTarget(pipe->node_uuid_from, false, false) ||
-                !validTarget(pipe->node_uuid_to, false, false) ||
-                !validTarget(pipe->material_uuid, true, false)) return std::nullopt;
+            if (!nodeTarget(pipe->node_uuid_from) || !nodeTarget(pipe->node_uuid_to) ||
+                !validTarget(pipe->material_uuid, {8})) return std::nullopt;
+        } else if (const HydraulicLinkPump* pump = std::get_if<HydraulicLinkPump>(&*change.value)) {
+            if (!nodeTarget(pump->node_uuid_from) || !nodeTarget(pump->node_uuid_to) ||
+                !validTarget(pump->head_curve_uuid, {11}) ||
+                !patternTarget(pump->speed_pattern_uuid) ||
+                !validTarget(pump->efficiency_curve_uuid, {12}) ||
+                !patternTarget(pump->price_pattern_uuid)) return std::nullopt;
+        } else if (const HydraulicLinkValve* valve = std::get_if<HydraulicLinkValve>(&*change.value)) {
+            if (!nodeTarget(valve->node_uuid_from) || !nodeTarget(valve->node_uuid_to) ||
+                !validTarget(valve->head_loss_curve_uuid, {13}) ||
+                !validTarget(valve->characteristic_curve_uuid, {14})) return std::nullopt;
+        } else if (const HydraulicDemandPoint* point = std::get_if<HydraulicDemandPoint>(&*change.value)) {
+            for (const HydraulicDemand& demand : point->demands)
+                if (!patternTarget(demand.pattern_uuid)) return std::nullopt;
+            if (point->attachment.type == HydraulicDemandPointAttachmentType::Pipe) {
+                if (!validTarget(point->attachment.pipe_uuid, {pipeKind}) ||
+                    !std::isfinite(point->attachment.pipe_position) ||
+                    point->attachment.pipe_position < 0.0 || point->attachment.pipe_position > 1.0)
+                    return std::nullopt;
+                if (point->attachment.pipe_allocation_mode ==
+                    HydraulicDemandPointPipeAllocationMode::AssignedJunction) {
+                    const QUuid assigned = point->attachment.pipe_assigned_junction_uuid;
+                    if (!validTarget(assigned, {junctionKind})) return std::nullopt;
+                    // The canonical validator also requires an assigned
+                    // junction to be a real endpoint of the attached pipe.
+                    // Check both existing and same-batch inserted pipes.
+                    if (!point->attachment.pipe_uuid.isNull() && !assigned.isNull()) {
+                        const Key pipeKey = keyFromUuid(point->attachment.pipe_uuid);
+                        const std::map<Key, const HydraulicEntityChange*>::const_iterator inserted =
+                            insertions.find(pipeKey);
+                        std::optional<HydraulicLinkPipe> existingPipe;
+                        const HydraulicLinkPipe* pipe = nullptr;
+                        if (inserted != insertions.end()) {
+                            pipe = std::get_if<HydraulicLinkPipe>(&*inserted->second->value);
+                        } else {
+                            const std::optional<ModelRecord> record = repository.getModel(branch, pipeKey);
+                            if (!record || record->kind != pipeKind) return std::nullopt;
+                            existingPipe = ModelCodec<HydraulicLinkPipe>::decode(
+                                qByteArrayFromBytes(record->payload));
+                            if (!existingPipe || existingPipe->uuid != point->attachment.pipe_uuid ||
+                                record->references != scalarReferences(HydraulicEntity{*existingPipe}))
+                                return std::nullopt;
+                            pipe = &*existingPipe;
+                        }
+                        if (!pipe || (pipe->node_uuid_from != assigned &&
+                                      pipe->node_uuid_to != assigned)) return std::nullopt;
+                    }
+                }
+            } else if (point->attachment.type == HydraulicDemandPointAttachmentType::Junction) {
+                if (!validTarget(point->attachment.junction_uuid, {junctionKind})) return std::nullopt;
+            } else if (point->attachment.type != HydraulicDemandPointAttachmentType::None) {
+                return std::nullopt;
+            }
+        } else if (const HydraulicControlSimple* control =
+                   std::get_if<HydraulicControlSimple>(&*change.value)) {
+            if (!validTarget(control->link_uuid, {pipeKind, 5, 6}) ||
+                !nodeTarget(control->trigger_node_uuid)) return std::nullopt;
+        } else if (const HydraulicControlRule* rule =
+                   std::get_if<HydraulicControlRule>(&*change.value)) {
+            for (const HydraulicControlRulePremise& premise : rule->premises) {
+                if (premise.object == HydraulicControlRuleObject::Node &&
+                    !nodeTarget(premise.object_uuid)) return std::nullopt;
+                if (premise.object == HydraulicControlRuleObject::Link &&
+                    !validTarget(premise.object_uuid, {pipeKind, 5, 6})) return std::nullopt;
+            }
+            for (const HydraulicControlRuleAction& action : rule->actions_then)
+                if (!validTarget(action.link_uuid, {pipeKind, 5, 6})) return std::nullopt;
+            for (const HydraulicControlRuleAction& action : rule->actions_else)
+                if (!validTarget(action.link_uuid, {pipeKind, 5, 6})) return std::nullopt;
         } else if (const HydraulicMapLabel* label = std::get_if<HydraulicMapLabel>(&*change.value)) {
-            if (!validTarget(label->anchor_node_uuid, false, false)) return std::nullopt;
-        } else return std::nullopt;
+            if (!nodeTarget(label->anchor_node_uuid)) return std::nullopt;
+        } else if (change.value->index() >= 8) return std::nullopt;
+        // Catalogue entries have no outgoing refs.
     }
 
     std::map<Key, std::optional<MemberChunk>> modifiedChunks;
@@ -661,11 +1250,6 @@ std::optional<Revision> tryIndexedMembershipEdits(
 
     std::vector<ModelChange> pending;
     pending.reserve(changes.size() + 24);
-    static constexpr std::array<std::uint16_t, collectionCount> kinds = {
-#define MEMBER_KIND(name, type, kind) static_cast<std::uint16_t>(kind),
-        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
-#undef MEMBER_KIND
-    };
     for (const HydraulicEntityChange& change : changes) {
         const Key key = keyFromUuid(change.uuid);
         if (change.value) {
@@ -688,14 +1272,15 @@ std::optional<Revision> tryIndexedMembershipEdits(
                 record.payload = bytesFromQByteArray(ModelCodec<T>::encode(entity));
             }, *change.value);
             if (record.payload.empty()) throw std::runtime_error("cannot encode inserted entity");
-            record.references = scalarReferences(*change.value);
+            record.references = membershipReferences(*change.value);
             pending.push_back(ModelChange{key, std::move(record)});
         } else {
-            const std::size_t collection = static_cast<std::size_t>(HydraulicEntityType::MapLabel);
-            const Key owner = removals.at(key);
+            const Removal& removal = removals.at(key);
+            const std::size_t collection = removal.collection;
+            const Key owner = removal.owner;
             MemberChunk& chunk = mutableChunk(owner, collection);
             if (chunk.members.removeAll(change.uuid) != 1)
-                throw std::runtime_error("membership label missing from declared chunk");
+                throw std::runtime_error("member missing from declared membership chunk");
             if (chunk.members.isEmpty()) {
                 modifiedChunks[owner] = std::nullopt;
                 if (!manifest.chunks[collection].removeOne(uuidFromKey(owner)))
@@ -715,7 +1300,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
         root.references = chunkKeys(manifest);
         pending.push_back(ModelChange{networkKey, std::move(root)});
     }
-    const Revision result = repository.commitModel(branch, pending, starting.id);
+    const Revision result = repository.commitModel(branch, std::move(pending), starting.id);
     if (diagnostics) {
         diagnostics->indexedMembershipFastPath = true;
         diagnostics->validatedEntities = changes.size();
@@ -763,7 +1348,7 @@ std::optional<Revision> tryIndexedScalarEdits(
             throw std::runtime_error("branch head changed during hydraulic scalar edit");
         result = starting;
     } else {
-        result = repository.commitModel(branch, pending, starting.id);
+        result = repository.commitModel(branch, std::move(pending), starting.id);
     }
     if (diagnostics) {
         diagnostics->indexedScalarFastPath = true;
@@ -849,11 +1434,228 @@ std::optional<HydraulicEntity> loadHydraulicEntity(
     }
 }
 
+// The candidate is a private, lazy copy-on-write view held under the native
+// merge lock. Do not call Repository APIs from this function or its helpers.
+using CandidateReader = std::function<std::optional<ModelRecord>(const Key&)>;
+
+void candidateMembers(const CandidateReader& read, Manifest& manifest) {
+    std::set<Key> seen;
+    for (std::size_t collection = 0; collection < collectionCount; ++collection) {
+        for (const QUuid& id : manifest.chunks[collection]) {
+            const std::optional<ModelRecord> record = read(keyFromUuid(id));
+            if (!record) throw std::runtime_error("merged network is missing a membership chunk");
+            const MemberChunk chunk = decodeChunk(*record, manifest.metadata.uuid, collection);
+            for (const QUuid& member : chunk.members) {
+                if (!seen.insert(keyFromUuid(member)).second)
+                    throw std::runtime_error("merged network has duplicate members");
+                manifest.members[collection].append(member);
+            }
+        }
+    }
+}
+
+template<typename T>
+void candidateEntities(const CandidateReader& read, const QList<QUuid>& ids,
+                       std::uint16_t kind, QList<T>& output, DependencyIndex& recorded) {
+    for (const QUuid& id : ids) {
+        const std::optional<ModelRecord> record = read(keyFromUuid(id));
+        if (!record || record->kind != kind)
+            throw std::runtime_error("merged network contains a missing/wrong-kind entity");
+        const QByteArray bytes = qByteArrayFromBytes(record->payload);
+        const std::optional<T> decoded = aowis::native::ModelCodec<T>::decode(bytes);
+        if (!decoded || decoded->uuid != id ||
+            aowis::native::ModelCodec<T>::encode(*decoded) != bytes)
+            throw std::runtime_error("merged network contains noncanonical entity bytes");
+        for (const Key& ref : record->references)
+            recorded.emplace_back(keyFromUuid(id), ref);
+        output.append(*decoded);
+    }
+}
+
+std::optional<std::string> validateMergedHydraulicSnapshot(const MergeCandidate& candidate) {
+    try {
+        std::vector<Key> roots;
+        std::set<Key> existing;
+        candidate.forEach([&roots, &existing](const Key& key, const ModelRecord& record) {
+            if (!existing.insert(key).second)
+                throw std::runtime_error("duplicate object UUID in merged snapshot");
+            if (record.kind == hydraulicNetworkKind) roots.push_back(key);
+        });
+        if (roots.empty()) return std::string("hydraulic merge has no network root");
+        std::set<Key> globallyOwned;
+        for (const Key& rootKey : roots) {
+            const std::optional<ModelRecord> record = candidate.get(rootKey);
+            if (!record) throw std::runtime_error("missing merged hydraulic root");
+            Manifest manifest = decodeManifest(qByteArrayFromBytes(record->payload));
+            if (keyFromUuid(manifest.metadata.uuid) != rootKey)
+                throw std::runtime_error("merged root UUID and payload mismatch");
+            checkRoot(manifest, *record);
+            candidateMembers(candidate.get, manifest);
+            const std::set<Key> members = memberKeys(manifest);
+            if (!globallyOwned.insert(rootKey).second)
+                throw std::runtime_error("duplicate network root");
+            for (const Key& chunk : chunkKeys(manifest)) {
+                if (!globallyOwned.insert(chunk).second)
+                    throw std::runtime_error("membership chunk belongs to multiple networks");
+            }
+            for (const Key& member : members) {
+                if (!globallyOwned.insert(member).second)
+                    throw std::runtime_error("hydraulic entity belongs to multiple networks");
+            }
+            NetworkHydraulic network = std::move(manifest.metadata);
+            DependencyIndex stored;
+            std::size_t ordinal = 0;
+#define RESTORE_MERGED(name, type, kind) \
+            candidateEntities(candidate.get, manifest.members[ordinal], \
+                              static_cast<std::uint16_t>(kind), network.name, stored); \
+            ++ordinal;
+            AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE_MERGED)
+#undef RESTORE_MERGED
+            const aowis::native::HydraulicDependencyValidation validated =
+                aowis::native::validateHydraulicNetworkWithDependencies(network);
+            if (!validated.report.valid())
+                throw std::runtime_error("invalid combined hydraulic model: " +
+                                         validated.report.summary().toStdString());
+            DependencyIndex canonical = indexedDependencies(validated.dependencies, members);
+            std::sort(stored.begin(), stored.end());
+            stored.erase(std::unique(stored.begin(), stored.end()), stored.end());
+            if (stored != canonical)
+                throw std::runtime_error("merged model references disagree with canonical model payloads");
+        }
+        if (existing != globallyOwned)
+            throw std::runtime_error("merged hydraulic snapshot contains unowned or orphaned objects");
+        return std::nullopt;
+    } catch (const std::exception& error) {
+        return std::string(error.what());
+    }
+}
+
+// Core has no Qt dependency. Only canonical, already-valid typed entities
+// can reach this resolver, and only if their stored references are unchanged.
+MergeResolution resolveHydraulicRecord(const Key& key, const ModelRecord& base,
+                                        const ModelRecord& target, const ModelRecord& source,
+                                        const QMap<QString, bool>& fieldChoices) {
+    MergeResolution rejected{};
+    if (base.kind != target.kind || target.kind != source.kind ||
+        base.references != target.references || base.references != source.references)
+        return rejected; // topology, membership or ownership change
+    QString kindName;
+    // Map persisted kind codes to the codec's canonical field-merge descriptors.
+    static const std::array<const char*, collectionCount> canonicalKinds = {
+        "hydraulic.pipe_material", "hydraulic.pattern_time", "hydraulic.curve_tank_volume",
+        "hydraulic.curve_pump_head", "hydraulic.curve_pump_efficiency",
+        "hydraulic.curve_valve_headloss", "hydraulic.curve_valve_characteristic",
+        "hydraulic.curve_generic", "hydraulic.reservoir", "hydraulic.junction",
+        "hydraulic.tank", "hydraulic.demand_point", "hydraulic.pipe",
+        "hydraulic.pump", "hydraulic.valve", "hydraulic.control_simple",
+        "hydraulic.control_rule", "hydraulic.map_label"
+    };
+    const std::array<std::uint16_t, collectionCount> kinds = {
+#define MERGE_CODE(name, type, kind) static_cast<std::uint16_t>(kind),
+        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(MERGE_CODE)
+#undef MERGE_CODE
+    };
+    for (std::size_t i = 0; i < kinds.size(); ++i)
+        if (kinds[i] == base.kind) kindName = QString::fromLatin1(canonicalKinds[i]);
+    if (kindName.isEmpty()) return rejected;
+    const QByteArray baseBytes = qByteArrayFromBytes(base.payload);
+    const QByteArray targetBytes = qByteArrayFromBytes(target.payload);
+    const QByteArray sourceBytes = qByteArrayFromBytes(source.payload);
+    if (!fieldChoices.isEmpty()) {
+        const std::optional<aowis::native::ModelFieldMerge> preview =
+            aowis::native::mergeModelFields(uuidFromKey(key), kindName,
+                baseBytes, targetBytes, sourceBytes);
+        if (!preview) throw std::runtime_error("cannot resolve fields of an invalid canonical model");
+        for (QMap<QString, bool>::const_iterator choice = fieldChoices.cbegin();
+             choice != fieldChoices.cend(); ++choice) {
+            if (!preview->conflicting_fields.contains(choice.key()))
+                throw std::runtime_error("merge selection is not a conflicting field: " +
+                                         choice.key().toStdString());
+        }
+    }
+    const std::optional<aowis::native::ModelFieldMerge> merged =
+        aowis::native::mergeModelFields(uuidFromKey(key), kindName,
+            baseBytes, targetBytes, sourceBytes, fieldChoices);
+    if (!merged) return rejected;
+    if (!merged->conflicting_fields.isEmpty()) {
+        for (const QString& field : merged->conflicting_fields)
+            rejected.conflictingFields.push_back(field.toStdString());
+        return rejected;
+    }
+    if (merged->content.isEmpty()) return rejected;
+    ModelRecord record = target;
+    record.payload = bytesFromQByteArray(merged->content);
+    return MergeResolution{std::move(record), {}};
+}
+
+MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,
+                                   std::string_view source,
+                                   const HydraulicMergeSelections& selections) {
+    if ((!selections.fields.empty() || !selections.objects.empty()) &&
+        (!selections.expectedTargetHead || !selections.expectedSourceHead))
+        throw std::invalid_argument("explicit merge choices require both previewed branch heads");
+    // Build an immutable lookup before entering the Repository's merge lock.
+    // A duplicate (UUID, field) is rejected rather than choosing an arbitrary
+    // last-write-wins interpretation of the user's instructions.
+    std::map<Key, QMap<QString, bool>> choices;
+    for (const HydraulicFieldChoice& choice : selections.fields) {
+        if (choice.entityUuid.isNull() || choice.field.isEmpty())
+            throw std::invalid_argument("merge choice needs a non-null UUID and field name");
+        const Key key = keyFromUuid(choice.entityUuid);
+        QMap<QString, bool>& perEntity = choices[key];
+        if (perEntity.contains(choice.field))
+            throw std::invalid_argument("duplicate merge choice: " + choice.field.toStdString());
+        perEntity.insert(choice.field, choice.side == HydraulicMergeSide::Source);
+    }
+    std::map<Key, MergeChoiceSide> objectChoices;
+    for (const HydraulicObjectChoice& choice : selections.objects) {
+        if (choice.entityUuid.isNull())
+            throw std::invalid_argument("merge object choice needs a non-null UUID");
+        const Key key = keyFromUuid(choice.entityUuid);
+        if (choices.contains(key))
+            throw std::invalid_argument("cannot select both object and fields for one UUID");
+        if (!objectChoices.emplace(key, choice.side == HydraulicMergeSide::Source
+                                     ? MergeChoiceSide::Source : MergeChoiceSide::Target).second)
+            throw std::invalid_argument("duplicate merge object choice");
+    }
+    std::set<Key> consumed;
+    std::set<Key> consumedObjects;
+    MergeOptions options;
+    options.expectedTargetHead = selections.expectedTargetHead;
+    options.expectedSourceHead = selections.expectedSourceHead;
+    options.chooseConflict = [&objectChoices, &consumedObjects](const MergeConflict& conflict)
+        -> std::optional<MergeChoiceSide> {
+        const std::map<Key, MergeChoiceSide>::const_iterator choice =
+            objectChoices.find(conflict.key);
+        if (choice == objectChoices.end()) return std::nullopt;
+        consumedObjects.insert(conflict.key);
+        return choice->second;
+    };
+    options.resolve = [&choices, &consumed](const Key& key, const ModelRecord& base,
+                                            const ModelRecord& targetRecord,
+                                            const ModelRecord& sourceRecord) {
+        const std::map<Key, QMap<QString, bool>>::const_iterator match = choices.find(key);
+        const QMap<QString, bool> empty;
+        const QMap<QString, bool>& fieldChoices = match == choices.end() ? empty : match->second;
+        MergeResolution result = resolveHydraulicRecord(key, base, targetRecord,
+                                                        sourceRecord, fieldChoices);
+        if (match != choices.end()) consumed.insert(key);
+        return result;
+    };
+    options.checkSelections = [&choices, &consumed, &objectChoices, &consumedObjects]()
+        -> std::optional<std::string> {
+        if (choices.size() != consumed.size())
+            return std::string("merge contains unused or inapplicable field choices");
+        if (objectChoices.size() != consumedObjects.size())
+            return std::string("merge contains unused or inapplicable object choices");
+        return std::nullopt;
+    };
+    options.validate = validateMergedHydraulicSnapshot;
+    return repository.mergeBranches(target, source, options);
+}
+
 Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
                               const NetworkHydraulic& network) {
-    const aowis::native::ModelValidationReport report = aowis::native::validateHydraulicNetwork(network);
-    if (!report.valid()) throw std::runtime_error("invalid hydraulic network: " + report.summary().toStdString());
-
     // Read a stable logical starting point. commitModel() verifies this head
     // again under its repository lock, preventing lost updates between the
     // membership read and final revision publication.
@@ -861,7 +1663,14 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
     const Hash expectedHead = startingRevision.id;
     Manifest next = manifestFor(network);
     const std::set<Key> newMembers = memberKeys(next);
-    const QHash<QUuid, QSet<QUuid>> references = outgoingReferences(network, newMembers);
+    DependencyIndex references;
+    {
+        const aowis::native::HydraulicDependencyValidation validated =
+            aowis::native::validateHydraulicNetworkWithDependencies(network);
+        if (!validated.report.valid())
+            throw std::runtime_error("invalid hydraulic network: " + validated.report.summary().toStdString());
+        references = indexedDependencies(validated.dependencies, newMembers);
+    }
 
     // Discover the old membership first. Updates outside the old membership
     // are only valid when their UUID is not already claimed by another object.
@@ -889,7 +1698,7 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
     changes.reserve(newMembers.size() + oldMembers.size() + 1);
     // IDs are already in the manifest; build canonical payload records only.
 #define APPEND(name, type, kind) \
-    { QList<QUuid> ignored; addEntities(network.name, static_cast<std::uint16_t>(kind), ignored, references, changes); }
+    addEntities(network.name, static_cast<std::uint16_t>(kind), references, changes);
     AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(APPEND)
 #undef APPEND
     for (const Key& key : oldMembers) {
@@ -910,7 +1719,7 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
     root.payload = bytesFromQByteArray(encodeManifest(next));
     root.references = chunkKeys(next);
     changes.push_back(ModelChange{networkKey, std::move(root)});
-    return repository.commitModel(branch, changes, expectedHead);
+    return repository.commitModel(branch, std::move(changes), expectedHead);
 }
 
 
@@ -927,6 +1736,21 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
         return *indexed;
     }
     if (const std::optional<Revision> indexed = tryIndexedPipeRewires(
+            repository, branch, networkUuid, changes, startingRevision, diagnostics)) {
+        return *indexed;
+    }
+
+    if (const std::optional<Revision> indexed = tryIndexedPhysicalUpdates(
+            repository, branch, networkUuid, changes, startingRevision, diagnostics)) {
+        return *indexed;
+    }
+
+    if (const std::optional<Revision> indexed = tryIndexedCatalogueUpdates(
+            repository, branch, networkUuid, changes, startingRevision, diagnostics)) {
+        return *indexed;
+    }
+
+    if (const std::optional<Revision> indexed = tryIndexedDependentUpdates(
             repository, branch, networkUuid, changes, startingRevision, diagnostics)) {
         return *indexed;
     }
@@ -976,11 +1800,16 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
 
     // Use the complete canonical model validator until we have a proven
     // incremental validator with identical cross-entity semantics.
-    const aowis::native::ModelValidationReport report = aowis::native::validateHydraulicNetwork(*network);
-    if (!report.valid()) throw std::runtime_error("invalid hydraulic edit: " + report.summary().toStdString());
     const Manifest next = manifestFor(*network);
     const std::set<Key> nextKeys = memberKeys(next);
-    const QHash<QUuid, QSet<QUuid>> references = outgoingReferences(*network, nextKeys);
+    DependencyIndex references;
+    {
+        const aowis::native::HydraulicDependencyValidation validated =
+            aowis::native::validateHydraulicNetworkWithDependencies(*network);
+        if (!validated.report.valid())
+            throw std::runtime_error("invalid hydraulic edit: " + validated.report.summary().toStdString());
+        references = indexedDependencies(validated.dependencies, nextKeys);
+    }
 
     std::vector<ModelChange> pending;
     pending.reserve(changes.size() + 1);
@@ -1015,7 +1844,7 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
         }
         return startingRevision;
     }
-    return repository.commitModel(branch, pending, startingRevision.id);
+    return repository.commitModel(branch, std::move(pending), startingRevision.id);
 }
 
 std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
@@ -1033,7 +1862,7 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
         const std::set<Key> members = memberKeys(manifest);
 
         NetworkHydraulic network = std::move(manifest.metadata);
-        QHash<QUuid, QSet<QUuid>> storedReferences;
+        DependencyIndex storedReferences;
         std::size_t ordinal = 0;
 #define RESTORE(name, type, kind) \
         restoreEntities(repository, branch, manifest.members[ordinal], \
@@ -1041,15 +1870,16 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
         ++ordinal;
         AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE)
 #undef RESTORE
-        const aowis::native::ModelValidationReport report = aowis::native::validateHydraulicNetwork(network);
-        if (!report.valid()) throw std::runtime_error("loaded network invalid: " + report.summary().toStdString());
-        const QHash<QUuid, QSet<QUuid>> canonicalReferences = outgoingReferences(network, members);
-        for (const Key& key : members) {
-            const QUuid id = uuidFromKey(key);
-            if (canonicalReferences.value(id) != storedReferences.value(id)) {
-                throw std::runtime_error("stored hydraulic references differ from canonical model payload");
-            }
-        }
+        const aowis::native::HydraulicDependencyValidation validated =
+            aowis::native::validateHydraulicNetworkWithDependencies(network);
+        if (!validated.report.valid())
+            throw std::runtime_error("loaded network invalid: " + validated.report.summary().toStdString());
+        const DependencyIndex canonicalReferences = indexedDependencies(validated.dependencies, members);
+        std::sort(storedReferences.begin(), storedReferences.end());
+        storedReferences.erase(std::unique(storedReferences.begin(), storedReferences.end()),
+                               storedReferences.end());
+        if (storedReferences != canonicalReferences)
+            throw std::runtime_error("stored hydraulic references differ from canonical model payload");
         if (error) error->clear();
         return network;
     } catch (const std::exception& failure) {
@@ -1058,4 +1888,4 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
     }
 }
 
-} // namespace aowis::native::v5
+} // namespace aowis::native::hydraulic

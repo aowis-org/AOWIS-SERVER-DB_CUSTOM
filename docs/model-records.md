@@ -66,11 +66,11 @@ The target directory must not exist. This creates 100,001 junction records,
 revisions modify pipe payloads while retaining their endpoint references.
 Unlike the original microbenchmark it measures `commitModel` validation and
 record envelopes. It reports `fixture=synthetic-hydraulic-topology` and
-`codec=placeholder-not-sql-v5` deliberately: the payload is unique synthetic
+`codec=synthetic-not-serialized` deliberately: the payload is unique synthetic
 binary data, **not** serialized `HydraulicNodeJunction` or `HydraulicLinkPipe`
 instances and **not** comparable to full SQL `saveNetworkHydraulic` operations.
 
-## Native-owned canonical V5 codec
+## Native-owned canonical model codec
 
 The native database compiles its own canonical `ModelCodec<T>` implementation
 from `src/model_codec.cpp` and `src/model_validation.cpp`. All 68 persisted
@@ -80,7 +80,7 @@ operations use the native codec and native reference validator.
 See [native serialization](native-serialization.md).
 
 The synthetic workload above remains only a storage microbenchmark; use
-`aowis-native-v5-model-benchmark` for typed hydraulic entities. Full network
+`aowis-native-hydraulic-model-benchmark` for typed hydraulic entities. Full network
 save/load/edit behavior is tested in `aowis-native-hydraulic-network-tests`.
 
 ## Persistent model reference index (Stage 5)

@@ -8,15 +8,19 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
 namespace {
 namespace native = aowis::native;
-namespace v5 = aowis::native::v5;
+namespace hydraulic = aowis::native::hydraulic;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -30,7 +34,7 @@ QUuid uuid(int ordinal) {
     for (int i = 0; i < 4; ++i) {
         key[15 - i] = static_cast<std::uint8_t>(ordinal >> (8 * i));
     }
-    return v5::uuidFromKey(key);
+    return hydraulic::uuidFromKey(key);
 }
 
 template<typename T>
@@ -123,7 +127,7 @@ void compareNetworks(const NetworkHydraulic& source, const NetworkHydraulic& res
         require(result.name[i].uuid == source.name[i].uuid, "network order changed: " #name); \
         require(aowis::native::ModelCodec<type>::encode(result.name[i]) == \
                 aowis::native::ModelCodec<type>::encode(source.name[i]), \
-                "canonical V5 payload changed: " #name); \
+                "canonical model payload changed: " #name); \
     }
     CHECK_LIST(pipe_materials, HydraulicPipeMaterial)
     CHECK_LIST(patterns_time, HydraulicPatternTime)
@@ -150,7 +154,7 @@ NetworkHydraulic requiredLoad(native::Repository& repository, std::string_view b
                               const QUuid& id) {
     QString error;
     const std::optional<NetworkHydraulic> loaded =
-        v5::loadHydraulicNetwork(repository, branch, id, &error);
+        hydraulic::loadHydraulicNetwork(repository, branch, id, &error);
     if (!loaded) throw std::runtime_error("network load failed: " + error.toStdString());
     return *loaded;
 }
@@ -160,15 +164,40 @@ void exercise(native::PhysicalStore physical) {
     try {
         const NetworkHydraulic initial = completeNetwork();
         require(aowis::native::validateHydraulicNetwork(initial).valid(), "test network invalid");
+        // Compact persistence edges must match the detailed reference walker.
+        const native::HydraulicDependencyValidation compact =
+            native::validateHydraulicNetworkWithDependencies(initial);
+        require(compact.report.valid(), "compact validation rejected valid network");
+        std::set<std::pair<native::Key, native::Key>> compactEdges;
+        for (const native::HydraulicDependency& edge : compact.dependencies) {
+            compactEdges.emplace(hydraulic::keyFromUuid(edge.source_uuid),
+                                 hydraulic::keyFromUuid(edge.target_uuid));
+        }
+        std::set<std::pair<native::Key, native::Key>> detailedEdges;
+        for (const native::HydraulicReference& edge : native::hydraulicReferences(initial)) {
+            detailedEdges.emplace(hydraulic::keyFromUuid(edge.source_uuid),
+                                  hydraulic::keyFromUuid(edge.target_uuid));
+        }
+        require(compactEdges == detailedEdges && !compactEdges.empty(),
+                "compact reference walker diverged from canonical detailed references");
+        NetworkHydraulic invalidCompactFixture = initial;
+        invalidCompactFixture.links_pipes[0].node_uuid_from = uuid(9999);
+        const native::HydraulicDependencyValidation invalidCompact =
+            native::validateHydraulicNetworkWithDependencies(invalidCompactFixture);
+        const native::ModelValidationReport invalidDetailed =
+            native::validateHydraulicNetwork(invalidCompactFixture);
+        require(!invalidDetailed.valid() && !invalidCompact.report.valid() &&
+                invalidCompact.report.summary() == invalidDetailed.summary(),
+                "compact validation accepted an invalid endpoint or changed diagnostics");
         native::Hash original{};
         {
             native::Repository repository(folder, physical);
             repository.createBranch("main");
-            original = v5::saveHydraulicNetwork(repository, "main", initial).id;
+            original = hydraulic::saveHydraulicNetwork(repository, "main", initial).id;
             require(repository.head("main").modelIndexed, "model index was not published");
             QString error;
             const std::optional<NetworkHydraulic> restored =
-                v5::loadHydraulicNetwork(repository, "main", initial.uuid, &error);
+                hydraulic::loadHydraulicNetwork(repository, "main", initial.uuid, &error);
             require(restored.has_value(), "first network load failed");
             compareNetworks(initial, *restored);
             // Fast indexed reads must return the canonical entity without
@@ -176,16 +205,16 @@ void exercise(native::PhysicalStore physical) {
             std::size_t checkedCollection = 0;
 #define CHECK_FAST_READ(name, type) \
             { \
-                const std::optional<QList<QUuid>> ids = v5::listHydraulicEntityIds( \
+                const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIds( \
                     repository, "main", initial.uuid, \
-                    static_cast<v5::HydraulicEntityType>(checkedCollection), &error); \
+                    static_cast<hydraulic::HydraulicEntityType>(checkedCollection), &error); \
                 require(ids.has_value() && *ids == [&]() { \
                     QList<QUuid> expected; \
                     for (const type& item : initial.name) expected.append(item.uuid); \
                     return expected; \
                 }(), "fast membership list changed: " #name); \
                 for (const type& expected : initial.name) { \
-                    const std::optional<v5::HydraulicEntity> actual = v5::loadHydraulicEntity( \
+                    const std::optional<hydraulic::HydraulicEntity> actual = hydraulic::loadHydraulicEntity( \
                         repository, "main", initial.uuid, expected.uuid, &error); \
                     require(actual.has_value(), "fast entity lookup missing: " #name); \
                     const type* entity = std::get_if<type>(&*actual); \
@@ -216,20 +245,20 @@ void exercise(native::PhysicalStore physical) {
             CHECK_FAST_READ(map_labels, HydraulicMapLabel)
 #undef CHECK_FAST_READ
             require(checkedCollection == 18, "incomplete indexed entity read coverage");
-            require(!v5::loadHydraulicEntity(repository, "main", initial.uuid, uuid(999), &error) &&
+            require(!hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(999), &error) &&
                     error.isEmpty(), "unknown UUID unexpectedly resolved");
-            require(!v5::loadHydraulicEntity(repository, "main", uuid(999), uuid(23), &error) &&
+            require(!hydraulic::loadHydraulicEntity(repository, "main", uuid(999), uuid(23), &error) &&
                     error.isEmpty(), "entity unexpectedly belongs to another network");
-            require(!v5::listHydraulicEntityIds(repository, "main", uuid(999),
-                     v5::HydraulicEntityType::Pipe, &error) && error.isEmpty(),
+            require(!hydraulic::listHydraulicEntityIds(repository, "main", uuid(999),
+                     hydraulic::HydraulicEntityType::Pipe, &error) && error.isEmpty(),
                     "unknown network unexpectedly listed members");
-            require(!v5::listHydraulicEntityIds(repository, "main", initial.uuid,
-                     static_cast<v5::HydraulicEntityType>(99), &error) && !error.isEmpty(),
+            require(!hydraulic::listHydraulicEntityIds(repository, "main", initial.uuid,
+                     static_cast<hydraulic::HydraulicEntityType>(99), &error) && !error.isEmpty(),
                     "invalid collection kind not rejected");
-            require(repository.referencingModel("main", v5::keyFromUuid(uuid(19))).size() >= 2,
+            require(repository.referencingModel("main", hydraulic::keyFromUuid(uuid(19))).size() >= 2,
                     "inbound model references were not indexed");
             bool rejectedRawDeletion = false;
-            try { repository.commitModel("main", {{v5::keyFromUuid(uuid(19)), std::nullopt}}); }
+            try { repository.commitModel("main", {{hydraulic::keyFromUuid(uuid(19)), std::nullopt}}); }
             catch (const std::runtime_error&) { rejectedRawDeletion = true; }
             require(rejectedRawDeletion && repository.head("main").id == original,
                     "network membership allowed raw deletion of a listed entity");
@@ -241,7 +270,7 @@ void exercise(native::PhysicalStore physical) {
             // A raw Merkle diff includes storage-level membership chunks.
             // Removing the only label retires its chunk as well as its entity;
             // it is not just the three semantic changes (root, pipe, label).
-            const native::Key labelKey = v5::keyFromUuid(uuid(28));
+            const native::Key labelKey = hydraulic::keyFromUuid(uuid(28));
             const std::vector<native::Key> labelOwners = repository.referencingModel("main", labelKey);
             require(labelOwners.size() == 1, "label must belong to exactly one membership chunk");
             const native::Key labelChunkKey = labelOwners.front();
@@ -250,7 +279,7 @@ void exercise(native::PhysicalStore physical) {
             require(labelChunk.has_value() && labelChunk->references.size() == 1 &&
                     labelChunk->references.front() == labelKey,
                     "original label membership chunk is invalid");
-            v5::saveHydraulicNetwork(repository, "feature", modified);
+            hydraulic::saveHydraulicNetwork(repository, "feature", modified);
             const std::vector<native::Difference> differences = repository.diff("main", "feature");
             require(differences.size() == 4,
                     "whole-network update must affect root, pipe, label and retired membership chunk");
@@ -260,8 +289,8 @@ void exercise(native::PhysicalStore physical) {
                                        return difference.key == key;
                                    });
             };
-            require(containsChangedKey(v5::keyFromUuid(initial.uuid)) &&
-                    containsChangedKey(v5::keyFromUuid(uuid(23))) &&
+            require(containsChangedKey(hydraulic::keyFromUuid(initial.uuid)) &&
+                    containsChangedKey(hydraulic::keyFromUuid(uuid(23))) &&
                     containsChangedKey(labelKey) && containsChangedKey(labelChunkKey),
                     "whole-network update changed unexpected model records");
             require(repository.getModel("main", labelChunkKey).has_value() &&
@@ -269,61 +298,321 @@ void exercise(native::PhysicalStore physical) {
                     "membership chunk deletion did not preserve branch isolation");
             compareNetworks(initial, requiredLoad(repository, "main", initial.uuid));
             compareNetworks(modified, requiredLoad(repository, "feature", initial.uuid));
-            require(!repository.getModel("feature", v5::keyFromUuid(uuid(28))),
+            require(!repository.getModel("feature", hydraulic::keyFromUuid(uuid(28))),
                     "removed label still has a model record");
-            const std::optional<v5::HydraulicEntity> featurePipe =
-                v5::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(23), &error);
+            const std::optional<hydraulic::HydraulicEntity> featurePipe =
+                hydraulic::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(23), &error);
             require(featurePipe.has_value() &&
                     std::get<HydraulicLinkPipe>(*featurePipe).diameter_mm == 211.5,
                     "indexed entity read did not follow branch changes");
-            require(!v5::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(28), &error) &&
+            require(!hydraulic::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(28), &error) &&
                     error.isEmpty(), "deleted entity still appears as a member");
-            require(v5::listHydraulicEntityIds(repository, "feature", initial.uuid,
-                    v5::HydraulicEntityType::MapLabel, &error)->empty(),
+            require(hydraulic::listHydraulicEntityIds(repository, "feature", initial.uuid,
+                    hydraulic::HydraulicEntityType::MapLabel, &error)->empty(),
                     "deleted label still appears in ordered membership");
-            require(v5::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28), &error).has_value(),
+            require(hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28), &error).has_value(),
                     "branch isolation failed for indexed lookups");
+            // Bounded physical editing of all four non-pipe hydraulic kinds.
+            // These test objects have live inbound and outgoing references;
+            // preserving structural links is essential for correctness.
+            repository.createBranch("physical-indexed", "main");
+            NetworkHydraulic physicalExpected = initial;
+            HydraulicNodeReservoir updatedReservoir = initial.nodes_reservoirs[0];
+            updatedReservoir.hydraulic_head_m = 147.5;
+            updatedReservoir.terrain_elevation_m = 135.0;
+            HydraulicNodeTank updatedTank = initial.nodes_tanks[0];
+            updatedTank.water_level_initial_m = 4.25;
+            updatedTank.water_level_maximum_m = 9.5;
+            HydraulicLinkPump updatedPump = initial.links_pumps[0];
+            updatedPump.initial_speed_ratio = 1.4;
+            updatedPump.constant_power_kw = 34.0;
+            HydraulicLinkValve updatedValve = initial.links_valves[0];
+            updatedValve.setting_pressure_head_m = 16.5;
+            updatedValve.diameter_mm = 240.0;
+            hydraulic::HydraulicEditDiagnostics physicalStats;
+            const native::Revision physicalBase = repository.head("physical-indexed");
+            const native::ModelRecord physicalRootBefore = *repository.getModel(
+                "physical-indexed", hydraulic::keyFromUuid(initial.uuid));
+            const native::Revision physicalChanged = hydraulic::editHydraulicNetwork(
+                repository, "physical-indexed", initial.uuid,
+                {{updatedReservoir.uuid, hydraulic::HydraulicEntity{updatedReservoir}},
+                 {updatedTank.uuid, hydraulic::HydraulicEntity{updatedTank}},
+                 {updatedPump.uuid, hydraulic::HydraulicEntity{updatedPump}},
+                 {updatedValve.uuid, hydraulic::HydraulicEntity{updatedValve}}}, &physicalStats);
+            require(physicalStats.indexedPhysicalFastPath && physicalStats.validatedEntities == 4 &&
+                    physicalChanged.id != physicalBase.id,
+                    "physical parameter batch did not use bounded validation");
+            physicalExpected.nodes_reservoirs[0] = updatedReservoir;
+            physicalExpected.nodes_tanks[0] = updatedTank;
+            physicalExpected.links_pumps[0] = updatedPump;
+            physicalExpected.links_valves[0] = updatedValve;
+            compareNetworks(physicalExpected, requiredLoad(repository, "physical-indexed", initial.uuid));
+            require(repository.getModel("physical-indexed", hydraulic::keyFromUuid(initial.uuid))->payload ==
+                    physicalRootBefore.payload,
+                    "physical-only update rewrote network membership");
+            require(hydraulic::editHydraulicNetwork(repository, "physical-indexed", initial.uuid,
+                {{updatedTank.uuid, hydraulic::HydraulicEntity{updatedTank}}}, &physicalStats).id ==
+                    physicalChanged.id && physicalStats.indexedPhysicalFastPath,
+                    "identical tank update advanced revision");
+            const std::vector<native::Key> reservoirIncoming = repository.referencingModel(
+                "physical-indexed", hydraulic::keyFromUuid(updatedReservoir.uuid));
+            require(std::find(reservoirIncoming.begin(), reservoirIncoming.end(),
+                    hydraulic::keyFromUuid(updatedPump.uuid)) != reservoirIncoming.end(),
+                    "physical update lost pump-to-reservoir reference");
+            const std::vector<native::Key> tankIncoming = repository.referencingModel(
+                "physical-indexed", hydraulic::keyFromUuid(updatedTank.uuid));
+            require(std::find(tankIncoming.begin(), tankIncoming.end(),
+                    hydraulic::keyFromUuid(updatedValve.uuid)) != tankIncoming.end(),
+                    "physical update lost valve-to-tank reference");
+            HydraulicLinkPump wrongCurve = updatedPump;
+            wrongCurve.head_curve_uuid = uuid(12); // Tank-volume curve, not pump-head curve.
+            bool rejectedPhysical = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "physical-indexed", initial.uuid,
+                    {{wrongCurve.uuid, hydraulic::HydraulicEntity{wrongCurve}}}, &physicalStats);
+            } catch (const std::exception&) { rejectedPhysical = true; }
+            require(rejectedPhysical && !physicalStats.indexedPhysicalFastPath &&
+                    repository.head("physical-indexed").id == physicalChanged.id,
+                    "indexed physical path accepted a wrong-type structural link");
+            HydraulicNodeTank wrongCurveTank = updatedTank;
+            wrongCurveTank.volume_curve_uuid = uuid(13); // Pump-head curve, not tank-volume curve.
+            rejectedPhysical = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "physical-indexed", initial.uuid,
+                    {{wrongCurveTank.uuid, hydraulic::HydraulicEntity{wrongCurveTank}}}, &physicalStats);
+            } catch (const std::exception&) { rejectedPhysical = true; }
+            require(rejectedPhysical && !physicalStats.indexedPhysicalFastPath &&
+                    repository.head("physical-indexed").id == physicalChanged.id,
+                    "indexed physical path accepted a wrong-type tank curve");
+            // A mixed update must fail atomically, even if one physical edit
+            // would have qualified for the fast path by itself.
+            HydraulicLinkPump mixedPump = updatedPump;
+            mixedPump.constant_power_kw += 11.0;
+            rejectedPhysical = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "physical-indexed", initial.uuid,
+                    {{mixedPump.uuid, hydraulic::HydraulicEntity{mixedPump}},
+                     {wrongCurveTank.uuid, hydraulic::HydraulicEntity{wrongCurveTank}}}, &physicalStats);
+            } catch (const std::exception&) { rejectedPhysical = true; }
+            const std::optional<hydraulic::HydraulicEntity> pumpAfterRejected =
+                hydraulic::loadHydraulicEntity(repository, "physical-indexed", initial.uuid, mixedPump.uuid);
+            require(rejectedPhysical && !physicalStats.indexedPhysicalFastPath &&
+                    repository.head("physical-indexed").id == physicalChanged.id &&
+                    pumpAfterRejected.has_value() &&
+                    std::get<HydraulicLinkPump>(*pumpAfterRejected).constant_power_kw ==
+                        updatedPump.constant_power_kw,
+                    "mixed physical/invalid reference batch partially committed");
+            HydraulicLinkValve structuralValve = updatedValve;
+            structuralValve.node_uuid_from = uuid(18);
+            const native::Revision fallbackPhysical = hydraulic::editHydraulicNetwork(
+                repository, "physical-indexed", initial.uuid,
+                {{structuralValve.uuid, hydraulic::HydraulicEntity{structuralValve}}}, &physicalStats);
+            require(!physicalStats.indexedPhysicalFastPath &&
+                    fallbackPhysical.id != physicalChanged.id,
+                    "valve endpoint rewire bypassed canonical validation");
+            physicalExpected.links_valves[0] = structuralValve;
+            compareNetworks(physicalExpected, requiredLoad(repository, "physical-indexed", initial.uuid));
+            compareNetworks(initial, requiredLoad(repository, "main", initial.uuid));
+
+            // Native indexed structural insertion/deletion for reservoirs,
+            // tanks, pumps, and valves. References may point to other members
+            // newly inserted in the SAME atomic batch, independent of order.
+            repository.createBranch("structural-indexed", "main");
+            hydraulic::HydraulicEditDiagnostics structuralStats;
+            HydraulicNodeReservoir newReservoir = item<HydraulicNodeReservoir>(33001);
+            newReservoir.head_pattern_uuid = uuid(11);
+            newReservoir.quality_source.pattern_uuid = uuid(11);
+            HydraulicNodeTank newTank = item<HydraulicNodeTank>(33002);
+            newTank.volume_curve_uuid = uuid(12);
+            newTank.quality_source.pattern_uuid = uuid(11);
+            HydraulicLinkPump newPump = item<HydraulicLinkPump>(33003);
+            newPump.node_uuid_from = newReservoir.uuid;
+            newPump.node_uuid_to = newTank.uuid;
+            newPump.head_curve_uuid = uuid(13);
+            newPump.speed_pattern_uuid = uuid(11);
+            newPump.efficiency_curve_uuid = uuid(14);
+            newPump.price_pattern_uuid = uuid(11);
+            HydraulicLinkValve newValve = item<HydraulicLinkValve>(33004);
+            newValve.node_uuid_from = newTank.uuid;
+            newValve.node_uuid_to = uuid(19);
+            newValve.head_loss_curve_uuid = uuid(15);
+            newValve.characteristic_curve_uuid = uuid(16);
+            const std::vector<hydraulic::HydraulicEntityChange> structuralInsertions = {
+                {newPump.uuid, hydraulic::HydraulicEntity{newPump}},
+                {newValve.uuid, hydraulic::HydraulicEntity{newValve}},
+                {newTank.uuid, hydraulic::HydraulicEntity{newTank}},
+                {newReservoir.uuid, hydraulic::HydraulicEntity{newReservoir}}
+            };
+            const native::Revision structuralInserted = hydraulic::editHydraulicNetwork(
+                repository, "structural-indexed", initial.uuid, structuralInsertions, &structuralStats);
+            require(structuralStats.indexedMembershipFastPath && structuralStats.validatedEntities == 4 &&
+                    structuralInserted.id != repository.head("main").id,
+                    "structural insertion did not use indexed membership validation");
+            NetworkHydraulic structuralExpected = initial;
+            structuralExpected.nodes_reservoirs.append(newReservoir);
+            structuralExpected.nodes_tanks.append(newTank);
+            structuralExpected.links_pumps.append(newPump);
+            structuralExpected.links_valves.append(newValve);
+            compareNetworks(structuralExpected,
+                requiredLoad(repository, "structural-indexed", initial.uuid));
+            require(aowis::native::validateHydraulicNetwork(structuralExpected).valid(),
+                    "indexed structural insertion bypassed canonical validator");
+            const std::vector<native::Key> pumpNodeIncoming = repository.referencingModel(
+                "structural-indexed", hydraulic::keyFromUuid(newReservoir.uuid));
+            require(std::find(pumpNodeIncoming.begin(), pumpNodeIncoming.end(),
+                        hydraulic::keyFromUuid(newPump.uuid)) != pumpNodeIncoming.end(),
+                    "structural insertion lost pump-to-reservoir reverse reference");
+            const std::vector<native::Key> tankIncomingAfterInsert = repository.referencingModel(
+                "structural-indexed", hydraulic::keyFromUuid(newTank.uuid));
+            require(std::find(tankIncomingAfterInsert.begin(), tankIncomingAfterInsert.end(),
+                        hydraulic::keyFromUuid(newPump.uuid)) != tankIncomingAfterInsert.end() &&
+                    std::find(tankIncomingAfterInsert.begin(), tankIncomingAfterInsert.end(),
+                        hydraulic::keyFromUuid(newValve.uuid)) != tankIncomingAfterInsert.end(),
+                    "structural insertion lost cross-batch references");
+
+            // A valve/pump endpoint and each curve/pattern is checked against
+            // exact target kinds, not just UUID presence or incoming edges.
+            HydraulicLinkPump invalidPump = item<HydraulicLinkPump>(33005);
+            invalidPump.node_uuid_from = newReservoir.uuid;
+            invalidPump.node_uuid_to = newTank.uuid;
+            invalidPump.head_curve_uuid = uuid(12); // Wrong: tank-volume curve.
+            const native::Revision structuralHead = repository.head("structural-indexed");
+            bool rejectedStructural = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "structural-indexed", initial.uuid,
+                    {{invalidPump.uuid, hydraulic::HydraulicEntity{invalidPump}}}, &structuralStats);
+            } catch (const std::exception&) { rejectedStructural = true; }
+            require(rejectedStructural && !structuralStats.indexedMembershipFastPath &&
+                    repository.head("structural-indexed").id == structuralHead.id,
+                    "wrong-type structural insertion bypassed validation");
+            HydraulicNodeTank invalidTank = item<HydraulicNodeTank>(33006);
+            invalidTank.volume_curve_uuid = uuid(13); // Wrong: pump-head curve.
+            rejectedStructural = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "structural-indexed", initial.uuid,
+                    {{invalidTank.uuid, hydraulic::HydraulicEntity{invalidTank}}}, &structuralStats);
+            } catch (const std::exception&) { rejectedStructural = true; }
+            require(rejectedStructural && !structuralStats.indexedMembershipFastPath &&
+                    repository.head("structural-indexed").id == structuralHead.id,
+                    "wrong-type tank curve bypassed validation");
+            // Even a target created in the same atomic batch must have the
+            // right kind; a new tank-volume curve is not a pump-head curve.
+            HydraulicCurveTankVolume insertedWrongCurve =
+                item<HydraulicCurveTankVolume>(33007);
+            HydraulicLinkPump wrongBatchPump = item<HydraulicLinkPump>(33008);
+            wrongBatchPump.node_uuid_from = newReservoir.uuid;
+            wrongBatchPump.node_uuid_to = newTank.uuid;
+            wrongBatchPump.head_curve_uuid = insertedWrongCurve.uuid;
+            rejectedStructural = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "structural-indexed", initial.uuid,
+                    {{wrongBatchPump.uuid, hydraulic::HydraulicEntity{wrongBatchPump}},
+                     {insertedWrongCurve.uuid, hydraulic::HydraulicEntity{insertedWrongCurve}}},
+                    &structuralStats);
+            } catch (const std::exception&) { rejectedStructural = true; }
+            require(rejectedStructural && !structuralStats.indexedMembershipFastPath &&
+                    repository.head("structural-indexed").id == structuralHead.id &&
+                    !repository.getModel("structural-indexed", hydraulic::keyFromUuid(insertedWrongCurve.uuid)),
+                    "cross-batch wrong-kind reference partially committed");
+            // Inbound references from live entities forbid deleting a node by
+            // itself, and canonical control rules protect the original pump.
+            rejectedStructural = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "structural-indexed", initial.uuid,
+                    {{newTank.uuid, std::nullopt}}, &structuralStats);
+            } catch (const std::exception&) { rejectedStructural = true; }
+            require(rejectedStructural && repository.head("structural-indexed").id ==
+                    structuralHead.id, "referenced tank was deleted");
+            rejectedStructural = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "structural-indexed", initial.uuid,
+                    {{uuid(24), std::nullopt}}, &structuralStats);
+            } catch (const std::exception&) { rejectedStructural = true; }
+            require(rejectedStructural && repository.head("structural-indexed").id ==
+                    structuralHead.id, "control-rule referenced pump was deleted");
+
+            // Network metadata is not represented in the ordinary incoming
+            // model index. MSX references to a tank must still block deletion.
+            repository.createBranch("structural-msx", "structural-indexed");
+            NetworkHydraulic protectedNetwork = structuralExpected;
+            MultiSpeciesParameterOverrideTank tankOverride;
+            tankOverride.tank_uuid = newTank.uuid;
+            protectedNetwork.multi_species.parameter_overrides_tanks.append(tankOverride);
+            // Empty parameter UUID is legal in the canonical validator.
+            require(aowis::native::validateHydraulicNetwork(protectedNetwork).valid(),
+                    "structural MSX fixture invalid");
+            hydraulic::saveHydraulicNetwork(repository, "structural-msx", protectedNetwork);
+            rejectedStructural = false;
+            const native::Revision protectedHead = repository.head("structural-msx");
+            try {
+                hydraulic::editHydraulicNetwork(repository, "structural-msx", initial.uuid,
+                    {{newPump.uuid, std::nullopt}, {newValve.uuid, std::nullopt},
+                     {newTank.uuid, std::nullopt}, {newReservoir.uuid, std::nullopt}},
+                    &structuralStats);
+            } catch (const std::exception&) { rejectedStructural = true; }
+            require(rejectedStructural && !structuralStats.indexedMembershipFastPath &&
+                    repository.head("structural-msx").id == protectedHead.id,
+                    "MSX metadata dependency bypassed structural deletion guard");
+
+            // All model-level dependencies are removed in one revision. The
+            // original and MSX-protected branches remain unchanged.
+            repository.createBranch("structural-removed", "structural-indexed");
+            const native::Revision structuralRemoved = hydraulic::editHydraulicNetwork(
+                repository, "structural-removed", initial.uuid,
+                {{newPump.uuid, std::nullopt}, {newValve.uuid, std::nullopt},
+                 {newTank.uuid, std::nullopt}, {newReservoir.uuid, std::nullopt}},
+                &structuralStats);
+            require(structuralStats.indexedMembershipFastPath &&
+                    structuralStats.validatedEntities == 4 && structuralRemoved.id != structuralInserted.id,
+                    "related structural deletion missed indexed path");
+            compareNetworks(initial, requiredLoad(repository, "structural-removed", initial.uuid));
+            compareNetworks(structuralExpected,
+                requiredLoad(repository, "structural-indexed", initial.uuid));
+            require(!repository.getModel("structural-removed", hydraulic::keyFromUuid(newTank.uuid)) &&
+                    repository.getModel("structural-indexed", hydraulic::keyFromUuid(newTank.uuid)),
+                    "branch-local structural deletion corrupted another branch");
+
             repository.createBranch("corrupt-query", "main");
             const std::optional<native::ModelRecord> validLabel =
-                repository.getModel("corrupt-query", v5::keyFromUuid(uuid(28)));
+                repository.getModel("corrupt-query", hydraulic::keyFromUuid(uuid(28)));
             require(validLabel.has_value(), "test label disappeared");
             native::ModelRecord malformedLabel = *validLabel;
             malformedLabel.kind = 999;
             repository.commitModel("corrupt-query", {
-                {v5::keyFromUuid(uuid(28)), std::move(malformedLabel)}});
-            require(!v5::loadHydraulicEntity(repository, "corrupt-query", initial.uuid,
+                {hydraulic::keyFromUuid(uuid(28)), std::move(malformedLabel)}});
+            require(!hydraulic::loadHydraulicEntity(repository, "corrupt-query", initial.uuid,
                     uuid(28), &error) && !error.isEmpty(),
                     "indexed query accepted an unknown entity kind");
-            require(v5::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28), &error).has_value(),
+            require(hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28), &error).has_value(),
                     "malformed branch damaged the original branch");
 
             // Fast indexed scalar edits must NOT reconstruct the entire
             // network, modify its membership, or lose typed reference checks.
             repository.createBranch("scalar-indexed", "main");
             const native::ModelRecord scalarManifest = *repository.getModel(
-                "scalar-indexed", v5::keyFromUuid(initial.uuid));
+                "scalar-indexed", hydraulic::keyFromUuid(initial.uuid));
             NetworkHydraulic scalarExpected = initial;
             scalarExpected.links_pipes[0].diameter_mm = 143.25;
             scalarExpected.nodes_junctions[0].elevation_m = 17.0;
             scalarExpected.map_labels[0].text = QStringLiteral("Renamed label");
-            v5::HydraulicEditDiagnostics indexedStats;
-            const native::Revision scalarRevision = v5::editHydraulicNetwork(
+            hydraulic::HydraulicEditDiagnostics indexedStats;
+            const native::Revision scalarRevision = hydraulic::editHydraulicNetwork(
                 repository, "scalar-indexed", initial.uuid,
-                {{uuid(23), v5::HydraulicEntity{scalarExpected.links_pipes[0]}},
-                 {uuid(19), v5::HydraulicEntity{scalarExpected.nodes_junctions[0]}},
-                 {uuid(28), v5::HydraulicEntity{scalarExpected.map_labels[0]}}},
+                {{uuid(23), hydraulic::HydraulicEntity{scalarExpected.links_pipes[0]}},
+                 {uuid(19), hydraulic::HydraulicEntity{scalarExpected.nodes_junctions[0]}},
+                 {uuid(28), hydraulic::HydraulicEntity{scalarExpected.map_labels[0]}}},
                 &indexedStats);
             require(indexedStats.indexedScalarFastPath && indexedStats.validatedEntities == 3,
                     "safe scalar changes did not take indexed validation path");
             compareNetworks(scalarExpected, requiredLoad(repository, "scalar-indexed", initial.uuid));
             const std::optional<native::ModelRecord> scalarManifestAfter = repository.getModel(
-                "scalar-indexed", v5::keyFromUuid(initial.uuid));
+                "scalar-indexed", hydraulic::keyFromUuid(initial.uuid));
             require(scalarManifestAfter &&
                     native::encodeModelRecord(*scalarManifestAfter) ==
                         native::encodeModelRecord(scalarManifest),
                     "indexed scalar edit changed the membership manifest");
-            require(v5::editHydraulicNetwork(repository, "scalar-indexed", initial.uuid,
-                    {{uuid(23), v5::HydraulicEntity{scalarExpected.links_pipes[0]}}},
+            require(hydraulic::editHydraulicNetwork(repository, "scalar-indexed", initial.uuid,
+                    {{uuid(23), hydraulic::HydraulicEntity{scalarExpected.links_pipes[0]}}},
                     &indexedStats).id == scalarRevision.id && indexedStats.indexedScalarFastPath,
                     "no-op scalar edit did not preserve revision identity");
 
@@ -333,8 +622,8 @@ void exercise(native::PhysicalStore physical) {
             invalidRewire.node_uuid_from = uuid(9009);
             bool rejectedScalar = false;
             try {
-                v5::editHydraulicNetwork(repository, "scalar-indexed", initial.uuid,
-                    {{uuid(23), v5::HydraulicEntity{invalidRewire}}}, &indexedStats);
+                hydraulic::editHydraulicNetwork(repository, "scalar-indexed", initial.uuid,
+                    {{uuid(23), hydraulic::HydraulicEntity{invalidRewire}}}, &indexedStats);
             } catch (const std::exception&) { rejectedScalar = true; }
             require(rejectedScalar && !indexedStats.indexedScalarFastPath &&
                     repository.head("scalar-indexed").id == scalarRevision.id,
@@ -342,9 +631,9 @@ void exercise(native::PhysicalStore physical) {
             // Metadata and graph-affecting edits use canonical full validation.
             HydraulicLinkPipe validRewire = scalarExpected.links_pipes[0];
             validRewire.node_uuid_from = uuid(18);
-            const native::Revision rewiredRevision = v5::editHydraulicNetwork(
+            const native::Revision rewiredRevision = hydraulic::editHydraulicNetwork(
                 repository, "scalar-indexed", initial.uuid,
-                {{uuid(23), v5::HydraulicEntity{validRewire}}}, &indexedStats);
+                {{uuid(23), hydraulic::HydraulicEntity{validRewire}}}, &indexedStats);
             require(!indexedStats.indexedScalarFastPath && rewiredRevision.id != scalarRevision.id,
                     "topology edit incorrectly used scalar validation");
             scalarExpected.links_pipes[0] = validRewire;
@@ -354,15 +643,15 @@ void exercise(native::PhysicalStore physical) {
             repository.createBranch("topology-indexed", "main");
             NetworkHydraulic unreferenced = initial;
             unreferenced.controls_simple.clear(); // Remove the inbound control reference.
-            v5::saveHydraulicNetwork(repository, "topology-indexed", unreferenced);
+            hydraulic::saveHydraulicNetwork(repository, "topology-indexed", unreferenced);
             const native::ModelRecord topologyManifest = *repository.getModel(
-                "topology-indexed", v5::keyFromUuid(unreferenced.uuid));
+                "topology-indexed", hydraulic::keyFromUuid(unreferenced.uuid));
             const native::Revision topologyBase = repository.head("topology-indexed");
             HydraulicLinkPipe independentPipe = unreferenced.links_pipes[0];
             independentPipe.node_uuid_from = uuid(18); // Owned reservoir, valid node endpoint.
-            const native::Revision topologyRevision = v5::editHydraulicNetwork(
+            const native::Revision topologyRevision = hydraulic::editHydraulicNetwork(
                 repository, "topology-indexed", initial.uuid,
-                {{independentPipe.uuid, v5::HydraulicEntity{independentPipe}}}, &indexedStats);
+                {{independentPipe.uuid, hydraulic::HydraulicEntity{independentPipe}}}, &indexedStats);
             require(indexedStats.indexedTopologyFastPath &&
                     !indexedStats.indexedScalarFastPath && indexedStats.validatedEntities == 1 &&
                     topologyRevision.id != topologyBase.id,
@@ -370,25 +659,25 @@ void exercise(native::PhysicalStore physical) {
             unreferenced.links_pipes[0] = independentPipe;
             compareNetworks(unreferenced, requiredLoad(repository, "topology-indexed", initial.uuid));
             require(native::encodeModelRecord(*repository.getModel(
-                        "topology-indexed", v5::keyFromUuid(initial.uuid))) ==
+                        "topology-indexed", hydraulic::keyFromUuid(initial.uuid))) ==
                     native::encodeModelRecord(topologyManifest),
                     "indexed topology change rewrote network membership");
             const std::vector<native::Key> oldEndpointRefs = repository.referencingModel(
-                "topology-indexed", v5::keyFromUuid(uuid(19)));
+                "topology-indexed", hydraulic::keyFromUuid(uuid(19)));
             require(std::find(oldEndpointRefs.begin(), oldEndpointRefs.end(),
-                    v5::keyFromUuid(uuid(23))) == oldEndpointRefs.end(),
+                    hydraulic::keyFromUuid(uuid(23))) == oldEndpointRefs.end(),
                     "indexed rewire retained old endpoint edge");
             const std::vector<native::Key> newEndpointRefs = repository.referencingModel(
-                "topology-indexed", v5::keyFromUuid(uuid(18)));
+                "topology-indexed", hydraulic::keyFromUuid(uuid(18)));
             require(std::find(newEndpointRefs.begin(), newEndpointRefs.end(),
-                    v5::keyFromUuid(uuid(23))) != newEndpointRefs.end(),
+                    hydraulic::keyFromUuid(uuid(23))) != newEndpointRefs.end(),
                     "indexed rewire did not create new endpoint edge");
             bool rejectedTopology = false;
             HydraulicLinkPipe wrongNodeKind = independentPipe;
             wrongNodeKind.node_uuid_from = uuid(10); // A pipe material, not a node.
             try {
-                v5::editHydraulicNetwork(repository, "topology-indexed", initial.uuid,
-                    {{wrongNodeKind.uuid, v5::HydraulicEntity{wrongNodeKind}}}, &indexedStats);
+                hydraulic::editHydraulicNetwork(repository, "topology-indexed", initial.uuid,
+                    {{wrongNodeKind.uuid, hydraulic::HydraulicEntity{wrongNodeKind}}}, &indexedStats);
             } catch (const std::exception&) { rejectedTopology = true; }
             require(rejectedTopology && !indexedStats.indexedTopologyFastPath &&
                     repository.head("topology-indexed").id == topologyRevision.id,
@@ -397,8 +686,8 @@ void exercise(native::PhysicalStore physical) {
             missingEndpoint.node_uuid_from = uuid(9009);
             rejectedTopology = false;
             try {
-                v5::editHydraulicNetwork(repository, "topology-indexed", initial.uuid,
-                    {{missingEndpoint.uuid, v5::HydraulicEntity{missingEndpoint}}}, &indexedStats);
+                hydraulic::editHydraulicNetwork(repository, "topology-indexed", initial.uuid,
+                    {{missingEndpoint.uuid, hydraulic::HydraulicEntity{missingEndpoint}}}, &indexedStats);
             } catch (const std::exception&) { rejectedTopology = true; }
             require(rejectedTopology && !indexedStats.indexedTopologyFastPath &&
                     repository.head("topology-indexed").id == topologyRevision.id,
@@ -406,9 +695,9 @@ void exercise(native::PhysicalStore physical) {
             HydraulicLinkPipe metadataRewire = independentPipe;
             metadataRewire.node_uuid_from = uuid(19);
             metadataRewire.id = QStringLiteral("Changed pipe ID");
-            const native::Revision canonicalFallback = v5::editHydraulicNetwork(
+            const native::Revision canonicalFallback = hydraulic::editHydraulicNetwork(
                 repository, "topology-indexed", initial.uuid,
-                {{metadataRewire.uuid, v5::HydraulicEntity{metadataRewire}}}, &indexedStats);
+                {{metadataRewire.uuid, hydraulic::HydraulicEntity{metadataRewire}}}, &indexedStats);
             require(!indexedStats.indexedTopologyFastPath &&
                     !indexedStats.indexedScalarFastPath &&
                     canonicalFallback.id != topologyRevision.id,
@@ -426,14 +715,14 @@ void exercise(native::PhysicalStore physical) {
             attached.demand_points[0].attachment.pipe_allocation_mode =
                 HydraulicDemandPointPipeAllocationMode::AssignedJunction;
             attached.demand_points[0].attachment.pipe_assigned_junction_uuid = uuid(19);
-            v5::saveHydraulicNetwork(repository, "attached-pipe", attached);
+            hydraulic::saveHydraulicNetwork(repository, "attached-pipe", attached);
             const native::Revision attachedHead = repository.head("attached-pipe");
             HydraulicLinkPipe invalidAttachedRewire = attached.links_pipes[0];
             invalidAttachedRewire.node_uuid_from = uuid(18);
             rejectedTopology = false;
             try {
-                v5::editHydraulicNetwork(repository, "attached-pipe", initial.uuid,
-                    {{invalidAttachedRewire.uuid, v5::HydraulicEntity{invalidAttachedRewire}}},
+                hydraulic::editHydraulicNetwork(repository, "attached-pipe", initial.uuid,
+                    {{invalidAttachedRewire.uuid, hydraulic::HydraulicEntity{invalidAttachedRewire}}},
                     &indexedStats);
             } catch (const std::exception&) { rejectedTopology = true; }
             require(rejectedTopology && !indexedStats.indexedTopologyFastPath &&
@@ -442,11 +731,11 @@ void exercise(native::PhysicalStore physical) {
 
             // The fast path must also reject any ownership ambiguity.
             const native::Revision otherNetworkRevision = repository.head("main");
-            v5::HydraulicEditDiagnostics ownershipStats;
+            hydraulic::HydraulicEditDiagnostics ownershipStats;
             rejectedScalar = false;
             try {
-                v5::editHydraulicNetwork(repository, "main", uuid(9000),
-                    {{uuid(23), v5::HydraulicEntity{scalarExpected.links_pipes[0]}}},
+                hydraulic::editHydraulicNetwork(repository, "main", uuid(9000),
+                    {{uuid(23), hydraulic::HydraulicEntity{scalarExpected.links_pipes[0]}}},
                     &ownershipStats);
             } catch (const std::exception&) { rejectedScalar = true; }
             require(rejectedScalar && repository.head("main").id == otherNetworkRevision.id,
@@ -465,13 +754,13 @@ void exercise(native::PhysicalStore physical) {
             HydraulicMapLabel membershipLabel = item<HydraulicMapLabel>(30112);
             membershipLabel.anchor_node_uuid = membershipNode.uuid;
             membershipLabel.text = QStringLiteral("New well");
-            v5::HydraulicEditDiagnostics membershipStats;
+            hydraulic::HydraulicEditDiagnostics membershipStats;
             const native::Revision membershipBase = repository.head("membership-indexed");
-            const native::Revision membershipRevision = v5::editHydraulicNetwork(
+            const native::Revision membershipRevision = hydraulic::editHydraulicNetwork(
                 repository, "membership-indexed", initial.uuid,
-                {{membershipPipe.uuid, v5::HydraulicEntity{membershipPipe}},
-                 {membershipNode.uuid, v5::HydraulicEntity{membershipNode}},
-                 {membershipLabel.uuid, v5::HydraulicEntity{membershipLabel}}}, &membershipStats);
+                {{membershipPipe.uuid, hydraulic::HydraulicEntity{membershipPipe}},
+                 {membershipNode.uuid, hydraulic::HydraulicEntity{membershipNode}},
+                 {membershipLabel.uuid, hydraulic::HydraulicEntity{membershipLabel}}}, &membershipStats);
             require(membershipStats.indexedMembershipFastPath &&
                     !membershipStats.indexedScalarFastPath &&
                     !membershipStats.indexedTopologyFastPath &&
@@ -484,13 +773,13 @@ void exercise(native::PhysicalStore physical) {
             compareNetworks(membershipExpected,
                 requiredLoad(repository, "membership-indexed", initial.uuid));
             const std::vector<native::Key> memberIncoming = repository.referencingModel(
-                "membership-indexed", v5::keyFromUuid(membershipNode.uuid));
+                "membership-indexed", hydraulic::keyFromUuid(membershipNode.uuid));
             require(std::find(memberIncoming.begin(), memberIncoming.end(),
-                    v5::keyFromUuid(membershipPipe.uuid)) != memberIncoming.end() &&
+                    hydraulic::keyFromUuid(membershipPipe.uuid)) != memberIncoming.end() &&
                     std::find(memberIncoming.begin(), memberIncoming.end(),
-                    v5::keyFromUuid(membershipLabel.uuid)) != memberIncoming.end(),
+                    hydraulic::keyFromUuid(membershipLabel.uuid)) != memberIncoming.end(),
                     "new member reference edges were not committed");
-            const native::Revision afterRemoval = v5::editHydraulicNetwork(
+            const native::Revision afterRemoval = hydraulic::editHydraulicNetwork(
                 repository, "membership-indexed", initial.uuid,
                 {{membershipLabel.uuid, std::nullopt}}, &membershipStats);
             require(membershipStats.indexedMembershipFastPath &&
@@ -499,7 +788,7 @@ void exercise(native::PhysicalStore physical) {
             membershipExpected.map_labels.removeLast();
             compareNetworks(membershipExpected,
                 requiredLoad(repository, "membership-indexed", initial.uuid));
-            require(!repository.getModel("membership-indexed", v5::keyFromUuid(membershipLabel.uuid)),
+            require(!repository.getModel("membership-indexed", hydraulic::keyFromUuid(membershipLabel.uuid)),
                     "deleted indexed label remains stored");
             const native::Revision beforeBadMembership = repository.head("membership-indexed");
             HydraulicLinkPipe badMembershipPipe = item<HydraulicLinkPipe>(30113);
@@ -507,8 +796,8 @@ void exercise(native::PhysicalStore physical) {
             badMembershipPipe.node_uuid_to = membershipNode.uuid;
             rejectedTopology = false;
             try {
-                v5::editHydraulicNetwork(repository, "membership-indexed", initial.uuid,
-                    {{badMembershipPipe.uuid, v5::HydraulicEntity{badMembershipPipe}}},
+                hydraulic::editHydraulicNetwork(repository, "membership-indexed", initial.uuid,
+                    {{badMembershipPipe.uuid, hydraulic::HydraulicEntity{badMembershipPipe}}},
                     &membershipStats);
             } catch (const std::exception&) { rejectedTopology = true; }
             require(rejectedTopology && !membershipStats.indexedMembershipFastPath &&
@@ -520,8 +809,8 @@ void exercise(native::PhysicalStore physical) {
             badPatternNode.demands.append(invalidDemand);
             rejectedTopology = false;
             try {
-                v5::editHydraulicNetwork(repository, "membership-indexed", initial.uuid,
-                    {{badPatternNode.uuid, v5::HydraulicEntity{badPatternNode}}},
+                hydraulic::editHydraulicNetwork(repository, "membership-indexed", initial.uuid,
+                    {{badPatternNode.uuid, hydraulic::HydraulicEntity{badPatternNode}}},
                     &membershipStats);
             } catch (const std::exception&) { rejectedTopology = true; }
             require(rejectedTopology && !membershipStats.indexedMembershipFastPath &&
@@ -529,18 +818,213 @@ void exercise(native::PhysicalStore physical) {
                     "missing junction pattern passed indexed validation");
             rejectedTopology = false;
             try {
-                v5::editHydraulicNetwork(repository, "membership-indexed", initial.uuid,
+                hydraulic::editHydraulicNetwork(repository, "membership-indexed", initial.uuid,
                     {{membershipNode.uuid, std::nullopt}}, &membershipStats);
             } catch (const std::exception&) { rejectedTopology = true; }
             require(rejectedTopology && !membershipStats.indexedMembershipFastPath &&
                     repository.head("membership-indexed").id == beforeBadMembership.id,
                     "referenced junction deletion bypassed canonical validation");
+            // A pipe and its incident junction can be removed together without
+            // reconstructing the entire network. The pipe's incoming edge to
+            // the junction is safe only because BOTH are removed atomically.
+            repository.createBranch("membership-cascade", "membership-indexed");
+            hydraulic::HydraulicEditDiagnostics removalStats;
+            const native::Revision beforeCascade = repository.head("membership-cascade");
+            const native::Revision afterCascade = hydraulic::editHydraulicNetwork(
+                repository, "membership-cascade", initial.uuid,
+                {{membershipNode.uuid, std::nullopt}, {membershipPipe.uuid, std::nullopt}},
+                &removalStats);
+            require(removalStats.indexedMembershipFastPath &&
+                    removalStats.validatedEntities == 2 && afterCascade.id != beforeCascade.id,
+                    "dependent pipe/junction batch missed indexed deletion");
+            compareNetworks(initial, requiredLoad(repository, "membership-cascade", initial.uuid));
+            require(!repository.getModel("membership-cascade", hydraulic::keyFromUuid(membershipNode.uuid)) &&
+                    !repository.getModel("membership-cascade", hydraulic::keyFromUuid(membershipPipe.uuid)),
+                    "indexed deleted objects still exist in revision");
+            require(repository.getModel("membership-indexed", hydraulic::keyFromUuid(membershipNode.uuid)) &&
+                    repository.getModel("membership-indexed", hydraulic::keyFromUuid(membershipPipe.uuid)),
+                    "indexed deletion changed original branch");
+
+            // Embedded network metadata can refer to a pipe without a native
+            // incoming-reference edge. The fast deletion MUST reject it.
+            repository.createBranch("membership-metadata", "membership-indexed");
+            NetworkHydraulic metadataProtected = membershipExpected;
+            metadataProtected.options_report.selection_links.mode =
+                HydraulicSimulationReportSelectionMode::Selected;
+            metadataProtected.options_report.selection_links.uuids.append(membershipPipe.uuid);
+            hydraulic::saveHydraulicNetwork(repository, "membership-metadata", metadataProtected);
+            const native::Revision metadataProtectedHead = repository.head("membership-metadata");
+            bool rejectedMetadataDeletion = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "membership-metadata", initial.uuid,
+                    {{membershipPipe.uuid, std::nullopt}, {membershipNode.uuid, std::nullopt}},
+                    &removalStats);
+            } catch (const std::exception&) { rejectedMetadataDeletion = true; }
+            require(rejectedMetadataDeletion && !removalStats.indexedMembershipFastPath &&
+                    repository.head("membership-metadata").id == metadataProtectedHead.id,
+                    "network metadata reference bypassed indexed deletion protection");
+
+            // MSX node references are also embedded in network metadata;
+            // they cannot be detected using ordinary incoming object edges.
+            repository.createBranch("membership-msx", "membership-indexed");
+            NetworkHydraulic msxProtected = membershipExpected;
+            MultiSpeciesNodeInitialQuality initialQuality;
+            initialQuality.node_uuid = membershipNode.uuid;
+            initialQuality.species_uuid = msxProtected.multi_species.species[0].uuid;
+            msxProtected.multi_species.initial_quality_nodes.append(initialQuality);
+            hydraulic::saveHydraulicNetwork(repository, "membership-msx", msxProtected);
+            const native::Revision msxHead = repository.head("membership-msx");
+            bool rejectedMsxDeletion = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "membership-msx", initial.uuid,
+                    {{membershipPipe.uuid, std::nullopt}, {membershipNode.uuid, std::nullopt}},
+                    &removalStats);
+            } catch (const std::exception&) { rejectedMsxDeletion = true; }
+            require(rejectedMsxDeletion && !removalStats.indexedMembershipFastPath &&
+                    repository.head("membership-msx").id == msxHead.id,
+                    "MSX metadata reference bypassed indexed deletion protection");
+
+            // A new pipe cannot claim a junction simultaneously being removed.
+            repository.createBranch("membership-replace", "membership-indexed");
+            HydraulicLinkPipe invalidReplacement = item<HydraulicLinkPipe>(30119);
+            invalidReplacement.node_uuid_from = membershipNode.uuid;
+            invalidReplacement.node_uuid_to = uuid(19);
+            const native::Revision replaceHead = repository.head("membership-replace");
+            bool rejectedMixedBatch = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "membership-replace", initial.uuid,
+                    {{membershipPipe.uuid, std::nullopt},
+                     {membershipNode.uuid, std::nullopt},
+                     {invalidReplacement.uuid, hydraulic::HydraulicEntity{invalidReplacement}}},
+                    &removalStats);
+            } catch (const std::exception&) { rejectedMixedBatch = true; }
+            require(rejectedMixedBatch && !removalStats.indexedMembershipFastPath &&
+                    repository.head("membership-replace").id == replaceHead.id,
+                    "inserted pipe referenced a node removed in the same commit");
+
+            // Deleting a standalone pipe is independently eligible, without
+            // forcing removal of a junction that is still a model member.
+            repository.createBranch("membership-delete-pipe", "membership-indexed");
+            const native::Revision pipeRemoved = hydraulic::editHydraulicNetwork(
+                repository, "membership-delete-pipe", initial.uuid,
+                {{membershipPipe.uuid, std::nullopt}}, &removalStats);
+            require(removalStats.indexedMembershipFastPath && pipeRemoved.id != afterRemoval.id,
+                    "standalone pipe removal did not use indexed membership validation");
+            NetworkHydraulic noAddedPipe = membershipExpected;
+            noAddedPipe.links_pipes.removeLast();
+            compareNetworks(noAddedPipe, requiredLoad(repository, "membership-delete-pipe", initial.uuid));
+            compareNetworks(initial, requiredLoad(repository, "main", initial.uuid));
+
+            // All eight catalogue collections have no outgoing model refs.
+            // Changing their value preserves typed incoming edges; membership
+            // changes use bounded indexed chunks and must remain branch-local.
+            repository.createBranch("catalogue-indexed", "main");
+            NetworkHydraulic catalogueExpected = initial;
+            HydraulicPipeMaterial materialEdit = catalogueExpected.pipe_materials[0];
+            materialEdit.id = QStringLiteral("catalogue-material-revised");
+            HydraulicPatternTime patternEdit = catalogueExpected.patterns_time[0];
+            patternEdit.multipliers = {0.8, 1.1, 1.3, 1.2};
+            const std::optional<native::ModelRecord> catalogueManifestBefore =
+                repository.getModel("catalogue-indexed", hydraulic::keyFromUuid(initial.uuid));
+            require(catalogueManifestBefore.has_value(), "missing catalogue membership manifest");
+            hydraulic::HydraulicEditDiagnostics catalogueStats;
+            const native::Revision catalogueChanged = hydraulic::editHydraulicNetwork(
+                repository, "catalogue-indexed", initial.uuid,
+                {{materialEdit.uuid, hydraulic::HydraulicEntity{materialEdit}},
+                 {patternEdit.uuid, hydraulic::HydraulicEntity{patternEdit}}}, &catalogueStats);
+            require(catalogueStats.indexedCatalogueFastPath && catalogueStats.validatedEntities == 2,
+                    "catalogue update reconstructed full network");
+            catalogueExpected.pipe_materials[0] = materialEdit;
+            catalogueExpected.patterns_time[0] = patternEdit;
+            compareNetworks(catalogueExpected,
+                requiredLoad(repository, "catalogue-indexed", initial.uuid));
+            require(repository.getModel("catalogue-indexed", hydraulic::keyFromUuid(initial.uuid))->payload ==
+                    catalogueManifestBefore->payload, "catalogue-only update rewrote membership");
+            require(hydraulic::editHydraulicNetwork(repository, "catalogue-indexed", initial.uuid,
+                        {{materialEdit.uuid, hydraulic::HydraulicEntity{materialEdit}}},
+                        &catalogueStats).id == catalogueChanged.id &&
+                    catalogueStats.indexedCatalogueFastPath,
+                    "identical catalogue update advanced revision");
+            const std::vector<native::Key> catalogueIncoming = repository.referencingModel(
+                "catalogue-indexed", hydraulic::keyFromUuid(materialEdit.uuid));
+            require(std::find(catalogueIncoming.begin(), catalogueIncoming.end(),
+                    hydraulic::keyFromUuid(uuid(23))) != catalogueIncoming.end(),
+                    "catalogue update discarded existing pipe reference");
+            HydraulicPipeMaterial addedMaterial = item<HydraulicPipeMaterial>(31001);
+            HydraulicPatternTime addedPattern = item<HydraulicPatternTime>(31002);
+            HydraulicCurveTankVolume addedTankCurve = item<HydraulicCurveTankVolume>(31003);
+            HydraulicCurvePumpHead addedPumpCurve = item<HydraulicCurvePumpHead>(31004);
+            HydraulicCurvePumpEfficiency addedEfficiencyCurve = item<HydraulicCurvePumpEfficiency>(31005);
+            HydraulicCurveValveHeadloss addedHeadlossCurve = item<HydraulicCurveValveHeadloss>(31006);
+            HydraulicCurveValveCharacteristic addedCharacteristicCurve = item<HydraulicCurveValveCharacteristic>(31007);
+            HydraulicCurveGeneric addedGenericCurve = item<HydraulicCurveGeneric>(31008);
+            const std::vector<hydraulic::HydraulicEntityChange> catalogueInsertions = {
+                {addedGenericCurve.uuid, hydraulic::HydraulicEntity{addedGenericCurve}},
+                {addedMaterial.uuid, hydraulic::HydraulicEntity{addedMaterial}},
+                {addedPattern.uuid, hydraulic::HydraulicEntity{addedPattern}},
+                {addedCharacteristicCurve.uuid, hydraulic::HydraulicEntity{addedCharacteristicCurve}},
+                {addedTankCurve.uuid, hydraulic::HydraulicEntity{addedTankCurve}},
+                {addedPumpCurve.uuid, hydraulic::HydraulicEntity{addedPumpCurve}},
+                {addedHeadlossCurve.uuid, hydraulic::HydraulicEntity{addedHeadlossCurve}},
+                {addedEfficiencyCurve.uuid, hydraulic::HydraulicEntity{addedEfficiencyCurve}}
+            };
+            const native::Revision catalogueInserted = hydraulic::editHydraulicNetwork(
+                repository, "catalogue-indexed", initial.uuid,
+                catalogueInsertions, &catalogueStats);
+            require(catalogueStats.indexedMembershipFastPath && catalogueStats.validatedEntities == 8 &&
+                    catalogueInserted.id != catalogueChanged.id,
+                    "catalogue insertion did not use indexed chunks");
+            catalogueExpected.pipe_materials.append(addedMaterial);
+            catalogueExpected.patterns_time.append(addedPattern);
+            catalogueExpected.curves_tank_volume.append(addedTankCurve);
+            catalogueExpected.curves_pump_head.append(addedPumpCurve);
+            catalogueExpected.curves_pump_efficiency.append(addedEfficiencyCurve);
+            catalogueExpected.curves_valve_headloss.append(addedHeadlossCurve);
+            catalogueExpected.curves_valve_characteristic.append(addedCharacteristicCurve);
+            catalogueExpected.curves_generic.append(addedGenericCurve);
+            compareNetworks(catalogueExpected,
+                requiredLoad(repository, "catalogue-indexed", initial.uuid));
+            const native::Revision beforeInvalidCatalogue = repository.head("catalogue-indexed");
+            bool rejectedCatalogueRemoval = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "catalogue-indexed", initial.uuid,
+                    {{materialEdit.uuid, std::nullopt}}, &catalogueStats);
+            } catch (const std::exception&) { rejectedCatalogueRemoval = true; }
+            require(rejectedCatalogueRemoval && repository.head("catalogue-indexed").id ==
+                    beforeInvalidCatalogue.id, "deleted a material referenced by a pipe");
+            rejectedCatalogueRemoval = false;
+            try {
+                hydraulic::editHydraulicNetwork(repository, "catalogue-indexed", initial.uuid,
+                    {{patternEdit.uuid, std::nullopt}}, &catalogueStats);
+            } catch (const std::exception&) { rejectedCatalogueRemoval = true; }
+            require(rejectedCatalogueRemoval && repository.head("catalogue-indexed").id ==
+                    beforeInvalidCatalogue.id, "deleted a pattern referenced by a pump");
+            const std::vector<hydraulic::HydraulicEntityChange> catalogueRemovals = {
+                {addedHeadlossCurve.uuid, std::nullopt}, {addedMaterial.uuid, std::nullopt},
+                {addedGenericCurve.uuid, std::nullopt}, {addedTankCurve.uuid, std::nullopt},
+                {addedPattern.uuid, std::nullopt}, {addedPumpCurve.uuid, std::nullopt},
+                {addedCharacteristicCurve.uuid, std::nullopt}, {addedEfficiencyCurve.uuid, std::nullopt}
+            };
+            hydraulic::editHydraulicNetwork(repository, "catalogue-indexed", initial.uuid,
+                catalogueRemovals, &catalogueStats);
+            require(catalogueStats.indexedMembershipFastPath && catalogueStats.validatedEntities == 8,
+                    "catalogue deletion batch did not use indexed membership validation");
+            catalogueExpected.pipe_materials.removeLast();
+            catalogueExpected.patterns_time.removeLast();
+            catalogueExpected.curves_tank_volume.removeLast();
+            catalogueExpected.curves_pump_head.removeLast();
+            catalogueExpected.curves_pump_efficiency.removeLast();
+            catalogueExpected.curves_valve_headloss.removeLast();
+            catalogueExpected.curves_valve_characteristic.removeLast();
+            catalogueExpected.curves_generic.removeLast();
+            compareNetworks(catalogueExpected,
+                requiredLoad(repository, "catalogue-indexed", initial.uuid));
             compareNetworks(initial, requiredLoad(repository, "main", initial.uuid));
 
             // Incremental edits must share the same semantic validation as a
             // complete save without rewriting unchanged records/manifest.
             repository.createBranch("incremental", "feature");
-            const native::Key rootKey = v5::keyFromUuid(initial.uuid);
+            const native::Key rootKey = hydraulic::keyFromUuid(initial.uuid);
             const std::optional<native::ModelRecord> manifestBefore =
                 repository.getModel("incremental", rootKey);
             require(manifestBefore.has_value(), "missing indexed network manifest");
@@ -550,9 +1034,9 @@ void exercise(native::PhysicalStore physical) {
             changedPipe.diameter_mm = 250.0;
             changedPipe.node_uuid_from = uuid(18);
             edited.links_pipes[0] = changedPipe;
-            const native::Revision changed = v5::editHydraulicNetwork(
+            const native::Revision changed = hydraulic::editHydraulicNetwork(
                 repository, "incremental", initial.uuid,
-                {{changedPipe.uuid, v5::HydraulicEntity{changedPipe}}});
+                {{changedPipe.uuid, hydraulic::HydraulicEntity{changedPipe}}});
             compareNetworks(edited, requiredLoad(repository, "incremental", initial.uuid));
             require(changed.id == repository.head("incremental").id,
                     "incremental revision not published");
@@ -562,34 +1046,34 @@ void exercise(native::PhysicalStore physical) {
                     native::encodeModelRecord(*manifestAfter) == manifestBytes,
                     "payload-only edit rewrote network membership");
             const std::vector<native::Key> beforeRefs =
-                repository.referencingModel("incremental", v5::keyFromUuid(uuid(19)));
-            require(std::find(beforeRefs.begin(), beforeRefs.end(), v5::keyFromUuid(uuid(23))) ==
+                repository.referencingModel("incremental", hydraulic::keyFromUuid(uuid(19)));
+            require(std::find(beforeRefs.begin(), beforeRefs.end(), hydraulic::keyFromUuid(uuid(23))) ==
                         beforeRefs.end(), "old pipe endpoint reverse-reference was retained");
             const std::vector<native::Key> afterRefs =
-                repository.referencingModel("incremental", v5::keyFromUuid(uuid(18)));
-            require(std::find(afterRefs.begin(), afterRefs.end(), v5::keyFromUuid(uuid(23))) !=
+                repository.referencingModel("incremental", hydraulic::keyFromUuid(uuid(18)));
+            require(std::find(afterRefs.begin(), afterRefs.end(), hydraulic::keyFromUuid(uuid(23))) !=
                         afterRefs.end(), "new pipe endpoint reverse-reference missing");
-            require(v5::editHydraulicNetwork(repository, "incremental", initial.uuid,
-                        {{changedPipe.uuid, v5::HydraulicEntity{changedPipe}}}).id == changed.id,
+            require(hydraulic::editHydraulicNetwork(repository, "incremental", initial.uuid,
+                        {{changedPipe.uuid, hydraulic::HydraulicEntity{changedPipe}}}).id == changed.id,
                     "identical hydraulic upsert created an unnecessary revision");
-            require(v5::editHydraulicNetwork(repository, "incremental", initial.uuid, {}).id == changed.id,
+            require(hydraulic::editHydraulicNetwork(repository, "incremental", initial.uuid, {}).id == changed.id,
                     "empty batch created a new revision");
 
             HydraulicNodeJunction extraNode = item<HydraulicNodeJunction>(202);
             HydraulicLinkPipe extraPipe = item<HydraulicLinkPipe>(203);
             extraPipe.node_uuid_from = uuid(20);
             extraPipe.node_uuid_to = extraNode.uuid;
-            const native::Revision inserted = v5::editHydraulicNetwork(
+            const native::Revision inserted = hydraulic::editHydraulicNetwork(
                 repository, "incremental", initial.uuid,
-                {{extraNode.uuid, v5::HydraulicEntity{extraNode}},
-                 {extraPipe.uuid, v5::HydraulicEntity{extraPipe}}});
+                {{extraNode.uuid, hydraulic::HydraulicEntity{extraNode}},
+                 {extraPipe.uuid, hydraulic::HydraulicEntity{extraPipe}}});
             edited.nodes_junctions.append(extraNode);
             edited.links_pipes.append(extraPipe);
             compareNetworks(edited, requiredLoad(repository, "incremental", initial.uuid));
             require(inserted.id != changed.id, "new members did not create revision");
             bool rejectedEdit = false;
             try {
-                v5::editHydraulicNetwork(repository, "incremental", initial.uuid,
+                hydraulic::editHydraulicNetwork(repository, "incremental", initial.uuid,
                                          {{extraNode.uuid, std::nullopt}});
             } catch (const std::exception&) { rejectedEdit = true; }
             require(rejectedEdit && repository.head("incremental").id == inserted.id,
@@ -597,34 +1081,34 @@ void exercise(native::PhysicalStore physical) {
             rejectedEdit = false;
             try {
                 HydraulicLinkValve wrongType = item<HydraulicLinkValve>(23);
-                v5::editHydraulicNetwork(repository, "incremental", initial.uuid,
-                                         {{wrongType.uuid, v5::HydraulicEntity{wrongType}}});
+                hydraulic::editHydraulicNetwork(repository, "incremental", initial.uuid,
+                                         {{wrongType.uuid, hydraulic::HydraulicEntity{wrongType}}});
             } catch (const std::exception&) { rejectedEdit = true; }
             require(rejectedEdit && repository.head("incremental").id == inserted.id,
                     "incremental editor changed an existing entity kind");
             rejectedEdit = false;
             try {
-                v5::editHydraulicNetwork(repository, "incremental", initial.uuid,
+                hydraulic::editHydraulicNetwork(repository, "incremental", initial.uuid,
                                          {{extraPipe.uuid, std::nullopt},
                                           {extraPipe.uuid, std::nullopt}});
             } catch (const std::exception&) { rejectedEdit = true; }
             require(rejectedEdit && repository.head("incremental").id == inserted.id,
                     "duplicate UUID batch was accepted");
-            v5::editHydraulicNetwork(repository, "incremental", initial.uuid,
+            hydraulic::editHydraulicNetwork(repository, "incremental", initial.uuid,
                                      {{extraPipe.uuid, std::nullopt},
                                       {extraNode.uuid, std::nullopt}});
             edited.links_pipes.removeLast();
             edited.nodes_junctions.removeLast();
             compareNetworks(edited, requiredLoad(repository, "incremental", initial.uuid));
             compareNetworks(modified, requiredLoad(repository, "feature", initial.uuid));
-            require(!repository.getModel("incremental", v5::keyFromUuid(extraNode.uuid)),
+            require(!repository.getModel("incremental", hydraulic::keyFromUuid(extraNode.uuid)),
                     "deleted incremental member still stored in branch");
             repository.verifyPack();
 
             NetworkHydraulic invalid = modified;
             invalid.nodes_junctions.removeAt(0);
             bool rejected = false;
-            try { v5::saveHydraulicNetwork(repository, "feature", invalid); }
+            try { hydraulic::saveHydraulicNetwork(repository, "feature", invalid); }
             catch (const std::exception&) { rejected = true; }
             require(rejected && repository.head("feature").id != original,
                     "dangling node change was accepted");
@@ -634,18 +1118,18 @@ void exercise(native::PhysicalStore physical) {
             second.uuid = uuid(200);
             second.id = QStringLiteral("second-network");
             second.nodes_junctions.append(item<HydraulicNodeJunction>(201));
-            v5::saveHydraulicNetwork(repository, "main", second);
+            hydraulic::saveHydraulicNetwork(repository, "main", second);
             compareNetworks(second, requiredLoad(repository, "main", second.uuid));
             second.nodes_junctions.append(initial.nodes_junctions[0]);
             rejected = false;
-            try { v5::saveHydraulicNetwork(repository, "main", second); }
+            try { hydraulic::saveHydraulicNetwork(repository, "main", second); }
             catch (const std::exception&) { rejected = true; }
             require(rejected, "cross-network UUID ownership collision was accepted");
 
             NetworkHydraulic duplicate = initial;
             duplicate.links_valves[0].uuid = duplicate.links_pipes[0].uuid;
             rejected = false;
-            try { v5::saveHydraulicNetwork(repository, "feature", duplicate); }
+            try { hydraulic::saveHydraulicNetwork(repository, "feature", duplicate); }
             catch (const std::exception&) { rejected = true; }
             require(rejected, "duplicate UUID among entity kinds was accepted");
             repository.verifyPack();
@@ -653,9 +1137,32 @@ void exercise(native::PhysicalStore physical) {
         {
             native::Repository reopened(folder, physical);
             compareNetworks(initial, requiredLoad(reopened, "main", initial.uuid));
+            const NetworkHydraulic physicalReloaded = requiredLoad(
+                reopened, "physical-indexed", initial.uuid);
+            require(physicalReloaded.nodes_reservoirs[0].hydraulic_head_m == 147.5 &&
+                    physicalReloaded.nodes_tanks[0].water_level_initial_m == 4.25 &&
+                    physicalReloaded.links_pumps[0].initial_speed_ratio == 1.4 &&
+                    physicalReloaded.links_valves[0].node_uuid_from == uuid(18),
+                    "physical indexed updates lost after reopening");
+            compareNetworks(initial, requiredLoad(reopened, "structural-removed", initial.uuid));
+            const NetworkHydraulic structuralReloaded = requiredLoad(
+                reopened, "structural-indexed", initial.uuid);
+            require(structuralReloaded.links_pumps.size() == initial.links_pumps.size() + 1 &&
+                    structuralReloaded.nodes_tanks.size() == initial.nodes_tanks.size() + 1 &&
+                    structuralReloaded.links_pumps.last().node_uuid_to == uuid(33002),
+                    "indexed structural members lost after repository reopen");
+            require(requiredLoad(reopened, "structural-msx", initial.uuid)
+                        .multi_species.parameter_overrides_tanks.size() == 1,
+                    "metadata-protected branch changed after structural deletion");
+            const NetworkHydraulic catalogueReloaded = requiredLoad(
+                reopened, "catalogue-indexed", initial.uuid);
+            require(catalogueReloaded.pipe_materials[0].id ==
+                    QStringLiteral("catalogue-material-revised") &&
+                    catalogueReloaded.patterns_time[0].multipliers.size() == 4,
+                    "catalogue indexed changes lost after reopen");
             QString indexedError;
-            const std::optional<v5::HydraulicEntity> reopenedPipe =
-                v5::loadHydraulicEntity(reopened, "main", initial.uuid, uuid(23), &indexedError);
+            const std::optional<hydraulic::HydraulicEntity> reopenedPipe =
+                hydraulic::loadHydraulicEntity(reopened, "main", initial.uuid, uuid(23), &indexedError);
             require(reopenedPipe.has_value() && indexedError.isEmpty() &&
                     std::get<HydraulicLinkPipe>(*reopenedPipe).diameter_mm == 110.75,
                     "indexed hydraulic lookup failed after repository reopen");
@@ -696,9 +1203,9 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
         {
             native::Repository repository(folder, physical);
             repository.createBranch("main");
-            original = v5::saveHydraulicNetwork(repository, "main", network).id;
+            original = hydraulic::saveHydraulicNetwork(repository, "main", network).id;
             const std::optional<native::ModelRecord> root = repository.getModel(
-                "main", v5::keyFromUuid(network.uuid));
+                "main", hydraulic::keyFromUuid(network.uuid));
             require(root.has_value() && root->references.size() == 8,
                     "chunk count was not bounded by 256 members");
             // Snapshot and branch isolation through different membership paths.
@@ -707,13 +1214,13 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
             HydraulicLinkPipe addedPipe = item<HydraulicLinkPipe>(804001);
             addedPipe.node_uuid_from = network.nodes_junctions[0].uuid;
             addedPipe.node_uuid_to = addedNode.uuid;
-            v5::HydraulicEditDiagnostics stats;
-            v5::editHydraulicNetwork(repository, "feature", network.uuid,
-                {{addedNode.uuid, v5::HydraulicEntity{addedNode}},
-                 {addedPipe.uuid, v5::HydraulicEntity{addedPipe}}}, &stats);
+            hydraulic::HydraulicEditDiagnostics stats;
+            hydraulic::editHydraulicNetwork(repository, "feature", network.uuid,
+                {{addedNode.uuid, hydraulic::HydraulicEntity{addedNode}},
+                 {addedPipe.uuid, hydraulic::HydraulicEntity{addedPipe}}}, &stats);
             require(stats.indexedMembershipFastPath, "chunked insertion missed fast path");
             for (int index = 0; index < 7; ++index) {
-                v5::editHydraulicNetwork(repository, "feature", network.uuid,
+                hydraulic::editHydraulicNetwork(repository, "feature", network.uuid,
                     {{network.map_labels[index].uuid, std::nullopt}}, &stats);
                 require(stats.indexedMembershipFastPath, "label deletion missed fast path");
             }
@@ -723,26 +1230,26 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
             for (int index = 0; index < 7; ++index) expected.map_labels.removeFirst();
             // Remove all four labels from the final, partial membership chunk.
             // Its owner link and physical model record must be retired atomically.
-            std::vector<v5::HydraulicEntityChange> lastChunkRemoval;
+            std::vector<hydraulic::HydraulicEntityChange> lastChunkRemoval;
             for (int index = 256; index < 260; ++index) {
                 lastChunkRemoval.push_back({network.map_labels[index].uuid, std::nullopt});
             }
-            v5::editHydraulicNetwork(repository, "feature", network.uuid,
+            hydraulic::editHydraulicNetwork(repository, "feature", network.uuid,
                                     lastChunkRemoval, &stats);
             require(stats.indexedMembershipFastPath,
                     "empty chunk retirement missed indexed validation");
             for (int index = 0; index < 4; ++index) expected.map_labels.removeLast();
             compareNetworks(expected, requiredLoad(repository, "feature", network.uuid));
             compareNetworks(network, requiredLoad(repository, "main", network.uuid));
-            const std::optional<QList<QUuid>> ids = v5::listHydraulicEntityIds(repository, "feature",
-                network.uuid, v5::HydraulicEntityType::MapLabel);
+            const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIds(repository, "feature",
+                network.uuid, hydraulic::HydraulicEntityType::MapLabel);
             require(ids.has_value() && ids->size() == expected.map_labels.size() &&
                     ids->front() == expected.map_labels.front().uuid,
                     "chunk deletion lost ordered membership");
             HydraulicLinkPipe rewired = expected.links_pipes[0];
             rewired.node_uuid_to = expected.nodes_junctions[2].uuid;
-            v5::editHydraulicNetwork(repository, "feature", network.uuid,
-                {{rewired.uuid, v5::HydraulicEntity{rewired}}}, &stats);
+            hydraulic::editHydraulicNetwork(repository, "feature", network.uuid,
+                {{rewired.uuid, hydraulic::HydraulicEntity{rewired}}}, &stats);
             require(stats.indexedTopologyFastPath, "chunked owner index blocked independent rewire");
             expected.links_pipes[0] = rewired;
             compareNetworks(expected, requiredLoad(repository, "feature", network.uuid));
@@ -754,9 +1261,737 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
                     "original chunked branch head changed");
             compareNetworks(network, requiredLoad(reopened, "main", network.uuid));
             QString error;
-            require(v5::loadHydraulicEntity(reopened, "feature", network.uuid,
+            require(hydraulic::loadHydraulicEntity(reopened, "feature", network.uuid,
                             uuid(804000), &error).has_value() && error.isEmpty(),
                     "added chunk member lost on reopen");
+            reopened.verifyPack();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+// Demand points and controls have typed references, and pipe-attached demand
+// points additionally constrain assigned junctions to the pipe's endpoints.
+// Verify that the bounded indexed path agrees with the canonical validator
+// on both physical backends, including a single-batch dependency graph.
+void exerciseDependentMembership(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        NetworkHydraulic baseline = completeNetwork();
+        baseline.nodes_junctions.append(item<HydraulicNodeJunction>(42000));
+        require(aowis::native::validateHydraulicNetwork(baseline).valid(),
+                "dependent membership fixture invalid");
+        {
+            native::Repository repository(folder, physical);
+            repository.createBranch("main");
+            hydraulic::saveHydraulicNetwork(repository, "main", baseline);
+            repository.createBranch("dependent", "main");
+
+            HydraulicDemandPoint point = item<HydraulicDemandPoint>(42001);
+            point.attachment.type = HydraulicDemandPointAttachmentType::Pipe;
+            point.attachment.pipe_uuid = uuid(23);
+            point.attachment.pipe_position = 0.35;
+            point.attachment.pipe_allocation_mode =
+                HydraulicDemandPointPipeAllocationMode::AssignedJunction;
+            point.attachment.pipe_assigned_junction_uuid = uuid(19);
+            HydraulicDemand pointDemand;
+            pointDemand.pattern_uuid = uuid(11);
+            point.demands.append(pointDemand);
+
+            HydraulicControlSimple control = item<HydraulicControlSimple>(42002);
+            control.link_uuid = uuid(23);
+            control.trigger_node_uuid = uuid(20);
+
+            HydraulicControlRule rule = item<HydraulicControlRule>(42003);
+            HydraulicControlRulePremise nodePremise;
+            nodePremise.object = HydraulicControlRuleObject::Node;
+            nodePremise.object_uuid = uuid(19);
+            rule.premises.append(nodePremise);
+            HydraulicControlRulePremise linkPremise;
+            linkPremise.object = HydraulicControlRuleObject::Link;
+            linkPremise.object_uuid = uuid(23);
+            rule.premises.append(linkPremise);
+            HydraulicControlRuleAction thenAction;
+            thenAction.link_uuid = uuid(24);
+            rule.actions_then.append(thenAction);
+            HydraulicControlRuleAction elseAction;
+            elseAction.link_uuid = uuid(25);
+            rule.actions_else.append(elseAction);
+
+            hydraulic::HydraulicEditDiagnostics stats;
+            const native::Revision inserted = hydraulic::editHydraulicNetwork(repository, "dependent", baseline.uuid,
+                {{control.uuid, hydraulic::HydraulicEntity{control}},
+                 {point.uuid, hydraulic::HydraulicEntity{point}},
+                 {rule.uuid, hydraulic::HydraulicEntity{rule}}}, &stats);
+            require(stats.indexedMembershipFastPath && stats.validatedEntities == 3,
+                    "demand and controls insertion missed indexed validation");
+            NetworkHydraulic expected = baseline;
+            expected.demand_points.append(point);
+            expected.controls_simple.append(control);
+            expected.controls_rules.append(rule);
+            require(aowis::native::validateHydraulicNetwork(expected).valid(),
+                    "indexed demand and controls did not satisfy canonical validation");
+            compareNetworks(expected, requiredLoad(repository, "dependent", baseline.uuid));
+
+            // Persisted outgoing reference sets must exactly match canonical
+            // extraction, not just pass the edit path's local type checks.
+            const QVector<native::HydraulicReference> canonical = native::hydraulicReferences(expected);
+            for (const QUuid& source : {point.uuid, control.uuid, rule.uuid}) {
+                std::set<native::Key> expectedReferences;
+                for (const native::HydraulicReference& reference : canonical) {
+                    if (reference.source_uuid == source && !reference.target_uuid.isNull())
+                        expectedReferences.insert(hydraulic::keyFromUuid(reference.target_uuid));
+                }
+                const std::optional<native::ModelRecord> record =
+                    repository.getModel("dependent", hydraulic::keyFromUuid(source));
+                require(record.has_value() &&
+                        record->references == std::vector<native::Key>(
+                            expectedReferences.begin(), expectedReferences.end()),
+                        "indexed dependent object references differ from canonical validator");
+            }
+            const std::vector<native::Key> pipeReferences = repository.referencingModel(
+                "dependent", hydraulic::keyFromUuid(uuid(23)));
+            require(std::find(pipeReferences.begin(), pipeReferences.end(),
+                              hydraulic::keyFromUuid(point.uuid)) != pipeReferences.end() &&
+                    std::find(pipeReferences.begin(), pipeReferences.end(),
+                              hydraulic::keyFromUuid(control.uuid)) != pipeReferences.end() &&
+                    std::find(pipeReferences.begin(), pipeReferences.end(),
+                              hydraulic::keyFromUuid(rule.uuid)) != pipeReferences.end(),
+                    "indexed dependent objects are absent from reverse-reference index");
+
+            const auto reject = [&](const std::vector<hydraulic::HydraulicEntityChange>& changes,
+                                    const char* message) {
+                const native::Hash headBefore = repository.head("dependent").id;
+                bool rejected = false;
+                try { hydraulic::editHydraulicNetwork(repository, "dependent", baseline.uuid, changes); }
+                catch (const std::exception&) { rejected = true; }
+                require(rejected && repository.head("dependent").id == headBefore, message);
+            };
+            reject({{uuid(23), std::nullopt}}, "dependent pipe deletion was accepted");
+            {
+                HydraulicDemandPoint invalid = point;
+                invalid.uuid = uuid(42010);
+                invalid.attachment.pipe_assigned_junction_uuid = uuid(42000);
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "non-endpoint demand assignment was accepted");
+                invalid.attachment.pipe_position = -0.1;
+                invalid.attachment.pipe_assigned_junction_uuid = uuid(19);
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "negative pipe position was accepted");
+                invalid.attachment.pipe_position = std::numeric_limits<double>::quiet_NaN();
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "non-finite pipe position was accepted");
+                invalid.attachment.pipe_position = 0.5;
+                invalid.demands[0].pattern_uuid = uuid(19);
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "wrong-type demand pattern was accepted");
+            }
+            {
+                HydraulicControlSimple invalid = control;
+                invalid.uuid = uuid(42011);
+                invalid.link_uuid = uuid(19);
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "simple control targeting a node was accepted");
+            }
+            {
+                HydraulicControlRule invalid = rule;
+                invalid.uuid = uuid(42012);
+                invalid.premises[0].object_uuid = uuid(23);
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "rule node premise targeting a pipe was accepted");
+                invalid.premises[0].object_uuid = uuid(19);
+                invalid.actions_else[0].link_uuid = uuid(20);
+                reject({{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                       "rule action targeting a node was accepted");
+            }
+            require(repository.head("dependent").id == inserted.id,
+                    "rejected dependent changes published a revision");
+
+            hydraulic::editHydraulicNetwork(repository, "dependent", baseline.uuid,
+                {{point.uuid, std::nullopt}, {control.uuid, std::nullopt},
+                 {rule.uuid, std::nullopt}}, &stats);
+            require(stats.indexedMembershipFastPath && stats.validatedEntities == 3,
+                    "independent demand and controls deletion missed indexed validation");
+            compareNetworks(baseline, requiredLoad(repository, "dependent", baseline.uuid));
+
+            // The new pipe, junction, demand point and controls refer to one
+            // another in one atomic batch. Every target may be initially absent.
+            HydraulicNodeJunction newJunction = item<HydraulicNodeJunction>(42020);
+            HydraulicLinkPipe newPipe = item<HydraulicLinkPipe>(42021);
+            newPipe.node_uuid_from = uuid(19);
+            newPipe.node_uuid_to = newJunction.uuid;
+            HydraulicDemandPoint newPoint = point;
+            newPoint.uuid = uuid(42022);
+            newPoint.attachment.pipe_uuid = newPipe.uuid;
+            newPoint.attachment.pipe_assigned_junction_uuid = newJunction.uuid;
+            HydraulicControlSimple newControl = control;
+            newControl.uuid = uuid(42023);
+            newControl.link_uuid = newPipe.uuid;
+            newControl.trigger_node_uuid = newJunction.uuid;
+            HydraulicControlRule newRule = rule;
+            newRule.uuid = uuid(42024);
+            newRule.premises[0].object_uuid = newJunction.uuid;
+            newRule.premises[1].object_uuid = newPipe.uuid;
+            newRule.actions_then[0].link_uuid = newPipe.uuid;
+            newRule.actions_else[0].link_uuid = newPipe.uuid;
+            hydraulic::editHydraulicNetwork(repository, "dependent", baseline.uuid,
+                {{newPoint.uuid, hydraulic::HydraulicEntity{newPoint}},
+                 {newRule.uuid, hydraulic::HydraulicEntity{newRule}},
+                 {newPipe.uuid, hydraulic::HydraulicEntity{newPipe}},
+                 {newControl.uuid, hydraulic::HydraulicEntity{newControl}},
+                 {newJunction.uuid, hydraulic::HydraulicEntity{newJunction}}}, &stats);
+            require(stats.indexedMembershipFastPath && stats.validatedEntities == 5,
+                    "same-batch demand/control references missed indexed validation");
+            NetworkHydraulic together = baseline;
+            together.nodes_junctions.append(newJunction);
+            together.links_pipes.append(newPipe);
+            together.demand_points.append(newPoint);
+            together.controls_simple.append(newControl);
+            together.controls_rules.append(newRule);
+            require(native::validateHydraulicNetwork(together).valid(),
+                    "same-batch dependent edits fail canonical validation");
+            compareNetworks(together, requiredLoad(repository, "dependent", baseline.uuid));
+            reject({{newPipe.uuid, std::nullopt}},
+                   "new pipe deletion ignored same-batch demand/control references");
+            hydraulic::editHydraulicNetwork(repository, "dependent", baseline.uuid,
+                {{newJunction.uuid, std::nullopt},
+                 {newPipe.uuid, std::nullopt},
+                 {newPoint.uuid, std::nullopt},
+                 {newControl.uuid, std::nullopt},
+                 {newRule.uuid, std::nullopt}}, &stats);
+            require(stats.indexedMembershipFastPath && stats.validatedEntities == 5,
+                    "dependent batch deletion missed indexed validation");
+            compareNetworks(baseline, requiredLoad(repository, "dependent", baseline.uuid));
+            compareNetworks(baseline, requiredLoad(repository, "main", baseline.uuid));
+            repository.verifyPack();
+        }
+        {
+            native::Repository reopened(folder, physical);
+            compareNetworks(baseline, requiredLoad(reopened, "dependent", baseline.uuid));
+            compareNetworks(baseline, requiredLoad(reopened, "main", baseline.uuid));
+            reopened.verifyPack();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+// Existing demand/control edits may change referenced UUIDs without touching
+// network membership. Exercise the real canonical validator and reference index
+// on both physical backends, including no-op, rejection and reopening.
+void exerciseDependentUpdates(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        NetworkHydraulic baseline = completeNetwork();
+        NetworkHydraulic expected = baseline;
+        {
+            native::Repository repository(folder, physical);
+            repository.createBranch("main");
+            hydraulic::saveHydraulicNetwork(repository, "main", baseline);
+            repository.createBranch("dependent-updates", "main");
+            const std::optional<native::ModelRecord> beforeRoot = repository.getModel(
+                "dependent-updates", hydraulic::keyFromUuid(baseline.uuid));
+            require(beforeRoot.has_value(), "missing root for dependent edit test");
+            const native::Bytes rootBytes = native::encodeModelRecord(*beforeRoot);
+
+            HydraulicDemandPoint point = baseline.demand_points[0];
+            point.attachment.type = HydraulicDemandPointAttachmentType::Pipe;
+            point.attachment.pipe_uuid = uuid(23);
+            point.attachment.pipe_position = 0.65;
+            point.attachment.pipe_allocation_mode =
+                HydraulicDemandPointPipeAllocationMode::AssignedJunction;
+            point.attachment.pipe_assigned_junction_uuid = uuid(20);
+            HydraulicDemand demand;
+            demand.pattern_uuid = uuid(11);
+            point.demands.append(demand);
+            HydraulicControlSimple control = baseline.controls_simple[0];
+            control.link_uuid = uuid(25);
+            control.trigger_node_uuid = uuid(21);
+            HydraulicControlRule rule = baseline.controls_rules[0];
+            HydraulicControlRulePremise premise;
+            premise.object = HydraulicControlRuleObject::Node;
+            premise.object_uuid = uuid(18);
+            rule.premises.append(premise);
+            rule.actions_then[0].link_uuid = uuid(23);
+            HydraulicControlRuleAction elseAction;
+            elseAction.link_uuid = uuid(25);
+            rule.actions_else.append(elseAction);
+
+            hydraulic::HydraulicEditDiagnostics stats;
+            const std::vector<hydraulic::HydraulicEntityChange> edits = {
+                {rule.uuid, hydraulic::HydraulicEntity{rule}},
+                {point.uuid, hydraulic::HydraulicEntity{point}},
+                {control.uuid, hydraulic::HydraulicEntity{control}}
+            };
+            const native::Revision updated = hydraulic::editHydraulicNetwork(
+                repository, "dependent-updates", baseline.uuid, edits, &stats);
+            require(stats.indexedDependentUpdateFastPath && stats.validatedEntities == 3,
+                    "existing demand/control update missed bounded indexed validation");
+            expected.demand_points[0] = point;
+            expected.controls_simple[0] = control;
+            expected.controls_rules[0] = rule;
+            require(native::validateHydraulicNetwork(expected).valid(),
+                    "indexed dependent update violated canonical validation");
+            compareNetworks(expected, requiredLoad(repository, "dependent-updates", baseline.uuid));
+            compareNetworks(baseline, requiredLoad(repository, "main", baseline.uuid));
+            const std::optional<native::ModelRecord> afterRoot = repository.getModel(
+                "dependent-updates", hydraulic::keyFromUuid(baseline.uuid));
+            require(afterRoot.has_value() && native::encodeModelRecord(*afterRoot) == rootBytes,
+                    "existing dependent update changed network membership root");
+
+            // Incoming edges must reflect the NEW canonical reference set, not the
+            // old attachments. Check every updated record and a removed edge.
+            const QVector<native::HydraulicReference> canonical = native::hydraulicReferences(expected);
+            for (const QUuid& source : {point.uuid, control.uuid, rule.uuid}) {
+                std::set<native::Key> targets;
+                for (const native::HydraulicReference& ref : canonical)
+                    if (ref.source_uuid == source && !ref.target_uuid.isNull())
+                        targets.insert(hydraulic::keyFromUuid(ref.target_uuid));
+                const std::optional<native::ModelRecord> stored = repository.getModel(
+                    "dependent-updates", hydraulic::keyFromUuid(source));
+                require(stored.has_value() && stored->references ==
+                        std::vector<native::Key>(targets.begin(), targets.end()),
+                        "updated reference index differs from canonical validator");
+            }
+            const std::vector<native::Key> incomingOld = repository.referencingModel(
+                "dependent-updates", hydraulic::keyFromUuid(uuid(19)));
+            require(std::find(incomingOld.begin(), incomingOld.end(),
+                              hydraulic::keyFromUuid(point.uuid)) == incomingOld.end() &&
+                    std::find(incomingOld.begin(), incomingOld.end(),
+                              hydraulic::keyFromUuid(control.uuid)) == incomingOld.end(),
+                    "outdated reverse references survived dependent updates");
+            const std::vector<native::Key> incomingNew = repository.referencingModel(
+                "dependent-updates", hydraulic::keyFromUuid(uuid(25)));
+            require(std::find(incomingNew.begin(), incomingNew.end(),
+                              hydraulic::keyFromUuid(control.uuid)) != incomingNew.end() &&
+                    std::find(incomingNew.begin(), incomingNew.end(),
+                              hydraulic::keyFromUuid(rule.uuid)) != incomingNew.end(),
+                    "new dependent reverse references were not persisted");
+            require(hydraulic::editHydraulicNetwork(repository, "dependent-updates", baseline.uuid,
+                        edits, &stats).id == updated.id && stats.indexedDependentUpdateFastPath,
+                    "identical dependent updates created a new revision");
+
+            const auto reject = [&](const hydraulic::HydraulicEntity& entity, const char* message) {
+                const QUuid key = std::visit([](const auto& value) { return value.uuid; }, entity);
+                const native::Hash head = repository.head("dependent-updates").id;
+                bool rejected = false;
+                try {
+                    hydraulic::editHydraulicNetwork(repository, "dependent-updates", baseline.uuid,
+                        {{key, entity}}, &stats);
+                } catch (const std::exception&) { rejected = true; }
+                require(rejected && repository.head("dependent-updates").id == head, message);
+            };
+            HydraulicDemandPoint wrong = point;
+            wrong.attachment.pipe_assigned_junction_uuid = uuid(18);
+            reject(hydraulic::HydraulicEntity{wrong}, "demand assigned non-endpoint was accepted");
+            wrong = point;
+            wrong.attachment.pipe_position = std::numeric_limits<double>::quiet_NaN();
+            reject(hydraulic::HydraulicEntity{wrong}, "nonfinite demand position was accepted");
+            wrong = point;
+            wrong.attachment.pipe_position = 1.1;
+            reject(hydraulic::HydraulicEntity{wrong}, "out-of-range demand position was accepted");
+            wrong = point;
+            wrong.demands[0].pattern_uuid = uuid(19);
+            reject(hydraulic::HydraulicEntity{wrong}, "wrong-kind demand pattern was accepted");
+            wrong = point;
+            wrong.attachment.pipe_uuid = uuid(420099);
+            reject(hydraulic::HydraulicEntity{wrong}, "missing demand pipe was accepted");
+            HydraulicControlSimple badControl = control;
+            badControl.link_uuid = uuid(20);
+            reject(hydraulic::HydraulicEntity{badControl}, "simple control targeted node as link");
+            badControl = control;
+            badControl.trigger_node_uuid = uuid(11);
+            reject(hydraulic::HydraulicEntity{badControl}, "simple control targeted pattern as node");
+            HydraulicControlRule badRule = rule;
+            badRule.premises.last().object_uuid = uuid(23);
+            reject(hydraulic::HydraulicEntity{badRule}, "rule node premise targeted pipe");
+            badRule = rule;
+            badRule.actions_else[0].link_uuid = uuid(19);
+            reject(hydraulic::HydraulicEntity{badRule}, "rule action targeted junction");
+            {
+                // One valid change must not sneak into an invalid atomic batch.
+                HydraulicDemandPoint validPoint = point;
+                validPoint.attachment.pipe_position = 0.4;
+                const native::Hash beforeRejectedBatch = repository.head("dependent-updates").id;
+                bool rejectedBatch = false;
+                try {
+                    hydraulic::editHydraulicNetwork(repository, "dependent-updates", baseline.uuid,
+                        {{validPoint.uuid, hydraulic::HydraulicEntity{validPoint}},
+                         {badRule.uuid, hydraulic::HydraulicEntity{badRule}}}, &stats);
+                } catch (const std::exception&) { rejectedBatch = true; }
+                require(rejectedBatch && repository.head("dependent-updates").id == beforeRejectedBatch,
+                        "invalid dependent batch published the otherwise valid change");
+            }
+
+            // Mixed batches are deliberately *not* treated as independent bounded
+            // dependent updates. Full validation must still handle them atomically.
+            HydraulicMapLabel updatedLabel = baseline.map_labels[0];
+            updatedLabel.text = QStringLiteral("changed through full validation");
+            HydraulicControlSimple controlAgain = control;
+            controlAgain.trigger_node_uuid = uuid(20);
+            hydraulic::editHydraulicNetwork(repository, "dependent-updates", baseline.uuid,
+                {{controlAgain.uuid, hydraulic::HydraulicEntity{controlAgain}},
+                 {updatedLabel.uuid, hydraulic::HydraulicEntity{updatedLabel}}}, &stats);
+            require(!stats.indexedDependentUpdateFastPath,
+                    "mixed dependent and label edits bypassed full validation");
+            expected.controls_simple[0] = controlAgain;
+            expected.map_labels[0] = updatedLabel;
+            compareNetworks(expected, requiredLoad(repository, "dependent-updates", baseline.uuid));
+            repository.verifyPack();
+        } // Release the writer lock before checking durability via a fresh handle.
+        {
+            native::Repository reopened(folder, physical);
+            compareNetworks(expected, requiredLoad(reopened, "dependent-updates", baseline.uuid));
+            compareNetworks(baseline, requiredLoad(reopened, "main", baseline.uuid));
+            reopened.verifyPack();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+void exerciseHydraulicMerging(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        const NetworkHydraulic baseline = completeNetwork();
+        {
+            native::Repository repository(folder, physical);
+            repository.createBranch("main");
+            hydraulic::saveHydraulicNetwork(repository, "main", baseline);
+            repository.createBranch("feature", "main");
+            HydraulicLinkPipe left = baseline.links_pipes[0];
+            HydraulicLinkPipe right = baseline.links_pipes[0];
+            left.diameter_mm = 179.0;
+            right.length_calculated_m = 37.5;
+            hydraulic::editHydraulicNetwork(repository, "main", baseline.uuid,
+                {{left.uuid, hydraulic::HydraulicEntity{left}}});
+            hydraulic::editHydraulicNetwork(repository, "feature", baseline.uuid,
+                {{right.uuid, hydraulic::HydraulicEntity{right}}});
+            const native::MergeResult merged = hydraulic::mergeHydraulicBranches(repository, "main", "feature");
+            require(merged.status == native::MergeStatus::Merged &&
+                    merged.revision.parents.size() == 2,
+                    "hydraulic field merge did not produce a two-parent revision");
+            NetworkHydraulic expected = baseline;
+            expected.links_pipes[0].diameter_mm = 179.0;
+            expected.links_pipes[0].length_calculated_m = 37.5;
+            compareNetworks(expected, requiredLoad(repository, "main", baseline.uuid));
+            NetworkHydraulic featureExpected = baseline;
+            featureExpected.links_pipes[0].length_calculated_m = 37.5;
+            compareNetworks(featureExpected, requiredLoad(repository, "feature", baseline.uuid));
+            require(repository.referencingModel("main", hydraulic::keyFromUuid(uuid(19))).size() > 0,
+                    "field merge lost reverse references");
+            // Repeated merge must not replay an incorporated source.
+            require(hydraulic::mergeHydraulicBranches(repository, "main", "feature").status ==
+                    native::MergeStatus::UpToDate,
+                    "repeated hydraulic merge changed branch history");
+
+            repository.createBranch("conflict-left", "main");
+            repository.createBranch("conflict-right", "main");
+            HydraulicLinkPipe a = expected.links_pipes[0];
+            HydraulicLinkPipe b = expected.links_pipes[0];
+            a.diameter_mm = 181.0;
+            b.diameter_mm = 182.0;
+            hydraulic::editHydraulicNetwork(repository, "conflict-left", baseline.uuid,
+                {{a.uuid, hydraulic::HydraulicEntity{a}}});
+            hydraulic::editHydraulicNetwork(repository, "conflict-right", baseline.uuid,
+                {{b.uuid, hydraulic::HydraulicEntity{b}}});
+            const native::Hash conflictHead = repository.head("conflict-left").id;
+            const std::uint64_t conflictBytes = repository.packSize();
+            const native::MergeResult conflict = hydraulic::mergeHydraulicBranches(
+                repository, "conflict-left", "conflict-right");
+            require(conflict.status == native::MergeStatus::Conflicts &&
+                    !conflict.conflicts.empty() &&
+                    conflict.conflicts[0].reason.find("diameter_mm") != std::string::npos &&
+                    repository.head("conflict-left").id == conflictHead &&
+                    repository.packSize() == conflictBytes,
+                    "hydraulic same-field conflict did not fail without writing");
+
+            // A GUI resolution must select only actual conflicting fields,
+            // from the exact revision tips that were shown to the user.
+            hydraulic::HydraulicMergeSelections chooseSource;
+            chooseSource.expectedTargetHead = conflictHead;
+            chooseSource.expectedSourceHead = repository.head("conflict-right").id;
+            chooseSource.fields.push_back({uuid(23), QStringLiteral("diameter_mm"),
+                                           hydraulic::HydraulicMergeSide::Source});
+            const std::function<void(const hydraulic::HydraulicMergeSelections&, const char*)> rejectChoice =
+                [&repository, &conflictHead, &conflictBytes](
+                    const hydraulic::HydraulicMergeSelections& selections, const char* message) {
+                    bool rejectedChoice = false;
+                    try {
+                        (void)hydraulic::mergeHydraulicBranches(repository, "conflict-left", "conflict-right",
+                                                         selections);
+                    } catch (const std::exception&) { rejectedChoice = true; }
+                    require(rejectedChoice && repository.head("conflict-left").id == conflictHead &&
+                            repository.packSize() == conflictBytes, message);
+                };
+            hydraulic::HydraulicMergeSelections missingPins;
+            missingPins.fields = chooseSource.fields;
+            rejectChoice(missingPins, "unpinned field choice was accepted");
+            hydraulic::HydraulicMergeSelections staleChoice = chooseSource;
+            staleChoice.expectedSourceHead = repository.head("main").id;
+            rejectChoice(staleChoice, "stale source revision was accepted");
+            hydraulic::HydraulicMergeSelections unknownField = chooseSource;
+            unknownField.fields[0].field = QStringLiteral("length_calculated_m");
+            rejectChoice(unknownField, "choice for non-conflicting field was accepted");
+            hydraulic::HydraulicMergeSelections duplicate = chooseSource;
+            duplicate.fields.push_back(duplicate.fields[0]);
+            rejectChoice(duplicate, "duplicate field choice was accepted");
+            hydraulic::HydraulicMergeSelections unused = chooseSource;
+            unused.fields.push_back({uuid(20), QStringLiteral("elevation_m"),
+                                     hydraulic::HydraulicMergeSide::Target});
+            rejectChoice(unused, "unused field choice was ignored");
+
+            const native::MergeResult userMerged = hydraulic::mergeHydraulicBranches(
+                repository, "conflict-left", "conflict-right", chooseSource);
+            require(userMerged.status == native::MergeStatus::Merged &&
+                    userMerged.revision.parents == std::vector<native::Hash>{
+                        conflictHead, *chooseSource.expectedSourceHead} &&
+                    repository.head("conflict-right").id == *chooseSource.expectedSourceHead,
+                    "source-choice merge failed to preserve two-parent history");
+            NetworkHydraulic chosenNetwork = expected;
+            chosenNetwork.links_pipes[0].diameter_mm = 182.0;
+            compareNetworks(chosenNetwork,
+                requiredLoad(repository, "conflict-left", baseline.uuid));
+            // After publication the same UI choices must be rejected as stale.
+            bool staleAfterMerge = false;
+            try {
+                (void)hydraulic::mergeHydraulicBranches(repository, "conflict-left", "conflict-right",
+                                                 chooseSource);
+            } catch (const std::runtime_error&) { staleAfterMerge = true; }
+            require(staleAfterMerge, "already-applied field choices were silently replayed");
+
+            repository.createBranch("target-choice-left", "main");
+            repository.createBranch("target-choice-right", "main");
+            HydraulicLinkPipe keepTarget = expected.links_pipes[0];
+            HydraulicLinkPipe otherTarget = expected.links_pipes[0];
+            keepTarget.diameter_mm = 191.0;
+            otherTarget.diameter_mm = 192.0;
+            otherTarget.length_calculated_m = 48.0;
+            hydraulic::editHydraulicNetwork(repository, "target-choice-left", baseline.uuid,
+                {{keepTarget.uuid, hydraulic::HydraulicEntity{keepTarget}}});
+            hydraulic::editHydraulicNetwork(repository, "target-choice-right", baseline.uuid,
+                {{otherTarget.uuid, hydraulic::HydraulicEntity{otherTarget}}});
+            hydraulic::HydraulicMergeSelections chooseTarget;
+            chooseTarget.expectedTargetHead = repository.head("target-choice-left").id;
+            chooseTarget.expectedSourceHead = repository.head("target-choice-right").id;
+            chooseTarget.fields.push_back({uuid(23), QStringLiteral("diameter_mm"),
+                                           hydraulic::HydraulicMergeSide::Target});
+            const native::MergeResult targetMerged = hydraulic::mergeHydraulicBranches(
+                repository, "target-choice-left", "target-choice-right", chooseTarget);
+            require(targetMerged.status == native::MergeStatus::Merged,
+                    "target-side field resolution was rejected");
+            NetworkHydraulic targetChosenNetwork = expected;
+            targetChosenNetwork.links_pipes[0].diameter_mm = 191.0;
+            targetChosenNetwork.links_pipes[0].length_calculated_m = 48.0;
+            compareNetworks(targetChosenNetwork,
+                requiredLoad(repository, "target-choice-left", baseline.uuid));
+
+            // Two individually valid branches can combine into invalid demand
+            // allocation even when they edit DIFFERENT entities.
+            repository.createBranch("topology-left", "feature");
+            repository.createBranch("topology-right", "feature");
+            HydraulicLinkPipe rewired = right;
+            rewired.node_uuid_from = uuid(18);
+            hydraulic::editHydraulicNetwork(repository, "topology-left", baseline.uuid,
+                {{rewired.uuid, hydraulic::HydraulicEntity{rewired}}});
+            HydraulicDemandPoint attached = baseline.demand_points[0];
+            attached.attachment.type = HydraulicDemandPointAttachmentType::Pipe;
+            attached.attachment.pipe_uuid = uuid(23);
+            attached.attachment.pipe_position = 0.4;
+            attached.attachment.pipe_allocation_mode =
+                HydraulicDemandPointPipeAllocationMode::AssignedJunction;
+            attached.attachment.pipe_assigned_junction_uuid = uuid(19);
+            hydraulic::editHydraulicNetwork(repository, "topology-right", baseline.uuid,
+                {{attached.uuid, hydraulic::HydraulicEntity{attached}}});
+            const native::Hash topologyHead = repository.head("topology-left").id;
+            const std::uint64_t topologyBytes = repository.packSize();
+            const native::MergeResult invalid = hydraulic::mergeHydraulicBranches(
+                repository, "topology-left", "topology-right");
+            require(invalid.status == native::MergeStatus::Conflicts &&
+                    !invalid.conflicts.empty() &&
+                    invalid.conflicts[0].reason.find("endpoint") != std::string::npos &&
+                    repository.head("topology-left").id == topologyHead &&
+                    repository.packSize() == topologyBytes,
+                    "hydraulic merge published a semantically invalid combined network");
+            repository.verifyPack();
+        }
+        {
+            native::Repository reopened(folder, physical);
+            NetworkHydraulic expected = baseline;
+            expected.links_pipes[0].diameter_mm = 179.0;
+            expected.links_pipes[0].length_calculated_m = 37.5;
+            compareNetworks(expected, requiredLoad(reopened, "main", baseline.uuid));
+            reopened.verifyPack();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+
+void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        const NetworkHydraulic baseline = completeNetwork();
+        {
+            native::Repository repository(folder, physical);
+            repository.createBranch("main");
+            hydraulic::saveHydraulicNetwork(repository, "main", baseline);
+            repository.createBranch("delete-left", "main");
+            repository.createBranch("modify-right", "main");
+            repository.createBranch("delete-right", "main");
+            repository.createBranch("modify-left", "main");
+            HydraulicMapLabel label = baseline.map_labels[0];
+            label.text = QStringLiteral("edited on surviving branch");
+            hydraulic::editHydraulicNetwork(repository, "delete-left", baseline.uuid,
+                                     {{label.uuid, std::nullopt}});
+            hydraulic::editHydraulicNetwork(repository, "delete-right", baseline.uuid,
+                                     {{label.uuid, std::nullopt}});
+            hydraulic::editHydraulicNetwork(repository, "modify-left", baseline.uuid,
+                                     {{label.uuid, hydraulic::HydraulicEntity{label}}});
+            hydraulic::editHydraulicNetwork(repository, "modify-right", baseline.uuid,
+                                     {{label.uuid, hydraulic::HydraulicEntity{label}}});
+            const native::Hash leftTip = repository.head("delete-left").id;
+            const native::Hash rightTip = repository.head("modify-right").id;
+            const std::uint64_t bytesBefore = repository.packSize();
+            const native::MergeResult defaultConflict =
+                hydraulic::mergeHydraulicBranches(repository, "delete-left", "modify-right");
+            require(defaultConflict.status == native::MergeStatus::Conflicts &&
+                    repository.packSize() == bytesBefore &&
+                    repository.head("delete-left").id == leftTip,
+                    "delete-vs-modify failed to produce a non-writing conflict");
+            hydraulic::HydraulicMergeSelections choice;
+            choice.expectedTargetHead = leftTip;
+            choice.expectedSourceHead = rightTip;
+            choice.objects.push_back({label.uuid, hydraulic::HydraulicMergeSide::Target});
+            const std::function<void(const hydraulic::HydraulicMergeSelections&, const char*)> rejectObjectChoice =
+                [&repository, &leftTip, &bytesBefore](
+                    const hydraulic::HydraulicMergeSelections& invalid, const char* description) {
+                    bool rejected = false;
+                    try {
+                        (void)hydraulic::mergeHydraulicBranches(
+                            repository, "delete-left", "modify-right", invalid);
+                    } catch (const std::exception&) { rejected = true; }
+                    require(rejected && repository.head("delete-left").id == leftTip &&
+                            repository.packSize() == bytesBefore, description);
+                };
+            hydraulic::HydraulicMergeSelections stale = choice;
+            stale.expectedSourceHead = repository.head("main").id;
+            rejectObjectChoice(stale, "stale structural choice changed a branch");
+            hydraulic::HydraulicMergeSelections duplicate = choice;
+            duplicate.objects.push_back(duplicate.objects[0]);
+            rejectObjectChoice(duplicate, "duplicate structural choice accepted");
+            hydraulic::HydraulicMergeSelections overlapping = choice;
+            overlapping.fields.push_back({label.uuid, QStringLiteral("text"),
+                                           hydraulic::HydraulicMergeSide::Target});
+            rejectObjectChoice(overlapping, "field and whole-object choices overlapped");
+            hydraulic::HydraulicMergeSelections unpinned = choice;
+            unpinned.expectedTargetHead.reset();
+            rejectObjectChoice(unpinned, "un-pinned structural resolution accepted");
+            const native::MergeResult deleted = hydraulic::mergeHydraulicBranches(
+                repository, "delete-left", "modify-right", choice);
+            require(deleted.status == native::MergeStatus::Merged &&
+                    deleted.revision.parents == std::vector<native::Hash>{leftTip, rightTip},
+                    "explicit deletion did not produce a two-parent merge");
+            NetworkHydraulic withoutLabel = baseline;
+            withoutLabel.map_labels.clear();
+            compareNetworks(withoutLabel, requiredLoad(repository, "delete-left", baseline.uuid));
+            NetworkHydraulic withLabel = baseline;
+            withLabel.map_labels[0] = label;
+            compareNetworks(withLabel, requiredLoad(repository, "modify-right", baseline.uuid));
+
+            // Choosing the modified record without restoring its deleted
+            // membership would create an orphan. Must fail before pack writes.
+            const native::Hash oppositeHead = repository.head("modify-left").id;
+            const native::Hash oppositeSource = repository.head("delete-right").id;
+            const std::uint64_t oppositeBytes = repository.packSize();
+            hydraulic::HydraulicMergeSelections keepOrphan;
+            keepOrphan.expectedTargetHead = oppositeHead;
+            keepOrphan.expectedSourceHead = oppositeSource;
+            keepOrphan.objects.push_back({label.uuid, hydraulic::HydraulicMergeSide::Target});
+            const native::MergeResult orphan = hydraulic::mergeHydraulicBranches(
+                repository, "modify-left", "delete-right", keepOrphan);
+            require(orphan.status == native::MergeStatus::Conflicts &&
+                    repository.head("modify-left").id == oppositeHead &&
+                    repository.packSize() == oppositeBytes,
+                    "keeping an unowned deleted entity bypassed membership validation");
+            keepOrphan.objects[0].side = hydraulic::HydraulicMergeSide::Source;
+            const native::MergeResult sourceDeletion = hydraulic::mergeHydraulicBranches(
+                repository, "modify-left", "delete-right", keepOrphan);
+            require(sourceDeletion.status == native::MergeStatus::Merged &&
+                    !repository.getModel("modify-left", hydraulic::keyFromUuid(label.uuid)),
+                    "source-side deletion was not selected");
+            compareNetworks(withoutLabel, requiredLoad(repository, "modify-left", baseline.uuid));
+
+            repository.createBranch("rewire-left", "main");
+            repository.createBranch("rewire-right", "main");
+            HydraulicLinkPipe left = baseline.links_pipes[0];
+            HydraulicLinkPipe right = baseline.links_pipes[0];
+            left.node_uuid_from = uuid(21);
+            right.node_uuid_from = uuid(18);
+            hydraulic::editHydraulicNetwork(repository, "rewire-left", baseline.uuid,
+                                     {{left.uuid, hydraulic::HydraulicEntity{left}}});
+            hydraulic::editHydraulicNetwork(repository, "rewire-right", baseline.uuid,
+                                     {{right.uuid, hydraulic::HydraulicEntity{right}}});
+            const native::Hash topologyHead = repository.head("rewire-left").id;
+            const native::Hash topologyOther = repository.head("rewire-right").id;
+            const native::MergeResult unresolved =
+                hydraulic::mergeHydraulicBranches(repository, "rewire-left", "rewire-right");
+            require(unresolved.status == native::MergeStatus::Conflicts,
+                    "competing pipe rewires should require an object choice");
+            hydraulic::HydraulicMergeSelections topologyChoice;
+            topologyChoice.expectedTargetHead = topologyHead;
+            topologyChoice.expectedSourceHead = topologyOther;
+            topologyChoice.objects.push_back({right.uuid, hydraulic::HydraulicMergeSide::Source});
+            const native::MergeResult rewire = hydraulic::mergeHydraulicBranches(
+                repository, "rewire-left", "rewire-right", topologyChoice);
+            require(rewire.status == native::MergeStatus::Merged,
+                    "source-side topology choice was not accepted");
+            NetworkHydraulic rewired = baseline;
+            rewired.links_pipes[0] = right;
+            compareNetworks(rewired, requiredLoad(repository, "rewire-left", baseline.uuid));
+            const std::vector<native::Key> sourceReferrers =
+                repository.referencingModel("rewire-left", hydraulic::keyFromUuid(uuid(18)));
+            require(std::find(sourceReferrers.begin(), sourceReferrers.end(),
+                              hydraulic::keyFromUuid(right.uuid)) != sourceReferrers.end(),
+                    "source-side rewire lost reverse reference");
+            // Reject selections for the wrong UUID or selections with stale
+            // heads; neither may publish a revision nor write pack bytes.
+            hydraulic::HydraulicMergeSelections unused;
+            unused.expectedTargetHead = repository.head("delete-right").id;
+            unused.expectedSourceHead = repository.head("modify-right").id;
+            unused.objects.push_back({uuid(50001), hydraulic::HydraulicMergeSide::Target});
+            const std::uint64_t rejectBytes = repository.packSize();
+            bool unusedRejected = false;
+            try { (void)hydraulic::mergeHydraulicBranches(repository, "delete-right", "modify-right", unused); }
+            catch (const std::exception&) { unusedRejected = true; }
+            require(unusedRejected && repository.packSize() == rejectBytes,
+                    "unused object choice was not rejected before publication");
+            repository.verifyPack();
+        }
+        {
+            native::Repository reopened(folder, physical);
+            NetworkHydraulic expected = baseline;
+            expected.map_labels.clear();
+            compareNetworks(expected, requiredLoad(reopened, "delete-left", baseline.uuid));
+            compareNetworks(expected, requiredLoad(reopened, "modify-left", baseline.uuid));
             reopened.verifyPack();
         }
     } catch (...) {
@@ -777,7 +2012,15 @@ int main(int argc, char** argv) {
         exercise(native::PhysicalStore::ExperimentalBlocks);
         exerciseChunkBoundaries(native::PhysicalStore::Stage7Pack);
         exerciseChunkBoundaries(native::PhysicalStore::ExperimentalBlocks);
-        std::cout << "Complete V5 hydraulic network persistence tests passed on both backends\n";
+        exerciseDependentMembership(native::PhysicalStore::Stage7Pack);
+        exerciseDependentMembership(native::PhysicalStore::ExperimentalBlocks);
+        exerciseDependentUpdates(native::PhysicalStore::Stage7Pack);
+        exerciseDependentUpdates(native::PhysicalStore::ExperimentalBlocks);
+        exerciseHydraulicMerging(native::PhysicalStore::Stage7Pack);
+        exerciseHydraulicMerging(native::PhysicalStore::ExperimentalBlocks);
+        exerciseStructuralMergeChoices(native::PhysicalStore::Stage7Pack);
+        exerciseStructuralMergeChoices(native::PhysicalStore::ExperimentalBlocks);
+        std::cout << "Complete hydraulic network persistence tests passed on both backends\n";
         return 0;
     } catch (const std::exception& failure) {
         std::cerr << "Hydraulic network persistence test failed: " << failure.what() << '\n';

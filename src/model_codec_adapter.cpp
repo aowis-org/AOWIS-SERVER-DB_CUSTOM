@@ -5,7 +5,7 @@
 #include <utility>
 #include <limits>
 
-namespace aowis::native::v5 {
+namespace aowis::native::hydraulic {
 
 Key keyFromUuid(const QUuid& uuid) {
     const QByteArray raw = uuid.toRfc4122();
@@ -36,7 +36,7 @@ Bytes bytesFromQByteArray(const QByteArray& data) {
 
 QByteArray qByteArrayFromBytes(const Bytes& data) {
     if (data.size() > static_cast<std::size_t>(std::numeric_limits<qsizetype>::max())) {
-        throw std::length_error("canonical V5 model payload too large");
+        throw std::length_error("canonical model payload too large");
     }
     return QByteArray(reinterpret_cast<const char*>(data.data()),
                       static_cast<qsizetype>(data.size()));
@@ -98,11 +98,11 @@ std::optional<HydraulicLinkPipe> readPipe(Repository& store,
         std::sort(expected.begin(), expected.end());
         expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
         if (record->references != expected) {
-            if (error) *error = QStringLiteral("Pipe endpoint references differ from canonical V5 payload");
+            if (error) *error = QStringLiteral("Pipe endpoint references differ from canonical model payload");
             return std::nullopt;
         }
     }
     return result;
 }
 
-}  // namespace aowis::native::v5
+}  // namespace aowis::native::hydraulic

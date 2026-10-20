@@ -1,7 +1,8 @@
 #pragma once
 
-// Optional integration with the existing native V5 codec. This header is not
-// included by native_store.h: the core engine has no Qt or SQL dependency.
+// Hydraulic entity bridge for the native-owned model serializer.
+// This header is not included by native_store.h: the core storage engine
+// has no Qt dependency.
 #include "aowis/native/native_store.h"
 #include <aowis/native/model_codec.h>
 
@@ -12,10 +13,10 @@
 #include <optional>
 #include <stdexcept>
 
-namespace aowis::native::v5 {
+namespace aowis::native::hydraulic {
 
 // These local storage-kind values correspond to the Stage 3 contract, not to
-// a finalized global entity catalog. The codec bytes are exactly native V5.
+// a finalized global entity catalog. Payloads use ModelCodec<T>.
 inline constexpr std::uint16_t junctionKind = 1;
 inline constexpr std::uint16_t pipeKind = 4;
 
@@ -32,4 +33,4 @@ std::optional<HydraulicLinkPipe> readPipe(Repository& store,
                                           std::string_view branch, const Key& key,
                                           QString* error = nullptr);
 
-}  // namespace aowis::native::v5
+}  // namespace aowis::native::hydraulic
