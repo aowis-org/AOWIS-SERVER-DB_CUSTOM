@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+usage() {
+    printf 'Usage: %s [--debug | --release | --both]\n' "${0##*/}"
+}
+case "${1:-}" in
+    --help|-h) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; usage; exit 0 ;;
+    ''|--debug|--release|--both) [[ $# -le 1 ]] || { usage >&2; exit 2; } ;;
+    *) usage >&2; exit 2 ;;
+esac
+run_suite() {
+    local build_dir="$1" build_type="$2"
+    local arguments=(-S "$project_dir" -B "$build_dir" -G Ninja -DBUILD_TESTING=ON)
+    if [[ -n "$build_type" ]]; then
+        arguments+=("-DCMAKE_BUILD_TYPE=$build_type")
+    fi
+    cmake "${arguments[@]}"
+    cmake --build "$build_dir" --target aowis-db-tests --parallel
+    local registered
+    registered="$(ctest --test-dir "$build_dir" -N -L '^aowis$')"
+    if ! grep -Eq 'Total Tests: [1-9][0-9]*' <<< "$registered"; then
+        printf 'ERROR: no AOWIS native tests registered\n%s\n' "$registered" >&2
+        exit 1
+    fi
+    ctest --test-dir "$build_dir" --output-on-failure -L '^aowis$'
+}
+case "${1:-}" in
+    '') run_suite "$project_dir/build-linux-tests" '' ;;
+    --debug) run_suite "$project_dir/build-linux-tests-debug" Debug ;;
+    --release) run_suite "$project_dir/build-linux-tests-release" Release ;;
+    --both) run_suite "$project_dir/build-linux-tests-debug" Debug; run_suite "$project_dir/build-linux-tests-release" Release ;;
+esac
