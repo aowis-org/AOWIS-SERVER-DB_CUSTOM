@@ -1606,6 +1606,64 @@ void testWholeObjectMergeChoices() {
     }
 }
 
+void testMergeCandidateReconciliation() {
+    using aowis::native::MergeOptions;
+    using aowis::native::MergeStatus;
+    using aowis::native::MergeCandidate;
+    using aowis::native::ModelRecord;
+    for (const aowis::native::PhysicalStore storage :
+         {aowis::native::PhysicalStore::Stage7Pack,
+          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+        TemporaryRepo temporary("merge-candidate-reconciliation");
+        Repository repository(temporary.directory, storage);
+        repository.createBranch("main");
+        repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("one")}},
+                                       {key(2), ModelRecord{1, {}, value("two")}}});
+        repository.createBranch("feature", "main");
+        repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("main")}}});
+        repository.commitModel("feature", {{key(2), ModelRecord{1, {}, value("feature")}}});
+        const Hash original = repository.head("main").id;
+        const std::uint64_t bytes = repository.packSize();
+        MergeOptions invalid;
+        invalid.reconcile = [](const MergeCandidate& candidate,
+            const std::function<void(const Key&, std::optional<ModelRecord>)>& set,
+            const std::function<std::optional<ModelRecord>(const Key&)>& target,
+            const std::function<std::optional<ModelRecord>(const Key&)>& source)
+            -> std::optional<std::string> {
+            expect(candidate.get(key(1)) && target(key(1)) && source(key(1)) &&
+                   target(key(1))->payload == value("main") &&
+                   source(key(1))->payload == value("one"),
+                   "candidate reconciliation saw incorrect branch snapshots");
+            set(key(3), ModelRecord{1, {key(99)}, value("invalid")});
+            return std::nullopt;
+        };
+        expect(repository.mergeBranches("main", "feature", invalid).status ==
+                   MergeStatus::Conflicts &&
+               repository.head("main").id == original && repository.packSize() == bytes,
+               "merge reconciler published an invalid candidate");
+        MergeOptions valid;
+        valid.reconcile = [](const MergeCandidate& candidate,
+            const std::function<void(const Key&, std::optional<ModelRecord>)>& set,
+            const std::function<std::optional<ModelRecord>(const Key&)>&,
+            const std::function<std::optional<ModelRecord>(const Key&)>&)
+            -> std::optional<std::string> {
+            expect(candidate.get(key(2)) && candidate.get(key(2))->payload == value("feature"),
+                   "reconciliation did not see source changes");
+            set(key(3), ModelRecord{1, {key(1)}, value("combined")});
+            return std::nullopt;
+        };
+        const aowis::native::MergeResult merged =
+            repository.mergeBranches("main", "feature", valid);
+        expect(merged.status == MergeStatus::Merged &&
+               repository.getModel("main", key(3))->payload == value("combined") &&
+               repository.referencingModel("main", key(1)) == std::vector<Key>{key(3)} &&
+               repository.getModel("main", key(2))->payload == value("feature") &&
+               !repository.getModel("feature", key(3)),
+               "candidate reconciliation lost changes or reference indexes");
+        repository.verifyPack();
+    }
+}
+
 int main() {
     try {
         testEmptyAndBranches();
@@ -1633,6 +1691,7 @@ int main() {
         testIndexedModelMerges();
         testMergeHooksAndSemanticPreflight();
         testWholeObjectMergeChoices();
+        testMergeCandidateReconciliation();
         std::cout << "AOWIS native storage tests: passed\n";
         return 0;
     } catch (const std::exception& failure) {

@@ -1530,15 +1530,241 @@ std::optional<std::string> validateMergedHydraulicSnapshot(const MergeCandidate&
     }
 }
 
+// Reconcile independent membership edits using the common-ancestor membership
+// order. Removals made on either branch are retained; independent additions
+// from both branches survive. Existing members retain their original order.
+QList<QUuid> mergeOrderedMembers(const QList<QUuid>& base, const QList<QUuid>& target,
+                                const QList<QUuid>& source) {
+    QSet<QUuid> baseline;
+    QSet<QUuid> left;
+    QSet<QUuid> right;
+    for (const QUuid& id : base) baseline.insert(id);
+    for (const QUuid& id : target) left.insert(id);
+    for (const QUuid& id : source) right.insert(id);
+    QList<QUuid> output;
+    // Membership order is model data. Never silently replace a concurrent
+    // reorder or a positional insertion with our deterministic append order.
+    // This reconciler is deliberately restricted to append/remove edits.
+    const auto appendOrRemoveOnly = [&base, &baseline](const QList<QUuid>& branch) {
+        qsizetype previous = -1;
+        bool encounteredNew = false;
+        for (const QUuid& id : branch) {
+            if (!baseline.contains(id)) { encounteredNew = true; continue; }
+            if (encounteredNew) return false;
+            const qsizetype position = base.indexOf(id);
+            if (position <= previous) return false;
+            previous = position;
+        }
+        return true;
+    };
+    if (!appendOrRemoveOnly(target) || !appendOrRemoveOnly(source))
+        throw std::runtime_error("membership ordering changes require explicit resolution");
+    QSet<QUuid> seen;
+    const auto insert = [&output, &seen](const QUuid& id) {
+        if (!seen.contains(id)) { output.append(id); seen.insert(id); }
+    };
+    for (const QUuid& id : base)
+        if (left.contains(id) && right.contains(id)) insert(id);
+    for (const QUuid& id : target)
+        if (!baseline.contains(id)) insert(id);
+    for (const QUuid& id : source)
+        if (!baseline.contains(id)) insert(id);
+    return output;
+}
+
+std::optional<ModelRecord> mergeHydraulicMembershipRecord(
+    const ModelRecord& base, const ModelRecord& target, const ModelRecord& source) {
+    if (base.kind != target.kind || base.kind != source.kind) return std::nullopt;
+    if (base.kind == chunkKind) {
+        // Read only enough of the envelope to determine the expected owner;
+        // decodeChunk then verifies all bytes and the stored reference index.
+        QDataStream stream(qByteArrayFromBytes(base.payload));
+        stream.setVersion(QDataStream::Qt_6_0);
+        quint32 magic = 0, version = 0, collection = 0;
+        QUuid network;
+        stream >> magic >> version >> network >> collection;
+        if (stream.status() != QDataStream::Ok || magic != chunkMagic ||
+            version != chunkVersion || collection >= collectionCount) return std::nullopt;
+        const MemberChunk ancestor = decodeChunk(base, network, collection);
+        const MemberChunk left = decodeChunk(target, network, collection);
+        const MemberChunk right = decodeChunk(source, network, collection);
+        MemberChunk merged{network, collection,
+            mergeOrderedMembers(ancestor.members, left.members, right.members)};
+        if (merged.members.isEmpty() || merged.members.size() > chunkCapacity)
+            return std::nullopt;
+        return encodeChunk(merged);
+    }
+    if (base.kind == hydraulicNetworkKind) {
+        const Manifest ancestor = decodeManifest(qByteArrayFromBytes(base.payload));
+        const Manifest left = decodeManifest(qByteArrayFromBytes(target.payload));
+        const Manifest right = decodeManifest(qByteArrayFromBytes(source.payload));
+        if (ancestor.metadata.uuid != left.metadata.uuid ||
+            ancestor.metadata.uuid != right.metadata.uuid) return std::nullopt;
+        const QByteArray baseMetadata = ModelCodec<NetworkHydraulic>::encode(ancestor.metadata);
+        const QByteArray leftMetadata = ModelCodec<NetworkHydraulic>::encode(left.metadata);
+        const QByteArray rightMetadata = ModelCodec<NetworkHydraulic>::encode(right.metadata);
+        if (leftMetadata != rightMetadata && leftMetadata != baseMetadata &&
+            rightMetadata != baseMetadata) return std::nullopt;
+        Manifest merged = leftMetadata == baseMetadata ? right : left;
+        for (std::size_t i = 0; i < collectionCount; ++i) {
+            merged.chunks[i] = mergeOrderedMembers(ancestor.chunks[i],
+                                                   left.chunks[i], right.chunks[i]);
+            merged.nextChunk[i] = std::max(left.nextChunk[i], right.nextChunk[i]);
+        }
+        ModelRecord record;
+        record.kind = hydraulicNetworkKind;
+        record.payload = bytesFromQByteArray(encodeManifest(merged));
+        record.references = chunkKeys(merged);
+        return record;
+    }
+    return std::nullopt;
+}
+
+std::optional<ModelRecord> mergeConcurrentHydraulicChunk(
+    const ModelRecord& target, const ModelRecord& source) {
+    if (target.kind != chunkKind || source.kind != chunkKind) return std::nullopt;
+    QDataStream stream(qByteArrayFromBytes(target.payload));
+    stream.setVersion(QDataStream::Qt_6_0);
+    quint32 magic = 0, version = 0, collection = 0;
+    QUuid network;
+    stream >> magic >> version >> network >> collection;
+    if (stream.status() != QDataStream::Ok || magic != chunkMagic ||
+        version != chunkVersion || collection >= collectionCount) return std::nullopt;
+    const MemberChunk left = decodeChunk(target, network, collection);
+    const MemberChunk right = decodeChunk(source, network, collection);
+    MemberChunk merged{network, collection, left.members};
+    for (const QUuid& id : right.members)
+        if (!merged.members.contains(id)) merged.members.append(id);
+    if (merged.members.size() > chunkCapacity) return std::nullopt;
+    return encodeChunk(merged);
+}
+
+// A selected object may have been removed from its old membership chunk by
+// the other branch. Locate its *actual historical owner*, then restore only
+// the chosen entity to the candidate membership; never restore unrelated
+// records deleted by either branch. All updates are ephemeral until the
+// repository's reference and full hydraulic validators accept the snapshot.
+std::optional<std::string> reconcileExplicitHydraulicMembership(
+    const MergeCandidate& candidate,
+    const std::function<void(const Key&, std::optional<ModelRecord>)>& set,
+    const CandidateReader& target,
+    const CandidateReader& source,
+    const std::map<Key, MergeChoiceSide>& choices) {
+    try {
+        std::vector<Key> networks;
+        candidate.forEach([&networks](const Key& key, const ModelRecord& record) {
+            if (record.kind == hydraulicNetworkKind) networks.push_back(key);
+        });
+        for (const std::pair<const Key, MergeChoiceSide>& choice : choices) {
+            const std::optional<ModelRecord> historicalTarget = target(choice.first);
+            const std::optional<ModelRecord> historicalSource = source(choice.first);
+            for (const std::optional<ModelRecord>& record : {historicalTarget, historicalSource}) {
+                if (record && (record->kind == hydraulicNetworkKind || record->kind == chunkKind))
+                    throw std::runtime_error("internal membership records cannot be selected directly");
+            }
+            const std::optional<ModelRecord> kept = candidate.get(choice.first);
+            if (!kept || kept->kind == hydraulicNetworkKind || kept->kind == chunkKind)
+                continue; // a selected deletion, or a non-entity choice
+            std::size_t type = collectionCount;
+            const std::array<std::uint16_t, collectionCount> kinds = {
+#define RESTORE_KIND(name, entityType, kind) static_cast<std::uint16_t>(kind),
+                AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE_KIND)
+#undef RESTORE_KIND
+            };
+            for (std::size_t i = 0; i < kinds.size(); ++i)
+                if (kept->kind == kinds[i]) type = i;
+            if (type == collectionCount) continue;
+
+            // Already represented by a surviving membership chunk? Nothing
+            // to repair; the normal validator will check all relationships.
+            std::optional<Key> owner;
+            bool alreadyMember = false;
+            for (const Key& networkKey : networks) {
+                const ModelRecord root = *candidate.get(networkKey);
+                const Manifest manifest = decodeManifest(qByteArrayFromBytes(root.payload));
+                for (const QUuid& chunkId : manifest.chunks[type]) {
+                    const std::optional<ModelRecord> record = candidate.get(keyFromUuid(chunkId));
+                    if (!record) continue; // validator handles unrelated inconsistencies
+                    const MemberChunk chunk = decodeChunk(*record, manifest.metadata.uuid, type);
+                    if (chunk.members.contains(uuidFromKey(choice.first))) {
+                        if (owner) throw std::runtime_error("entity belongs to multiple candidate networks");
+                        owner = networkKey;
+                        alreadyMember = true;
+                    }
+                }
+            }
+            if (alreadyMember) continue;
+
+            // Look for membership on the selected side of the original edit.
+            const CandidateReader& selectedSide = choice.second == MergeChoiceSide::Source
+                ? source : target;
+            for (const Key& networkKey : networks) {
+                const std::optional<ModelRecord> historicRoot = selectedSide(networkKey);
+                if (!historicRoot || historicRoot->kind != hydraulicNetworkKind) continue;
+                const Manifest original = decodeManifest(qByteArrayFromBytes(historicRoot->payload));
+                for (const QUuid& chunkId : original.chunks[type]) {
+                    const std::optional<ModelRecord> historicChunk = selectedSide(keyFromUuid(chunkId));
+                    if (!historicChunk) throw std::runtime_error("missing historical membership chunk");
+                    const MemberChunk members = decodeChunk(*historicChunk, original.metadata.uuid, type);
+                    if (members.members.contains(uuidFromKey(choice.first))) {
+                        if (owner) throw std::runtime_error("ambiguous historical entity ownership");
+                        owner = networkKey;
+                    }
+                }
+            }
+            if (!owner) throw std::runtime_error("chosen entity has no historical network membership");
+            ModelRecord root = *candidate.get(*owner);
+            Manifest manifest = decodeManifest(qByteArrayFromBytes(root.payload));
+            const QUuid id = uuidFromKey(choice.first);
+            bool appended = false;
+            if (!manifest.chunks[type].isEmpty()) {
+                const Key lastKey = keyFromUuid(manifest.chunks[type].last());
+                const std::optional<ModelRecord> previous = candidate.get(lastKey);
+                if (previous) {
+                    MemberChunk chunk = decodeChunk(*previous, manifest.metadata.uuid, type);
+                    if (chunk.members.size() < chunkCapacity) {
+                        chunk.members.append(id);
+                        set(lastKey, encodeChunk(chunk));
+                        appended = true;
+                    }
+                }
+            }
+            if (!appended) {
+                if (manifest.nextChunk[type] == std::numeric_limits<quint32>::max())
+                    throw std::runtime_error("membership serial exhausted while restoring entity");
+                const QUuid newId = chunkUuid(manifest.metadata.uuid, type, manifest.nextChunk[type]++);
+                if (candidate.get(keyFromUuid(newId)))
+                    throw std::runtime_error("membership UUID collision during merge");
+                manifest.chunks[type].append(newId);
+                set(keyFromUuid(newId), encodeChunk(MemberChunk{manifest.metadata.uuid, type, {id}}));
+                root.payload = bytesFromQByteArray(encodeManifest(manifest));
+                root.references = chunkKeys(manifest);
+                set(*owner, std::move(root));
+            }
+        }
+        return std::nullopt;
+    } catch (const std::exception& error) {
+        return std::string(error.what());
+    }
+}
+
 // Core has no Qt dependency. Only canonical, already-valid typed entities
 // can reach this resolver, and only if their stored references are unchanged.
 MergeResolution resolveHydraulicRecord(const Key& key, const ModelRecord& base,
                                         const ModelRecord& target, const ModelRecord& source,
                                         const QMap<QString, bool>& fieldChoices) {
     MergeResolution rejected{};
+    if (base.kind == chunkKind || base.kind == hydraulicNetworkKind) {
+        try {
+            const std::optional<ModelRecord> merged =
+                mergeHydraulicMembershipRecord(base, target, source);
+            if (merged) return MergeResolution{*merged, {}};
+        } catch (const std::exception&) { /* conservative conflict */ }
+        return rejected;
+    }
     if (base.kind != target.kind || target.kind != source.kind ||
         base.references != target.references || base.references != source.references)
-        return rejected; // topology, membership or ownership change
+        return rejected; // topology or ownership change
     QString kindName;
     // Map persisted kind codes to the codec's canonical field-merge descriptors.
     static const std::array<const char*, collectionCount> canonicalKinds = {
@@ -1642,6 +1868,15 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
         if (match != choices.end()) consumed.insert(key);
         return result;
     };
+    options.resolveConcurrentAddition = [](const Key&, const ModelRecord& targetRecord,
+                                            const ModelRecord& sourceRecord) {
+        try {
+            const std::optional<ModelRecord> merged =
+                mergeConcurrentHydraulicChunk(targetRecord, sourceRecord);
+            if (merged) return MergeResolution{*merged, {}};
+        } catch (const std::exception&) { /* fail closed */ }
+        return MergeResolution{};
+    };
     options.checkSelections = [&choices, &consumed, &objectChoices, &consumedObjects]()
         -> std::optional<std::string> {
         if (choices.size() != consumed.size())
@@ -1649,6 +1884,13 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
         if (objectChoices.size() != consumedObjects.size())
             return std::string("merge contains unused or inapplicable object choices");
         return std::nullopt;
+    };
+    options.reconcile = [&objectChoices](
+        const MergeCandidate& candidate,
+        const std::function<void(const Key&, std::optional<ModelRecord>)>& set,
+        const CandidateReader& targetReader, const CandidateReader& sourceReader) {
+        return reconcileExplicitHydraulicMembership(candidate, set, targetReader,
+                                                    sourceReader, objectChoices);
     };
     options.validate = validateMergedHydraulicSnapshot;
     return repository.mergeBranches(target, source, options);
@@ -1760,7 +2002,7 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
         return *indexed;
     }
 
-    // The Stage 17 loader checks all stored UUIDs, kinds, reference edges and
+    // The whole-network loader checks all stored UUIDs, kinds, reference edges and
     // network semantics. Fail closed if the current aggregate is malformed.
     QString error;
     std::optional<NetworkHydraulic> network = loadHydraulicNetwork(repository, branch, networkUuid, &error);

@@ -23,6 +23,16 @@
 namespace aowis::native {
 namespace {
 
+constexpr std::array<std::uint8_t, 8> bundleMagic{
+    'A', 'O', 'W', 'S', 'Y', 'N', 'C', '1'
+};
+constexpr std::array<std::uint8_t, 8> incrementalBundleMagic{
+    'A', 'O', 'W', 'S', 'Y', 'N', 'C', '2'
+};
+constexpr std::uint64_t bundleHeaderBytes = 48; // marker, tip, object count
+constexpr std::uint64_t incrementalBundleHeaderBytes = 80; // plus required recipient base
+constexpr std::uint64_t bundleEntryBytes = 40;  // hash, big-endian size
+
 constexpr std::size_t headerSize = 45;
 constexpr std::size_t indexHeaderSize = 8;
 constexpr std::size_t indexEntrySize = 52;
@@ -980,6 +990,22 @@ void Repository::createBranch(std::string_view name, std::optional<std::string_v
     publishRef(name, initial, true);
 }
 
+std::vector<std::string> Repository::listBranches() {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    std::vector<std::string> result;
+    const std::filesystem::path heads = this->directory_ / "refs" / "heads";
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(heads)) {
+        if (entry.is_symlink() || !entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        try { checkBranch(name); }
+        catch (const std::exception&) { continue; } // Ignore temporary and unrelated files.
+        result.push_back(name);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
 Revision Repository::head(std::string_view branch) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
@@ -1218,6 +1244,24 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                         }
                     }
                 }
+                if (options.resolveConcurrentAddition && targetHead.modelIndexed &&
+                    !values.base && values.target && values.source) {
+                    const auto decodeAt = [this](const Hash& hash) {
+                        const Bytes envelope = load(hash);
+                        require(!envelope.empty() && envelope.front() == 'V',
+                                "invalid model envelope in concurrent addition");
+                        return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
+                    };
+                    const ModelRecord left = decodeAt(*values.target);
+                    const ModelRecord right = decodeAt(*values.source);
+                    MergeResolution resolution = options.resolveConcurrentAddition(
+                        item.first, left, right);
+                    if (resolution.record && resolution.conflictingFields.empty() &&
+                        resolution.record->kind == left.kind && left.kind == right.kind) {
+                        resolved.emplace(item.first, std::move(*resolution.record));
+                        continue;
+                    }
+                }
                 result.conflicts.push_back(MergeConflict{item.first, values.base,
                     values.target, values.source, "both branches changed the same UUID"});
             } else if (values.target == values.base) {
@@ -1256,6 +1300,70 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
         }
         for (std::pair<const Key, ModelRecord>& item : resolved)
             selectedRecords.emplace(item.first, std::move(item.second));
+        if (targetHead.modelIndexed && options.reconcile) {
+            // Readers inspect authenticated, immutable branch tips; candidate
+            // modifications remain memory-only until ALL preflights complete.
+            const auto readSnapshot = [this](const Hash& root, const Key& key)
+                -> std::optional<ModelRecord> {
+                const std::optional<Hash> hash = lookup(root, key);
+                if (!hash) return std::nullopt;
+                const Bytes value = load(*hash);
+                require(!value.empty() && value.front() == 'V',
+                        "invalid model envelope in merge reconciliation");
+                return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
+            };
+            const std::function<std::optional<ModelRecord>(const Key&)> readTarget =
+                [&readSnapshot, &targetHead](const Key& key) {
+                    return readSnapshot(targetHead.root, key);
+                };
+            const std::function<std::optional<ModelRecord>(const Key&)> readSource =
+                [&readSnapshot, &sourceHead](const Key& key) {
+                    return readSnapshot(sourceHead.root, key);
+                };
+            const std::function<std::optional<ModelRecord>(const Key&)> readMerged =
+                [&selectedRecords, &readTarget](const Key& key) {
+                    const std::map<Key, std::optional<ModelRecord>>::const_iterator found =
+                        selectedRecords.find(key);
+                    return found == selectedRecords.end() ? readTarget(key) : found->second;
+                };
+            const MergeCandidate candidate{
+                readMerged,
+                [this, &targetHead, &selectedRecords, &readMerged](
+                    const std::function<void(const Key&, const ModelRecord&)>& visitor) {
+                    std::vector<std::pair<Key, Hash>> hashes;
+                    listHashes(targetHead.root, hashes);
+                    std::map<Key, std::optional<ModelRecord>>::const_iterator pending =
+                        selectedRecords.begin();
+                    for (const std::pair<Key, Hash>& entry : hashes) {
+                        while (pending != selectedRecords.end() && pending->first < entry.first) {
+                            if (pending->second) visitor(pending->first, *pending->second);
+                            ++pending;
+                        }
+                        if (pending != selectedRecords.end() && pending->first == entry.first) {
+                            if (pending->second) visitor(entry.first, *pending->second);
+                            ++pending;
+                        } else {
+                            const std::optional<ModelRecord> record = readMerged(entry.first);
+                            require(record.has_value(), "missing record in merge reconciliation");
+                            visitor(entry.first, *record);
+                        }
+                    }
+                    for (; pending != selectedRecords.end(); ++pending)
+                        if (pending->second) visitor(pending->first, *pending->second);
+                }
+            };
+            const std::function<void(const Key&, std::optional<ModelRecord>)> set =
+                [&selectedRecords](const Key& key, std::optional<ModelRecord> record) {
+                    selectedRecords.insert_or_assign(key, std::move(record));
+                };
+            if (const std::optional<std::string> error =
+                options.reconcile(candidate, set, readTarget, readSource)) {
+                result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
+                    std::nullopt, std::nullopt, *error});
+                result.status = MergeStatus::Conflicts;
+                return result;
+            }
+        }
         if (targetHead.modelIndexed) {
             // Content-hash conflicts are not enough: an unrelated deletion may
             // invalidate references created independently on the other branch.
@@ -1269,9 +1377,12 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                         ? pendingTarget->second.has_value()
                         : lookup(targetHead.root, reference).has_value();
                     if (!exists || reference == Key{} || reference == item.first) {
-                        const Values& values = differences.at(item.first);
-                        result.conflicts.push_back(MergeConflict{item.first, values.base,
-                            values.target, values.source, "merged record has an invalid reference target"});
+                        const std::map<Key, Values>::const_iterator values = differences.find(item.first);
+                        result.conflicts.push_back(MergeConflict{item.first,
+                            values == differences.end() ? std::nullopt : values->second.base,
+                            values == differences.end() ? std::nullopt : values->second.target,
+                            values == differences.end() ? std::nullopt : values->second.source,
+                            "merged record has an invalid reference target"});
                         break;
                     }
                 }
@@ -1286,9 +1397,12 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                         (!updated->second || std::find(updated->second->references.begin(),
                             updated->second->references.end(), item.first) ==
                             updated->second->references.end())) continue;
-                    const Values& values = differences.at(item.first);
-                    result.conflicts.push_back(MergeConflict{item.first, values.base,
-                        values.target, values.source, "merged deletion leaves a surviving incoming reference"});
+                    const std::map<Key, Values>::const_iterator values = differences.find(item.first);
+                    result.conflicts.push_back(MergeConflict{item.first,
+                        values == differences.end() ? std::nullopt : values->second.base,
+                        values == differences.end() ? std::nullopt : values->second.target,
+                        values == differences.end() ? std::nullopt : values->second.source,
+                        "merged deletion leaves a surviving incoming reference"});
                     break;
                 }
             }
@@ -1756,6 +1870,322 @@ std::uint64_t Repository::packSize() {
     if (this->blockStore_) return this->blockStore_->stats().packBytes;
     refreshIndex();
     return this->scanOffset_;
+}
+
+// Portable offline replication intentionally transfers logical immutable objects,
+// never physical pack/index pages. This makes cross-backend imports possible.
+void Repository::exportBranchBundle(std::string_view branch,
+                                    const std::filesystem::path& bundlePath) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    exportBundleLocked(branch, bundlePath, std::nullopt);
+}
+
+void Repository::exportIncrementalBranchBundle(std::string_view branch,
+                                               const Hash& recipientBase,
+                                               const std::filesystem::path& bundlePath) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    exportBundleLocked(branch, bundlePath, recipientBase);
+}
+
+void Repository::exportBundleLocked(std::string_view branch,
+                                    const std::filesystem::path& bundlePath,
+                                    std::optional<Hash> recipientBase) {
+    const Hash tip = branchHead(branch);
+    // Scan the base's *complete* reachable graph. Objects shared by new
+    // revisions (Merkle subtrees, values, reference indexes) need not travel.
+    const auto collectObjects = [&](const Hash& revisionTip) {
+        enum class Kind { Revision, Tree, Value };
+        std::vector<std::pair<Hash, Kind>> pending{{revisionTip, Kind::Revision}};
+        std::set<Hash> objects;
+        while (!pending.empty()) {
+            const std::pair<Hash, Kind> entry = pending.back();
+            pending.pop_back();
+            if (isZero(entry.first) || !objects.insert(entry.first).second) continue;
+            if (entry.second == Kind::Revision) {
+                const Revision revision = readRevision(entry.first);
+                pending.emplace_back(revision.root, Kind::Tree);
+                pending.emplace_back(revision.referencesRoot, Kind::Tree);
+                for (const Hash& parent : revision.parents) {
+                    pending.emplace_back(parent, Kind::Revision);
+                }
+            } else if (entry.second == Kind::Tree) {
+                const TreeNode node = readNode(entry.first);
+                if (node.leaf) {
+                    pending.emplace_back(node.value, Kind::Value);
+                } else {
+                    for (const Hash& child : node.children) {
+                        pending.emplace_back(child, Kind::Tree);
+                    }
+                }
+            } else {
+                (void)load(entry.first); // Verify every immutable object on export.
+            }
+        }
+        return objects;
+    };
+    // Validate the request before creating an output file. A parent revision
+    // can be shared even if it is not on the first-parent history.
+    if (recipientBase) {
+        require(!isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
+                "incremental export base is not an ancestor of the source branch");
+    }
+    std::set<Hash> objects = collectObjects(tip);
+    if (recipientBase) {
+        const std::set<Hash> knownObjects = collectObjects(*recipientBase);
+        for (const Hash& known : knownObjects) objects.erase(known);
+    }
+    require(recipientBase.has_value() || !objects.empty(),
+            "cannot export an empty revision graph");
+    const int fd = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+                          O_NOFOLLOW | O_CLOEXEC, 0600);
+    systemCall(fd >= 0, "create replication bundle (must not already exist)");
+    try {
+        const std::uint64_t headerSize = recipientBase
+            ? incrementalBundleHeaderBytes : bundleHeaderBytes;
+        Bytes header(static_cast<std::size_t>(headerSize));
+        const std::array<std::uint8_t, 8>& magic = recipientBase
+            ? incrementalBundleMagic : bundleMagic;
+        std::copy(magic.begin(), magic.end(), header.begin());
+        std::copy(tip.begin(), tip.end(), header.begin() + 8);
+        storeU64(header.data() + 40, static_cast<std::uint64_t>(objects.size()));
+        if (recipientBase) {
+            std::copy(recipientBase->begin(), recipientBase->end(), header.begin() + 48);
+        }
+        writeExact(fd, header.data(), header.size(), 0);
+        std::uint64_t offset = headerSize;
+        for (const Hash& hash : objects) {
+            const Bytes bytes = load(hash);
+            std::array<std::uint8_t, bundleEntryBytes> entry{};
+            std::copy(hash.begin(), hash.end(), entry.begin());
+            storeU64(entry.data() + 32, static_cast<std::uint64_t>(bytes.size()));
+            writeExact(fd, entry.data(), entry.size(), offset);
+            offset += bundleEntryBytes;
+            if (!bytes.empty()) writeExact(fd, bytes.data(), bytes.size(), offset);
+            offset += bytes.size();
+        }
+        systemCall(::fsync(fd) == 0, "sync replication bundle");
+        systemCall(::close(fd) == 0, "close replication bundle");
+        const std::filesystem::path parent = bundlePath.parent_path().empty()
+            ? std::filesystem::path(".") : bundlePath.parent_path();
+        syncDirectory(parent);
+    } catch (...) {
+        ::close(fd);
+        std::error_code ignored;
+        std::filesystem::remove(bundlePath, ignored);
+        throw;
+    }
+}
+
+BundleImportResult Repository::importBranchBundle(const std::filesystem::path& bundlePath,
+                                                   std::string_view localBranch) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    checkBranch(localBranch);
+    const int fd = ::open(bundlePath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    systemCall(fd >= 0, "open replication bundle");
+    try {
+        struct stat metadata{};
+        systemCall(::fstat(fd, &metadata) == 0, "stat replication bundle");
+        require(S_ISREG(metadata.st_mode) && metadata.st_size >= 0 &&
+                static_cast<std::uint64_t>(metadata.st_size) >= bundleHeaderBytes,
+                "invalid replication bundle file");
+        const std::uint64_t fileSize = static_cast<std::uint64_t>(metadata.st_size);
+        std::array<std::uint8_t, bundleHeaderBytes> header{};
+        readExact(fd, header.data(), header.size(), 0);
+        const bool incremental = std::equal(incrementalBundleMagic.begin(),
+                                            incrementalBundleMagic.end(), header.begin());
+        require(incremental || std::equal(bundleMagic.begin(), bundleMagic.end(), header.begin()),
+                "invalid replication bundle magic");
+        const std::uint64_t headerBytes = incremental
+            ? incrementalBundleHeaderBytes : bundleHeaderBytes;
+        require(fileSize >= headerBytes, "truncated replication bundle header");
+        Hash recipientBase{};
+        if (incremental) {
+            readExact(fd, recipientBase.data(), recipientBase.size(), bundleHeaderBytes);
+            require(!isZero(recipientBase), "incremental bundle has zero base revision");
+            const bool known = this->blockStore_ ? this->blockStore_->contains(recipientBase)
+                                                  : this->index_.contains(recipientBase);
+            require(known, "incremental bundle base revision is missing locally");
+            (void)readRevision(recipientBase); // Must be a real revision, not another object.
+        }
+        Hash incoming{};
+        std::copy_n(header.begin() + 8, 32, incoming.begin());
+        require(!isZero(incoming), "replication bundle has zero revision head");
+        const std::uint64_t count = readU64(header.data() + 40);
+        require((incremental || count != 0) &&
+                count <= (fileSize - headerBytes) / bundleEntryBytes,
+                "invalid replication bundle object count");
+        struct BundleLocation {
+            std::uint64_t offset = 0;
+            std::uint64_t size = 0;
+        };
+        std::map<Hash, BundleLocation> entries;
+        std::uint64_t offset = headerBytes;
+        Hash previous{};
+        for (std::uint64_t index = 0; index < count; ++index) {
+            require(fileSize - offset >= bundleEntryBytes,
+                    "truncated replication bundle entry");
+            std::array<std::uint8_t, bundleEntryBytes> entry{};
+            readExact(fd, entry.data(), entry.size(), offset);
+            offset += bundleEntryBytes;
+            Hash hash{};
+            std::copy_n(entry.begin(), 32, hash.begin());
+            const std::uint64_t size = readU64(entry.data() + 32);
+            require(!isZero(hash) && (index == 0 || previous < hash),
+                    "replication bundle object hashes must be unique and sorted");
+            require(size <= maxObjectBytes && size <= fileSize - offset,
+                    "replication bundle object exceeds bounds");
+            Bytes payload(static_cast<std::size_t>(size));
+            if (!payload.empty()) readExact(fd, payload.data(), payload.size(), offset);
+            require(sha256(payload) == hash, "replication bundle SHA-256 mismatch");
+            entries.emplace(hash, BundleLocation{offset, size});
+            offset += size;
+            previous = hash;
+        }
+        require(offset == fileSize, "replication bundle contains trailing bytes");
+        const auto containsLocally = [&](const Hash& hash) {
+            return this->blockStore_ ? this->blockStore_->contains(hash)
+                                      : this->index_.contains(hash);
+        };
+        require(entries.contains(incoming) || (incremental && containsLocally(incoming)),
+                "replication bundle lacks tip revision");
+        const auto bundleObject = [&](const Hash& hash) -> Bytes {
+            const std::map<Hash, BundleLocation>::const_iterator it = entries.find(hash);
+            if (it == entries.end()) {
+                require(incremental && containsLocally(hash),
+                        "incremental replication bundle is missing a referenced object");
+                const Bytes local = load(hash);
+                require(sha256(local) == hash, "local replication object SHA-256 mismatch");
+                return local;
+            }
+            Bytes object(static_cast<std::size_t>(it->second.size));
+            if (!object.empty()) readExact(fd, object.data(), object.size(), it->second.offset);
+            require(sha256(object) == hash, "replication bundle changed during import");
+            return object;
+        };
+        // Validate every referenced object in its structural context, not
+        // merely that the hash exists. Some immutable objects may legitimately
+        // be shared between revisions or trees.
+        enum class Kind {
+            Revision, RawTree, ModelTree, ReferenceTree,
+            RawValue, ModelValue, ReferenceValue
+        };
+        std::vector<std::pair<Hash, Kind>> pending{{incoming, Kind::Revision}};
+        std::map<Hash, std::uint8_t> checkedKinds;
+        std::set<Hash> incomingRevisions;
+        while (!pending.empty()) {
+            const std::pair<Hash, Kind> next = pending.back();
+            pending.pop_back();
+            if (isZero(next.first)) continue;
+            const unsigned bit = 1U << static_cast<unsigned>(next.second);
+            std::uint8_t& bits = checkedKinds[next.first];
+            if ((static_cast<unsigned>(bits) & bit) != 0U) continue;
+            bits = static_cast<std::uint8_t>(static_cast<unsigned>(bits) | bit);
+            const Bytes object = bundleObject(next.first);
+            if (next.second == Kind::Revision) {
+                require(object.size() >= 67 && object[0] == 'S',
+                        "invalid bundled revision");
+                const unsigned parents = object[66];
+                require(object[65] <= 1 && parents <= 2 &&
+                        object.size() == 67 + 32U * parents,
+                        "invalid bundled revision metadata");
+                const Hash root = readHash(object, 1);
+                const Hash referenceRoot = readHash(object, 33);
+                require(object[65] == 1 || isZero(referenceRoot),
+                        "raw bundled revision has reference index");
+                incomingRevisions.insert(next.first);
+                pending.emplace_back(root, object[65] == 1 ? Kind::ModelTree : Kind::RawTree);
+                pending.emplace_back(referenceRoot, Kind::ReferenceTree);
+                for (unsigned index = 0; index < parents; ++index) {
+                    const Hash parent = readHash(object, 67 + index * 32);
+                    require(!isZero(parent), "zero parent in bundled revision");
+                    pending.emplace_back(parent, Kind::Revision);
+                }
+            } else if (next.second == Kind::RawTree || next.second == Kind::ModelTree ||
+                       next.second == Kind::ReferenceTree) {
+                require(!object.empty(), "invalid bundled tree node");
+                if (object[0] == 'L') {
+                    require(object.size() == 49, "invalid bundled leaf");
+                    const Kind valueKind = next.second == Kind::RawTree ? Kind::RawValue :
+                        next.second == Kind::ModelTree ? Kind::ModelValue : Kind::ReferenceValue;
+                    pending.emplace_back(readHash(object, 17), valueKind);
+                } else if (object[0] == 'B') {
+                    require(object.size() == 530 && object[1] < 32,
+                            "invalid bundled tree branch");
+                    unsigned children = 0;
+                    for (std::size_t index = 0; index < 16; ++index) {
+                        const Hash child = readHash(object, 18 + 32 * index);
+                        if (!isZero(child)) ++children;
+                        pending.emplace_back(child, next.second);
+                    }
+                    require(children >= 2, "invalid bundled branch child count");
+                } else {
+                    throw std::runtime_error("invalid bundled tree tag");
+                }
+            } else if (next.second == Kind::ReferenceValue) {
+                (void)decodeReferrers(object);
+            } else {
+                require(!object.empty() && object[0] == 'V',
+                        "invalid bundled model/raw value");
+                if (next.second == Kind::ModelValue) {
+                    (void)decodeModelRecord(Bytes(object.begin() + 1, object.end()));
+                }
+            }
+        }
+        for (const std::pair<const Hash, BundleLocation>& entry : entries) {
+            require(checkedKinds.contains(entry.first),
+                    "replication bundle contains unreachable objects");
+        }
+        if (incremental) {
+            require(incomingRevisions.contains(recipientBase),
+                    "incremental bundle base is not an ancestor of incoming revision");
+        }
+        const std::filesystem::path ref = this->directory_ / "refs" / "heads" /
+                                          std::string(localBranch);
+        const bool exists = std::filesystem::exists(ref);
+        Hash previousHead{};
+        BundleImportStatus status = BundleImportStatus::Created;
+        if (exists) {
+            previousHead = branchHead(localBranch);
+            if (previousHead == incoming ||
+                // A previous import may already have advanced past this tip.
+                ((this->blockStore_ ? this->blockStore_->contains(incoming) :
+                                      this->index_.contains(incoming)) &&
+                 revisionReachableFrom(previousHead, incoming))) {
+                status = BundleImportStatus::UpToDate;
+            } else {
+                require(incomingRevisions.contains(previousHead),
+                        "replication would overwrite divergent branch history");
+                status = BundleImportStatus::FastForward;
+            }
+        }
+        if (status == BundleImportStatus::UpToDate) {
+            ::close(fd);
+            return BundleImportResult{status, previousHead, 0};
+        }
+        std::uint64_t imported = 0;
+        for (const std::pair<const Hash, BundleLocation>& entry : entries) {
+            const bool present = this->blockStore_
+                ? this->blockStore_->contains(entry.first) : this->index_.contains(entry.first);
+            if (present) continue;
+            Bytes payload = bundleObject(entry.first);
+            require(store(std::move(payload)) == entry.first,
+                    "replication content hash changed before publication");
+            ++imported;
+        }
+        syncPack(); // durable objects before an atomic branch-ref update
+        publishRef(localBranch, incoming, !exists);
+        ::close(fd);
+        return BundleImportResult{status, incoming, imported};
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
 }
 
 CompactionStats Repository::compact() {

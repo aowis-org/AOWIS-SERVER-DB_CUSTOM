@@ -86,6 +86,11 @@ struct MergeOptions {
     std::function<std::optional<MergeChoiceSide>(const MergeConflict&)> chooseConflict;
     std::function<MergeResolution(const Key&, const ModelRecord&, const ModelRecord&,
                                   const ModelRecord&)> resolve;
+    // Explicit resolver for two independently added records with the SAME UUID
+    // (no ancestor record). Needed by deterministic membership-chunk IDs.
+    // Callers must verify they represent the same logical internal object.
+    std::function<MergeResolution(const Key&, const ModelRecord&,
+                                  const ModelRecord&)> resolveConcurrentAddition;
     // Optional optimistic concurrency pins for UI-driven conflict resolution.
     // Checked under the same repository lock as merge publication.
     std::optional<Hash> expectedTargetHead;
@@ -96,7 +101,26 @@ struct MergeOptions {
     std::function<std::optional<std::string>()> checkSelections;
     // Return a nonempty diagnostic on semantic failure. Invoked before any
     // object bytes or branch refs are written; cannot call Repository methods.
+    // Optional model-aware reconciliation of coordinated changes. Operates on a
+    // private copy-on-write candidate BEFORE reference and semantic preflight.
+    // `set` changes candidate records only; nothing is written until every
+    // validator succeeds. Readers provide immutable branch-tip records.
+    std::function<std::optional<std::string>(
+        const MergeCandidate&,
+        const std::function<void(const Key&, std::optional<ModelRecord>)>& set,
+        const std::function<std::optional<ModelRecord>(const Key&)>& target,
+        const std::function<std::optional<ModelRecord>(const Key&)>& source)> reconcile;
     std::function<std::optional<std::string>(const MergeCandidate&)> validate;
+};
+
+// Offline, physical-format-independent replication. Bundles carry the full
+// immutable ancestry and both trees for a single branch tip. Imported branch
+// refs are created or fast-forwarded only; divergent history is never replaced.
+enum class BundleImportStatus { Created, FastForward, UpToDate };
+struct BundleImportResult {
+    BundleImportStatus status = BundleImportStatus::UpToDate;
+    Hash head{};
+    std::uint64_t objectsImported = 0;
 };
 
 struct CompactionStats {
@@ -144,6 +168,8 @@ public:
 
     void createBranch(std::string_view name, std::optional<std::string_view> from = std::nullopt);
     Revision head(std::string_view branch);
+    // Sorted branch names, independent of authorization. Filter at the service boundary.
+    std::vector<std::string> listBranches();
     // Immutable history: newest first along the first-parent chain. `after`
     // is an exclusive pagination cursor and must belong to this branch's
     // first-parent history. A branch advancing between pages is harmless.
@@ -182,6 +208,22 @@ public:
     std::vector<std::pair<Key, Bytes>> scan(std::string_view branch);
     std::vector<Difference> diff(std::string_view from, std::string_view to);
     std::vector<Difference> diffRevisions(const Hash& fromRevision, const Hash& toRevision);
+    // A self-contained branch snapshot for offline transfer between independent
+    // native repositories, including different physical storage backends.
+    // Export refuses to replace an existing bundle file.
+    void exportBranchBundle(std::string_view branch, const std::filesystem::path& bundlePath);
+    // Delta relative to a revision already present at the recipient. The base
+    // must be an ancestor (through either merge parent) of the exported head.
+    // Every object reachable from that base is omitted from the transfer.
+    void exportIncrementalBranchBundle(std::string_view branch, const Hash& recipientBase,
+                                       const std::filesystem::path& bundlePath);
+    // Import creates a new local branch or advances it only by fast-forward.
+    // It never overwrites divergent local work or creates an implicit merge.
+    // All bundle SHA-256 hashes and object graph edges are verified before
+    // writing any objects or publishing a ref. Authorization is not provided.
+    BundleImportResult importBranchBundle(const std::filesystem::path& bundlePath,
+                                          std::string_view localBranch);
+
     std::uint64_t packSize();
     std::uint64_t objectCount();
     // Full SHA-256 verification of every physical object. Normal reopening
@@ -235,6 +277,8 @@ private:
     std::uint64_t indexReadOffset_ = 0;
     Bytes pendingIndex_;
 
+    void exportBundleLocked(std::string_view branch, const std::filesystem::path& bundlePath,
+                            std::optional<Hash> recipientBase);
     void scanPackTail();
     void rebuildIndex();
 

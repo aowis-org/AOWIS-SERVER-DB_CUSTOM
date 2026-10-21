@@ -7,6 +7,7 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(aowis-native-store STATIC
     src/native_store.cpp
     src/model_record.cpp
+    src/access_policy.cpp
     src/pack_experiment.cpp
     src/block_store_prototype.cpp
 )
@@ -22,6 +23,12 @@ target_link_libraries(aowis-native-pack-experiment PRIVATE aowis-native-store)
 
 add_executable(aowis-native-block-store-benchmark tools/native_block_store_benchmark.cpp)
 target_link_libraries(aowis-native-block-store-benchmark PRIVATE aowis-native-store)
+
+add_executable(aowis-native-access tools/native_access.cpp)
+target_link_libraries(aowis-native-access PRIVATE aowis-native-store)
+
+add_executable(aowis-native-sync tools/native_sync.cpp)
+target_link_libraries(aowis-native-sync PRIVATE aowis-native-store)
 
 add_executable(aowis-native-verify tools/native_verify.cpp)
 target_link_libraries(aowis-native-verify PRIVATE aowis-native-store)
@@ -40,11 +47,26 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-pack-experiment-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-pack-experiment-tests COMMAND aowis-native-pack-experiment-tests)
     set_tests_properties(aowis-native-pack-experiment-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-native-sync-cli-tests tests/native_sync_cli_tests.cpp)
+    target_link_libraries(aowis-native-sync-cli-tests PRIVATE aowis-native-store)
+    add_dependencies(aowis-native-sync-cli-tests aowis-native-sync)
+    add_test(NAME aowis-native-sync-cli-tests COMMAND aowis-native-sync-cli-tests
+        $<TARGET_FILE:aowis-native-sync>)
+    set_tests_properties(aowis-native-sync-cli-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-native-access-tests tests/native_access_tests.cpp)
+    target_link_libraries(aowis-native-access-tests PRIVATE aowis-native-store)
+    add_dependencies(aowis-native-access-tests aowis-native-access)
+    add_test(NAME aowis-native-access-tests COMMAND aowis-native-access-tests $<TARGET_FILE:aowis-native-access>)
+    set_tests_properties(aowis-native-access-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-native-sync-tests tests/native_sync_tests.cpp)
+    target_link_libraries(aowis-native-sync-tests PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-sync-tests COMMAND aowis-native-sync-tests)
+    set_tests_properties(aowis-native-sync-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-store-tests tests/native_store_tests.cpp)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-store-tests aowis-native-pack-experiment-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

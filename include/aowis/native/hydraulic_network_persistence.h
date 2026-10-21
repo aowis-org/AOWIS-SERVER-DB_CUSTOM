@@ -133,8 +133,10 @@ struct HydraulicMergeSelections {
 // hydraulic validation before publication. Field choices resolve only actual
 // same-field conflicts of unchanged-reference existing entities. Whole-object
 // choices may select either version of a divergent entity (including deletion),
-// subject to complete network and membership validation. Automatic structural
-// reconciliation remains conservative: incompatible combinations are conflicts.
+// subject to complete network and membership validation. Kept entities whose
+// membership the other branch deleted are restored to bounded chunks using
+// historical ownership. Compatible append/deletes in the same chunk merge;
+// reordered membership and unsafe combinations remain conflicts.
 // The default native object merge is unaffected. Invalid or stale choices
 // throw without changing either branch or appending pack objects.
 MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,

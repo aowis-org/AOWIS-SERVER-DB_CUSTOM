@@ -1917,8 +1917,11 @@ void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
             withLabel.map_labels[0] = label;
             compareNetworks(withLabel, requiredLoad(repository, "modify-right", baseline.uuid));
 
-            // Choosing the modified record without restoring its deleted
-            // membership would create an orphan. Must fail before pack writes.
+            // Keep a second branch at the unmerged tip to check that choosing
+            // deletion still works independently of restoring the kept entity.
+            repository.createBranch("modify-left-delete-choice", "modify-left");
+            // Choosing the modified record now restores ONLY that entity's
+            // network membership in the private merge candidate.
             const native::Hash oppositeHead = repository.head("modify-left").id;
             const native::Hash oppositeSource = repository.head("delete-right").id;
             const std::uint64_t oppositeBytes = repository.packSize();
@@ -1926,19 +1929,21 @@ void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
             keepOrphan.expectedTargetHead = oppositeHead;
             keepOrphan.expectedSourceHead = oppositeSource;
             keepOrphan.objects.push_back({label.uuid, hydraulic::HydraulicMergeSide::Target});
-            const native::MergeResult orphan = hydraulic::mergeHydraulicBranches(
+            const native::MergeResult restored = hydraulic::mergeHydraulicBranches(
                 repository, "modify-left", "delete-right", keepOrphan);
-            require(orphan.status == native::MergeStatus::Conflicts &&
-                    repository.head("modify-left").id == oppositeHead &&
-                    repository.packSize() == oppositeBytes,
-                    "keeping an unowned deleted entity bypassed membership validation");
+            require(restored.status == native::MergeStatus::Merged &&
+                    restored.revision.parents == std::vector<native::Hash>{oppositeHead, oppositeSource} &&
+                    repository.packSize() > oppositeBytes,
+                    "keeping a deleted-on-source entity did not restore its membership");
+            compareNetworks(withLabel, requiredLoad(repository, "modify-left", baseline.uuid));
+            keepOrphan.expectedTargetHead = repository.head("modify-left-delete-choice").id;
             keepOrphan.objects[0].side = hydraulic::HydraulicMergeSide::Source;
             const native::MergeResult sourceDeletion = hydraulic::mergeHydraulicBranches(
-                repository, "modify-left", "delete-right", keepOrphan);
+                repository, "modify-left-delete-choice", "delete-right", keepOrphan);
             require(sourceDeletion.status == native::MergeStatus::Merged &&
-                    !repository.getModel("modify-left", hydraulic::keyFromUuid(label.uuid)),
+                    !repository.getModel("modify-left-delete-choice", hydraulic::keyFromUuid(label.uuid)),
                     "source-side deletion was not selected");
-            compareNetworks(withoutLabel, requiredLoad(repository, "modify-left", baseline.uuid));
+            compareNetworks(withoutLabel, requiredLoad(repository, "modify-left-delete-choice", baseline.uuid));
 
             repository.createBranch("rewire-left", "main");
             repository.createBranch("rewire-right", "main");
@@ -1991,7 +1996,122 @@ void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
             NetworkHydraulic expected = baseline;
             expected.map_labels.clear();
             compareNetworks(expected, requiredLoad(reopened, "delete-left", baseline.uuid));
-            compareNetworks(expected, requiredLoad(reopened, "modify-left", baseline.uuid));
+            compareNetworks(expected, requiredLoad(reopened, "modify-left-delete-choice", baseline.uuid));
+            NetworkHydraulic restoredLabel = baseline;
+            restoredLabel.map_labels[0].text = QStringLiteral("edited on surviving branch");
+            compareNetworks(restoredLabel, requiredLoad(reopened, "modify-left", baseline.uuid));
+            reopened.verifyPack();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+void exerciseCoordinatedMembershipMerges(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        const NetworkHydraulic baseline = completeNetwork();
+        {
+            native::Repository repository(folder, physical);
+            repository.createBranch("main");
+            hydraulic::saveHydraulicNetwork(repository, "main", baseline);
+            repository.createBranch("append-left", "main");
+            repository.createBranch("append-right", "main");
+            HydraulicMapLabel labelA = item<HydraulicMapLabel>(8101);
+            HydraulicMapLabel labelB = item<HydraulicMapLabel>(8102);
+            labelA.text = QStringLiteral("left append");
+            labelB.text = QStringLiteral("right append");
+            labelA.anchor_node_uuid = uuid(20);
+            labelB.anchor_node_uuid = uuid(20);
+            hydraulic::editHydraulicNetwork(repository, "append-left", baseline.uuid,
+                {{labelA.uuid, hydraulic::HydraulicEntity{labelA}}});
+            hydraulic::editHydraulicNetwork(repository, "append-right", baseline.uuid,
+                {{labelB.uuid, hydraulic::HydraulicEntity{labelB}}});
+            const native::Hash leftHead = repository.head("append-left").id;
+            const native::Hash rightHead = repository.head("append-right").id;
+            const native::MergeResult appended = hydraulic::mergeHydraulicBranches(
+                repository, "append-left", "append-right");
+            require(appended.status == native::MergeStatus::Merged &&
+                    appended.revision.parents == std::vector<native::Hash>{leftHead, rightHead},
+                    "two independent appends to the same membership chunk did not merge");
+            NetworkHydraulic combined = baseline;
+            combined.map_labels.append(labelA);
+            combined.map_labels.append(labelB);
+            compareNetworks(combined, requiredLoad(repository, "append-left", baseline.uuid));
+            // Reordering existing members must NOT be mistaken for an
+            // append-only edit and silently discarded during reconciliation.
+            repository.createBranch("order-left", "append-left");
+            repository.createBranch("order-right", "append-left");
+            NetworkHydraulic reordered = combined;
+            reordered.map_labels.swapItemsAt(0, 1);
+            hydraulic::saveHydraulicNetwork(repository, "order-left", reordered);
+            HydraulicMapLabel later = item<HydraulicMapLabel>(8103);
+            later.text = QStringLiteral("added after reorder");
+            later.anchor_node_uuid = uuid(20);
+            hydraulic::editHydraulicNetwork(repository, "order-right", baseline.uuid,
+                {{later.uuid, hydraulic::HydraulicEntity{later}}});
+            const native::Hash orderHead = repository.head("order-left").id;
+            const std::uint64_t orderBytes = repository.packSize();
+            const native::MergeResult orderConflict = hydraulic::mergeHydraulicBranches(
+                repository, "order-left", "order-right");
+            require(orderConflict.status == native::MergeStatus::Conflicts &&
+                    repository.head("order-left").id == orderHead &&
+                    repository.packSize() == orderBytes,
+                    "membership reordering was silently discarded");
+            repository.createBranch("remove-left", "append-left");
+            repository.createBranch("remove-right", "append-left");
+            hydraulic::editHydraulicNetwork(repository, "remove-left", baseline.uuid,
+                {{labelA.uuid, std::nullopt}});
+            hydraulic::editHydraulicNetwork(repository, "remove-right", baseline.uuid,
+                {{labelB.uuid, std::nullopt}});
+            const native::MergeResult removed = hydraulic::mergeHydraulicBranches(
+                repository, "remove-left", "remove-right");
+            require(removed.status == native::MergeStatus::Merged,
+                    "independent deletions from a shared chunk conflicted");
+            compareNetworks(baseline, requiredLoad(repository, "remove-left", baseline.uuid));
+
+            // Two new branches create their first membership chunk at the
+            // same deterministic serial/UUID, with different contents.
+            NetworkHydraulic noLabels = baseline;
+            noLabels.map_labels.clear();
+            repository.createBranch("empty-labels", "main");
+            hydraulic::saveHydraulicNetwork(repository, "empty-labels", noLabels);
+            repository.createBranch("first-left", "empty-labels");
+            repository.createBranch("first-right", "empty-labels");
+            hydraulic::editHydraulicNetwork(repository, "first-left", baseline.uuid,
+                {{labelA.uuid, hydraulic::HydraulicEntity{labelA}}});
+            hydraulic::editHydraulicNetwork(repository, "first-right", baseline.uuid,
+                {{labelB.uuid, hydraulic::HydraulicEntity{labelB}}});
+            const native::MergeResult newChunk = hydraulic::mergeHydraulicBranches(
+                repository, "first-left", "first-right");
+            require(newChunk.status == native::MergeStatus::Merged,
+                    "independent initial chunks with deterministic IDs did not reconcile");
+            noLabels.map_labels.append(labelA);
+            noLabels.map_labels.append(labelB);
+            compareNetworks(noLabels, requiredLoad(repository, "first-left", baseline.uuid));
+            repository.verifyPack();
+        }
+        {
+            native::Repository reopened(folder, physical);
+            NetworkHydraulic combined = baseline;
+            HydraulicMapLabel labelA = item<HydraulicMapLabel>(8101);
+            HydraulicMapLabel labelB = item<HydraulicMapLabel>(8102);
+            labelA.text = QStringLiteral("left append");
+            labelB.text = QStringLiteral("right append");
+            labelA.anchor_node_uuid = uuid(20);
+            labelB.anchor_node_uuid = uuid(20);
+            combined.map_labels.append(labelA);
+            combined.map_labels.append(labelB);
+            compareNetworks(combined, requiredLoad(reopened, "append-left", baseline.uuid));
+            compareNetworks(baseline, requiredLoad(reopened, "remove-left", baseline.uuid));
+            combined.map_labels.clear();
+            combined.map_labels.append(labelA);
+            combined.map_labels.append(labelB);
+            compareNetworks(combined, requiredLoad(reopened, "first-left", baseline.uuid));
             reopened.verifyPack();
         }
     } catch (...) {
@@ -2020,6 +2140,8 @@ int main(int argc, char** argv) {
         exerciseHydraulicMerging(native::PhysicalStore::ExperimentalBlocks);
         exerciseStructuralMergeChoices(native::PhysicalStore::Stage7Pack);
         exerciseStructuralMergeChoices(native::PhysicalStore::ExperimentalBlocks);
+        exerciseCoordinatedMembershipMerges(native::PhysicalStore::Stage7Pack);
+        exerciseCoordinatedMembershipMerges(native::PhysicalStore::ExperimentalBlocks);
         std::cout << "Complete hydraulic network persistence tests passed on both backends\n";
         return 0;
     } catch (const std::exception& failure) {

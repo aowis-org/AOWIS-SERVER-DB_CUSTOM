@@ -65,14 +65,25 @@ merged. It never applies automatically. Whole-object and field choices for the
 same UUID are mutually exclusive. Duplicate, stale, irrelevant and unused
 choices are rejected without writing objects.
 
-Choosing a deleted side means deletion. A choice that keeps an entity deleted
-on the other branch can require restoring the entity's membership chunk, too.
-The API **does not implicitly restore or invent chunks**. If the resulting
-snapshot contains an unowned object, missing member, dangling reference,
-invalid typed relationship or otherwise invalid network, it reports a conflict
-and leaves the branch and pack unchanged. Correcting mutually inconsistent
-membership or topology changes remains a separate resolution operation. This
-first structural step is deliberately conservative.
+Choosing a deleted side means deletion. When a user explicitly selects a
+surviving entity that the other branch removed from membership, the merge now
+finds the **selected side's historical network/collection ownership** and
+restores *only that chosen entity* to a bounded membership chunk. Other objects
+removed on either branch are not resurrected. This also works with multiple
+chosen entities in the same merge. Ambiguous historical ownership, invalid
+references or an invalid hydraulic network cause a conflict **before pack
+writes**; a stale branch head cannot accept an old selection.
+
+Concurrent independent appends/deletions within the same membership chunk are
+merged using three-way UUID membership. When both branches create the same
+initial chunk UUID from a deterministic serial, their distinct member UUIDs
+are combined rather than dropping either branch. Network-root membership
+changes are reconciled similarly, retaining stable original order and
+appending new entries in target-then-source order. **Reordering existing
+members and inserting in the middle are not automatic merges**: such changes
+remain conflicts. A resulting chunk exceeding 256 entries is also a conflict,
+not silently truncated. Complex overlapping chunk deletions may still require
+manual structural resolution.
 
 Field selections still only resolve true same-field conflicts of existing
 entities with unchanged kinds and outgoing UUID-reference sets. Structural
@@ -91,5 +102,7 @@ The plain `Repository::mergeBranches()` remains a Qt-free generic object merge
 with no hydraulic validation. AOWIS should use the hydraulic-specific API for
 branches containing hydraulic networks. Fast-forwards and up-to-date merges
 adopt already immutable source history and do not validate a new combined
-snapshot. This API does not implement recursive merge-base synthesis, arbitrary
-multi-object topology/membership reconciliation, or solver feasibility validation.
+snapshot. This API does not implement recursive merge-base synthesis, unconstrained
+multi-object topology reconciliation, or solver feasibility validation.
+Candidate-wide semantic validation still takes O(network size) and is not an
+indexed edit operation.

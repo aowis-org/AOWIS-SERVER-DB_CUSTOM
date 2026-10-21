@@ -15,7 +15,7 @@
 
 namespace aowis::native::hydraulic {
 
-// These local storage-kind values correspond to the Stage 3 contract, not to
+// These local storage-kind values follow the native model-record contract, not
 // a finalized global entity catalog. Payloads use ModelCodec<T>.
 inline constexpr std::uint16_t junctionKind = 1;
 inline constexpr std::uint16_t pipeKind = 4;

@@ -1,129 +1,65 @@
-# Native storage architecture (experimental)
+# Native database architecture
 
-## Goal
+AOWIS uses an independent, content-addressed C++ model database. The core is both a reusable library and the storage foundation of the planned multi-project HTTP service. The engine does **not** use SQL storage. It owns model serialization and uses `AOWIS-SERVER-MODEL` for canonical model types.
 
-Answer one technical question: is a persistent native tree a better **primary
-model store** for AOWIS than a mutable SQL working model plus a separate Merkle
-snapshot? Do not assume a native binary store is faster without measurements.
+## Layers
 
-## Current on-disk layout
+1. **Model definitions and codec:** `AOWIS-SERVER-MODEL` (Git submodule) defines model types; this repository's `ModelCodec<T>` serializes them and checks a 68-structure schema contract.
+2. **Domain persistence:** the hydraulic adapter validates `NetworkHydraulic`, persists network metadata, up to 256 ordered UUIDs per membership chunk, and one independently addressed record per top-level entity.
+3. **Logical object store:** content-addressed immutable values, compressed 16-way UUID Merkle trie, persistent reverse-reference index, revision DAG and named branch refs.
+4. **Physical store:** default append-only object pack with derived index; optional block-packed backend. Both represent the same logical objects and revisions, but their directories cannot be mixed.
+5. **Service boundary (planned):** a Qt QHttpServer REST application over HTTP/TCP managing multiple project repositories. No server executable exists yet; native storage and model APIs are already usable directly from C++. The service will not change stored model identities.
+
+## Logical identities and history
+
+- Entity keys are 16-byte UUIDs. Object and revision identities are 32-byte SHA-256 hashes of canonical bytes.
+- A persistent, path-compressed 16-way radix Merkle tree maps UUIDs to immutable object hashes. Unchanged values/subtrees are reused across revisions.
+- Model-indexed revisions also publish a reverse-reference Merkle tree mapping a UUID to its incoming referencing UUIDs. Both roots belong to one revision.
+- Each revision holds zero, one or two parent revision hashes. Branch names resolve to mutable refs pointing at immutable revision objects. Changes to one branch do not modify other branches.
+- Generic model commits validate required UUID references atomically. The hydraulic layer adds typed reference and model-level validation. Generic merges do **not** replace hydraulic semantic validation.
+
+## Default pack layout
 
 ```text
 repository/
-├── objects.pack           # append-only versioned binary records
-├── objects.idx            # initial generation, recoverable sidecar
-├── objects.current        # optional atomic active-pack generation pointer
-├── objects.<id>.pack      # immutable replacement after compaction
-├── objects.<id>.idx       # replacement index for the same generation
-├── maintenance.lock      # shared lifetime lock; exclusive for compaction
-├── repo.lock              # advisory interprocess lock
-└── refs/
-    └── heads/
-        ├── main           # SHA-256 of a revision record
-        └── experiment     # SHA-256 of a revision record
+├── objects.pack            # initial append-only pack
+├── objects.idx             # recoverable object-location sidecar
+├── objects.current         # optional active compaction generation
+├── objects.<id>.pack       # generated replacement pack
+├── objects.<id>.idx        # its corresponding index
+├── maintenance.lock        # repository lifetime/compaction locking
+├── repo.lock               # repository operation locking
+└── refs/heads/             # branch -> immutable revision hash
 ```
 
-Each packed record contains a fixed header (magic `AOBJ`, version 1,
-SHA-256, big-endian 64-bit payload size) followed by its bytes. Object keys
-are SHA-256 of the complete payload. The in-memory index maps each 32-byte hash to its byte offset and length.
-A separate `objects.idx` holds an append-only sequence of 52-byte entries:
-SHA-256 (32 bytes), big-endian payload offset (8), payload length (8), and
-CRC32 over those first 48 bytes (4). The eight-byte header is `AOIDX01\0`.
-These are *physical* offsets, not content identities, and are never included
-in revision hashes. Opening normally checks sidecar structure, offsets, bounds,
-and entry checksums **without re-hashing every content payload**. Each object
-read still checks the payload against its SHA-256.
+Object records use an `AOBJ` header and typed canonical bytes. Index entries contain object hash, physical offset/length and a CRC32 checksum. The index is derived: on damage or absence it can be rebuilt from the authoritative pack. A normal reopen checks index structure but does **not** hash every object; payload reads and explicit verification check SHA-256. Corrupted complete pack records are rejected. Incomplete trailing records can be truncated during recovery.
 
-`objects.idx` is derived and expendable: missing, truncated or internally
-corrupt indexes are rebuilt from the pack, verifying every recovered payload.
-A valid unindexed pack suffix is hash-checked and indexed on open. Incomplete
-trailing pack records are truncated; fully present records whose hash or
-header fails verification are rejected. Use `aowis-native-verify` (or
-`Repository::verifyPack()`) to verify **every** physical object explicitly.
-Because fast reopening does not read all payloads, damage to an otherwise
-unread object is discovered on access, index reconstruction or explicit
-full verification, not necessarily at startup. CRC32 is for accidental
-sidecar damage detection, not an authentication mechanism.
+`aowis-native-verify` explicitly verifies all stored objects. CRC32 is an accidental-corruption check for index entries, **not a signature or authentication mechanism**.
 
-Payloads have a leading type tag:
+## Block-packed storage
 
-- `V`: canonical bytes of the stored model value.
-- `L`: tree leaf, 16-byte UUID and 32-byte value hash.
-- `B`: radix branch, nibble depth, 16-byte *canonical* prefix (nibbles
-  beginning at the branch depth are zero), and 16 child hashes.
-- `S`: revision metadata containing both tree roots, a model-indexed flag,
-  parent count and ordered parent hashes (zero or one
-  parent currently written; parser permits two for later merge support).
+`PhysicalStore::ExperimentalBlocks` groups small content-addressed objects into blocks to reduce physical overhead while preserving the same logical hashes and revision roots. Block-level verification, an independent derived object-location index, writable atomic batches, and offline compaction exist. It is still explicitly experimental. Use `PhysicalStore::Stage7Pack` for the default backend and `ExperimentalBlocks` only when deliberately selected. See [block storage](block-pack-experiment.md).
 
-A zero hash represents an empty root/child, never an actual stored object.
-The trie uses **path compression**: leaves carry full UUIDs and branches only
-appear where two keys actually diverge. This avoids 32 single-child nodes for
-every UUID. Inserting/deleting an object rewrites the minimal affected path;
-unchanged nodes and values retain their hashes and are reused.
+## Publication, durability and failure handling
 
-## Commit publication and recovery
+- Repository operations coordinate using POSIX locks. Commits preflight references and optimistic expected-head checks under the same lock as branch publication.
+- Newly encoded immutable objects are appended, flushed with `fsync`, and only then does the engine atomically publish a synced branch ref. An interrupted commit may leave unreachable objects but should not expose an incompletely flushed revision through a published ref on supported filesystems.
+- Offline compaction retains **all** objects reachable from every branch's revision ancestry (including merge parents and both Merkle indexes). The replacement generation is synchronized before the active-generation pointer is published.
+- Compaction requires exclusive lifetime access; do not compact a live service repository. Independent backup, restore verification, fault-injection and online maintenance are not yet complete.
 
-1. Acquire an exclusive `flock` for the whole repository.
-2. Refresh the pack index to observe objects appended by other processes.
-3. Encode changed model values, new tree nodes and a new revision record.
-4. `fsync(objects.pack)` so immutable dependencies are durable.
-5. Append checksummed entries to `objects.idx` (no extra per-commit fsync:
-   this cache is reconstructible from durable pack bytes).
-6. Write a temporary branch ref, sync it, rename over the branch ref,
-   and sync the `refs/heads` directory.
-7. Release the lock.
+## Concurrency and physical limits
 
-A crash before step 5 leaves unreferenced immutable objects, which can later
-be garbage-collected. The previous branch head remains valid. A crash after
-publication must not expose references to unflushed objects on filesystems
-providing the expected `fsync`/rename guarantees. Pack and ref backup must
-be captured as a consistent repository state; backup and recovery APIs are
-future work.
+The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. The block backend permits one open repository handle at a time. An HTTP service managing multiple projects must own/manage their repository handles centrally, rather than repeatedly opening competing handles. The database and server are Linux/POSIX-oriented and not yet production hardened.
 
-## Revision comparison
+## Replication independence
 
-Matching node hashes immediately prune entire subtrees. Matching internal
-branch depths can be compared recursively. When compressed paths do not
-align, only those subtrees are decoded to compare sorted UUID/hash entries.
-This is a correct first implementation, not yet an optimal diff algorithm.
+Portable `.aowbundle` files contain a complete reachable branch graph or a delta relative to a shared base revision. Import verifies object hashes and graph completeness before creating or fast-forwarding a branch. Divergent branch heads are refused. The transport format is independent of both disk layouts; HTTP synchronization is planned on top of this existing core. See [synchronization](offline-repository-synchronization.md).
 
-## Typed model-record prototype
+## API ownership
 
-`Repository::commitModel` adds a stable binary envelope around opaque shared
-model-codec bytes, required UUID-reference validation during atomic commits,
-and safe deletion checks. It is a deliberately incomplete model adapter, **not**
-a full hydraulic persistence layer. See [model-records.md](model-records.md).
+- `aowis::native::Repository` — low-level storage, history, compaction, bundles and generic merges.
+- `aowis::native::ModelCodec<T>` — typed serialization.
+- `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
+- Planned `aowis-server-db` REST handlers — thin adapters calling these libraries, **not an independent persistence system**.
 
-## Next steps
-
-1. Establish matched native and SQL benchmarks with identical **real model
-   serialization**, reference validation and transaction semantics.
-2. Add durable secondary model indexes, then domain-aware integrity checks.
-3. Benchmark the indexed single-pack format, then investigate pack segments,
-   compression, compaction and reachability-based garbage collection.
-4. Add a staged working transaction model, merge parents and three-way merge.
-5. Develop concurrent readers, finer write-locking, crash-injection testing,
-   backup/recovery tooling and verified distributed object exchange.
-
-Neither SQL compatibility nor migration support for experimental disk formats
-is a goal at this pre-release stage.
-
-## Stage 7: offline retention-aware compaction
-
-Explicit `Repository::compact()` marks the transitive closure of every
-non-temporary branch-head ref (following revision parents, both indexed roots,
-all Merkle nodes and payloads), then copies verified reachable records into
-a newly synced pack generation and sidecar index. It atomically publishes
-`objects.current`, fsyncs the directory, reopens its own file descriptors,
-and unlinks the retired generation. The marker is the single publication
-point: a crash before publication keeps the old generation authoritative,
-while a crash afterward selects the new complete generation. Unused staging
-files from an interrupted compaction can remain and must not be mistaken for
-reachable history or removed without verifying the active pointer.
-
-The compactor takes an exclusive lifetime `flock`, refusing to run if any
-other repository instance is alive, even in another process. Regular handles
-hold a shared lifetime lock and continue using the existing `repo.lock` for
-individual operations. The lock protocol prevents writers from continuing
-on file descriptors belonging to a retired pack. Parent-history retention is
-mandatory: there is no history-expiration mechanism in this prototype.
+The binary formats are still pre-release; do not add migrations for obsolete development formats before agreeing a stable first-release contract. [Roadmap](roadmap.md).

@@ -1,387 +1,149 @@
-# AOWIS Native Versioned Model Database — experimental engine
+# AOWIS Versioned Model Database
 
-A native C++ versioned model database whose authoritative data is stored in
-persistent, content-addressed trees and binary object packs. This repository
-owns its canonical model codec and hydraulic reference validation. The only
-external AOWIS project dependency is the pinned `AOWIS-SERVER-MODEL` submodule;
-there is no SQLite, PostgreSQL, or other database-repository dependency.
+**AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is designed to be the **only database backend for AOWIS**; it does not require SQLite, PostgreSQL, or another database server.
 
-Native history, branch merging, hydraulic field reconciliation and explicit
-conflict choices are implemented. Authentication, distributed synchronization
-and the multi-user server remain to be implemented.
+This repository contains a working **native storage library**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a reusable provisional access-policy library. The intended server interface is a **REST API over ordinary HTTP/TCP**, with a single `aowis-server-db` process managing multiple projects. **That REST server is planned, not implemented yet.** See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
-## Initialize the Model submodule
+> **Service status:** No network/database service executable is currently provided. The multi-project Qt QHttpServer REST interface described below is the next planned component, not a working endpoint. Its initial HTTP/TCP interface will have no authentication, authorization enforcement, or HTTPS pending an AOWIS-wide security design. Do not expose it to untrusted networks or send sensitive data over it.
 
-A newly created repository may contain `.gitmodules` but not its required
-`160000` Git index entry (the *gitlink*). Unlike a directory, a gitlink cannot
-be transported in a normal ZIP patch. The helper takes care of registering it:
+## System overview
 
-```bash
-./git_submodule_init.sh
+```text
+AOWIS GUI / other AOWIS services / remote clients
+                      |
+                REST over HTTP                    PLANNED
+                      |
+                 aowis-server-db
+          configurable TCP address + port
+          multiple projects / repositories
+                      |
+        +-------------+-------------+
+        |                           |
+  project repository A       project repository B
+        |                           |
+        +------ native C++ engine --+
+               model objects / Merkle indexes
+               revisions / branches / merging
+               full and incremental replication
 ```
 
-On its **first** run it registers the Model repository defined in `.gitmodules`
-and stages the Model commit as a gitlink. **Commit the registration once**:
+The storage engine and hydraulic-model APIs are **also usable directly as C++ libraries**. A local or standalone AOWIS build will not have to send HTTP requests to call database functions inside the same process.
+
+## Implemented functionality
+
+| Area | Available today |
+|---|---|
+| Native storage | Immutable SHA-256 objects, copy-on-write Merkle UUID index, durable branch refs, recoverable index, integrity verification, offline compaction |
+| Physical storage | Append-only object packs (`PhysicalStore::Stage7Pack`, default) and block-packed storage (`PhysicalStore::ExperimentalBlocks`, opt-in) |
+| Model serialization | Native-owned `ModelCodec<T>` for AOWIS model definitions; configure-time schema coverage check for 68 persisted structures |
+| Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, indexed lookup/edit/delete |
+| History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
+| Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
+| Replication | Portable full/incremental `.aowbundle` exchange, SHA-256 and graph verification, fast-forward-only import, divergence protection |
+| Service | Multi-project HTTP/TCP REST server **planned; not yet implemented** |
+| Administrative access policy | Provisional UUID-based users/groups/roles/grants library and local CLI, **not currently enforced by any service** |
+
+These are engineering capabilities, **not a production-readiness claim**. See [limitations and roadmap](docs/roadmap.md).
+
+## Build and tests
+
+Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries and a POSIX filesystem with `flock`, `fsync`, `rename`, `pread` and `pwrite`. Qt6 Core and the pinned `AOWIS-SERVER-MODEL` submodule are required for typed model serialization and hydraulic persistence; the generic byte store can build without Qt.
 
 ```bash
-git add .gitmodules external/AOWIS-SERVER-MODEL
-git commit -m "Register AOWIS Model submodule"
+./git_submodule_init.sh          # on initial checkout, if the Model submodule is not initialized
+./compile_linux_tests.sh --both # Debug and Release CTest suites
+./compile_linux.sh              # optimized Release binaries and benchmarks
 ```
 
-Subsequent runs use `git submodule update --init --recursive` and therefore
-checkout the exact pinned commit. `git_submodule_update.sh` is for intentionally
-advancing the gitlink. The configured URL uses the `github-aowis` SSH host
-alias; that alias must be configured locally or the `.gitmodules` URL should
-be changed to a GitHub URL your environment can access before registration.
+`./git_submodule_init.sh` also handles initial registration of the Model gitlink in repositories where it is missing. That registration must be committed in Git for subsequent checkouts. Configure Git access for the Model submodule according to your development environment; source checkout authentication is separate from the database protocol.
 
-The low-level object store builds without Qt or the Model library. Typed
-model persistence requires the pinned Model submodule and Qt Core.
+With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. A REST server and its HTTP integration tests will be added separately.
 
-## Public API names
+Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraulic`. The public namespaces are `aowis::native` and `aowis::native::hydraulic`.
 
-* `aowis::native` — native storage, revisions, history and branch merging.
-* `aowis::native::ModelCodec<T>` — canonical typed model serializer.
-* `aowis::native::hydraulic` — hydraulic network persistence, indexed editing
-  and validated hydraulic merging.
+### Native C++ API
 
-Build integration exposes `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraulic`.
-Internal binary-format version markers (such as the `ANX5` manifest marker)
-are **not** public API namespaces. They are retained so existing object bytes,
-content hashes and revisions remain unchanged.
+```cpp
+#include <aowis/native/native_store.h>
+#include <aowis/native/hydraulic_network_persistence.h>
 
-## Full hydraulic model persistence
+// The native repository is a C++ object; no HTTP or SQL server is involved.
+aowis::native::Repository repository("/path/to/repository",
+                                     aowis::native::PhysicalStore::Stage7Pack);
+repository.createBranch("main");
+// Use aowis::native::hydraulic::saveHydraulicNetwork(),
+// loadHydraulicNetwork(), editHydraulicNetwork() and mergeHydraulicBranches()
+// with the canonical AOWIS NetworkHydraulic model.
+```
 
-The optional canonical hydraulic persistence adapter now saves and loads a complete
-`NetworkHydraulic` aggregate on both native backends, with all 18 top-level
-entity collections stored individually, typed reference validation, ordered
-network membership, atomic replacement and branch-specific reopening. This
-is separate from the junction/pipe storage microbenchmark. See
-[complete network persistence](docs/native-hydraulic-network.md) for API,
-format and remaining limitations. It uses this repository's native-owned
-canonical model `ModelCodec` and hydraulic model validator.
+For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).
 
-## Build and test (Linux)
+## Repository storage and maintenance
 
-Requires a C++20 compiler, CMake, Ninja, OpenSSL's development files, and a
-POSIX filesystem with working `flock`, `fsync`, `rename` and `pread`/`pwrite`.
+The default repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. Both supported physical backends share the same logical object and revision identities, but **their directories are not interchangeable**.
 
 ```bash
-./compile_linux_tests.sh --both  # Debug and Release tests only
-./compile_linux.sh               # Release-optimized library and benchmark
+./build-linux/aowis-native-verify /path/to/repository
+./build-linux/aowis-native-compact /path/to/repository
 ```
 
-The test script deliberately builds only test targets in
-`build-linux-tests-debug` and `build-linux-tests-release`; it does **not**
-build the benchmark in `build-linux`. Always run `./compile_linux.sh` before
-using the benchmark path below. The default `build-linux` configuration is
-explicitly **Release** so performance measurements are not taken from an
-unoptimized build.
+Verification checks stored object integrity. Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; stop the service and close repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
 
-Run the separate prototype benchmark on a **new, nonexistent directory**:
+The native binary formats are currently pre-release, and historical development formats are not automatically migrated. Back up important repositories separately; online backup, recovery drills and production hardening remain outstanding work.
+
+## Offline repository synchronization
+
+Portable bundles exchange immutable branches between independent repositories, including when the sender and receiver use different physical storage formats. Import verifies the graph before creating or fast-forwarding a branch and **never silently overwrites divergent work**.
 
 ```bash
-run_root="$(mktemp -d /tmp/aowis-db-custom-benchmark.XXXXXXXX)"
-./build-linux/aowis-native-benchmark "$run_root/repository" 100000 20 10 unique
-# For comparison with the original Stage 1 benchmark, use 'legacy' instead.
+./build-linux/aowis-native-sync export \
+  /path/to/source blocks main /tmp/main.aowbundle
+./build-linux/aowis-native-sync import \
+  /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
 
-Arguments: repository directory, number of objects, number of subsequent
-revisions, edits per revision, optional payload mode (`unique` by default,
-`legacy` to reproduce Stage 1). It prints import time, mean revision time,
-diff time, scan time, content-pack size, unique packed-object count and time
-spent reopening through the sidecar (`reopen_ms`) and separately hash-checking
-all pack records (`verify_ms`). The sidecar size is `index_bytes`. Every commit calls `fsync` before
-publishing its branch ref; the benchmark is not memory-only.
+A subsequent bundle can contain only objects missing relative to a shared base revision. The **bundle format and validation algorithms are implemented today**; HTTP transfer endpoints will expose them when the REST service is built. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
-The `unique` fixture deliberately assigns distinct deterministic 128-byte
-payloads to distinct objects and revisions. Stage 1's `legacy` fixture
-repeated the same value every 256 objects, causing unusually high value
-blob deduplication. Always report `payload_mode` when sharing benchmark
-results. Both fixtures use scattered deterministic 16-byte keys. They are storage
-microbenchmarks and do not exercise complete hydraulic model persistence.
+## Benchmarking
 
-## Experimental block-backed revision repository
-
-The default `Repository(directory)` continues using the proven Stage-7 pack.
-`Repository(directory, PhysicalStore::ExperimentalBlocks)` enables a separate,
-explicitly experimental packed-block backend that uses **the same** copy-on-write
-Merkle trees, model validation, revision serialization and atomic branch refs.
-The two formats are deliberately not interchangeable at the same directory.
-One writable handle at a time is enforced. Block retention compaction is
-available offline, but server concurrency and online maintenance are not
-implemented. See `docs/block-pack-experiment.md` for publication/recovery
-semantics and known limitations.
-
-Compare the two physical implementations with fresh directories:
+Every benchmark creates its own repository. Supply a **nonexistent child directory** inside a fresh random temporary parent; never reuse the same repository path for a second run.
 
 ```bash
-run_root="$(mktemp -d /tmp/aowis-db-custom-compare.XXXXXXXX)"
-./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/stage7" 100000 20 10
-./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/blocks" 100000 20 10 block
+run_root="$(mktemp -d /tmp/aowis-db-custom-bench.XXXXXXXX)"
+./build-linux/aowis-native-hydraulic-edit-benchmark \
+  "$run_root/repository" 100000 20 3 block
 ```
 
-The `block` argument opts in to experimental block storage; omit it for the
-Stage-7 baseline. Identical model/revision hashes and branch publication are
-asserted in the native tests. These measurements compare physical backends
-within the native database, not complete end-user workloads.
+The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
 
-## Implemented now
+## Intended REST server (not yet implemented)
 
-- Typed SHA-256 objects in one append-only binary `objects.pack`.
-- Persistent `objects.idx` with checksummed hash/offset/length entries: fast
-  normal reopening without scanning and hashing every stored payload.
-  Missing/torn/corrupt indexes are rebuilt from the authoritative pack.
-- Raw 32-byte hashes in the in-memory hash index (no per-object hex strings).
-- Explicit full-pack integrity verification via `aowis-native-verify`.
-- Integrity verification on content reads, rebuilds, recovered pack tails and
-  explicit full-pack verification (not on every routine reopen).
-- A compressed, 16-way, copy-on-write UUID trie with immutable node hashes.
-- Grouped batch updates that persist each affected subtree only in its final
-  form, instead of appending intermediate roots on initial import.
-- Canonical prefix encoding: the same key/value map produces the same Merkle
-  root independently of insertion order and batch boundaries.
-- Immutable one- and two-parent revisions, independent branch heads and
-  object-level three-way branch merging with explicit UUID conflicts.
-- Readable historical revisions with paginated first-parent history, immutable
-  raw and typed lookups, historical reverse-reference queries, Merkle diffs
-  between revision IDs, and branch creation from a retained ancestor. See
-  [revision history](docs/native-revision-history.md) and
-  [branch merging](docs/native-branch-merging.md).
-- Atomic ref publication after flushing appended data; orphan content is safe.
-- Repository-wide cross-process lock for read/write coordination.
-- Key lookup, sorted enumeration, insert/update/delete and Merkle-aware diff.
-- Recovery by truncating **incomplete trailing records only** (bad complete
-  records are rejected, never silently ignored).
-- Typed model-envelope commits with atomic UUID-reference existence validation.
-- A second immutable, revision-scoped UUID reverse-reference tree for model
-  dependency lookups and sublinear deletion checks. Primary model data and
-  reverse-reference roots are published atomically in the same revision.
-- Raw low-level benchmark writes cannot modify model-indexed branches.
-- Tests covering reopen, edits, deletion, branch isolation, historical roots,
-  insertion-order-independent roots, large mixed batches, diff, torn tails,
-  corruption and two handles.
+The chosen server design is:
 
-## Important limitations
+- **`aowis-server-db`**, built on **Qt QHttpServer**, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
+- **Multiple projects**, each identified by UUID and owning an independent native versioned repository, managed by one process. Clients never supply server filesystem paths as project identifiers.
+- Versioned REST resources for projects, branches, revisions, hydraulic networks/entities, merges/conflicts and full/incremental synchronization; JSON for normal operations and binary streams for large data.
+- Optimistic revision-head checks for mutations so concurrent users do not silently overwrite changes.
+- **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
+- File-based offline synchronization remains available as a CLI, and direct native C++ library access is supported. No alternative network service transport is provided yet.
 
-- Linux/POSIX prototype, not cross-platform or production-hardened.
-- Active append-only pack generation plus persistent sidecar. Startup still constructs
-  an in-memory hash-to-offset map in O(number of packed objects); multi-pack
-  indexing and paging remain unimplemented.
-- Sidecar adds ~52 bytes per physical object, in addition to the pack's
-  45-byte headers. Reachability compaction is available explicitly; no online
-  garbage collection, memory cache or compression yet.
-- Each `commit` writes a revision immediately; staged, uncommitted working
-  transactions and undo/redo need additional design.
-- Generic object-level merging and hydraulic-aware field merging with explicit
-  per-field and conservative whole-object structural choices are implemented;
-  arbitrary coordinated topology/membership conflict resolution
-  and solver feasibility checking remain open. No user authentication, project
-  isolation, authorization or HTTP API yet.
-- No independent remote synchronization or replication yet.
-- Only simple ASCII branch names (letters, digits, `_` and `-`).
-- Disk formats are **experimental and intentionally not migration-stable**.
-  Stage 5 changes revision serialization to publish the reference-index root.
-  Older prototype repositories are intentionally not supported: benchmark in
-  fresh paths and do not attempt to open Stage 4 repositories using Stage 5.
+The route examples and open decisions are in [REST API design](docs/rest-api-design.md), and the implementation sequencing is in [roadmap](docs/roadmap.md). **No REST server executable or routes are currently implemented.**
 
-Native model-record benchmark (synthetic junction/pipe topology; **NOT** the
-native-owned AOWIS model codec):
+## Documentation
 
-```bash
-./compile_linux.sh
-run_root="$(mktemp -d /tmp/aowis-db-custom-model.XXXXXXXX)"
-./build-linux/aowis-native-model-benchmark "$run_root/repository" 100000 20 10
-```
+| Document | Subject |
+|---|---|
+| [Architecture](docs/architecture.md) | Logical storage, physical formats, durability and limits |
+| [REST API design](docs/rest-api-design.md) | Agreed service boundaries, proposed resources and wire contracts |
+| [Roadmap](docs/roadmap.md) | Remaining implementation work |
+| [Database service design](docs/native-database-service.md) | Planned service architecture and operational requirements |
+| [Hydraulic model](docs/native-hydraulic-network.md) | Persistence, entity queries, indexed editing, validation |
+| [Canonical serialization](docs/canonical-model-codec.md) | Model codec/schema contract |
+| [Model records](docs/model-records.md) | Generic typed envelope and reference index |
+| [Revision history](docs/native-revision-history.md) | Historical reads and branching |
+| [Branch merging](docs/native-branch-merging.md) | Native three-way merge |
+| [Hydraulic merging](docs/native-hydraulic-merging.md) | Field and structural conflict resolution |
+| [Portable sync](docs/offline-repository-synchronization.md) | Full and incremental bundles |
+| [Benchmarks](docs/benchmark-plan.md) | Workloads, commands and measurement rules |
 
-See [docs/architecture.md](docs/architecture.md),
-[docs/model-records.md](docs/model-records.md), and
-[docs/benchmark-plan.md](docs/benchmark-plan.md).
-
-
-## Native-owned canonical model codec
-
-With Qt6 Core and the pinned Model submodule available, CMake builds
-`aowis-native-hydraulic-model-benchmark`, `aowis-native-model-codec-tests`, and
-`aowis-native-hydraulic-network-tests`. Serialization, field-merging helpers
-and hydraulic validation are implemented and compiled from this repository.
-The field-layout checker covers all 68 persisted Model structures.
-See [docs/native-serialization.md](docs/native-serialization.md) and
-[docs/canonical-model-codec.md](docs/canonical-model-codec.md).
-
-## Stage 18 — Incremental hydraulic network entity commits
-
-`editHydraulicNetwork()` can now atomically upsert or remove any of the 18
-canonical top-level hydraulic entity types from an existing network. Changed
-entity payloads are canonically encoded individually, and an unchanged member list does
-not rewrite the network manifest. New entities append to their collection,
-and deletions update membership and root dependencies atomically. The complete
-native hydraulic validator is used before commit, with expected-head concurrency
-protection and reverse-reference maintenance. See
-[docs/native-hydraulic-network.md](docs/native-hydraulic-network.md).
-
-The API intentionally leaves validation as a full-network read: *writing* is
-incremental, but validation is not yet incremental. This stage adds no new
-physical storage format or incompatibility. The `aowis-native-hydraulic-network-tests`
-target checks the edit API when Qt6 and the native model codec are available.
-
-## Stage 6 — Git-inspired persistent pack index
-
-The repository now contains both `objects.pack` and an append-only
-`objects.idx` index. Revision hashes and existing Stage 5 pack records have
-**not** changed. The sidecar is regenerated automatically if missing or
-corrupted; only complete corrupt pack objects require manual intervention.
-Fast open no longer cryptographically checks *every* object, so full
-verification is a deliberate action:
-
-```bash
-./compile_linux.sh
-./build-linux/aowis-native-verify /path/to/existing/repository
-```
-
-To benchmark the native engine with a fresh temporary repository:
-
-```bash
-run_root="$(mktemp -d /tmp/aowis-db-custom-stage6.XXXXXXXX)"
-./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/repository" 100000 20 10
-```
-
-Report `reopen_ms`, `verify_ms`, `index_bytes`, `pack_bytes`, and the complete
-model-edit workload together. Startup gains do not make pack reads or model
-validation inherently faster. This stage does **not** implement multi-pack indexing, compression, or
-online garbage collection; Stage 7 adds explicit offline reachability compaction.
-
-## Stage 16 — Offline block-pack compaction
-
-The experimental block-backed repository now supports the same conservative
-reachability rule as Stage 7: **every reachable branch head, its full parent
-history, both Merkle roots, and all leaf payloads** are retained. Unpublished
-objects left by failed branch-ref updates can be reclaimed.
-
-Maintenance writes a complete, verified replacement in a new
-`blocks/generation-<random-token>/` directory. Only after synchronizing it
-does it atomically replace `blocks/candidate.active`. The previous pack is
-retired afterward; a crashed compaction can leave an unused generation, but
-will not publish an incomplete one. The physical block layout and revision
-identities are unchanged. The default Stage-7 backend is unchanged.
-
-`aowis-native-compact` and `aowis-native-verify` select the storage backend
-from the existing `storage.format` marker. The block mode remains single-handle
-only, and compaction requires exclusive repository lifetime access. No online
-GC, fault-injection matrix for power loss, or multi-writer server support is
-claimed. The tools refuse to create a new repository accidentally.
-
-```bash
-run_root="$(mktemp -d /tmp/aowis-db-custom-stage16.XXXXXXXX)"
-./build-linux/aowis-native-hydraulic-model-benchmark \
-  "$run_root/blocks" 100000 20 10 block
-./build-linux/aowis-native-compact "$run_root/blocks"
-./build-linux/aowis-native-verify "$run_root/blocks"
-```
-
-A benchmark with no abandoned objects should show roughly unchanged counts
-and size: maintaining historical revisions is intentional.
-
-## Stage 7 — Offline, history-preserving pack compaction
-
-`aowis-native-compact` rebuilds a new immutable pack from all objects reachable
-from **every** branch head, **every** parent revision, both primary and
-reverse-reference roots, all tree nodes and leaf payloads. It does not expire
-revision history, prune branches, or change SHA-256 object identities. Only
-unreachable objects (including interrupted/unpublished writes) are reclaimed.
-
-The new pack and index are synced before an atomic `objects.current` marker
-publishes the generation. The old generation remains intact until that
-publication is durable, and is then retired. New openings follow the marker;
-legacy repositories without one continue using `objects.pack`/`objects.idx`.
-An interrupted compaction may leave an unused `objects.<generation>.pack`
-and `.idx` pair. Those files are not automatically deleted during recovery;
-clean them up only after confirming the active marker, with the repository
-closed and an independent backup. Never remove an active generation.
-
-Compaction is **offline maintenance**. It refuses to run while any other
-`Repository` instance has the directory open, including in another process.
-All handles hold a shared lifetime lock; compaction requires exclusive access.
-A successful compacted repository remains editable. Running compaction on
-a history containing only reachable records may reclaim zero bytes: **this is
-expected** because audit-worthy revisions are deliberately retained.
-
-```bash
-./compile_linux_tests.sh --both
-./compile_linux.sh
-run_root="$(mktemp -d /tmp/aowis-db-custom-stage7.XXXXXXXX)"
-./build-linux/aowis-native-hydraulic-model-benchmark "$run_root/repository" 100000 20 10
-./build-linux/aowis-native-compact "$run_root/repository"
-./build-linux/aowis-native-verify "$run_root/repository"
-```
-
-This is a Linux/POSIX experimental implementation, not yet an online GC or
-production backup/recovery service. For crash-sensitive deployments, retain
-a separate verified backup; live backup snapshots and explicit fault-injection
-coverage remain future work.
-
-## Experimental block-packing comparison
-
-Stage 7 remains the authoritative native storage format. For an offline,
-read-only comparison with Git-inspired grouped objects, see
-[Block-packed candidate](docs/block-pack-experiment.md). The
-`aowis-native-pack-experiment` tool writes candidate files to a new directory
-and does **not** convert or modify the repository.
-
-## Stage 10 — Experimental writable block packs
-
-The optional `BlockStorePrototype` supports persistent SHA-256 indexed reads
-and crash-conscious atomic **object batches** in an isolated block-packed
-candidate directory. It does not replace the authoritative Stage 7 repository
-format or atomically coordinate a revision head with a block batch. See
-[docs/block-pack-experiment.md](docs/block-pack-experiment.md) for guarantees
-and limitations.
-
-```bash
-run_root="$(mktemp -d /tmp/aowis-db-custom-stage10.XXXXXXXX)"
-./build-linux/aowis-native-model-benchmark "$run_root/repository" 10000 3 10
-./build-linux/aowis-native-pack-experiment "$run_root/repository" "$run_root/candidate" 65536
-./build-linux/aowis-native-block-store-benchmark "$run_root/candidate" 100
-```
-
-The last command performs indexed SHA-256 reads, commits a batch, reopens and
-verifies all objects. It **modifies only the candidate directory**; keep
-repository roots and candidate directories separate.
-
-## Indexed hydraulic deletion (Stage 26)
-
-The native hydraulic editor can atomically delete independent pipes/junctions
-and batches where all surviving incoming references are removed together
-(e.g. a pipe and its only incident junction). Indexed deletion checks stored
-reference edges, network ownership, canonical payload references and the
-network's embedded report/MSX references. Unsafe deletions continue through
-full canonical validation. The hydraulic edit benchmark reports
-`indexed_membership_delete_pipe_junction_batch_ms` alongside insertion and
-map-label deletion timing.
-
-
-Native hydraulic catalogue entities (pipe materials, time patterns, six curve
-kinds) support bounded indexed updates and independent insertion/deletion,
-with reverse-reference protection for in-use entries. See
-[`docs/native-hydraulic-network.md`](docs/native-hydraulic-network.md).
-
-Existing reservoir heads, tank levels/geometry, pump operating parameters and
-valve settings also support bounded indexed updates with unchanged typed
-relationships (Stage 28). Unsupported reference or metadata changes still use
-full canonical validation. The hydraulic edit benchmark reports
-`indexed_physical_update_batch_mean_ms` for four entities changed atomically.
-
-Indexed structural insertion and dependency-safe deletion for reservoirs, tanks, pumps and valves (including references to new members in the same atomic batch) are documented in [native hydraulic persistence](docs/native-hydraulic-network.md).
-
-Indexed membership edits now cover all 18 canonical top-level hydraulic entity
-collections, including demand points, simple controls and rule controls. Demand
-points with assigned-junction pipe attachments are checked against actual pipe
-endpoints; control premises and actions require the appropriate node/link types.
-Atomic insert/delete batches may contain interdependent new or removed entities.
-Existing demand points, simple controls and rule controls also support bounded
-indexed reference-changing updates with typed targets and pipe endpoint checks
-(Stage 31). Unsupported mixed edits continue through full canonical validation.
-See [hydraulic persistence and indexed editing](docs/native-hydraulic-network.md).
-
-### Hydraulic-aware branch merging
-
-For branches storing hydraulic networks, use `aowis::native::hydraulic::mergeHydraulicBranches()` instead of the generic merge. It reconciles non-overlapping canonical model fields on the same existing entity (when references are unchanged), supports explicit target/source choices for genuinely conflicting fields or whole records (including deletion and rewiring), with revision-head pinning, and validates the complete prospective hydraulic networks and persisted reference edges **before publishing**. See [hydraulic merge documentation](docs/native-hydraulic-merging.md).
+`AOWIS-SERVER-MODEL` is an external model-definition submodule; its README is maintained in that repository, not rewritten here.
