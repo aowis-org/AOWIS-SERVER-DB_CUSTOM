@@ -21,3 +21,6 @@
 # Local benchmark databases and generated archives
 /native-benchmark-data/
 /db_custom.zip
+
+# Transient archive deletion manifest (consumed by apply_patch.sh)
+/.aowis-patch-delete.txt
