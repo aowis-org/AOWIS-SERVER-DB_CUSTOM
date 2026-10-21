@@ -1,8 +1,8 @@
 # AOWIS Versioned Model Database
 
-**AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is designed to be the **only database backend for AOWIS**; it does not require SQLite, PostgreSQL, or another database server.
+**AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
-This repository contains a working **native storage library**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a reusable provisional access-policy library. The intended server interface is a **REST API over ordinary HTTP/TCP**, with a single `aowis-server-db` process managing multiple projects. **That REST server is planned, not implemented yet.** See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
+This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The intended server interface is a **REST API over ordinary HTTP/TCP**, with a single `aowis-server-db` process managing multiple projects. **That REST server is planned, not implemented yet.** See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
 > **Service status:** No network/database service executable is currently provided. The multi-project Qt QHttpServer REST interface described below is the next planned component, not a working endpoint. Its initial HTTP/TCP interface will have no authentication, authorization enforcement, or HTTPS pending an AOWIS-wide security design. Do not expose it to untrusted networks or send sensitive data over it.
 
@@ -27,7 +27,7 @@ AOWIS GUI / other AOWIS services / remote clients
                full and incremental replication
 ```
 
-The storage engine and hydraulic-model APIs are **also usable directly as C++ libraries**. A local or standalone AOWIS build will not have to send HTTP requests to call database functions inside the same process.
+The storage engine and hydraulic-model APIs can be called **directly from C++**. Standalone AOWIS builds can use the library without an HTTP connection.
 
 ## Implemented functionality
 
@@ -55,7 +55,7 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 ./compile_linux.sh              # optimized Release binaries and benchmarks
 ```
 
-`./git_submodule_init.sh` also handles initial registration of the Model gitlink in repositories where it is missing. That registration must be committed in Git for subsequent checkouts. Configure Git access for the Model submodule according to your development environment; source checkout authentication is separate from the database protocol.
+`./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
 With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. A REST server and its HTTP integration tests will be added separately.
 
@@ -67,7 +67,7 @@ Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraul
 #include <aowis/native/native_store.h>
 #include <aowis/native/hydraulic_network_persistence.h>
 
-// The native repository is a C++ object; no HTTP or SQL server is involved.
+// Use the native repository directly from C++.
 aowis::native::Repository repository("/path/to/repository",
                                      aowis::native::PhysicalStore::Stage7Pack);
 repository.createBranch("main");
@@ -87,9 +87,9 @@ The default repository uses an append-only content pack and rebuildable index. E
 ./build-linux/aowis-native-compact /path/to/repository
 ```
 
-Verification checks stored object integrity. Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; stop the service and close repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
+Verification checks stored object integrity. Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
 
-The native binary formats are currently pre-release, and historical development formats are not automatically migrated. Back up important repositories separately; online backup, recovery drills and production hardening remain outstanding work.
+The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, recovery drills and production hardening remain outstanding work.
 
 ## Offline repository synchronization
 
@@ -125,7 +125,7 @@ The chosen server design is:
 - Versioned REST resources for projects, branches, revisions, hydraulic networks/entities, merges/conflicts and full/incremental synchronization; JSON for normal operations and binary streams for large data.
 - Optimistic revision-head checks for mutations so concurrent users do not silently overwrite changes.
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
-- File-based offline synchronization remains available as a CLI, and direct native C++ library access is supported. No alternative network service transport is provided yet.
+- File-based synchronization and direct native C++ library access remain supported alongside the planned REST service.
 
 The route examples and open decisions are in [REST API design](docs/rest-api-design.md), and the implementation sequencing is in [roadmap](docs/roadmap.md). **No REST server executable or routes are currently implemented.**
 

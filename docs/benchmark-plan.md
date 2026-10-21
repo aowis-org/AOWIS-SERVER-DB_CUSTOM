@@ -1,6 +1,6 @@
 # Native database benchmarking
 
-Benchmarks measure the **current AOWIS native storage engine** and its real model workflows. The project is not a SQL-versus-native experiment and requires no SQL database for comparison.
+Benchmarks measure the **AOWIS native storage engine** and its model workflows, including persistence, editing, merging, and replication.
 
 ## Workloads
 

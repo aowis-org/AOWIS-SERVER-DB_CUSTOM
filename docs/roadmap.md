@@ -1,6 +1,6 @@
 # AOWIS Versioned Model Database — development roadmap
 
-This is a forward-looking list of capabilities **not yet complete**, not a record of patches or earlier implementations. The native database engine is AOWIS's sole intended storage backend.
+This roadmap covers planned capabilities for the AOWIS native database engine and service.
 
 ## Current baseline
 
@@ -10,7 +10,7 @@ The repository already implements content-addressed packs, immutable Merkle tree
 
 ### 1. Establish REST service foundation
 
-- Implement a new service on the existing native engine; the repository currently has no HTTP transport. **Retain** native bundle export/import, integrity checks, merge/revision APIs and direct C++ library usage.
+- Build the REST service on the native engine and its existing bundle, integrity, revision, merge and direct-library APIs.
 - Implement `aowis-server-db` with **Qt QHttpServer** on configurable **HTTP/TCP** address and port; no HTTPS/TLS initially.
 - Implement a persistent multi-project catalogue, project UUID/name metadata, project create/list/read operations and repository lifecycle management.
 - Implement branch listing, creation/forking and health/readiness endpoints in the new REST resource hierarchy.
@@ -47,9 +47,9 @@ The repository already implements content-addressed packs, immutable Merkle tree
 
 ## Principles
 
-- One native database implementation; **no SQLite/PostgreSQL dependency or dual adapter**.
+- One canonical native database engine for library and REST service use.
 - One canonical AOWIS model codec; do not create a serializer for REST.
 - C++ library use and REST server use expose the same model/storage semantics.
 - Database revisions and object integrity remain independent of transport.
 - Fail clearly on merge conflicts and unsupported semantics; never weaken validation as a shortcut.
-- Keep current behavior and planned functionality separate in README, docs and tests. No patch-number narratives or obsolete-version compatibility machinery before the first stable release.
+- Distinguish implemented capabilities from planned work in the README, documentation and tests. Define a stable persistence format before the first public release.

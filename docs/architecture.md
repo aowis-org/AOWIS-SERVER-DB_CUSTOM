@@ -1,6 +1,6 @@
 # Native database architecture
 
-AOWIS uses an independent, content-addressed C++ model database. The core is both a reusable library and the storage foundation of the planned multi-project HTTP service. The engine does **not** use SQL storage. It owns model serialization and uses `AOWIS-SERVER-MODEL` for canonical model types.
+AOWIS uses a content-addressed C++ model database. Its core is a reusable library and the storage foundation of the planned multi-project HTTP service. This repository owns model serialization and uses `AOWIS-SERVER-MODEL` for canonical model types.
 
 ## Layers
 
@@ -62,4 +62,4 @@ Portable `.aowbundle` files contain a complete reachable branch graph or a delta
 - `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
 - Planned `aowis-server-db` REST handlers — thin adapters calling these libraries, **not an independent persistence system**.
 
-The binary formats are still pre-release; do not add migrations for obsolete development formats before agreeing a stable first-release contract. [Roadmap](roadmap.md).
+The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [roadmap](roadmap.md).

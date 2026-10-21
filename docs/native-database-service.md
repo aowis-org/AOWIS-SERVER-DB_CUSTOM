@@ -21,6 +21,6 @@ The service should manage open repository handles centrally, including the block
 
 ## Configuration and deployment
 
-Define Qt QSettings INI configuration for bind address, port, project root/catalogue and logs, with Linux service defaults and explicit overrides. Provide systemd deployment files **only once an actual HTTP server is implemented**; no obsolete server unit is shipped. Publish a maintained OpenAPI contract and integration tests along with the executable.
+Define Qt QSettings INI configuration for bind address, port, project root/catalogue and logs, with Linux service defaults and explicit overrides. Include systemd deployment support, a maintained OpenAPI contract and HTTP integration tests with the service implementation.
 
 **Security caveat:** The initially planned plain-HTTP server is deliberately unauthenticated and unencrypted. Anyone able to reach it will be able to use its API. It is for controlled development environments, not untrusted or sensitive production networks. Authentication and TLS will be designed across AOWIS later.

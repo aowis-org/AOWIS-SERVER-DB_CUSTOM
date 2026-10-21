@@ -22,4 +22,4 @@ The generic store verifies **UUID existence and reference-index integrity**. It 
 
 `aowis-native-model-benchmark` uses synthetic hydraulic-shaped payloads to isolate model-envelope, reference-index and Merkle costs. It does **not** exercise full ModelCodec or complete hydraulic validation. For real typed junction/pipe data use `aowis-native-hydraulic-model-benchmark`; for network-wide editing use `aowis-native-hydraulic-edit-benchmark`.
 
-The native formats remain pre-release and are not automatically migrated from obsolete development schemas.
+The native record format is not yet frozen for a public release.
