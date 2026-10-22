@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import os
+import resource
 from pathlib import Path
 import shutil
 import subprocess
@@ -106,6 +107,14 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="Small full/delta correctness test")
     args = parser.parse_args()
     if args.smoke:
+        # Exercise child RSS isolation even if the runner has a much larger
+        # memory footprint. Linux ru_maxrss survives exec and would falsely
+        # label every child with this parent's high-water mark.
+        ballast = bytearray(64 * 1024 * 1024)
+        for page in range(0, len(ballast), 4096):
+            ballast[page] = 1
+        del ballast
+        parent_peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         args.objects = 24
         args.commits = 4
         args.payload_bytes = 32
@@ -164,6 +173,12 @@ def main():
                                                   str(destination), destination_backend], scratch)
                                 if metrics.get("phase") != phase or int(metrics["imported_objects"]) <= 0:
                                     raise RuntimeError("invalid benchmark import statistics")
+                                import_peak = int(metrics["import_peak_rss_kib"])
+                                audit_peak = int(metrics["process_peak_rss_kib"])
+                                if import_peak <= 0 or audit_peak < import_peak:
+                                    raise RuntimeError("invalid import RSS high-water marks")
+                                if args.smoke and import_peak >= parent_peak_kib - 4096:
+                                    raise RuntimeError("import RSS includes the Python parent's memory peak")
                                 if phase == "import-full":
                                     complete_metrics = metrics
                                 elif phase == "import-delta":

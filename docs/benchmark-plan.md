@@ -90,10 +90,15 @@ CSV fields include:
 - `import_ms`: duration of the native importer only, including its required
   pre-publication structural and model-reference verification and publication.
 - `verify_ms`: **additional**, independent post-import full-repository audit.
-- `import_peak_rss_kib`: peak child-process RSS sampled by `getrusage`
-  immediately after import. It includes runtime and repository setup, but
-  excludes subsequent audit allocation.
-- `process_peak_rss_kib`: peak RSS after import **and** post-import audit.
+- `import_peak_rss_kib`: peak child-process RSS read from Linux
+  `/proc/self/status` (`VmHWM`) immediately after import. It includes runtime
+  and repository setup, but excludes subsequent audit allocation. Using
+  `getrusage(RUSAGE_SELF).ru_maxrss` here would be incorrect: Linux may retain
+  the Python launcher's pre-`exec` high-water mark, yielding a misleading
+  constant memory baseline for every child.
+- `process_peak_rss_kib`: the same child-local Linux `VmHWM` measurement
+  after import **and** post-import audit. It must be at least as large as the
+  post-import high-water mark.
 - `observed_peak_scratch_logical_bytes` and
   `observed_peak_scratch_allocated_bytes`: sampled open scratch-file sizes
   (`fstat` via Linux `/proc/<pid>/fd`), including unlinked scratch files.

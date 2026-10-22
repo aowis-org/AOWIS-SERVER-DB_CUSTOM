@@ -9,12 +9,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <sys/resource.h>
 
 namespace {
 
@@ -98,6 +98,28 @@ std::pair<Hash, Hash> readHeads(const std::filesystem::path& directory) {
     require(static_cast<bool>(std::getline(in, base)) &&
             static_cast<bool>(std::getline(in, full)), "fixture heads are missing");
     return {aowis::native::fromHex(base), aowis::native::fromHex(full)};
+}
+
+// Linux getrusage(RUSAGE_SELF).ru_maxrss can retain the spawning process's
+// pre-exec RSS peak. Python's subprocess launcher is especially misleading:
+// every import may appear to use exactly as much RAM as the Python driver.
+// VmHWM belongs to this exec image, so it measures the import child itself.
+std::uint64_t peakResidentKiB() {
+    std::ifstream status("/proc/self/status");
+    require(status.good(), "cannot read Linux process memory status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (!line.starts_with("VmHWM:")) continue;
+        std::istringstream values(line.substr(6));
+        std::uint64_t kib = 0;
+        std::string units;
+        std::string extra;
+        require(static_cast<bool>(values >> kib >> units) && units == "kB" &&
+                !(values >> extra) && kib > 0,
+                "invalid Linux VmHWM memory measurement");
+        return kib;
+    }
+    throw std::runtime_error("Linux VmHWM memory measurement is unavailable");
 }
 
 double milliseconds(std::chrono::steady_clock::time_point start,
@@ -184,20 +206,19 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
     const BundleImportResult result = receiver.importBranchBundle(bundle, "main");
     const std::chrono::steady_clock::time_point imported = std::chrono::steady_clock::now();
     require(receiver.head("main").id == expected, "imported branch head differs from source");
-    struct rusage afterImport{};
-    require(::getrusage(RUSAGE_SELF, &afterImport) == 0, "getrusage failed after import");
+    const std::uint64_t afterImportKiB = peakResidentKiB();
     const VerificationReport report = receiver.verifyRepository();
     const std::chrono::steady_clock::time_point checked = std::chrono::steady_clock::now();
-    struct rusage usage{};
-    require(::getrusage(RUSAGE_SELF, &usage) == 0, "getrusage failed");
+    const std::uint64_t afterAuditKiB = peakResidentKiB();
+    require(afterAuditKiB >= afterImportKiB, "Linux RSS high-water mark decreased");
     require(result.status == (delta ? BundleImportStatus::FastForward : BundleImportStatus::Created),
             "import did not create/fast-forward as expected");
     std::cout << std::fixed << std::setprecision(3)
               << "phase=" << phase << "\nbackend=" << backendName
               << "\nimport_ms=" << milliseconds(start, imported)
               << "\nverify_ms=" << milliseconds(imported, checked)
-              << "\nimport_peak_rss_kib=" << afterImport.ru_maxrss
-              << "\nprocess_peak_rss_kib=" << usage.ru_maxrss
+              << "\nimport_peak_rss_kib=" << afterImportKiB
+              << "\nprocess_peak_rss_kib=" << afterAuditKiB
               << "\nimported_objects=" << result.objectsImported
               << "\nverified_revisions=" << report.revisions
               << "\nverified_reachable_objects=" << report.reachableObjects
