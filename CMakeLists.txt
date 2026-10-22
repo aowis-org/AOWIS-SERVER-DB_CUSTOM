@@ -67,6 +67,12 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_replication_scaling.py"
             --binary "$<TARGET_FILE:aowis-native-replication-scaling-benchmark>" --smoke)
     set_tests_properties(aowis-native-replication-benchmark-smoke PROPERTIES LABELS "aowis")
+    add_test(NAME aowis-native-replication-benchmark-phases
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/replication_benchmark_phases_tests.py"
+            --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_replication_scaling.py"
+            --binary "$<TARGET_FILE:aowis-native-replication-scaling-benchmark>")
+    set_tests_properties(aowis-native-replication-benchmark-phases PROPERTIES LABELS "aowis")
     # Compile the engine a second time exclusively for fault-injection tests.
     # Production targets never contain crash/failure injection hooks.
     add_library(aowis-native-store-fault-tests STATIC

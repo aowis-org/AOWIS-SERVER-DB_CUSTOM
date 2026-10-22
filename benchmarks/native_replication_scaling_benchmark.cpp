@@ -167,15 +167,36 @@ void prepare(const std::filesystem::path& directory, std::uint32_t objects,
             }
             (void)source.commit("main", changes);
         }
+        if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
+            const std::chrono::steady_clock::time_point checkpoint =
+                std::chrono::steady_clock::now();
+            std::cerr << "Fixture " << kind << '/' << backendName << ": commit "
+                      << (revision + 1U) << '/' << commits << " ("
+                      << (end - 1U) << '/' << objects << " records, "
+                      << std::fixed << std::setprecision(2)
+                      << milliseconds(start, checkpoint) / 1000.0 << "s)\n";
+        }
         if (revision + 1U == baseCommits) {
             base = source.head("main").id;
+            if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
+                std::cerr << "Exporting base bundle\n";
+            }
             source.exportBranchBundle("main", directory / "base.aowbundle");
         }
     }
     const Hash full = source.head("main").id;
+    if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
+        std::cerr << "Exporting full bundle\n";
+    }
     source.exportBranchBundle("main", directory / "full.aowbundle");
+    if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
+        std::cerr << "Exporting incremental bundle\n";
+    }
     source.exportIncrementalBranchBundle("main", base, directory / "delta.aowbundle");
     writeHeads(directory, base, full);
+    if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
+        std::cerr << "Verifying generated source repository\n";
+    }
     const VerificationReport verified = source.verifyRepository();
     require(verified.revisions >= commits, "source verification omitted history");
     const std::chrono::steady_clock::time_point finish = std::chrono::steady_clock::now();

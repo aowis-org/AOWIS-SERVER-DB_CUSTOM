@@ -77,6 +77,7 @@ The initial multi-project HTTP service executable is implemented, with project/c
 - **Outstanding:** Profile and bound remaining logical-verifier state (distinct snapshot-root pair tracking, locally resident object visits and Merkle summaries), and run the new measurements on substantially larger histories to identify actual bottlenecks. No constant-memory claim is made.
 - **Outstanding:** Implement true streaming HTTP bundle uploads through an ingestion layer that exposes request chunks before Qt buffers them; QHttpServerRequest.body() alone cannot provide this. Retain strict limits, backpressure, disconnect cleanup and pre-publication validation.
 - **Outstanding:** Benchmark representative 10k–1M hydraulic-entity projects, long revision histories, branching/merging, synchronization and compaction on both backends.
+- **Implemented (large-benchmark workflow):** Native replication benchmarks can preserve checksummed deterministic fixtures separately from disposable import recipients (`--mode prepare` / `--mode imports`), with per-commit and export/verification progress reporting. Reusing fixtures avoids conflating expensive 100k-record source construction with importer latency and permits repeated comparable import measurements. A dedicated test rejects fixture mismatches and modified bundle contents.
 - Use unique fresh temporary directories for every benchmark run.
 
 ### 9. Build strictness, maintainability and release preparation

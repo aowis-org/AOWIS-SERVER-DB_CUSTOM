@@ -156,3 +156,53 @@ The logical model and SHA-256 objects are independent of the physical backend. B
 ## Planned service benchmarks
 
 When the REST server exists, add separate measurements for project catalogue lookup, HTTP JSON/binary overhead, indexed entity GET, atomic edit POST, paginated history, large binary synchronization and concurrent project access. Compare library-direct and HTTP paths without modifying persistence semantics.
+
+### Large-repository replication measurements (persistent fixture mode)
+
+Preparing a large source repository may take considerably longer than a single
+import. For large model-indexed histories, split preparation from measurements
+so a timeout or an interrupted import cannot force fixture reconstruction.
+The runner refuses to overwrite an existing fixture directory and records SHA-256
+checksums of all bundles in `manifest.json`. Import-only runs validate the
+manifest, requested fixture parameters, source heads and bundle checksums before
+measuring transfers. The preparation phase is **not** included in import timing.
+
+From the project root, after a Release build:
+
+```bash
+# Unique, previously nonexistent directory for persistent fixtures.
+fixture_root="$(mktemp -d /tmp/aowis-db-custom-100k-fixture.XXXXXXXX)"
+rmdir "$fixture_root"
+
+python3 tools/benchmark_replication_scaling.py \
+  --binary ./build-linux/aowis-native-replication-scaling-benchmark \
+  --objects 100000 --commits 20 --payload-bytes 96 \
+  --kinds model --backends pack --repeats 1 \
+  --mode prepare --fixture-dir "$fixture_root" --progress
+
+python3 tools/benchmark_replication_scaling.py \
+  --binary ./build-linux/aowis-native-replication-scaling-benchmark \
+  --objects 100000 --commits 20 --payload-bytes 96 \
+  --kinds model --backends pack --repeats 3 \
+  --mode imports --fixture-dir "$fixture_root" \
+  --output "$fixture_root/import-results.csv"
+```
+
+The fixture directory is **retained** for import-only reruns; delete it manually
+when no longer needed. Import recipients and scratch data are created in fresh
+random temporary directories for each run, not inside the retained fixture.
+Progress reports each fixture commit and identifies base/full/incremental bundle
+exports and the final independent source verification; this makes long preparation
+stalls distinguishable from import bottlenecks. `--mode all` retains the original
+one-command behavior with automatically deleted fixtures, and `--smoke` still
+exercises both physical backends and both logical record kinds. To compare the
+physical stores, prepare another fixture using `--backends both`; that takes
+longer but also confirms identical exported bundles across the two backends.
+
+Do not interpret the 100k **logical model-record** fixture as 100k physical
+content-addressed objects: each commit creates additional immutable Merkle nodes
+and reverse-reference data. The CSV reports transferred physical object counts.
+Source fixture preparation, bundle generation and source verification are timed
+together and must not be confused with `import_ms`, which only measures native
+import and its prepublication integrity checks. The benchmark still does not
+measure streaming HTTP upload memory or production hydraulic ModelCodec parsing.
