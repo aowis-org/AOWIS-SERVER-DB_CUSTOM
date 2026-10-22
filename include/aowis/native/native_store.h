@@ -125,6 +125,24 @@ struct BundleLimits {
     std::uint64_t maxObjectBytes = 0;
 };
 
+// Optional import-stage timings, measured inside the native importer. All
+// durations are wall-clock milliseconds and can overlap neither each other
+// nor the separate post-import repository audit. Populated on success only.
+struct BundleImportProfile {
+    double scanMs = 0;               // Header, per-object SHA-256, and disk index.
+    double graphTraversalMs = 0;     // Typed revision/visited trie verification.
+    double modelReferenceMs = 0;     // Semantic model and reverse-index checks.
+    double reachabilityMs = 0;       // Unreachable object and ancestry checks.
+    double branchCheckMs = 0;        // Fast-forward and branch status checks.
+    double objectWriteMs = 0;        // Copy missing objects into local storage.
+    double publicationMs = 0;       // Sync and atomic branch ref publication.
+    double totalMs = 0;
+    std::uint64_t bundleObjectReads = 0;
+    std::uint64_t bundleObjectBytes = 0;
+    std::uint64_t localObjectReads = 0;
+    std::uint64_t localObjectBytes = 0;
+};
+
 struct BundleImportResult {
     BundleImportStatus status = BundleImportStatus::UpToDate;
     Hash head{};
@@ -242,7 +260,8 @@ public:
     // All bundle SHA-256 hashes and object graph edges are verified before
     // writing any objects or publishing a ref. Authorization is not provided.
     BundleImportResult importBranchBundle(const std::filesystem::path& bundlePath,
-                                          std::string_view localBranch, BundleLimits limits = {});
+                                          std::string_view localBranch, BundleLimits limits = {},
+                                          BundleImportProfile* profile = nullptr);
 
     std::uint64_t packSize();
     std::uint64_t objectCount();

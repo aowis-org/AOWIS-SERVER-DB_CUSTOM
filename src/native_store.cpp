@@ -6,6 +6,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -763,10 +764,21 @@ struct ExternalVerificationMarks {
     std::function<void(const std::function<void(const Hash&)>&)> forEachRevision;
 };
 
+struct LogicalVerificationProfile {
+    double graphTraversalMs = 0;
+    double modelReferenceMs = 0;
+};
+
+using ImportClock = std::chrono::steady_clock;
+double elapsedImportMs(ImportClock::time_point start, ImportClock::time_point finish) {
+    return std::chrono::duration<double, std::milli>(finish - start).count();
+}
+
 LogicalVerification verifyLogicalGraph(
         const std::vector<Hash>& tips,
         const std::function<Bytes(const Hash&)>& objectByHash,
-        const ExternalVerificationMarks& externalMarks = {}) {
+        const ExternalVerificationMarks& externalMarks = {},
+        LogicalVerificationProfile* profile = nullptr) {
     enum class Kind {
         Revision, RawTree, ModelTree, ReferenceTree,
         RawValue, ModelValue, ReferenceValue
@@ -884,6 +896,7 @@ LogicalVerification verifyLogicalGraph(
             throw std::runtime_error("tree " + toHex(hash) + ": " + error.what());
         }
     };
+    const ImportClock::time_point graphStart = ImportClock::now();
     while (!pending.empty()) {
         const std::pair<Hash, Kind> next = pending.back();
         pending.pop_back();
@@ -932,6 +945,11 @@ LogicalVerification verifyLogicalGraph(
             }
         }
     }
+    const ImportClock::time_point graphFinish = ImportClock::now();
+    if (profile != nullptr) {
+        profile->graphTraversalMs = elapsedImportMs(graphStart, graphFinish);
+    }
+    const ImportClock::time_point modelStart = graphFinish;
     // Verify the semantic relationship between the two immutable indexes,
     // not just their independent Merkle structure. Hash-valid imports can
     // otherwise carry an omitted incoming edge, and a later ordinary
@@ -1057,6 +1075,9 @@ LogicalVerification verifyLogicalGraph(
     for (const Hash& revisionId : localRevisions) checkModelRevision(revisionId);
     if (externalMarks.forEachRevision) externalMarks.forEachRevision(checkModelRevision);
 
+    if (profile != nullptr) {
+        profile->modelReferenceMs = elapsedImportMs(modelStart, ImportClock::now());
+    }
     LogicalVerification summary{};
     summary.reachableObjects = static_cast<std::uint64_t>(checkedKinds.size()) +
         (externalMarks.markedCount ? externalMarks.markedCount() : 0);
@@ -2851,7 +2872,10 @@ void Repository::exportBundleLocked(std::string_view branch,
 }
 
 BundleImportResult Repository::importBranchBundle(const std::filesystem::path& bundlePath,
-                                                   std::string_view localBranch, BundleLimits limits) {
+                                                   std::string_view localBranch, BundleLimits limits,
+                                                   BundleImportProfile* profile) {
+    const ImportClock::time_point importStart = ImportClock::now();
+    if (profile != nullptr) *profile = BundleImportProfile{};
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -2920,6 +2944,10 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         }
         require(offset == fileSize, "replication bundle contains trailing bytes");
         entries.finalize();
+        if (profile != nullptr) {
+            profile->scanMs = elapsedImportMs(importStart, ImportClock::now());
+        }
+        const ImportClock::time_point graphStart = ImportClock::now();
         const auto containsLocally = [&](const Hash& hash) {
             return this->blockStore_ ? this->blockStore_->contains(hash)
                                       : this->index_.contains(hash);
@@ -2934,11 +2962,19 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                         "incremental replication bundle is missing a referenced object");
                 const Bytes local = load(hash);
                 require(sha256(local) == hash, "local replication object SHA-256 mismatch");
+                if (profile != nullptr) {
+                    ++profile->localObjectReads;
+                    profile->localObjectBytes += local.size();
+                }
                 return local;
             }
             Bytes object(static_cast<std::size_t>(location->size));
             if (!object.empty()) readExact(fd, object.data(), object.size(), location->offset);
             require(sha256(object) == hash, "replication bundle changed during import");
+            if (profile != nullptr) {
+                ++profile->bundleObjectReads;
+                profile->bundleObjectBytes += object.size();
+            }
             return object;
         };
         // A content hash authenticates bytes, not trie semantics. Verify each
@@ -2982,8 +3018,19 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 }
             }
         };
+        LogicalVerificationProfile graphProfile{};
         const LogicalVerification verification =
-            verifyLogicalGraph({incoming}, bundleObject, externalMarks);
+            verifyLogicalGraph({incoming}, bundleObject, externalMarks,
+                               profile != nullptr ? &graphProfile : nullptr);
+        if (profile != nullptr) {
+            // Includes setup of visit-mark and trie-summary scratch tables.
+            // The separately reported graph/model stages cover the verifier
+            // itself; any remaining setup work stays in graphTraversalMs.
+            profile->graphTraversalMs = elapsedImportMs(graphStart, ImportClock::now()) -
+                                         graphProfile.modelReferenceMs;
+            profile->modelReferenceMs = graphProfile.modelReferenceMs;
+        }
+        const ImportClock::time_point reachStart = ImportClock::now();
         for (std::size_t index = 0; index < entries.size(); ++index) {
             require(visitMarks.at(index) != 0,
                     "replication bundle contains unreachable objects");
@@ -2992,6 +3039,10 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             require(verification.containsRevision(recipientBase),
                     "incremental bundle base is not an ancestor of incoming revision");
         }
+        if (profile != nullptr) {
+            profile->reachabilityMs = elapsedImportMs(reachStart, ImportClock::now());
+        }
+        const ImportClock::time_point branchStart = ImportClock::now();
         const std::filesystem::path ref = this->directory_ / "refs" / "heads" /
                                           std::string(localBranch);
         const bool exists = std::filesystem::exists(ref);
@@ -3011,10 +3062,17 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 status = BundleImportStatus::FastForward;
             }
         }
+        if (profile != nullptr) {
+            profile->branchCheckMs = elapsedImportMs(branchStart, ImportClock::now());
+        }
         if (status == BundleImportStatus::UpToDate) {
+            if (profile != nullptr) {
+                profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
+            }
             ::close(fd);
             return BundleImportResult{status, previousHead, 0};
         }
+        const ImportClock::time_point writeStart = ImportClock::now();
         std::uint64_t imported = 0;
         for (std::size_t index = 0; index < entries.size(); ++index) {
             const std::pair<Hash, BundleLocation> entry = entries.at(index);
@@ -3026,9 +3084,17 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                     "replication content hash changed before publication");
             ++imported;
         }
+        if (profile != nullptr) {
+            profile->objectWriteMs = elapsedImportMs(writeStart, ImportClock::now());
+        }
+        const ImportClock::time_point publishStart = ImportClock::now();
         syncPack(); // durable objects before an atomic branch-ref update
         detail::faultCheckpoint("import.after.sync");
         publishRef(localBranch, incoming, !exists);
+        if (profile != nullptr) {
+            profile->publicationMs = elapsedImportMs(publishStart, ImportClock::now());
+            profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
+        }
         ::close(fd);
         return BundleImportResult{status, incoming, imported};
     } catch (...) {

@@ -105,6 +105,20 @@ CSV fields include:
   This is a **sampled lower bound**, not a guaranteed high-water mark: files
   created and closed between 10 ms samples may be missed. Logical size and
   filesystem allocated blocks are reported independently.
+- `profile_total_ms`: importer's own elapsed time (excluding the independent
+  audit); it should closely agree with `import_ms`. The `profile_*_ms` fields
+  break this down into nonoverlapping scan/checksum/index, structural graph
+  traversal, semantic model-reference verification, reachability/ancestry,
+  branch fast-forward decision, object copying and fsync/ref publication.
+  `profile_graph_ms` includes scratch-table preparation, while
+  `profile_model_references_ms` covers the complete semantic validation of
+  distinct model snapshots. These are **wall-clock phase timings**: nested
+  individual operations such as I/O are not measured separately.
+- `profile_bundle_reads`, `profile_bundle_read_bytes`, `profile_local_reads`,
+  and `profile_local_read_bytes`: object fetch operations by the importer after
+  the initial checksum pass. These count **repeated reads** during verification
+  and copying, not unique physical objects or disk-sector reads. A repeated
+  local fetch can hit the operating-system page cache.
 - `process_wall_ms`: process-launch-to-exit wall time, including startup,
   import, separate full verification and benchmark-report generation.
 - `bundle_bytes`, `imported_objects`, `verified_revisions`,
@@ -206,3 +220,34 @@ Source fixture preparation, bundle generation and source verification are timed
 together and must not be confused with `import_ms`, which only measures native
 import and its prepublication integrity checks. The benchmark still does not
 measure streaming HTTP upload memory or production hydraulic ModelCodec parsing.
+
+### Investigating import latency (Stage 9.11)
+
+The bundle importer accepts an optional `BundleImportProfile*` for lightweight
+per-phase instrumentation. Normal C++ and HTTP callers may omit it; integrity
+checks and publication semantics are identical. A successful profile is reset
+on entry and populated before return, including idempotent up-to-date imports;
+partial fields after exceptions are **not** a valid completed profile.
+
+The 100k model benchmark on the development machine (pack → pack) previously
+showed incremental transfer taking longer than a larger full transfer. Rather
+than assuming the smaller transfer should necessarily be faster, compare the
+new phase columns on the *same* persistent fixture:
+
+```bash
+python3 tools/benchmark_replication_scaling.py \
+  --binary ./build-linux-tests-release/aowis-native-replication-scaling-benchmark \
+  --objects 100000 --commits 20 --payload-bytes 96 \
+  --kinds model --backends pack --repeats 3 \
+  --mode imports --fixture-dir "$fixture_root" \
+  --output "$fixture_root/results-profile.csv"
+```
+
+A local Release run with 10k logical model records (20 revisions, two
+repetitions, pack → pack) found `profile_model_references_ms` around 2.1–2.6 s
+out of 3.2–3.6 s import time. The incremental case fetched roughly 576k
+locally resident objects (114 MB of *logical bytes reread*, not necessarily
+physical disk I/O). Those observations identify a verification hotspot, but
+larger and cold-cache measurements must establish how much can safely be saved
+before changing integrity rules. The independent `verify_ms` audit is always
+separate and is **not** included in any of the `profile_*` phases.

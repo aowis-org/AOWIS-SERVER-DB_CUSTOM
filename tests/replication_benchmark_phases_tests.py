@@ -51,6 +51,29 @@ def main():
             rows = list(csv.DictReader(stream))
         if len(rows) != 16 or any(int(row["import_peak_rss_kib"]) <= 0 for row in rows):
             raise AssertionError("split benchmark produced incomplete import results")
+        # Profile data comes from inside the native importer, not from the
+        # independent post-import audit or Python launcher. Every phase must
+        # be measured and the nonoverlapping phases must fit the total.
+        phases = ("profile_scan_ms", "profile_graph_ms",
+                  "profile_model_references_ms", "profile_reachability_ms",
+                  "profile_branch_ms", "profile_write_ms", "profile_publication_ms")
+        for row in rows:
+            total = float(row["profile_total_ms"])
+            summed = sum(float(row[field]) for field in phases)
+            if total <= 0 or any(float(row[field]) < 0 for field in phases):
+                raise AssertionError("import profile has missing or negative stage timings")
+            if summed > total + max(0.2, total * 0.02):
+                raise AssertionError("import profile double-counted a stage")
+            if abs(total - float(row["import_ms"])) > max(3.0, total * 0.1):
+                raise AssertionError("native import profile differs from benchmark timer")
+            if int(row["profile_bundle_reads"]) <= 0 or int(row["profile_bundle_read_bytes"]) <= 0:
+                raise AssertionError("import profile omitted transferred object reads")
+            if row["phase"] == "import-full":
+                if int(row["profile_local_reads"]) != 0:
+                    raise AssertionError("full import unexpectedly used local object fallback")
+            elif row["phase"] == "import-delta":
+                if int(row["profile_local_reads"]) <= 0 or int(row["profile_local_read_bytes"]) <= 0:
+                    raise AssertionError("incremental import omitted existing object reads")
         expected_heads = {}
         for row in rows:
             key = (row["kind"], row["source_backend"])

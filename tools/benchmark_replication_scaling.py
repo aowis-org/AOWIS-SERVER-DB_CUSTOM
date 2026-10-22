@@ -100,6 +100,10 @@ COLUMNS = (
     "run", "kind", "source_backend", "destination_backend", "objects", "commits",
     "payload_bytes", "phase", "bundle_bytes", "imported_objects", "verified_revisions",
     "verified_reachable_objects", "import_ms", "verify_ms", "process_wall_ms",
+    "profile_total_ms", "profile_scan_ms", "profile_graph_ms",
+    "profile_model_references_ms", "profile_reachability_ms", "profile_branch_ms",
+    "profile_write_ms", "profile_publication_ms", "profile_bundle_reads",
+    "profile_bundle_read_bytes", "profile_local_reads", "profile_local_read_bytes",
     "import_peak_rss_kib", "process_peak_rss_kib", "observed_peak_scratch_logical_bytes",
     "observed_peak_scratch_allocated_bytes", "storage_pack_bytes", "head",
 )

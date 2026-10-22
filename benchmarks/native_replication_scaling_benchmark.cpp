@@ -19,6 +19,7 @@
 namespace {
 
 using aowis::native::BundleImportResult;
+using aowis::native::BundleImportProfile;
 using aowis::native::BundleImportStatus;
 using aowis::native::Bytes;
 using aowis::native::Change;
@@ -224,7 +225,8 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
     Repository receiver(destination, backend(backendName));
     if (delta) require(receiver.head("main").id == heads.first, "destination is not at base revision");
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    const BundleImportResult result = receiver.importBranchBundle(bundle, "main");
+    BundleImportProfile profile{};
+    const BundleImportResult result = receiver.importBranchBundle(bundle, "main", {}, &profile);
     const std::chrono::steady_clock::time_point imported = std::chrono::steady_clock::now();
     require(receiver.head("main").id == expected, "imported branch head differs from source");
     const std::uint64_t afterImportKiB = peakResidentKiB();
@@ -237,6 +239,18 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
     std::cout << std::fixed << std::setprecision(3)
               << "phase=" << phase << "\nbackend=" << backendName
               << "\nimport_ms=" << milliseconds(start, imported)
+              << "\nprofile_total_ms=" << profile.totalMs
+              << "\nprofile_scan_ms=" << profile.scanMs
+              << "\nprofile_graph_ms=" << profile.graphTraversalMs
+              << "\nprofile_model_references_ms=" << profile.modelReferenceMs
+              << "\nprofile_reachability_ms=" << profile.reachabilityMs
+              << "\nprofile_branch_ms=" << profile.branchCheckMs
+              << "\nprofile_write_ms=" << profile.objectWriteMs
+              << "\nprofile_publication_ms=" << profile.publicationMs
+              << "\nprofile_bundle_reads=" << profile.bundleObjectReads
+              << "\nprofile_bundle_read_bytes=" << profile.bundleObjectBytes
+              << "\nprofile_local_reads=" << profile.localObjectReads
+              << "\nprofile_local_read_bytes=" << profile.localObjectBytes
               << "\nverify_ms=" << milliseconds(imported, checked)
               << "\nimport_peak_rss_kib=" << afterImportKiB
               << "\nprocess_peak_rss_kib=" << afterAuditKiB
