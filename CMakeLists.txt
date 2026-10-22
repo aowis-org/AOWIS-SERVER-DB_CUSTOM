@@ -68,6 +68,13 @@ if(BUILD_TESTING)
     add_test(NAME aowis-native-model-import-integrity-tests
         COMMAND aowis-native-model-import-integrity-tests)
     set_tests_properties(aowis-native-model-import-integrity-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-native-repository-verify-tests
+        tests/native_repository_verify_tests.cpp)
+    target_link_libraries(aowis-native-repository-verify-tests PRIVATE aowis-native-store)
+    add_dependencies(aowis-native-repository-verify-tests aowis-native-verify)
+    add_test(NAME aowis-native-repository-verify-tests
+        COMMAND aowis-native-repository-verify-tests $<TARGET_FILE:aowis-native-verify>)
+    set_tests_properties(aowis-native-repository-verify-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-sync-tests tests/native_sync_tests.cpp)
     target_link_libraries(aowis-native-sync-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-sync-tests COMMAND aowis-native-sync-tests)
@@ -76,7 +83,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
@@ -84,7 +91,7 @@ endif()
 # The standalone byte/object store can still build without Qt.
 option(AOWIS_NATIVE_WITH_MODEL_CODEC "Build native model serialization and hydraulic persistence" ON)
 if(AOWIS_NATIVE_WITH_MODEL_CODEC)
-    find_package(Qt6 QUIET COMPONENTS Core)
+    find_package(Qt6 REQUIRED COMPONENTS Core)
     if(Qt6Core_FOUND)
         set(AOWIS_NATIVE_MODEL_SOURCE_DIR
             "${CMAKE_CURRENT_SOURCE_DIR}/external/AOWIS-SERVER-MODEL"

@@ -123,6 +123,17 @@ struct BundleImportResult {
     std::uint64_t objectsImported = 0;
 };
 
+// Results from physical verification and validation of every revision and
+// logical index reachable from each published branch head.
+struct VerificationReport {
+    std::uint64_t physicalObjects = 0;
+    std::uint64_t reachableObjects = 0;
+    std::uint64_t branches = 0;
+    std::uint64_t revisions = 0;
+    std::uint64_t treeNodes = 0;
+    std::uint64_t modelSnapshots = 0;
+};
+
 struct CompactionStats {
     std::uint64_t objectsBefore = 0;
     std::uint64_t objectsAfter = 0;
@@ -229,6 +240,10 @@ public:
     // Full SHA-256 verification of every physical object. Normal reopening
     // trusts the checksummed sidecar index and verifies object bytes on read.
     void verifyPack();
+    // Read-only full verification: physical objects, published revision history,
+    // canonical raw/model/reference trees and exact model reverse references.
+    // Checks every reachable ancestor, including second merge parents.
+    VerificationReport verifyRepository();
     // Offline maintenance: retain all branch heads AND their full parent histories.
     // Refuses to run while another Repository instance has this directory open.
     // Publishes an immutable replacement pack using an fsynced atomic pointer.
@@ -282,6 +297,7 @@ private:
     void scanPackTail();
     void rebuildIndex();
 
+    void verifyPackLocked();
     void refreshIndex();
     Bytes load(const Hash& hash);
     Hash store(const Bytes& bytes);

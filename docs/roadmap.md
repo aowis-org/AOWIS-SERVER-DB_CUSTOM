@@ -6,7 +6,7 @@ The AOWIS database has one native storage engine, usable directly as a C++ libra
 
 The repository implements immutable SHA-256 objects, copy-on-write Merkle UUID trees, revision-based atomic publication, model/reference indexes, hydraulic persistence, branches, merging, and full/incremental offline synchronization. Both native physical backends share the logical object and revision format.
 
-Bundle imports check object hashes, reachable object types and graph completeness; they also validate canonical Merkle structure, including UUID-to-path correspondence, compressed prefixes, branch depth ordering, child slots and nonzero leaf targets. These validations precede object publication on both backends. Model-indexed imported revisions additionally require canonical model references, existing dependency targets, and exact equivalence between model-derived edges and the reverse-reference index (including historical and incremental revisions). **Repositories already on disk are not yet comprehensively verified**, so physical verification alone is not a full logical database integrity check.
+Bundle imports check object hashes, reachable object types and graph completeness; they also validate canonical Merkle structure, including UUID-to-path correspondence, compressed prefixes, branch depth ordering, child slots and nonzero leaf targets. These validations precede object publication on both backends. Model-indexed imported revisions additionally require canonical model references, existing dependency targets, and exact equivalence between model-derived edges and the reverse-reference index (including historical and incremental revisions). The same generic logical validator is now available for existing repositories, with physical + logical verification the default mode of `aowis-native-verify`. Full native checks deliberately do not claim application-specific hydraulic semantic validation.
 
 The HTTP service executable is not yet implemented. The provisional access-policy library is not part of the planned HTTP service authorization model.
 
@@ -19,11 +19,12 @@ The HTTP service executable is not yet implemented. The provisional access-polic
 - Reuse verified immutable model/index root pairs across historical revisions within one import.
 - Regression-test SHA-256-valid forged histories and unsafe-deletion bypasses, full/incremental replication, and both physical backends (including cross-backend transfers).
 
-### 2. Comprehensive repository verification
+### 2. Comprehensive native repository verification — implemented
 
-- Extend the integrity checker from physical SHA-256/index verification to revision ancestry, canonical Merkle paths, model/reference consistency and, where available, typed hydraulic validation.
-- Distinguish verification levels and report actionable diagnostics; never claim full integrity when some layers did not run.
-- Keep repair and recovery explicit. Add independent corruption fixtures for every verification layer.
+- Shared importer/on-disk verifier checks all physical objects, complete published ancestry, canonical Merkle paths and generic model/reference consistency across both storage backends.
+- Full verification is the default; `--physical` checks physical integrity only, and the CLI explicitly states that application-specific hydraulic semantics are not checked.
+- Adversarial tests inject hash-valid logical corruption directly into both physical backends and check correct rejection, physical/logical separation, CLI status codes, valid merges and compaction.
+- Future: a separate domain-aware semantic audit, bounded-memory verification and fault-injection/recovery procedures.
 
 ### 3. Consistent snapshots and concurrency
 
@@ -63,7 +64,7 @@ The HTTP service executable is not yet implemented. The provisional access-polic
 
 ### 9. Build strictness, maintainability and release preparation
 
-- Fail CMake configuration when model codec support is requested but Qt6 is unavailable; retain an explicit native-only build mode.
+- **Implemented:** Fail CMake configuration when model codec support is requested but Qt6 is unavailable; retain an explicit native-only build mode.
 - Require Debug and Release builds and corresponding native/Qt-enabled tests, including adversarial regression coverage.
 - Eliminate obsolete development-stage names in public interfaces, apply the project's C++ conventions and keep documentation descriptive of the current architecture.
 - Establish and freeze the first public persistence format before introducing any historical migration machinery.

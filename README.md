@@ -57,7 +57,7 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
-With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. A REST server and its HTTP integration tests will be added separately.
+When `AOWIS_NATIVE_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. A REST server and its HTTP integration tests will be added separately.
 
 Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraulic`. The public namespaces are `aowis::native` and `aowis::native::hydraulic`.
 
@@ -83,11 +83,12 @@ For model semantics, query APIs and safe indexed edit rules, see [hydraulic pers
 The default repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. Both supported physical backends share the same logical object and revision identities, but **their directories are not interchangeable**.
 
 ```bash
-./build-linux/aowis-native-verify /path/to/repository
+./build-linux/aowis-native-verify /path/to/repository             # full (default)
+./build-linux/aowis-native-verify --physical /path/to/repository  # physical only
 ./build-linux/aowis-native-compact /path/to/repository
 ```
 
-The current `aowis-native-verify` command checks physical stored-object integrity; comprehensive on-disk logical verification is still planned. Bundle imports additionally validate canonical Merkle structure and recompute model references for all reachable model-indexed revisions, rejecting any mismatch with the reverse-reference index before publication. Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
+`aowis-native-verify` now performs complete **native storage** verification by default: physical objects, published branch/revision ancestry, canonical Merkle trees, and exact model-to-reverse-reference consistency. The optional `--physical` mode checks only physical stored objects. Bundle imports reuse the same logical validator, rejecting malformed history before publication. This does not yet check application-specific hydraulic semantics. See [repository verification](docs/repository-verification.md). Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
 
 The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, recovery drills and production hardening remain outstanding work.
 
