@@ -53,10 +53,20 @@ target_link_libraries(aowis-native-benchmark PRIVATE aowis-native-store)
 add_executable(aowis-native-merge-history-benchmark benchmarks/native_merge_history_benchmark.cpp)
 target_link_libraries(aowis-native-merge-history-benchmark PRIVATE aowis-native-store)
 
+add_executable(aowis-native-replication-scaling-benchmark
+    benchmarks/native_replication_scaling_benchmark.cpp)
+target_link_libraries(aowis-native-replication-scaling-benchmark PRIVATE aowis-native-store)
+
 add_executable(aowis-native-model-benchmark benchmarks/model_network_benchmark.cpp)
 target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME aowis-native-replication-benchmark-smoke
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_replication_scaling.py"
+            --binary "$<TARGET_FILE:aowis-native-replication-scaling-benchmark>" --smoke)
+    set_tests_properties(aowis-native-replication-benchmark-smoke PROPERTIES LABELS "aowis")
     # Compile the engine a second time exclusively for fault-injection tests.
     # Production targets never contain crash/failure injection hooks.
     add_library(aowis-native-store-fault-tests STATIC
@@ -144,7 +154,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
