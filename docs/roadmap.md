@@ -61,11 +61,14 @@ The initial multi-project HTTP service executable is implemented, with project/c
 - Native adversarial tests exercise limit rejection without branch/object writes on both physical backends. Qt integration tests exercise full/incremental transfers between backend types, truncated/forged content, retries, conflicting branches and interrupted uploads.
 - **Still required:** true streaming upload/download, disk-backed graph-validation metadata for huge histories, CPU/time budgets, cancellation handling, explicit concurrent-transfer quotas, and robust large-repository benchmarks. The current HTTP implementation buffers complete transfer bodies and processes them synchronously.
 
-### 8. Scalability and performance
+### 8. Scalability and performance — merge ancestry optimization implemented
 
-- Improve common-ancestor search for long histories and shared merge ancestry while preserving correct merge-base semantics.
-- Profile and bound bundle verification memory, using disk-backed structures or streaming where needed.
-- Benchmark representative 10k–1M hydraulic-entity projects, long revision histories, branching/merging, synchronization and compaction on both backends.
+- Implemented an early up-to-date exit, compact target-ancestor hash set and source-side pruning at the first common revision on each path. Multiple frontier candidates still undergo ancestry-based dominance checks; ambiguous criss-cross merge bases are rejected rather than guessed.
+- Added a deterministic exhaustive-ancestry oracle, randomized raw and model-indexed merge DAGs, dominated common-frontier and criss-cross cases, long shared histories and both physical backends as regression tests.
+- Added an isolated native merge-history conflict benchmark; it excludes publication/fsync while retaining merge-base and conflict validation. Benchmarks must use new random temporary repository paths for each run.
+- Further improve merge ancestry for very deep unrelated histories if profiling shows a need (the target-ancestor set still scales with target history).
+- **Outstanding:** Profile and bound bundle verification memory, using disk-backed structures or streaming where needed.
+- **Outstanding:** Benchmark representative 10k–1M hydraulic-entity projects, long revision histories, branching/merging, synchronization and compaction on both backends.
 - Use unique fresh temporary directories for every benchmark run.
 
 ### 9. Build strictness, maintainability and release preparation

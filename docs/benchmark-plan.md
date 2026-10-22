@@ -24,6 +24,35 @@ run_root="$(mktemp -d /tmp/aowis-db-custom-bench.XXXXXXXX)"
 
 The canonical hydraulic fixture reports `import_ms`, `peak_rss_kib`, `network_membership_chunk_count`, and indexed edit/structural operation times. It constructs a complete `NetworkHydraulic` fixture in memory; its peak RSS is not a measure of a future streaming import implementation. Lower-level benchmarks are deliberately not equivalent to whole-network validation.
 
+## Merge ancestry and conflict processing
+
+Build optimized binaries with `./compile_linux.sh`, then run the dedicated
+conflict benchmark using a **fresh, nonexistent repository path for every run**:
+
+```bash
+run_root="$(mktemp -d /tmp/aowis-db-custom-history.XXXXXXXX)"
+./build-linux/aowis-native-merge-history-benchmark \
+  "$run_root/pack" 10000 100 pack
+./build-linux/aowis-native-merge-history-benchmark \
+  "$run_root/blocks" 10000 100 block
+```
+
+The arguments are repository path, shared-commit count, divergent commits **per
+branch**, and physical backend. The benchmark constructs a common history,
+creates diverging branches with distinct UUIDs, then deliberately introduces
+one same-UUID conflict. It reports `merge_conflict_ms` for the failed merge,
+which includes ancestor lookup and Merkle difference/conflict computation but
+**not** merge revision writing or fsync. The benchmark asserts the correct
+base, one conflict, and unchanged heads. `process_peak_rss_kib` measures the
+**whole process**, including fixture construction, not the merge operation's
+incremental memory usage; don't use it to claim a merge-only RSS reduction.
+
+Measure repeated Release runs and report median, sample count and hardware.
+Use larger histories and varied branch DAGs to validate scaling; the separate
+ancestry correctness suite checks many non-linear histories against a deliberately
+exhaustive oracle. This microbenchmark does not substitute for hydraulic semantic
+merge, disk recovery or HTTP workloads.
+
 ## Comparing storage backends
 
 ```bash

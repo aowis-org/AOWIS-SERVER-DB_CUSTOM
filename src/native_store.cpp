@@ -1348,79 +1348,85 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
             return result;
         }
 
-        // Read the full DAG, not only first parents; otherwise a second merge
-        // would see the wrong base and incorrectly replay already merged edits.
-        const auto ancestors = [this](const Hash& tip) {
-            std::map<Hash, Revision> records;
-            std::vector<Hash> pending{tip};
-            while (!pending.empty()) {
-                const Hash current = pending.back();
-                pending.pop_back();
-                require(!isZero(current), "zero revision parent in merge ancestry");
-                if (records.find(current) != records.end()) continue;
-                const Revision item = readRevision(current);
-                records.emplace(current, item);
-                for (const Hash& parent : item.parents) pending.push_back(parent);
-            }
-            return records;
-        };
-        const std::map<Hash, Revision> targetHistory = ancestors(targetHead.id);
-        const std::map<Hash, Revision> sourceHistory = ancestors(sourceHead.id);
-        if (sourceHistory.find(targetHead.id) != sourceHistory.end()) {
-            // Fast forward retains the source's immutable revision identity.
-            checkSelections();
-            result.base = targetHead.id;
-            publishRef(target, sourceHead.id, false);
-            result.status = MergeStatus::FastForward;
-            result.revision = sourceHead;
-            return result;
-        }
-        if (targetHistory.find(sourceHead.id) != targetHistory.end()) {
-            checkSelections();
-            result.base = sourceHead.id;
-            return result; // source already incorporated
-        }
-
-        // Find the lowest common ancestors. When the DAG has multiple
-        // independent merge bases (criss-cross), do not guess one: recursive
-        // merge-base synthesis is deliberately a separate feature.
-        std::set<Hash> common;
-        for (const std::pair<const Hash, Revision>& item : sourceHistory) {
-            if (targetHistory.find(item.first) != targetHistory.end()) common.insert(item.first);
-        }
-        require(!common.empty(), "branches have no common revision ancestor");
-        std::set<Hash> dominated;
-        std::set<Hash> traversed;
-        std::vector<Hash> pending{sourceHead.id};
-        std::vector<Hash> orderedCommon;
+        // Track only target revision identities, not full Revision objects.
+        // Short-circuit up-to-date merges as soon as the source tip is found,
+        // including when it is a *second* parent of an earlier merge.
+        std::unordered_set<Hash, HashHasher> targetAncestors;
+        std::vector<Hash> pending{targetHead.id};
         while (!pending.empty()) {
             const Hash current = pending.back();
             pending.pop_back();
-            if (!traversed.insert(current).second) continue;
-            if (common.find(current) != common.end()) orderedCommon.push_back(current);
-            const Revision& record = sourceHistory.at(current);
+            require(!isZero(current), "zero revision parent in merge ancestry");
+            if (!targetAncestors.insert(current).second) continue;
+            if (current == sourceHead.id) {
+                checkSelections();
+                result.base = sourceHead.id;
+                return result; // source already incorporated
+            }
+            const Revision record = readRevision(current);
             for (const Hash& parent : record.parents) pending.push_back(parent);
         }
-        // Process descendants before their ancestors even on merge DAGs.
-        // A candidate is dominated if another common ancestor descends from it.
-        for (const Hash& candidate : orderedCommon) {
-            if (dominated.find(candidate) != dominated.end()) continue;
-            std::vector<Hash> ancestry = sourceHistory.at(candidate).parents;
-            while (!ancestry.empty()) {
-                const Hash current = ancestry.back();
-                ancestry.pop_back();
-                if (!dominated.insert(current).second) continue;
-                const Revision& record = sourceHistory.at(current);
-                for (const Hash& parent : record.parents) ancestry.push_back(parent);
+
+        // The first target-common revision encountered on each source path
+        // dominates all of its own ancestors. Stop walking that path there:
+        // descending into the shared history only to rediscover older common
+        // revisions is unnecessary. This bounds source-side work by the
+        // divergent graph plus the common frontier in typical histories.
+        std::unordered_set<Hash, HashHasher> sourceVisited;
+        std::unordered_set<Hash, HashHasher> commonFrontier;
+        pending.push_back(sourceHead.id);
+        while (!pending.empty()) {
+            const Hash current = pending.back();
+            pending.pop_back();
+            require(!isZero(current), "zero revision parent in merge ancestry");
+            if (!sourceVisited.insert(current).second) continue;
+            if (current == targetHead.id) {
+                // The target is an ancestor of the source: preserve the
+                // source revision identity rather than creating a new merge.
+                checkSelections();
+                result.base = targetHead.id;
+                publishRef(target, sourceHead.id, false);
+                result.status = MergeStatus::FastForward;
+                result.revision = sourceHead;
+                return result;
+            }
+            if (targetAncestors.contains(current)) {
+                commonFrontier.insert(current);
+                continue;
+            }
+            const Revision record = readRevision(current);
+            for (const Hash& parent : record.parents) pending.push_back(parent);
+        }
+        require(!commonFrontier.empty(), "branches have no common revision ancestor");
+
+        // Different merge paths can expose common-frontier nodes which are
+        // themselves ancestors of other frontier nodes (criss-cross DAGs).
+        // Remove dominated candidates, visiting any ancestor at most once.
+        // The overwhelmingly common single-frontier case performs no extra
+        // history traversal at all.
+        std::unordered_set<Hash, HashHasher> dominated;
+        if (commonFrontier.size() > 1) {
+            std::unordered_set<Hash, HashHasher> visitedAncestors;
+            for (const Hash& candidate : commonFrontier) {
+                const Revision record = readRevision(candidate);
+                std::vector<Hash> ancestry = record.parents;
+                while (!ancestry.empty()) {
+                    const Hash current = ancestry.back();
+                    ancestry.pop_back();
+                    if (!visitedAncestors.insert(current).second) continue;
+                    if (commonFrontier.contains(current)) dominated.insert(current);
+                    const Revision ancestor = readRevision(current);
+                    for (const Hash& parent : ancestor.parents) ancestry.push_back(parent);
+                }
             }
         }
         std::vector<Hash> lowest;
-        for (const Hash& candidate : common) {
-            if (dominated.find(candidate) == dominated.end()) lowest.push_back(candidate);
+        for (const Hash& candidate : commonFrontier) {
+            if (!dominated.contains(candidate)) lowest.push_back(candidate);
         }
         require(lowest.size() == 1, "multiple independent merge bases require recursive merging");
         result.base = lowest.front();
-        const Revision base = targetHistory.at(result.base);
+        const Revision base = readRevision(result.base);
         require(targetHead.modelIndexed == sourceHead.modelIndexed &&
                 (base.modelIndexed == targetHead.modelIndexed ||
                  (!base.modelIndexed && isZero(base.root) && targetHead.modelIndexed)),
