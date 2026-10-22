@@ -126,6 +126,12 @@ if(BUILD_TESTING)
     add_test(NAME aowis-native-bundle-shared-trie-tests
         COMMAND aowis-native-bundle-disk-index-tests --shared-kinds-only)
     set_tests_properties(aowis-native-bundle-shared-trie-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-native-bundle-revision-marks-tests
+        tests/native_bundle_revision_marks_tests.cpp)
+    target_link_libraries(aowis-native-bundle-revision-marks-tests PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-bundle-revision-marks-tests
+        COMMAND aowis-native-bundle-revision-marks-tests)
+    set_tests_properties(aowis-native-bundle-revision-marks-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-sync-tests tests/native_sync_tests.cpp)
     target_link_libraries(aowis-native-sync-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-sync-tests COMMAND aowis-native-sync-tests)
@@ -138,7 +144,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

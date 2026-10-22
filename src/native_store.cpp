@@ -733,9 +733,18 @@ int nibbleHex(char character) {
 // typed revision graph, trie, or reverse-reference index.
 struct LogicalVerification {
     std::uint64_t reachableObjects = 0;
-    std::set<Hash> revisions;
+    std::uint64_t revisionCount = 0;
+    // Locally resident historical revisions still need a hash set. Imported
+    // revisions instead use the file-backed visitation marks by bundle ordinal.
+    std::set<Hash> localRevisions;
+    std::function<bool(const Hash&)> containsBundledRevision;
     std::uint64_t treeNodes = 0;
     std::uint64_t modelSnapshots = 0;
+
+    bool containsRevision(const Hash& hash) const {
+        return this->localRevisions.contains(hash) ||
+               (this->containsBundledRevision && this->containsBundledRevision(hash));
+    }
 };
 
 // Only imported bundle hashes use external visitation marks. Incremental
@@ -748,6 +757,10 @@ struct ExternalVerificationMarks {
     std::function<std::optional<TreeSummary>(const Hash&, unsigned)> readTree;
     std::function<void(const Hash&, unsigned, const TreeSummary&)> writeTree;
     std::function<std::uint64_t()> treeCount;
+    // The importer enumerates imported revision identities from the already
+    // sorted bundle index, selecting only entries marked as revision objects.
+    // No separate std::set<Hash> is needed for those entries.
+    std::function<void(const std::function<void(const Hash&)>&)> forEachRevision;
 };
 
 LogicalVerification verifyLogicalGraph(
@@ -782,7 +795,8 @@ LogicalVerification verifyLogicalGraph(
             checkedKinds[hash] = bits;
         }
     };
-    std::set<Hash> verifiedRevisions;
+    std::set<Hash> localRevisions;
+    std::uint64_t verifiedRevisionCount = 0;
     std::map<std::pair<Hash, Kind>, TreeSummary> verifiedTrees;
     std::set<std::pair<Hash, Kind>> visitingTrees;
     std::function<TreeSummary(const Hash&, Kind, unsigned)> verifyTree;
@@ -894,7 +908,13 @@ LogicalVerification verifyLogicalGraph(
             const Hash referenceRoot = readHash(object, 33);
             require(object[65] == 1 || isZero(referenceRoot),
                     "raw bundled revision has reference index");
-            verifiedRevisions.insert(next.first);
+            ++verifiedRevisionCount;
+            // The bundle's visitation bitmap is already keyed by content
+            // hash. Avoid retaining each imported revision a second time.
+            // Incremental imports still track locally resident ancestors.
+            if (!externalMarks.read || !externalMarks.read(next.first)) {
+                localRevisions.insert(next.first);
+            }
             pending.emplace_back(root, object[65] == 1 ? Kind::ModelTree : Kind::RawTree);
             pending.emplace_back(referenceRoot, Kind::ReferenceTree);
             for (unsigned index = 0; index < parents; ++index) {
@@ -966,13 +986,13 @@ LogicalVerification verifyLogicalGraph(
             }
             return false;
         };
-    for (const Hash& revisionId : verifiedRevisions) {
+    const std::function<void(const Hash&)> checkModelRevision = [&](const Hash& revisionId) {
         try {
             const Bytes encodedRevision = objectByHash(revisionId);
-            if (encodedRevision[65] == 0) continue;
+            if (encodedRevision[65] == 0) return;
             const Hash modelRoot = readHash(encodedRevision, 1);
             const Hash referenceRoot = readHash(encodedRevision, 33);
-            if (!verifiedModelSnapshots.emplace(modelRoot, referenceRoot).second) continue;
+            if (!verifiedModelSnapshots.emplace(modelRoot, referenceRoot).second) return;
 
             SortedReferenceEdges expected;
             visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
@@ -1033,11 +1053,22 @@ LogicalVerification verifyLogicalGraph(
             throw std::runtime_error("model revision " + toHex(revisionId) +
                                      ": " + error.what());
         }
-    }
+    };
+    for (const Hash& revisionId : localRevisions) checkModelRevision(revisionId);
+    if (externalMarks.forEachRevision) externalMarks.forEachRevision(checkModelRevision);
+
     LogicalVerification summary{};
     summary.reachableObjects = static_cast<std::uint64_t>(checkedKinds.size()) +
         (externalMarks.markedCount ? externalMarks.markedCount() : 0);
-    summary.revisions = std::move(verifiedRevisions);
+    summary.revisionCount = verifiedRevisionCount;
+    summary.localRevisions = std::move(localRevisions);
+    if (externalMarks.read) {
+        const std::function<std::optional<std::uint8_t>(const Hash&)> read = externalMarks.read;
+        summary.containsBundledRevision = [read](const Hash& hash) {
+            const std::optional<std::uint8_t> kinds = read(hash);
+            return kinds && ((*kinds & 1U) != 0U);
+        };
+    }
     summary.treeNodes = static_cast<std::uint64_t>(verifiedTrees.size()) +
         (externalMarks.treeCount ? externalMarks.treeCount() : 0);
     summary.modelSnapshots = static_cast<std::uint64_t>(verifiedModelSnapshots.size());
@@ -2675,7 +2706,7 @@ VerificationReport Repository::verifyRepository() {
     }
     VerificationReport result{};
     result.branches = static_cast<std::uint64_t>(tips.size());
-    result.revisions = static_cast<std::uint64_t>(graph.revisions.size());
+    result.revisions = graph.revisionCount;
     result.reachableObjects = graph.reachableObjects;
     result.treeNodes = graph.treeNodes;
     result.modelSnapshots = graph.modelSnapshots;
@@ -2940,7 +2971,16 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 require(ordinal.has_value(), "missing hash in bundle trie summary index");
                 treeSummaries.write(*ordinal, kind, summary);
             },
-            [&]() { return treeSummaries.size(); }
+            [&]() { return treeSummaries.size(); },
+            [&](const std::function<void(const Hash&)>& visitor) {
+                // Ordinal traversal uses the mapped, sorted index and a
+                // single byte per object. No per-revision hash container.
+                for (std::size_t ordinal = 0; ordinal < entries.size(); ++ordinal) {
+                    if ((visitMarks.at(ordinal) & 1U) != 0U) {
+                        visitor(entries.at(ordinal).first);
+                    }
+                }
+            }
         };
         const LogicalVerification verification =
             verifyLogicalGraph({incoming}, bundleObject, externalMarks);
@@ -2949,7 +2989,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                     "replication bundle contains unreachable objects");
         }
         if (incremental) {
-            require(verification.revisions.contains(recipientBase),
+            require(verification.containsRevision(recipientBase),
                     "incremental bundle base is not an ancestor of incoming revision");
         }
         const std::filesystem::path ref = this->directory_ / "refs" / "heads" /
@@ -2966,7 +3006,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                  revisionReachableFrom(previousHead, incoming))) {
                 status = BundleImportStatus::UpToDate;
             } else {
-                require(verification.revisions.contains(previousHead),
+                require(verification.containsRevision(previousHead),
                         "replication would overwrite divergent branch history");
                 status = BundleImportStatus::FastForward;
             }
