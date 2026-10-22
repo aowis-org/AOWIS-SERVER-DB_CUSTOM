@@ -2,16 +2,16 @@
 
 **AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
-This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The intended server interface is a **REST API over ordinary HTTP/TCP**, with a single `aowis-server-db` process managing multiple projects. **That REST server is planned, not implemented yet.** See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
+This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-db` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
-> **Service status:** No network/database service executable is currently provided. The multi-project Qt QHttpServer REST interface described below is the next planned component, not a working endpoint. Its initial HTTP/TCP interface will have no authentication, authorization enforcement, or HTTPS pending an AOWIS-wide security design. Do not expose it to untrusted networks or send sensitive data over it.
+> **Service status:** The initial project/branch/history HTTP service is implemented. Hydraulic edits, merges, diffs and HTTP synchronization are not yet exposed. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
 ## System overview
 
 ```text
 AOWIS GUI / other AOWIS services / remote clients
                       |
-                REST over HTTP                    PLANNED
+                REST over HTTP
                       |
                  aowis-server-db
           configurable TCP address + port
@@ -40,14 +40,14 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
 | Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
 | Replication | Portable full/incremental `.aowbundle` exchange, SHA-256, object graph, canonical Merkle trie and model-reference index verification, fast-forward-only import, divergence protection |
-| Service | Multi-project HTTP/TCP REST server **planned; not yet implemented** |
+| Service | Qt QHttpServer TCP service with durable multi-project catalogue, project create/list/read, branches, heads, history and revision metadata |
 | Administrative access policy | Provisional UUID-based users/groups/roles/grants library and local CLI, **not currently enforced by any service** |
 
 These are engineering capabilities, **not a production-readiness claim**. See [limitations and roadmap](docs/roadmap.md).
 
 ## Build and tests
 
-Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries and a POSIX filesystem with `flock`, `fsync`, `rename`, `pread` and `pwrite`. Qt6 Core and the pinned `AOWIS-SERVER-MODEL` submodule are required for typed model serialization and hydraulic persistence; the generic byte store can build without Qt.
+Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries and a POSIX filesystem with `flock`, `fsync`, `rename`, `pread` and `pwrite`. Qt6 Core and the pinned `AOWIS-SERVER-MODEL` submodule are required for typed model serialization and hydraulic persistence; Qt6 Network and HttpServer are additionally required for the HTTP executable; the generic byte store can build without Qt.
 
 ```bash
 ./git_submodule_init.sh          # on initial checkout, if the Model submodule is not initialized
@@ -57,7 +57,7 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
-When `AOWIS_NATIVE_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. A REST server and its HTTP integration tests will be added separately.
+When `AOWIS_NATIVE_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. The project catalogue and HTTP route integration suites are included when their dependencies are enabled.
 
 Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraulic`. The public namespaces are `aowis::native` and `aowis::native::hydraulic`.
 
@@ -75,6 +75,8 @@ repository.createBranch("main");
 // loadHydraulicNetwork(), editHydraulicNetwork() and mergeHydraulicBranches()
 // with the canonical AOWIS NetworkHydraulic model.
 ```
+
+The project catalogue is also available as `AOWIS::NativeProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-db` (binds to 127.0.0.1:8755, project storage `./aowis-db-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/db-http-api.yaml) documents implemented routes.
 
 For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).
 
@@ -103,7 +105,7 @@ Portable bundles exchange immutable branches between independent repositories, i
   /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The **bundle format and validation algorithms are implemented today**; HTTP transfer endpoints will expose them when the REST service is built. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The **bundle format and validation algorithms are implemented today**; HTTP transfer endpoints will expose them in a later service stage. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 
@@ -123,18 +125,18 @@ The native test suite includes `aowis-native-recovery-tests`. It links a **separ
 
 These tests exercise deterministic software failure paths; they cannot by themselves establish durability under a real electrical outage or failing storage device. Device-level crash testing, prolonged disk-full conditions and production recovery procedures still need verification.
 
-## Intended REST server (not yet implemented)
+## HTTP/TCP project service
 
 The chosen server design is:
 
 - **`aowis-server-db`**, built on **Qt QHttpServer**, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
 - **Multiple projects**, each identified by UUID and owning an independent native versioned repository, managed by one process. Clients never supply server filesystem paths as project identifiers.
-- Versioned REST resources for projects, branches, revisions, hydraulic networks/entities, merges/conflicts and full/incremental synchronization; JSON for normal operations and binary streams for large data.
+- Implemented versioned REST resources for projects, branches and revision metadata, with JSON responses. Hydraulic networks/entities, merges/conflicts and binary full/incremental synchronization are future API additions.
 - Revision-pinned hydraulic network/entity/membership reads (including historical APIs) and optimistic revision-head checks for mutations, preventing mixed snapshots and silent concurrent overwrites.
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
-- File-based synchronization and direct native C++ library access remain supported alongside the planned REST service.
+- File-based synchronization and direct native C++ library access remain supported alongside the HTTP project service.
 
-The route examples and open decisions are in [REST API design](docs/rest-api-design.md), and the implementation sequencing is in [roadmap](docs/roadmap.md). **No REST server executable or routes are currently implemented.**
+The initial project/branch/revision API is implemented; HTTP model edits, merging and synchronization are planned. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/db-http-api.yaml) and the [roadmap](docs/roadmap.md).
 
 ## Documentation
 
@@ -143,7 +145,7 @@ The route examples and open decisions are in [REST API design](docs/rest-api-des
 | [Architecture](docs/architecture.md) | Logical storage, physical formats, durability and limits |
 | [REST API design](docs/rest-api-design.md) | Agreed service boundaries, proposed resources and wire contracts |
 | [Roadmap](docs/roadmap.md) | Remaining implementation work |
-| [Database service design](docs/native-database-service.md) | Planned service architecture and operational requirements |
+| [Database service](docs/native-database-service.md) | Implemented multi-project HTTP service, configuration, catalogue and endpoints |
 | [Hydraulic model](docs/native-hydraulic-network.md) | Persistence, entity queries, indexed editing, validation |
 | [Canonical serialization](docs/canonical-model-codec.md) | Model codec/schema contract |
 | [Model records](docs/model-records.md) | Generic typed envelope and reference index |

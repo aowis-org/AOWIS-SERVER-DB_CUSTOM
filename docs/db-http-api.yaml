@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: AOWIS Native Database Service API
+  version: 1.0.0
+  description: Initial project/catalogue/branch/history API. Hydraulic edits, merges and sync are not yet exposed over HTTP.
+servers:
+  - url: http://127.0.0.1:8755/api/v1
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        '200': {description: Server process is responding}
+  /ready:
+    get:
+      operationId: readiness
+      responses:
+        '200': {description: Catalogue is available}
+        '503': {description: Catalogue unavailable}
+  /projects:
+    get:
+      operationId: listProjects
+      responses:
+        '200':
+          description: Published projects ordered by UUID
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects:
+                    type: array
+                    items: {$ref: '#/components/schemas/Project'}
+    post:
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: {type: string, minLength: 1, maxLength: 200}
+                storage: {type: string, enum: [pack, blocks]}
+      responses:
+        '201':
+          description: Project and initial main branch published
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/{projectId}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    get:
+      operationId: getProject
+      responses:
+        '200':
+          description: Project metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    get:
+      operationId: listBranches
+      responses:
+        '200':
+          description: Branch names
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [branches]
+                properties:
+                  branches:
+                    type: array
+                    items: {type: string}
+    post:
+      operationId: createBranch
+      description: Creates an empty branch, forks the current head of fromBranch, or forks a specified reachable immutable revision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: {type: string, pattern: '^[a-zA-Z0-9_-]{1,96}$'}
+                fromBranch: {type: string, pattern: '^[a-zA-Z0-9_-]{1,96}$'}
+                revision: {$ref: '#/components/schemas/RevisionHash'}
+      responses:
+        '201':
+          description: New branch head
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Revision'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/branches/{branch}/head:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+    get:
+      operationId: getBranchHead
+      responses:
+        '200':
+          description: Current branch revision
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Revision'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches/{branch}/history:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - name: limit
+        in: query
+        schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+      - name: after
+        in: query
+        schema: {$ref: '#/components/schemas/RevisionHash'}
+    get:
+      operationId: getHistory
+      description: First-parent chain, newest first. Cursor exclusive and must belong to this branch's first-parent chain.
+      responses:
+        '200':
+          description: Revision page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revisions]
+                properties:
+                  revisions:
+                    type: array
+                    items: {$ref: '#/components/schemas/Revision'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/{projectId}/revisions/{revisionHash}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - name: revisionHash
+        in: path
+        required: true
+        schema: {$ref: '#/components/schemas/RevisionHash'}
+    get:
+      operationId: getRevision
+      responses:
+        '200':
+          description: Immutable revision metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Revision'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+components:
+  schemas:
+    RevisionHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+    Project:
+      type: object
+      required: [id, name, storage]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        storage: {type: string, enum: [pack, blocks]}
+    Revision:
+      type: object
+      required: [id, root, referencesRoot, modelIndexed, parents]
+      properties:
+        id: {$ref: '#/components/schemas/RevisionHash'}
+        root: {$ref: '#/components/schemas/RevisionHash'}
+        referencesRoot: {$ref: '#/components/schemas/RevisionHash'}
+        modelIndexed: {type: boolean}
+        parents:
+          type: array
+          items: {$ref: '#/components/schemas/RevisionHash'}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}
+  parameters:
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    Branch:
+      name: branch
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-zA-Z0-9_-]{1,96}$'}
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Conflict:
+      description: A resource already exists or revision conflict
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}

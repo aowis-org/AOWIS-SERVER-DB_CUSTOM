@@ -1,26 +1,66 @@
-# AOWIS database service — planned HTTP architecture
+# Native database HTTP/TCP service
 
-**Status: not implemented.** The repository provides a native C++ engine and model/merge/synchronization APIs, but currently builds **no database HTTP service executable**. REST/TCP endpoints described here are a design contract, not callable endpoints. The canonical route proposal is [REST API design](rest-api-design.md).
+`aowis-server-db` hosts independent AOWIS versioned project repositories in one process. The REST transport uses Qt QHttpServer; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::NativeProjectService` and `AOWIS::NativeHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
 
-## Server role
+## Build
 
-- A single executable named `aowis-server-db` will serve multiple independent project repositories through **Qt QHttpServer** over ordinary HTTP/TCP.
-- A configurable bind address and port will control where the server listens. TLS/HTTPS and authentication/authorization will not be implemented in the initial service; those belong to the future AOWIS-wide security architecture.
-- The server will own a durable catalogue of project UUIDs, names and server-controlled repository directories. Clients select projects by UUID, never by raw filesystem path.
-- Native C++ APIs will remain independently callable from AOWIS standalone builds. REST handlers are transport adapters, not replacements for the engine.
+With Qt6 Core, Network and HttpServer installed, run:
 
-## Service behavior
+```bash
+./compile_linux.sh
+./compile_linux_tests.sh --both
+```
 
-The initial REST foundation should implement health, project create/list/read, branch create/list/fork and read-only revision browsing. Subsequent API work will expose hydraulic entity lookup, validated atomic edit batches, merge previews and explicit conflict resolution, and binary full/incremental bundle transfer.
+`AOWIS_NATIVE_WITH_HTTP_SERVER=ON` builds the executable and HTTP integration tests (the default when the model codec is enabled). A missing Qt HttpServer module causes an explicit CMake error. A native-only build uses `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF -DAOWIS_NATIVE_WITH_HTTP_SERVER=OFF`.
 
-Every edit or merge publication must carry an expected branch revision and be checked atomically. Imports must continue rejecting divergent branch overwrites, incomplete graphs and invalid object hashes. No handler may substitute superficial HTTP-level checks for canonical model validation.
+## Run
 
-## Repository lifecycle
+```bash
+./build-linux/aowis-server-db --config ./deploy/aowis-server-db.ini
+# Or override the INI settings:
+./build-linux/aowis-server-db --bind 127.0.0.1 --port 8755 --data-root ./db-data --backend pack
+```
 
-The service should manage open repository handles centrally, including the block backend's single-open-handle constraint. Project metadata and repository creation must have defined failure/rollback behavior. Offline compaction requires the affected repository to be closed and exclusive. Graceful shutdown, bounded HTTP payloads, project isolation, restart persistence and failure diagnostics require end-to-end tests.
+`QSettings` reads `server/bind`, `server/port`, `storage/root`, `storage/default_backend` and optional `logging/file` from an INI file. Defaults if absent: `127.0.0.1`, `8755`, `./aowis-db-data`, and `pack`; errors go to stderr when no log file is configured. `--log-file` (or `logging/file` in INI) appends C++ service diagnostics to a file, which must be writable by the service account. Log rotation is the administrator's responsibility. Explicit CLI arguments override INI values. Paths are relative to the server process's working directory unless absolute. The example INI and systemd service unit in `deploy/` use `/var/lib/aowis-db`; an administrator must create the `aowis-db` service account and install the files at the paths specified by the unit. Run `--help` for supported CLI options.
 
-## Configuration and deployment
+The service listens on plain HTTP, **without TLS, authentication or authorization**. Expose it only on deliberately trusted networks. A cross-AOWIS security design is planned separately. Health: `GET /api/v1/health`; readiness: `GET /api/v1/ready`.
 
-Define Qt QSettings INI configuration for bind address, port, project root/catalogue and logs, with Linux service defaults and explicit overrides. Include systemd deployment support, a maintained OpenAPI contract and HTTP integration tests with the service implementation.
+## Project catalogue and lifecycle
 
-**Security caveat:** The initially planned plain-HTTP server is deliberately unauthenticated and unencrypted. Anyone able to reach it will be able to use its API. It is for controlled development environments, not untrusted or sensitive production networks. Authentication and TLS will be designed across AOWIS later.
+The service root contains a lifetime-locked `catalogue.lock` and a `projects/` directory. Each project is a UUID-named directory with a small durable `project.meta` manifest and a `repository/` subdirectory. The manifest records the UUID, display name and physical backend; no client may specify a repository path. Projects are created under a temporary `.creating-<uuid>` directory with a fully initialized `main` branch; after file/directory synchronization an atomic rename publishes the project, followed by synchronization of the parent directory.
+
+An interrupted creation may leave a `.creating-...` directory which startup ignores. Incomplete staging directories are not considered projects; administrators may remove them while the server is shut down after inspecting them. Once published, valid manifests are required: startup fails on damaged or unexpected catalogue entries rather than silently ignoring projects. The catalogue is locked exclusively across processes. The service retains at most one native `Repository` handle per project and closes them on shutdown, preserving the block backend's single-handle restriction.
+
+The native project manager serializes catalogue operations for correctness; concurrency/throughput improvements are deferred to performance work. Do not run offline compaction while the service has a repository open. Repository directories are physical-backend-specific; a project cannot switch formats in place.
+
+If a disk error occurs immediately after catalogue publication, the service fails closed for subsequent operations; restart recovers the published directory if it exists and is complete. Project deletion and renaming are not exposed in this milestone.
+
+## Current HTTP operations
+
+See the machine-readable [OpenAPI contract](db-http-api.yaml) for request/response schemas and exact paths. The available endpoints are:
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/api/v1/health`, `/api/v1/ready` | Process and catalogue checks |
+| GET, POST | `/api/v1/projects` | List and create projects |
+| GET | `/api/v1/projects/{projectId}` | Read project metadata |
+| GET, POST | `/api/v1/projects/{projectId}/branches` | List and create/fork branches |
+| GET | `/api/v1/projects/{projectId}/branches/{branch}/head` | Read current revision |
+| GET | `/api/v1/projects/{projectId}/branches/{branch}/history` | First-parent revision history (limit 1–1000, optional exclusive `after` cursor) |
+| GET | `/api/v1/projects/{projectId}/revisions/{revisionHash}` | Read immutable revision metadata |
+
+Example:
+
+```bash
+curl -sS http://127.0.0.1:8755/api/v1/health
+curl -sS -H 'Content-Type: application/json' -d '{"name":"Water Distribution"}' \
+  http://127.0.0.1:8755/api/v1/projects
+```
+
+Project creation accepts `{"name":"...", "storage":"pack"}` (backend optional, default configured). Creating a branch accepts `{"name":"scenario"}` (new independent raw history), `{"name":"scenario","fromBranch":"main"}` (fork current head) or `{"name":"scenario","fromBranch":"main","revision":"<64-character-hash>"}` (fork a particular reachable revision). A historical fork never changes the source branch. Branch names are `[A-Za-z0-9_-]`, maximum 96 characters; project IDs are lowercase UUIDs. JSON mutation bodies are currently limited to 16 KiB after QHttpServer has received them. Responses use JSON and include machine-readable error codes.
+
+This is the **initial service foundation**: it does not yet expose hydraulic network reads/edits, merges, diffs, binary sync, project deletion or runtime compaction. These follow in subsequent milestones. Bounds on HTTP buffering and concurrent requests require further hardening before untrusted or production traffic; current payload checks occur after Qt has buffered the request.
+
+## Verification and integration tests
+
+`aowis-native-project-service-tests` covers both physical storage formats, catalogue restart, project isolation, staged creation debris, malformed manifests, invalid path/ID inputs, multiple project/branch operations, concurrent creation and cross-process locking. When Qt HttpServer is installed, `aowis-native-http-tests` exercises the routes over real localhost TCP with Qt Network, including error codes, CRUD, pagination and restart. Both are part of `./compile_linux_tests.sh --both`.

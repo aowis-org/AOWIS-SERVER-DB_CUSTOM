@@ -1,6 +1,6 @@
-# AOWIS database REST API — agreed direction, planned interface
+# AOWIS database REST API — implemented foundation and next capabilities
 
-**Status: design, not implementation.** There is currently no database HTTP server executable or listening endpoint. The native storage and offline sync libraries are implemented; the project-scoped REST routes below are not. See [service design](native-database-service.md) for deployment and lifecycle requirements.
+**Status:** Project/catalogue, branch, head, history and immutable revision routes are implemented in the `aowis-server-db` executable. The machine-readable [OpenAPI contract](db-http-api.yaml) and [service documentation](native-database-service.md) describe exactly what is available. Hydraulic routes, merge APIs, diff and HTTP synchronization below remain planned.
 
 ## Goals and deployment
 
@@ -14,11 +14,11 @@
 
 ## Resources and suggested routes
 
-These route shapes are a **proposed contract**. Response bodies, pagination details and endpoint names should be finalized with tests and OpenAPI documentation before clients depend on them. The `/api/v1` prefix versions the HTTP interface, **not the model serialization format**.
+The service health, project, branch and revision metadata rows are implemented and documented by OpenAPI. The remaining rows are planned, not callable yet. The `/api/v1` prefix versions the HTTP interface, **not the model serialization format**.
 
 | Operation | Proposed method and route |
 |---|---|
-| Service health | `GET /api/v1/health` |
+| Service health and readiness | `GET /api/v1/health`, `GET /api/v1/ready` |
 | List projects | `GET /api/v1/projects` |
 | Create project | `POST /api/v1/projects` |
 | Read project details | `GET /api/v1/projects/{projectId}` |
@@ -55,7 +55,7 @@ A proposed incremental export supplies a known base revision, for example as a `
 - Persist a server-side **project catalogue** mapping UUIDs to administrator-controlled repository directories. The catalogue storage format, project metadata fields and project-create atomicity still need a concrete design and tests.
 - Decide and document repository-handle lifetime, the block backend's single-handle constraint, concurrent request handling, graceful shutdown and safe offline maintenance. Never promise online compaction before it is implemented.
 - Use configuration for bind address, port, project data root and logging; align with other AOWIS servers' conventions rather than invent per-request filesystem routing.
-- Generate an **OpenAPI specification** from the implemented contract (or maintain one alongside code) and exercise it with HTTP integration tests across both physical backends.
+- Maintain the [OpenAPI specification](db-http-api.yaml) alongside implemented endpoints and test them over real local TCP on both physical backends.
 - Keep a storage-agnostic native C++ façade so embedding the database in the AOWIS standalone build does not require TCP/HTTP.
 
 ## Deferred security
@@ -66,4 +66,4 @@ An AOWIS-wide security design will later specify identity/session lifecycle, tru
 
 ## Implementation sequence
 
-See [roadmap](roadmap.md). The first implementation milestone introduces the configurable TCP/HTTP service and a multi-project catalogue on top of the existing native libraries. Model operations and HTTP synchronization follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.
+See [roadmap](roadmap.md). The configurable TCP/HTTP service and durable multi-project catalogue have been implemented. Model operations and HTTP synchronization follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.

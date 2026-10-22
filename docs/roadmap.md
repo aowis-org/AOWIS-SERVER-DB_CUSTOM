@@ -1,6 +1,6 @@
 # AOWIS Versioned Model Database — development roadmap
 
-The AOWIS database has one native storage engine, usable directly as a C++ library and, eventually, through a multi-project HTTP/TCP service. This roadmap prioritizes database correctness and recovery before introducing the network service.
+The AOWIS database has one native storage engine, usable directly as a C++ library and through an initial multi-project HTTP/TCP service. This roadmap prioritizes correctness and recovery while expanding network functionality.
 
 ## Current baseline
 
@@ -8,7 +8,7 @@ The repository implements immutable SHA-256 objects, copy-on-write Merkle UUID t
 
 Bundle imports check object hashes, reachable object types and graph completeness; they also validate canonical Merkle structure, including UUID-to-path correspondence, compressed prefixes, branch depth ordering, child slots and nonzero leaf targets. These validations precede object publication on both backends. Model-indexed imported revisions additionally require canonical model references, existing dependency targets, and exact equivalence between model-derived edges and the reverse-reference index (including historical and incremental revisions). The same generic logical validator is now available for existing repositories, with physical + logical verification the default mode of `aowis-native-verify`. Full native checks deliberately do not claim application-specific hydraulic semantic validation.
 
-The HTTP service executable is not yet implemented. The provisional access-policy library is not part of the planned HTTP service authorization model.
+The initial multi-project HTTP service executable is implemented, with project/catalogue, branch and history endpoints. Hydraulic operations and online replication remain future milestones. The provisional access-policy library is not part of the planned HTTP service authorization model.
 
 ## Implementation order
 
@@ -40,12 +40,13 @@ The HTTP service executable is not yet implemented. The provisional access-polic
 - **Fixed:** a failed pack compaction after switching the generation pointer could leave a writable handle bound to the old pack. After a post-switch error, either backend now requires reopening; the recovery suite exercises this on the original handle.
 - **Still required:** real power-loss tests (including filesystem cache/device behavior), sustained disk-exhaustion scenarios and a documented external backup/restore operational procedure. Deterministic process termination and injected `ENOSPC` cannot prove power-failure durability across every filesystem or storage device.
 
-### 5. Multi-project HTTP server
+### 5. Multi-project HTTP server — implemented foundation
 
-- Implement `aowis-server-db` using Qt QHttpServer with configurable bind address and TCP port.
-- Add a durable project catalogue, repository lifecycle manager, branch/project management and readiness endpoints.
-- Keep the native engine available as a direct C++ library and make HTTP handlers use the same application operations.
-- Defer authentication, authorization and transport TLS to the planned AOWIS-wide security architecture.
+- Implemented `aowis-server-db` using Qt QHttpServer, configurable INI/CLI bind address, port, data root and default storage backend.
+- Implemented durable UUID-named project catalogue, atomic staged publication, restart/locking checks, native C++ project manager, project and branch routes, history and readiness endpoints.
+- The native engine and `AOWIS::NativeProjectService` remain callable directly without Qt; HTTP adapters use the same project manager.
+- Authentication, authorization and transport TLS remain outside this service until the planned AOWIS-wide security architecture.
+- Real TCP HTTP tests are included for Qt-enabled builds; requests are JSON-validated but size limits currently apply after Qt buffering. Further bounds, model routes, merge and synchronization are separate milestones.
 
 ### 6. Native model, history and merge REST API
 

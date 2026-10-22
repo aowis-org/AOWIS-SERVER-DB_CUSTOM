@@ -1,6 +1,6 @@
 # Native database architecture
 
-AOWIS uses a content-addressed C++ model database. Its core is a reusable library and the storage foundation of the planned multi-project HTTP service. This repository owns model serialization and uses `AOWIS-SERVER-MODEL` for canonical model types.
+AOWIS uses a content-addressed C++ model database. Its core is a reusable library and the storage foundation of the implemented multi-project HTTP service. This repository owns model serialization and uses `AOWIS-SERVER-MODEL` for canonical model types.
 
 ## Layers
 
@@ -8,7 +8,7 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 2. **Domain persistence:** the hydraulic adapter validates `NetworkHydraulic`, persists network metadata, up to 256 ordered UUIDs per membership chunk, and one independently addressed record per top-level entity.
 3. **Logical object store:** content-addressed immutable values, compressed 16-way UUID Merkle trie, persistent reverse-reference index, revision DAG and named branch refs.
 4. **Physical store:** default append-only object pack with derived index; optional block-packed backend. Both represent the same logical objects and revisions, but their directories cannot be mixed.
-5. **Service boundary (planned):** a Qt QHttpServer REST application over HTTP/TCP managing multiple project repositories. No server executable exists yet; native storage and model APIs are already usable directly from C++. The service will not change stored model identities.
+5. **Service boundary:** `aowis-server-db` uses Qt QHttpServer over HTTP/TCP with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Only catalogue/branch/history operations are HTTP-accessible so far.
 
 ## Logical identities and history
 
@@ -49,7 +49,7 @@ Object records use an `AOBJ` header and typed canonical bytes. Index entries con
 
 ## Concurrency and physical limits
 
-Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. The block backend permits one open repository handle at a time. An HTTP service managing multiple projects must own/manage their repository handles centrally, rather than repeatedly opening competing handles. The database and server are Linux/POSIX-oriented and not yet production hardened.
+Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. The block backend permits one open repository handle at a time. The HTTP service owns/manages one repository handle per project centrally, avoiding competing block-backend handles. The database and server are Linux/POSIX-oriented and not yet production hardened.
 
 ## Replication independence
 
@@ -60,6 +60,6 @@ Portable `.aowbundle` files contain a complete reachable branch graph or a delta
 - `aowis::native::Repository` — low-level storage, history, compaction, bundles and generic merges.
 - `aowis::native::ModelCodec<T>` — typed serialization.
 - `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
-- Planned `aowis-server-db` REST handlers — thin adapters calling these libraries, **not an independent persistence system**.
+- Implemented `aowis-server-db` catalogue/branch/history handlers — thin Qt transport adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. Model edit/merge/sync HTTP operations follow.
 
 The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [roadmap](roadmap.md).

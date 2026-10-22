@@ -1,0 +1,16 @@
+[Unit]
+Description=AOWIS native versioned database HTTP server
+After=network.target
+
+[Service]
+Type=simple
+User=aowis-db
+Group=aowis-db
+StateDirectory=aowis-db
+ExecStart=/usr/local/bin/aowis-server-db --config /etc/aowis/server-db.ini
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
