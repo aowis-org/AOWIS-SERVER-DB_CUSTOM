@@ -381,4 +381,12 @@ Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
     }
 }
 
+
+void ProjectService::withRepository(std::string_view projectId,
+                                    const std::function<void(Repository&)>& action) {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    Repository& repository = *repositoryEntry(projectId).repository;
+    action(repository);
+}
+
 } // namespace aowis::native

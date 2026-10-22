@@ -70,6 +70,34 @@ void exerciseBackend(PhysicalStore backend) {
         service.createBranch(firstId, "independent");
         require(service.listBranches(firstId).size() == 3, "missing new branch");
         require(service.listBranches(secondId).size() == 1, "projects are not isolated");
+        // The model HTTP adapter's scoped native callback shares the exact
+        // project handle and serializes access without exposing its lifetime.
+        aowis::native::Key modelKey{};
+        modelKey[0] = 0x91;
+        aowis::native::Hash modelRevision{};
+        service.withRepository(firstId, [&](aowis::native::Repository& repository) {
+            aowis::native::ModelRecord record;
+            record.kind = 31;
+            record.payload = {1, 3, 5};
+            modelRevision = repository.commitModel("main", {{modelKey, record}}, firstHead).id;
+            require(repository.getModel("main", modelKey).has_value(),
+                    "scoped repository callback did not persist model record");
+        });
+        require(modelRevision != firstHead && service.head(firstId, "main").id == modelRevision,
+                "scoped repository callback lost the model commit");
+        require(service.head(secondId, "main").id == firstHead,
+                "scoped model commit leaked across project boundaries");
+        expectError([&] {
+            service.withRepository("../../wrong", [](aowis::native::Repository&) {});
+        }, ProjectErrorKind::InvalidInput);
+        bool callbackFailure = false;
+        try {
+            service.withRepository(firstId, [](aowis::native::Repository&) {
+                throw std::runtime_error("intentional callback failure");
+            });
+        } catch (const std::runtime_error&) { callbackFailure = true; }
+        require(callbackFailure && service.head(firstId, "main").id == modelRevision,
+                "failing scoped callback left catalogue locked or corrupted");
         expectError([&]{ service.createBranch(firstId, "design"); }, ProjectErrorKind::Conflict);
         expectError([&]{ service.project("../../etc/passwd"); }, ProjectErrorKind::InvalidInput);
         expectError([&]{ service.project("00000000-0000-4000-8000-000000000000"); }, ProjectErrorKind::NotFound);

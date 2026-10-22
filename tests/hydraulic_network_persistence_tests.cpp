@@ -2370,6 +2370,59 @@ void exerciseSnapshotReads(native::PhysicalStore physical) {
     std::filesystem::remove_all(folder, ignored);
 }
 
+// Explicit caller-provided optimistic pins must survive the entire adapter
+// preparation path and reach the store's atomic compare-and-publish boundary.
+void exerciseCallerPinnedWrites(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        native::Repository repository(folder, physical);
+        repository.createBranch("main");
+        NetworkHydraulic network = completeNetwork();
+        const native::Hash emptyHead = repository.head("main").id;
+        const native::Revision initial = hydraulic::saveHydraulicNetwork(
+            repository, "main", network, emptyHead);
+        require(initial.id != emptyHead, "caller-pinned first save did not commit");
+        bool staleRejected = false;
+        try {
+            (void)hydraulic::saveHydraulicNetwork(repository, "main", network, emptyHead);
+        } catch (const std::runtime_error&) { staleRejected = true; }
+        require(staleRejected && repository.head("main").id == initial.id,
+                "stale full-network save was accepted");
+
+        HydraulicNodeJunction updated = network.nodes_junctions[0];
+        updated.elevation_m += 2.0;
+        const std::vector<hydraulic::HydraulicEntityChange> changes{
+            {updated.uuid, hydraulic::HydraulicEntity{updated}}};
+        const native::Revision edited = hydraulic::editHydraulicNetwork(
+            repository, "main", network.uuid, changes, nullptr, initial.id);
+        require(edited.id != initial.id, "caller-pinned edit did not commit");
+        staleRejected = false;
+        try {
+            (void)hydraulic::editHydraulicNetwork(repository, "main", network.uuid,
+                                                  changes, nullptr, initial.id);
+        } catch (const std::runtime_error&) { staleRejected = true; }
+        require(staleRejected && repository.head("main").id == edited.id,
+                "stale indexed edit was accepted");
+        staleRejected = false;
+        try {
+            (void)hydraulic::editHydraulicNetwork(repository, "main", network.uuid,
+                                                  {}, nullptr, initial.id);
+        } catch (const std::runtime_error&) { staleRejected = true; }
+        require(staleRejected && repository.head("main").id == edited.id,
+                "stale empty edit was accepted");
+        const native::Revision noop = hydraulic::editHydraulicNetwork(
+            repository, "main", network.uuid, {}, nullptr, edited.id);
+        require(noop.id == edited.id && repository.verifyRepository().revisions >= 3,
+                "valid pinned no-op changed history or damaged repository");
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2393,6 +2446,8 @@ int main(int argc, char** argv) {
         exerciseCoordinatedMembershipMerges(native::PhysicalStore::ExperimentalBlocks);
         exerciseSnapshotReads(native::PhysicalStore::Stage7Pack);
         exerciseSnapshotReads(native::PhysicalStore::ExperimentalBlocks);
+        exerciseCallerPinnedWrites(native::PhysicalStore::Stage7Pack);
+        exerciseCallerPinnedWrites(native::PhysicalStore::ExperimentalBlocks);
         std::cout << "Complete hydraulic network persistence tests passed on both backends\n";
         return 0;
     } catch (const std::exception& failure) {

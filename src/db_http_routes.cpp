@@ -1,5 +1,14 @@
 #include "aowis/native/db_http_routes.h"
 
+#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+#include "aowis/native/hydraulic_network_persistence.h"
+#include <QByteArray>
+#include <QUuid>
+#include <variant>
+#include <type_traits>
+#endif
+
+
 #include <QHttpServer>
 #include <QHttpServerRequest>
 #include <QHttpServerResponse>
@@ -8,8 +17,12 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QUrlQuery>
+#include <QUuid>
 
 #include <iostream>
+#include <algorithm>
+#include <cstdint>
+#include <set>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -51,10 +64,10 @@ void requireInput(bool valid, const char* message) {
     if (!valid) throw ProjectError(ProjectErrorKind::InvalidInput, message);
 }
 
-QJsonObject parseBody(const QHttpServerRequest& request) {
+QJsonObject parseBody(const QHttpServerRequest& request, qsizetype maxBytes = 16 * 1024) {
     const QByteArray body = request.body();
-    requireInput(!body.isEmpty() && body.size() <= 16 * 1024,
-                 "request body must contain at most 16 KiB of JSON");
+    requireInput(!body.isEmpty() && body.size() <= maxBytes,
+                 "request body is empty or exceeds the endpoint size limit");
     QJsonParseError error;
     const QJsonDocument document = QJsonDocument::fromJson(body, &error);
     requireInput(error.error == QJsonParseError::NoError && document.isObject(),
@@ -78,7 +91,9 @@ Hash parseHash(const QString& value) {
     for (char character : utf8)
         requireInput((character >= '0' && character <= '9') ||
                      (character >= 'a' && character <= 'f'), "invalid revision hash");
-    return fromHex(utf8);
+    const Hash parsed = fromHex(utf8);
+    requireInput(parsed != Hash{}, "zero revision hash is invalid");
+    return parsed;
 }
 
 QJsonObject revisionJson(const Revision& revision) {
@@ -97,6 +112,182 @@ QJsonObject projectJson(const ProjectInfo& project) {
                        {"storage", project.storage == PhysicalStore::Stage7Pack ?
                                     QStringLiteral("pack") : QStringLiteral("blocks")}};
 }
+
+
+
+QString hashString(const Hash& hash) {
+    return QString::fromStdString(toHex(hash));
+}
+
+QJsonValue optionalHashJson(const std::optional<Hash>& hash) {
+    return hash ? QJsonValue(hashString(*hash)) : QJsonValue(QJsonValue::Null);
+}
+
+void requireBranch(Repository& repository, const std::string& branch) {
+    requireInput(ProjectService::validBranchName(branch), "invalid branch name");
+    const std::vector<std::string> branches = repository.listBranches();
+    if (std::find(branches.begin(), branches.end(), branch) == branches.end())
+        throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
+}
+
+Revision checkedRevision(Repository& repository, const Hash& id) {
+    try { return repository.revision(id); }
+    catch (const std::runtime_error& error) {
+        if (std::string_view(error.what()).find("referenced content") != std::string_view::npos)
+            throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
+        throw;
+    }
+}
+
+// A client-selected revision may be historical; it is always looked up within
+// the selected project and never through an untrusted filesystem path.
+Hash revisionForRead(Repository& repository, const std::string& branch,
+                     const QHttpServerRequest& request) {
+    requireBranch(repository, branch);
+    const QUrlQuery query = request.query();
+    if (!query.hasQueryItem("revision")) return repository.head(branch).id;
+    const Hash revisionId = parseHash(query.queryItemValue("revision"));
+    (void)checkedRevision(repository, revisionId);
+    return revisionId;
+}
+
+#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+using HydraulicEntity = hydraulic::HydraulicEntity;
+
+QUuid parseUuid(const QString& value) {
+    requireInput(value.size() == 36, "UUID must be canonical lowercase without braces");
+    const QUuid uuid(value);
+    requireInput(!uuid.isNull() && uuid.toString(QUuid::WithoutBraces) == value,
+                 "invalid canonical UUID");
+    return uuid;
+}
+
+QString uuidString(const QUuid& uuid) {
+    return uuid.toString(QUuid::WithoutBraces);
+}
+
+QByteArray decodePayload(const QJsonObject& object, const QString& field,
+                         qsizetype maxEncoded = 8 * 1024 * 1024) {
+    requireInput(object.value(field).isString(), "missing base64 payload");
+    const QByteArray encoded = object.value(field).toString().toLatin1();
+    requireInput(encoded.size() <= maxEncoded, "base64 payload exceeds size limit");
+    const QByteArray::FromBase64Result decoded = QByteArray::fromBase64Encoding(
+        encoded, QByteArray::AbortOnBase64DecodingErrors);
+    requireInput(static_cast<bool>(decoded), "invalid base64 payload");
+    return decoded.decoded;
+}
+
+QString encodePayload(const QByteArray& bytes) {
+    return QString::fromLatin1(bytes.toBase64());
+}
+
+template <std::size_t Index = 0>
+HydraulicEntity decodeEntity(std::size_t requested, const QByteArray& payload) {
+    if constexpr (Index < std::variant_size_v<HydraulicEntity>) {
+        if (requested == Index) {
+            using Type = std::variant_alternative_t<Index, HydraulicEntity>;
+            QString error;
+            std::optional<Type> entity = ModelCodec<Type>::decode(payload, &error);
+            requireInput(entity.has_value(), "invalid canonical hydraulic entity payload");
+            return HydraulicEntity{std::move(*entity)};
+        }
+        return decodeEntity<Index + 1>(requested, payload);
+    } else {
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid hydraulic entity type");
+    }
+}
+
+QByteArray encodeEntity(const HydraulicEntity& entity) {
+    return std::visit([]<typename Type>(const Type& item) {
+        return ModelCodec<Type>::encode(item);
+    }, entity);
+}
+
+QUuid entityUuid(const HydraulicEntity& entity) {
+    return std::visit([]<typename Type>(const Type& item) {
+        return item.uuid;
+    }, entity);
+}
+
+Hash requiredExpectedHead(const QJsonObject& object) {
+    return parseHash(QString::fromStdString(requiredString(object, "expectedHead")));
+}
+
+void enforceHead(Repository& repository, const std::string& branch, const Hash& expected) {
+    requireBranch(repository, branch);
+    if (repository.head(branch).id != expected)
+        throw ProjectError(ProjectErrorKind::Conflict, "branch head does not match expectedHead");
+}
+
+// The underlying hydraulic adapter also checks expectedHead during atomic
+// publication. This precheck only improves the HTTP error response.
+template <typename Function>
+void hydraulicWrite(Function&& function) {
+    try { function(); }
+    catch (const ProjectError&) { throw; }
+    catch (const std::invalid_argument& error) {
+        throw ProjectError(ProjectErrorKind::InvalidInput, error.what());
+    }
+    catch (const std::runtime_error& error) {
+        const std::string message(error.what());
+        if (message.find("branch head changed") != std::string::npos ||
+            message.find("branch advanced") != std::string::npos ||
+            message.find("branch tip") != std::string::npos)
+            throw ProjectError(ProjectErrorKind::Conflict, message);
+        // Hydraulic validation and incompatible edit/merge choices are
+        // expected client errors; I/O and corruption failures remain 500.
+        if (message.starts_with("invalid ") || message.starts_with("cannot edit ") ||
+            message.starts_with("hydraulic ") || message.starts_with("duplicate ") ||
+            message.starts_with("null, network-owned") ||
+            message.starts_with("cannot delete referenced model UUID") ||
+            message.starts_with("model reference target") ||
+            message.starts_with("cannot commit model records") ||
+            message.find("merge contains unused") != std::string::npos ||
+            message.starts_with("cannot select both object and fields"))
+            throw ProjectError(ProjectErrorKind::InvalidInput, message);
+        throw;
+    }
+}
+
+QJsonObject diagnosticJson(const hydraulic::HydraulicEditDiagnostics& diagnostics) {
+    return QJsonObject{{"indexedScalarFastPath", diagnostics.indexedScalarFastPath},
+                       {"indexedTopologyFastPath", diagnostics.indexedTopologyFastPath},
+                       {"indexedMembershipFastPath", diagnostics.indexedMembershipFastPath},
+                       {"indexedCatalogueFastPath", diagnostics.indexedCatalogueFastPath},
+                       {"indexedPhysicalFastPath", diagnostics.indexedPhysicalFastPath},
+                       {"indexedDependentUpdateFastPath", diagnostics.indexedDependentUpdateFastPath},
+                       {"validatedEntities", static_cast<qint64>(diagnostics.validatedEntities)}};
+}
+
+hydraulic::HydraulicMergeSide mergeSide(const QJsonValue& value) {
+    requireInput(value.isString() && (value.toString() == "target" || value.toString() == "source"),
+                 "merge side must be target or source");
+    return value.toString() == "target" ? hydraulic::HydraulicMergeSide::Target :
+                                          hydraulic::HydraulicMergeSide::Source;
+}
+
+QJsonObject mergeJson(const MergeResult& result) {
+    QString status = QStringLiteral("up_to_date");
+    switch (result.status) {
+    case MergeStatus::UpToDate: break;
+    case MergeStatus::FastForward: status = QStringLiteral("fast_forward"); break;
+    case MergeStatus::Merged: status = QStringLiteral("merged"); break;
+    case MergeStatus::Conflicts: status = QStringLiteral("conflicts"); break;
+    }
+    QJsonArray conflicts;
+    for (const MergeConflict& conflict : result.conflicts) {
+        conflicts.append(QJsonObject{{"uuid", uuidString(hydraulic::uuidFromKey(conflict.key))},
+                                     {"base", optionalHashJson(conflict.base)},
+                                     {"target", optionalHashJson(conflict.target)},
+                                     {"source", optionalHashJson(conflict.source)},
+                                     {"reason", QString::fromStdString(conflict.reason)}});
+    }
+    return QJsonObject{{"status", status}, {"base", hashString(result.base)},
+                       {"targetBefore", hashString(result.targetBefore)},
+                       {"sourceHead", hashString(result.sourceHead)},
+                       {"revision", revisionJson(result.revision)}, {"conflicts", conflicts}};
+}
+#endif
 
 } // namespace
 
@@ -198,6 +389,264 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             return QHttpServerResponse(revisionJson(service.revision(id.toStdString(), parseHash(hash))));
         });
     });
+    // Diffs are immutable revision-to-revision comparisons, never two moving heads.
+    server.route("/api/v1/projects/<arg>/diff", QHttpServerRequest::Method::Get,
+                 [&service](const QString& id, const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QUrlQuery query = request.query();
+            requireInput(query.hasQueryItem("from") && query.hasQueryItem("to"),
+                         "diff requires from and to revision hashes");
+            const Hash from = parseHash(query.queryItemValue("from"));
+            const Hash to = parseHash(query.queryItemValue("to"));
+            QJsonArray differences;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                (void)checkedRevision(repository, from);
+                (void)checkedRevision(repository, to);
+                const std::vector<Difference> changes = repository.diffRevisions(from, to);
+                requireInput(changes.size() <= 1000,
+                             "diff exceeds 1000 records; use native library for large diffs");
+                for (const Difference& item : changes) {
+                    const QByteArray bytes(reinterpret_cast<const char*>(item.key.data()),
+                                           static_cast<qsizetype>(item.key.size()));
+                    const QUuid uuid = QUuid::fromRfc4122(bytes);
+                    differences.append(QJsonObject{{"uuid", uuid.toString(QUuid::WithoutBraces)},
+                                                   {"before", optionalHashJson(item.before)},
+                                                   {"after", optionalHashJson(item.after)}});
+                }
+            });
+            return QHttpServerResponse(QJsonObject{{"from", hashString(from)},
+                                                   {"to", hashString(to)},
+                                                   {"changes", differences}});
+        });
+    });
+#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+    // Snapshot-pinned complete hydraulic network. NetworkHydraulic uses the
+    // shared canonical model codec, never a second JSON field serializer.
+    server.route("/api/v1/projects/<arg>/branches/<arg>/networks/<arg>",
+                 QHttpServerRequest::Method::Get,
+                 [&service](const QString& id, const QString& branch,
+                            const QString& network, const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QUuid networkUuid = parseUuid(network);
+            QJsonObject result;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                const Hash revisionId = revisionForRead(repository, branch.toStdString(), request);
+                const Revision snapshot = repository.revision(revisionId);
+                if (!snapshot.modelIndexed) {
+                    if (snapshot.root == Hash{})
+                        throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
+                    throw ProjectError(ProjectErrorKind::InvalidInput, "revision is not model-indexed");
+                }
+                QString error;
+                const std::optional<NetworkHydraulic> loaded =
+                    hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkUuid, &error);
+                if (!loaded) {
+                    if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
+                    throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
+                }
+                result = QJsonObject{{"revision", hashString(revisionId)},
+                                     {"uuid", uuidString(networkUuid)},
+                                     {"payloadBase64", encodePayload(ModelCodec<NetworkHydraulic>::encode(*loaded))}};
+            });
+            return QHttpServerResponse(result);
+        });
+    });
+    server.route("/api/v1/projects/<arg>/branches/<arg>/networks", QHttpServerRequest::Method::Post,
+                 [&service](const QString& id, const QString& branch, const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QJsonObject object = parseBody(request, 8 * 1024 * 1024);
+            requireKeys(object, {"expectedHead", "payloadBase64"});
+            const Hash expected = requiredExpectedHead(object);
+            QString error;
+            const std::optional<NetworkHydraulic> network = ModelCodec<NetworkHydraulic>::decode(
+                decodePayload(object, "payloadBase64"), &error);
+            requireInput(network.has_value() && !network->uuid.isNull(),
+                         "invalid canonical hydraulic network payload");
+            Revision committed;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                enforceHead(repository, branch.toStdString(), expected);
+                hydraulicWrite([&]() {
+                    committed = hydraulic::saveHydraulicNetwork(
+                        repository, branch.toStdString(), *network, expected);
+                });
+            });
+            return QHttpServerResponse(revisionJson(committed), Status::Created);
+        });
+    });
+    server.route("/api/v1/projects/<arg>/branches/<arg>/networks/<arg>/entities",
+                 QHttpServerRequest::Method::Get,
+                 [&service](const QString& id, const QString& branch, const QString& network,
+                            const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QUuid networkUuid = parseUuid(network);
+            const QUrlQuery query = request.query();
+            bool typeValid = false;
+            const unsigned type = query.queryItemValue("type").toUInt(&typeValid);
+            requireInput(typeValid && type < 18, "entity type must be an integer in 0..17");
+            QJsonObject result;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                const Hash revisionId = revisionForRead(repository, branch.toStdString(), request);
+                const Revision snapshot = repository.revision(revisionId);
+                if (!snapshot.modelIndexed) {
+                    if (snapshot.root == Hash{})
+                        throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
+                    throw ProjectError(ProjectErrorKind::InvalidInput, "revision is not model-indexed");
+                }
+                QString error;
+                const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevision(
+                    repository, revisionId, networkUuid,
+                    static_cast<hydraulic::HydraulicEntityType>(type), &error);
+                if (!ids) {
+                    if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
+                    throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
+                }
+                requireInput(ids->size() <= 10000,
+                             "entity list exceeds 10000 UUIDs; use native library for large collections");
+                QJsonArray entries;
+                for (const QUuid& uuid : *ids) entries.append(uuidString(uuid));
+                result = QJsonObject{{"revision", hashString(revisionId)},
+                                     {"type", static_cast<int>(type)}, {"uuids", entries}};
+            });
+            return QHttpServerResponse(result);
+        });
+    });
+    server.route("/api/v1/projects/<arg>/branches/<arg>/networks/<arg>/entities/<arg>",
+                 QHttpServerRequest::Method::Get,
+                 [&service](const QString& id, const QString& branch, const QString& network,
+                            const QString& entity, const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QUuid networkUuid = parseUuid(network);
+            const QUuid entityUuid = parseUuid(entity);
+            QJsonObject result;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                const Hash revisionId = revisionForRead(repository, branch.toStdString(), request);
+                const Revision snapshot = repository.revision(revisionId);
+                if (!snapshot.modelIndexed) {
+                    if (snapshot.root == Hash{})
+                        throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
+                    throw ProjectError(ProjectErrorKind::InvalidInput, "revision is not model-indexed");
+                }
+                QString error;
+                const std::optional<HydraulicEntity> item = hydraulic::loadHydraulicEntityAtRevision(
+                    repository, revisionId, networkUuid, entityUuid, &error);
+                if (!item) {
+                    if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
+                    throw ProjectError(ProjectErrorKind::NotFound, "hydraulic entity not found");
+                }
+                result = QJsonObject{{"revision", hashString(revisionId)},
+                                     {"uuid", uuidString(entityUuid)},
+                                     {"type", static_cast<int>(item->index())},
+                                     {"payloadBase64", encodePayload(encodeEntity(*item))}};
+            });
+            return QHttpServerResponse(result);
+        });
+    });
+    server.route("/api/v1/projects/<arg>/branches/<arg>/networks/<arg>/edits",
+                 QHttpServerRequest::Method::Post,
+                 [&service](const QString& id, const QString& branch, const QString& network,
+                            const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QUuid networkUuid = parseUuid(network);
+            const QJsonObject object = parseBody(request, 8 * 1024 * 1024);
+            requireKeys(object, {"expectedHead", "changes"});
+            const Hash expected = requiredExpectedHead(object);
+            requireInput(object.value("changes").isArray(), "missing changes array");
+            const QJsonArray input = object.value("changes").toArray();
+            requireInput(input.size() <= 128, "hydraulic edit batch exceeds 128 entities");
+            std::vector<hydraulic::HydraulicEntityChange> changes;
+            std::set<QString> unique;
+            changes.reserve(static_cast<std::size_t>(input.size()));
+            for (const QJsonValue& value : input) {
+                requireInput(value.isObject(), "edit change must be an object");
+                const QJsonObject change = value.toObject();
+                requireKeys(change, {"uuid", "delete", "type", "payloadBase64"});
+                const QUuid uuid = parseUuid(QString::fromStdString(requiredString(change, "uuid")));
+                requireInput(unique.insert(uuidString(uuid)).second, "duplicate entity UUID in edit batch");
+                if (change.value("delete") == QJsonValue(true)) {
+                    requireInput(!change.contains("type") && !change.contains("payloadBase64"),
+                                 "delete must not include an entity payload");
+                    changes.push_back(hydraulic::HydraulicEntityChange{uuid, std::nullopt});
+                } else {
+                    requireInput(!change.contains("delete"), "delete must be true or omitted");
+                    requireInput(change.value("type").isDouble(), "missing entity type");
+                    const int type = change.value("type").toInt(-1);
+                    requireInput(type >= 0 && type < 18 && change.value("type").toDouble() == type,
+                                 "invalid entity type");
+                    HydraulicEntity decoded = decodeEntity(static_cast<std::size_t>(type),
+                                                           decodePayload(change, "payloadBase64"));
+                    requireInput(entityUuid(decoded) == uuid, "entity payload UUID differs from edit UUID");
+                    changes.push_back(hydraulic::HydraulicEntityChange{uuid, std::move(decoded)});
+                }
+            }
+            Revision committed;
+            hydraulic::HydraulicEditDiagnostics diagnostics;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                enforceHead(repository, branch.toStdString(), expected);
+                hydraulicWrite([&]() {
+                    committed = hydraulic::editHydraulicNetwork(repository, branch.toStdString(),
+                                                                networkUuid, changes, &diagnostics, expected);
+                });
+            });
+            return QHttpServerResponse(QJsonObject{{"revision", revisionJson(committed)},
+                                                   {"diagnostics", diagnosticJson(diagnostics)}});
+        });
+    });
+    server.route("/api/v1/projects/<arg>/merges", QHttpServerRequest::Method::Post,
+                 [&service](const QString& id, const QHttpServerRequest& request) {
+        return guarded([&]() {
+            const QJsonObject object = parseBody(request, 256 * 1024);
+            requireKeys(object, {"target", "source", "expectedTargetHead", "expectedSourceHead",
+                                 "fieldChoices", "objectChoices"});
+            const std::string target = requiredString(object, "target");
+            const std::string source = requiredString(object, "source");
+            const Hash targetHead = parseHash(QString::fromStdString(requiredString(object, "expectedTargetHead")));
+            const Hash sourceHead = parseHash(QString::fromStdString(requiredString(object, "expectedSourceHead")));
+            requireInput(target != source, "merge requires different branches");
+            hydraulic::HydraulicMergeSelections selections;
+            selections.expectedTargetHead = targetHead;
+            selections.expectedSourceHead = sourceHead;
+            const QJsonArray fields = object.value("fieldChoices").toArray();
+            const QJsonArray objects = object.value("objectChoices").toArray();
+            requireInput(fields.size() <= 128 && objects.size() <= 128,
+                         "too many merge resolution choices");
+            requireInput(!object.contains("fieldChoices") || object.value("fieldChoices").isArray(),
+                         "fieldChoices must be an array");
+            requireInput(!object.contains("objectChoices") || object.value("objectChoices").isArray(),
+                         "objectChoices must be an array");
+            for (const QJsonValue& value : fields) {
+                requireInput(value.isObject(), "field choice must be an object");
+                const QJsonObject choice = value.toObject();
+                requireKeys(choice, {"entityUuid", "field", "side"});
+                selections.fields.push_back(hydraulic::HydraulicFieldChoice{
+                    parseUuid(QString::fromStdString(requiredString(choice, "entityUuid"))),
+                    QString::fromStdString(requiredString(choice, "field")),
+                    mergeSide(choice.value("side"))});
+            }
+            for (const QJsonValue& value : objects) {
+                requireInput(value.isObject(), "object choice must be an object");
+                const QJsonObject choice = value.toObject();
+                requireKeys(choice, {"entityUuid", "side"});
+                selections.objects.push_back(hydraulic::HydraulicObjectChoice{
+                    parseUuid(QString::fromStdString(requiredString(choice, "entityUuid"))),
+                    mergeSide(choice.value("side"))});
+            }
+            MergeResult result;
+            service.withRepository(id.toStdString(), [&](Repository& repository) {
+                requireBranch(repository, target);
+                requireBranch(repository, source);
+                if (repository.head(target).id != targetHead || repository.head(source).id != sourceHead)
+                    throw ProjectError(ProjectErrorKind::Conflict, "merge branch head has advanced");
+                hydraulicWrite([&]() {
+                    result = hydraulic::mergeHydraulicBranches(repository, target, source, selections);
+                });
+            });
+            const QJsonObject output = mergeJson(result);
+            return QHttpServerResponse(output, result.status == MergeStatus::Conflicts ?
+                                       Status::Conflict : Status::Ok);
+        });
+    });
+#endif
+
 }
 
 } // namespace aowis::native::http

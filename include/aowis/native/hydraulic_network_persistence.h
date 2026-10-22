@@ -22,7 +22,8 @@ inline constexpr std::uint16_t hydraulicNetworkKind = 100;
 // Validation is the native canonical hydraulic-model validator, including typed refs.
 // Throws std::runtime_error on validation, ownership, or storage failures.
 Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
-                              const NetworkHydraulic& network);
+                              const NetworkHydraulic& network,
+                              std::optional<Hash> expectedHead = std::nullopt);
 
 // Reconstructs the complete network in the original list order. All members,
 // identities, kinds and declared reference sets are checked. A missing root
@@ -179,6 +180,7 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
 Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
                               const QUuid& networkUuid,
                               const std::vector<HydraulicEntityChange>& changes,
-                              HydraulicEditDiagnostics* diagnostics = nullptr);
+                              HydraulicEditDiagnostics* diagnostics = nullptr,
+                              std::optional<Hash> expectedHead = std::nullopt);
 
 } // namespace aowis::native::hydraulic

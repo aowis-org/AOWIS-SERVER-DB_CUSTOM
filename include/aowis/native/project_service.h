@@ -3,6 +3,7 @@
 #include "aowis/native/native_store.h"
 
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,6 +50,12 @@ public:
                                   std::size_t maxCount,
                                   std::optional<Hash> after = std::nullopt);
     Revision revision(std::string_view projectId, const Hash& id);
+
+    // Execute a scoped operation with this project's repository and the catalogue
+    // mutex held. Callbacks must not retain the Repository or call ProjectService.
+    // This is the transport-independent adapter boundary for model operations.
+    void withRepository(std::string_view projectId,
+                        const std::function<void(Repository&)>& action);
 
     static bool validProjectId(std::string_view id);
     static bool validBranchName(std::string_view name);

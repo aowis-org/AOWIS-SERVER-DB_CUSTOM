@@ -1,6 +1,6 @@
 # AOWIS database REST API — implemented foundation and next capabilities
 
-**Status:** Project/catalogue, branch, head, history and immutable revision routes are implemented in the `aowis-server-db` executable. The machine-readable [OpenAPI contract](db-http-api.yaml) and [service documentation](native-database-service.md) describe exactly what is available. Hydraulic routes, merge APIs, diff and HTTP synchronization below remain planned.
+**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-db` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](db-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and HTTP bundle synchronization remain planned.
 
 ## Goals and deployment
 
@@ -27,13 +27,13 @@ The service health, project, branch and revision metadata rows are implemented a
 | Read branch head | `GET /api/v1/projects/{projectId}/branches/{branch}/head` |
 | Browse branch history | `GET /api/v1/projects/{projectId}/branches/{branch}/history` |
 | Inspect immutable revision | `GET /api/v1/projects/{projectId}/revisions/{revisionHash}` |
-| Compare revisions | `GET /api/v1/projects/{projectId}/diff?from={hash}&to={hash}` |
-| List hydraulic networks | `GET /api/v1/projects/{projectId}/branches/{branch}/networks` |
-| Read network | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` |
-| List a network's entities | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type=pipe` |
-| Read one entity | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` |
-| Edit entities atomically | `POST /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` |
-| Preview or perform merge | `POST /api/v1/projects/{projectId}/merges` |
+| Compare revisions | `GET /api/v1/projects/{projectId}/diff?from={hash}&to={hash}` (implemented) |
+| List hydraulic networks | `GET /api/v1/projects/{projectId}/branches/{branch}/networks` (planned) |
+| Read network | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` (implemented) |
+| List a network's entities | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type=9` (implemented, ordinal type) |
+| Read one entity | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` (implemented) |
+| Edit entities atomically | `POST /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` (implemented) |
+| Perform merge | `POST /api/v1/projects/{projectId}/merges` (implemented; conflicts returned without publication) |
 | Export branch bundle | `GET /api/v1/projects/{projectId}/sync/branches/{branch}/bundle` |
 | Import branch bundle | `POST /api/v1/projects/{projectId}/sync/branches/{branch}/bundle` |
 
@@ -41,12 +41,12 @@ A proposed incremental export supplies a known base revision, for example as a `
 
 ## Response and request principles
 
-- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Binary streaming** for canonical model payloads and sync bundles; avoid hex-encoding potentially large blobs in production REST responses.
+- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Binary streaming** for the *future* sync bundles. The current HTTP model API uses canonical ModelCodec bytes encoded as `payloadBase64` in JSON; this is a deliberately simple initial format, not streaming, and is limited to 8 MiB per mutation request.
 - Use appropriate HTTP status codes (`400` malformed input, `404` unknown resource, `409` revision conflict or divergence, `413` size limit, `422` semantic validation failure where appropriate, `5xx` internal/server errors). Provide stable machine-readable error codes and useful human-readable descriptions.
 - Pagination and limits for large collections/history. Use immutable revision IDs for reproducible historical reads, with explicit semantics when a branch moves.
 - Each **mutating** request identifies the expected branch-head revision (for example via an `If-Match`/ETag contract or an explicit expected revision field). Validate it under the same repository lock as publication. Return a conflict on stale writes; do not silently retry against a different model.
 - One HTTP edit request maps to **one atomic native model commit**, not multiple independent partial commits. Domain validation stays in the model/storage layer.
-- Merges must report conflict information and support explicit field/record choices using the existing native hydraulic merge APIs. Candidate merged networks must undergo semantic validation before publishing divergent merges.
+- Merges report conflict information and support explicit field/record choices using the existing native hydraulic merge APIs. Candidate merged networks must undergo semantic validation before publishing divergent merges.
 - Synchronization import must verify object hashes, complete Merkle/revision graphs and branch fast-forward semantics before publishing. Never overwrite a divergent branch automatically. Fetch to a separate tracking branch and merge explicitly when required.
 - Return canonical model/entity identifiers consistently; do not confuse `NetworkHydraulic`, project UUIDs, revision hashes or serializer format versions.
 
@@ -66,4 +66,4 @@ An AOWIS-wide security design will later specify identity/session lifecycle, tru
 
 ## Implementation sequence
 
-See [roadmap](roadmap.md). The configurable TCP/HTTP service and durable multi-project catalogue have been implemented. Model operations and HTTP synchronization follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.
+See [roadmap](roadmap.md). The configurable TCP/HTTP service, durable multi-project catalogue, canonical hydraulic editing and semantic merges have been implemented. Preview-only merges, HTTP synchronization and streaming/resource hardening follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.

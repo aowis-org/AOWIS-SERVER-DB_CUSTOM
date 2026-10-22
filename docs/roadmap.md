@@ -8,7 +8,7 @@ The repository implements immutable SHA-256 objects, copy-on-write Merkle UUID t
 
 Bundle imports check object hashes, reachable object types and graph completeness; they also validate canonical Merkle structure, including UUID-to-path correspondence, compressed prefixes, branch depth ordering, child slots and nonzero leaf targets. These validations precede object publication on both backends. Model-indexed imported revisions additionally require canonical model references, existing dependency targets, and exact equivalence between model-derived edges and the reverse-reference index (including historical and incremental revisions). The same generic logical validator is now available for existing repositories, with physical + logical verification the default mode of `aowis-native-verify`. Full native checks deliberately do not claim application-specific hydraulic semantic validation.
 
-The initial multi-project HTTP service executable is implemented, with project/catalogue, branch and history endpoints. Hydraulic operations and online replication remain future milestones. The provisional access-policy library is not part of the planned HTTP service authorization model.
+The initial multi-project HTTP service executable is implemented, with project/catalogue, branch and history endpoints. Hydraulic network reads/writes, indexed entity edits, revision diffs and semantic merges now have HTTP routes; online replication remains a future milestone. The provisional access-policy library is not part of the planned HTTP service authorization model.
 
 ## Implementation order
 
@@ -48,11 +48,11 @@ The initial multi-project HTTP service executable is implemented, with project/c
 - Authentication, authorization and transport TLS remain outside this service until the planned AOWIS-wide security architecture.
 - Real TCP HTTP tests are included for Qt-enabled builds; requests are JSON-validated but size limits currently apply after Qt buffering. Further bounds, model routes, merge and synchronization are separate milestones.
 
-### 6. Native model, history and merge REST API
+### 6. Native model, history and merge REST API — implemented initial operations
 
-- Expose historical model/entity reads, diffs, atomic edit batches, network reads, branch history, merge previews, conflict resolutions and validated merge publication.
-- Require expected revision heads on writes; use stable errors and a published OpenAPI contract.
-- Test equivalence of HTTP operations and direct-library operations.
+- Implemented revision-pinned complete hydraulic network and targeted entity reads, diffs, atomic entity edit batches, full-network saves, conflict resolution and validated merge publication. Standalone preview-only merge, network enumeration and streaming large responses remain future work.
+- Writes require expected branch heads enforced again at native publication; conflict responses preserve branch tips. API contracts include canonical ModelCodec payloads in Base64, not a duplicate JSON model schema.
+- Qt HTTP integration tests exercise canonical codec round trips, immutable history, stale-write rejection, errors, edits and semantic merge conflicts/choices on both physical backends.
 
 ### 7. HTTP synchronization and resource bounds
 

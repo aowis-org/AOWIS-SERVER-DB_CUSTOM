@@ -199,7 +199,8 @@ else()
     message(STATUS "Native model serialization disabled by configuration")
 endif()
 
-# Qt is restricted to the HTTP transport. A native-only build uses
+# The HTTP transport optionally links the Qt-based hydraulic model adapter.
+# A native-only build uses
 # -DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF (HTTP defaults to OFF as well).
 option(AOWIS_NATIVE_WITH_HTTP_SERVER "Build the Qt HTTP/TCP multi-project server" ${AOWIS_NATIVE_WITH_MODEL_CODEC})
 if(AOWIS_NATIVE_WITH_HTTP_SERVER)
@@ -208,6 +209,10 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
     target_compile_features(aowis-native-http PUBLIC cxx_std_20)
     target_include_directories(aowis-native-http PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_link_libraries(aowis-native-http PUBLIC aowis-native-project-service Qt6::HttpServer Qt6::Network)
+    if(TARGET aowis-native-hydraulic)
+        target_link_libraries(aowis-native-http PUBLIC aowis-native-hydraulic)
+        target_compile_definitions(aowis-native-http PUBLIC AOWIS_HTTP_WITH_HYDRAULIC=1)
+    endif()
 
     add_executable(aowis-server-db tools/aowis_server_db.cpp)
     target_link_libraries(aowis-server-db PRIVATE aowis-native-http)

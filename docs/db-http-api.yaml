@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: AOWIS Native Database Service API
   version: 1.0.0
-  description: Initial project/catalogue/branch/history API. Hydraulic edits, merges and sync are not yet exposed over HTTP.
+  description: Project/catalogue, revision, hydraulic persistence, entity edits, diffs and semantic merge API. Bundle synchronization remains a future milestone.
 servers:
   - url: http://127.0.0.1:8755/api/v1
 paths:
@@ -161,8 +161,191 @@ paths:
               schema: {$ref: '#/components/schemas/Revision'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/diff:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {name: from, in: query, required: true, schema: {$ref: '#/components/schemas/RevisionHash'}}
+      - {name: to, in: query, required: true, schema: {$ref: '#/components/schemas/RevisionHash'}}
+    get:
+      operationId: diffImmutableRevisions
+      description: Compare two immutable revision roots. Currently restricted to at most 1000 changed records; no pagination.
+      responses:
+        '200':
+          description: Changed UUIDs and before/after value hashes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [from, to, changes]
+                properties:
+                  from: {$ref: '#/components/schemas/RevisionHash'}
+                  to: {$ref: '#/components/schemas/RevisionHash'}
+                  changes:
+                    type: array
+                    items:
+                      type: object
+                      required: [uuid, before, after]
+                      properties:
+                        uuid: {type: string, format: uuid}
+                        before: {oneOf: [{$ref: '#/components/schemas/RevisionHash'}, {type: 'null'}]}
+                        after: {oneOf: [{$ref: '#/components/schemas/RevisionHash'}, {type: 'null'}]}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/{projectId}/branches/{branch}/networks:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+    post:
+      operationId: saveHydraulicNetwork
+      description: Atomically create or replace a complete validated network. Requires the exact expected branch head; no implicit retry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedHead, payloadBase64]
+              properties:
+                expectedHead: {$ref: '#/components/schemas/RevisionHash'}
+                payloadBase64: {type: string, contentEncoding: base64, description: Canonical ModelCodec<NetworkHydraulic> bytes}
+      responses:
+        '201':
+          description: Published revision
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Revision'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+      - {$ref: '#/components/parameters/OptionalRevision'}
+    get:
+      operationId: getHydraulicNetwork
+      responses:
+        '200':
+          description: Snapshot-pinned complete hydraulic network
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CanonicalPayload'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}/entities:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+      - {$ref: '#/components/parameters/OptionalRevision'}
+      - {name: type, in: query, required: true, schema: {type: integer, minimum: 0, maximum: 17}}
+    get:
+      operationId: listHydraulicEntities
+      description: Ordered UUIDs for one network collection; currently restricted to at most 10000 UUIDs.
+      responses:
+        '200':
+          description: Entity UUIDs and pinned revision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revision, type, uuids]
+                properties:
+                  revision: {$ref: '#/components/schemas/RevisionHash'}
+                  type: {type: integer, minimum: 0, maximum: 17}
+                  uuids: {type: array, items: {type: string, format: uuid}}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+      - {$ref: '#/components/parameters/OptionalRevision'}
+      - {name: entityId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: getHydraulicEntity
+      responses:
+        '200':
+          description: Canonical entity payload and enum ordinal type
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CanonicalPayload'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}/edits:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+    post:
+      operationId: editHydraulicNetwork
+      description: One atomic batch of at most 128 changes validated by native hydraulic persistence.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedHead, changes]
+              properties:
+                expectedHead: {$ref: '#/components/schemas/RevisionHash'}
+                changes:
+                  type: array
+                  maxItems: 128
+                  items:
+                    oneOf:
+                      - {type: object, additionalProperties: false, required: [uuid, delete], properties: {uuid: {type: string, format: uuid}, delete: {const: true}}}
+                      - {type: object, additionalProperties: false, required: [uuid, type, payloadBase64], properties: {uuid: {type: string, format: uuid}, type: {type: integer, minimum: 0, maximum: 17}, payloadBase64: {type: string, contentEncoding: base64}}}
+      responses:
+        '200':
+          description: New revision and edit diagnostics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revision, diagnostics]
+                properties:
+                  revision: {$ref: '#/components/schemas/Revision'}
+                  diagnostics: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/merges:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    post:
+      operationId: mergeHydraulicBranches
+      description: Validated hydraulic three-way merge. Conflicts return 409 and do not publish; explicit field/object choices must be pinned to the exact branch tips.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target, source, expectedTargetHead, expectedSourceHead]
+              properties:
+                target: {type: string}
+                source: {type: string}
+                expectedTargetHead: {$ref: '#/components/schemas/RevisionHash'}
+                expectedSourceHead: {$ref: '#/components/schemas/RevisionHash'}
+                fieldChoices:
+                  type: array
+                  items: {type: object, required: [entityUuid, field, side], properties: {entityUuid: {type: string, format: uuid}, field: {type: string}, side: {type: string, enum: [target, source]}}}
+                objectChoices:
+                  type: array
+                  items: {type: object, required: [entityUuid, side], properties: {entityUuid: {type: string, format: uuid}, side: {type: string, enum: [target, source]}}}
+      responses:
+        '200': {description: Up-to-date, fast-forward or merged revision with conflict list}
+        '409': {description: Unpublished conflicts or changed expected heads}
 components:
   schemas:
+    CanonicalPayload:
+      type: object
+      required: [revision, uuid, payloadBase64]
+      properties:
+        revision: {$ref: '#/components/schemas/RevisionHash'}
+        uuid: {type: string, format: uuid}
+        type: {type: integer, minimum: 0, maximum: 17}
+        payloadBase64: {type: string, contentEncoding: base64}
     RevisionHash: {type: string, pattern: '^[a-f0-9]{64}$'}
     Project:
       type: object
@@ -193,6 +376,17 @@ components:
             code: {type: string}
             message: {type: string}
   parameters:
+    NetworkId:
+      name: networkId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    OptionalRevision:
+      name: revision
+      in: query
+      required: false
+      description: Explicit immutable revision snapshot; defaults to the branch head captured once
+      schema: {$ref: '#/components/schemas/RevisionHash'}
     ProjectId:
       name: projectId
       in: path

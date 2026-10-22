@@ -48,6 +48,13 @@ See the machine-readable [OpenAPI contract](db-http-api.yaml) for request/respon
 | GET | `/api/v1/projects/{projectId}/branches/{branch}/head` | Read current revision |
 | GET | `/api/v1/projects/{projectId}/branches/{branch}/history` | First-parent revision history (limit 1–1000, optional exclusive `after` cursor) |
 | GET | `/api/v1/projects/{projectId}/revisions/{revisionHash}` | Read immutable revision metadata |
+| GET | `/api/v1/projects/{projectId}/diff?from={hash}&to={hash}` | Immutable object diff, up to 1000 changed UUIDs |
+| GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` | Complete revision-pinned hydraulic network |
+| POST | `/api/v1/projects/{projectId}/branches/{branch}/networks` | Validated, atomic full-network save |
+| GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type={ordinal}` | Ordered UUIDs of one collection (up to 10000) |
+| GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` | Revision-pinned targeted entity |
+| POST | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` | Atomic validated entity edits, up to 128 changes |
+| POST | `/api/v1/projects/{projectId}/merges` | Semantic hydraulic three-way merge and explicit conflict choices |
 
 Example:
 
@@ -59,7 +66,19 @@ curl -sS -H 'Content-Type: application/json' -d '{"name":"Water Distribution"}' 
 
 Project creation accepts `{"name":"...", "storage":"pack"}` (backend optional, default configured). Creating a branch accepts `{"name":"scenario"}` (new independent raw history), `{"name":"scenario","fromBranch":"main"}` (fork current head) or `{"name":"scenario","fromBranch":"main","revision":"<64-character-hash>"}` (fork a particular reachable revision). A historical fork never changes the source branch. Branch names are `[A-Za-z0-9_-]`, maximum 96 characters; project IDs are lowercase UUIDs. JSON mutation bodies are currently limited to 16 KiB after QHttpServer has received them. Responses use JSON and include machine-readable error codes.
 
-This is the **initial service foundation**: it does not yet expose hydraulic network reads/edits, merges, diffs, binary sync, project deletion or runtime compaction. These follow in subsequent milestones. Bounds on HTTP buffering and concurrent requests require further hardening before untrusted or production traffic; current payload checks occur after Qt has buffered the request.
+### Canonical hydraulic API
+
+The native model codec must be enabled for hydraulic HTTP routes. Network and entity payloads are **canonical `ModelCodec<T>` bytes in standard Base64**, not a second hand-maintained JSON model serializer. A client uses `ModelCodec<NetworkHydraulic>::encode/decode` for complete network payloads and `ModelCodec<EntityType>::encode/decode` for individual entities. The JSON envelope also contains UUID, entity type (where applicable) and the exact immutable revision used for the read. Network/entity reads accept optional `?revision=<hash>`; without it they pin the branch head at the beginning of that call. Separate calls requiring a consistent historical view must supply the same revision.
+
+Full saves: `POST .../branches/{branch}/networks` with `{"expectedHead":"<64 lowercase hex>","payloadBase64":"<canonical NetworkHydraulic bytes>"}`. This creates or replaces **one** complete network after domain validation. It does not replace unrelated networks. HTTP edits: `POST .../networks/{networkId}/edits` with an `expectedHead` and `changes` array. Each upsert is `{"uuid":"<uuid>","type":9,"payloadBase64":"<canonical entity bytes>"}`; deletion is `{"uuid":"<uuid>","delete":true}`. Every edit in the array is one atomic validated native commit, with a single expected-head comparison guarding the whole batch. Stale heads return HTTP 409, not silently retried. The API does not expose arbitrary unvalidated `commitModel()` operations.
+
+Entity `type` is the numeric ordinal in `HydraulicEntityType` (0–17): pipe material, time pattern, tank volume curve, pump head curve, pump efficiency curve, valve headloss curve, valve characteristic curve, generic curve, reservoir, **junction (9)**, tank, demand point, pipe, pump, valve, simple control, rule control, map label. The corresponding canonical payload includes the entity UUID, which must agree with the JSON UUID.
+
+Semantic merges use `POST .../projects/{projectId}/merges` with `target`, `source`, `expectedTargetHead`, `expectedSourceHead`, and optional `fieldChoices` / `objectChoices`. Each choice identifies an actual conflict and selects `target` or `source`; all choices must match pinned tips. Successful merges return the resulting revision and status; unresolved conflicts return HTTP 409 with UUIDs, hashes and reasons **without changing either branch**. This endpoint executes a merge and is not a dry-run preview API.
+
+JSON payloads are limited to 8 MiB for network saves and entity edits (256 KiB for merges). Entity batches are limited to 128 changes; UUID lists to 10000 entries and diffs to 1000 changed UUIDs. Limits are enforced after Qt has already buffered HTTP requests, so they are **not** sufficient protection for an untrusted/public listener. Large network retrievals currently encode the full result in memory; paginated/streaming alternatives are part of the subsequent resource-hardening stage.
+
+The service does not yet provide network enumeration, a dry-run merge preview, HTTP bundle synchronization, project deletion or runtime compaction. These follow in subsequent milestones. Bounds on HTTP buffering and concurrent requests require further hardening before untrusted or production traffic; current payload checks occur after Qt has buffered the request.
 
 ## Verification and integration tests
 

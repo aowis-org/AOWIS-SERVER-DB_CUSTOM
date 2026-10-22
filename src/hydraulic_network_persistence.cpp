@@ -1965,12 +1965,14 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
 }
 
 Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
-                              const NetworkHydraulic& network) {
+                              const NetworkHydraulic& network, std::optional<Hash> expectedHeadFromCaller) {
     // Read a stable logical starting point. commitModel() verifies this head
     // again under its repository lock, preventing lost updates between the
     // membership read and final revision publication.
     const Revision startingRevision = repository.head(branch);
-    const Hash expectedHead = startingRevision.id;
+    if (expectedHeadFromCaller && startingRevision.id != *expectedHeadFromCaller)
+        throw std::runtime_error("branch head changed since hydraulic network save was prepared");
+    const Hash expectedHead = expectedHeadFromCaller.value_or(startingRevision.id);
     Manifest next = manifestFor(network);
     const std::set<Key> newMembers = memberKeys(next);
     DependencyIndex references;
@@ -2045,11 +2047,18 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
 Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
                               const QUuid& networkUuid,
                               const std::vector<HydraulicEntityChange>& changes,
-                              HydraulicEditDiagnostics* diagnostics) {
+                              HydraulicEditDiagnostics* diagnostics,
+                              std::optional<Hash> expectedHeadFromCaller) {
     if (networkUuid.isNull()) throw std::runtime_error("hydraulic network UUID is null");
     if (diagnostics) *diagnostics = HydraulicEditDiagnostics{};
     const Revision startingRevision = repository.head(branch);
-    if (changes.empty()) return startingRevision;
+    if (expectedHeadFromCaller && startingRevision.id != *expectedHeadFromCaller)
+        throw std::runtime_error("branch head changed since hydraulic edit was prepared");
+    if (changes.empty()) {
+        if (repository.head(branch).id != startingRevision.id)
+            throw std::runtime_error("branch head changed during hydraulic edit");
+        return startingRevision;
+    }
     if (const std::optional<Revision> indexed = tryIndexedScalarEdits(
             repository, branch, networkUuid, changes, startingRevision, diagnostics)) {
         return *indexed;

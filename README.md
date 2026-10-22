@@ -4,7 +4,7 @@
 
 This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-db` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
-> **Service status:** The initial project/branch/history HTTP service is implemented. Hydraulic edits, merges, diffs and HTTP synchronization are not yet exposed. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
+> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. HTTP bundle synchronization and preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
 ## System overview
 
@@ -156,3 +156,6 @@ The initial project/branch/revision API is implemented; HTTP model edits, mergin
 | [Benchmarks](docs/benchmark-plan.md) | Workloads, commands and measurement rules |
 
 `AOWIS-SERVER-MODEL` is an external model-definition submodule; its README is maintained in that repository, not rewritten here.
+
+
+The HTTP server exposes canonical hydraulic network reads/writes, revision-pinned entity queries, atomic edits, revision diffs and validated hydraulic merges when built with the AOWIS model codec. See [HTTP service](docs/native-database-service.md) and [OpenAPI](docs/db-http-api.yaml) for implemented routes and request limits.
