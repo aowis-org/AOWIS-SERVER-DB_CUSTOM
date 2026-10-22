@@ -67,7 +67,8 @@ The initial multi-project HTTP service executable is implemented, with project/c
 - Added a deterministic exhaustive-ancestry oracle, randomized raw and model-indexed merge DAGs, dominated common-frontier and criss-cross cases, long shared histories and both physical backends as regression tests.
 - Added an isolated native merge-history conflict benchmark; it excludes publication/fsync while retaining merge-base and conflict validation. Benchmarks must use new random temporary repository paths for each run.
 - Further improve merge ancestry for very deep unrelated histories if profiling shows a need (the target-ancestor set still scales with target history).
-- **Outstanding:** Profile and bound bundle verification memory, using disk-backed structures or streaming where needed.
+- **Implemented (first replication-memory step):** Native bundle import writes hash-to-offset metadata into a private, immediately unlinked temporary file and maps that fixed-size index read-only; the checksum preflight hashes objects with a fixed 64 KiB scratch buffer instead of allocating their full payloads. Full/incremental imports, invalid transfers, empty deltas and all four physical-backend combinations are regression-tested. This removes the per-object in-memory location map; it does **not** make logical verification constant-memory.
+- **Outstanding:** Profile and bound *logical graph-validation* memory (reachable-object/revision sets, Merkle summaries and model-reference maps), using disk-backed structures or streaming where needed. The file-backed index also needs temporary disk space (48 bytes per received object) and may use resident page cache.
 - **Outstanding:** Benchmark representative 10k–1M hydraulic-entity projects, long revision histories, branching/merging, synchronization and compaction on both backends.
 - Use unique fresh temporary directories for every benchmark run.
 

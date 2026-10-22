@@ -15,6 +15,8 @@
 #include <map>
 #include <set>
 #include <limits>
+#include <memory>
+#include <sys/mman.h>
 #include <stdexcept>
 #include <unordered_set>
 #include <string>
@@ -239,6 +241,134 @@ void writeExact(int fd, const std::uint8_t* bytes, std::size_t size, std::uint64
         require(count != 0, "pwrite made no progress");
         done += static_cast<std::size_t>(count);
     }
+}
+
+// The on-disk bundle is sorted by SHA-256 but has variable-sized payloads.
+// Record fixed-size file offsets in an unlinked temporary index rather than
+// retaining one std::map node per transferred object on the C++ heap. Mapping
+// it read-only lets the kernel evict cold pages under memory pressure.
+constexpr std::size_t bundleLocationRecordBytes = 48;
+
+struct BundleLocation {
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+};
+
+class BundleLocationIndex {
+public:
+    explicit BundleLocationIndex(std::uint64_t capacity) {
+        require(capacity <= std::numeric_limits<std::size_t>::max() /
+                                bundleLocationRecordBytes,
+                "replication bundle index exceeds addressable memory");
+        const std::filesystem::path temporaryName =
+            std::filesystem::temp_directory_path() / "aowis-db-bundle-index-XXXXXX";
+        const std::string name = temporaryName.string();
+        std::vector<char> writableName(name.begin(), name.end());
+        writableName.push_back('\0');
+        this->fd_ = ::mkstemp(writableName.data());
+        systemCall(this->fd_ >= 0, "create temporary replication index");
+        if (::unlink(writableName.data()) != 0) {
+            const int saved = errno;
+            ::close(this->fd_);
+            this->fd_ = -1;
+            errno = saved;
+            systemCall(false, "unlink temporary replication index");
+        }
+        if (::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) < 0) {
+            const int saved = errno;
+            ::close(this->fd_);
+            this->fd_ = -1;
+            errno = saved;
+            systemCall(false, "mark temporary replication index close-on-exec");
+        }
+    }
+
+    ~BundleLocationIndex() {
+        if (this->mapped_ != nullptr)
+            ::munmap(this->mapped_, this->count_ * bundleLocationRecordBytes);
+        if (this->fd_ >= 0) ::close(this->fd_);
+    }
+
+    BundleLocationIndex(const BundleLocationIndex&) = delete;
+    BundleLocationIndex& operator=(const BundleLocationIndex&) = delete;
+
+    void append(const Hash& hash, BundleLocation location) {
+        require(this->mapped_ == nullptr, "cannot append to finalized replication index");
+        std::array<std::uint8_t, bundleLocationRecordBytes> record{};
+        std::copy(hash.begin(), hash.end(), record.begin());
+        storeU64(record.data() + 32, location.offset);
+        storeU64(record.data() + 40, location.size);
+        writeExact(this->fd_, record.data(), record.size(),
+                   static_cast<std::uint64_t>(this->count_) * bundleLocationRecordBytes);
+        ++this->count_;
+    }
+
+    void finalize() {
+        if (this->count_ == 0) return;
+        void* const mapped = ::mmap(nullptr, this->count_ * bundleLocationRecordBytes,
+                                    PROT_READ, MAP_SHARED, this->fd_, 0);
+        systemCall(mapped != MAP_FAILED, "map temporary replication index");
+        this->mapped_ = mapped;
+    }
+
+    std::size_t size() const { return this->count_; }
+
+    std::pair<Hash, BundleLocation> at(std::size_t index) const {
+        require(index < this->count_ && this->mapped_ != nullptr,
+                "replication index lookup out of range");
+        const std::uint8_t* record = static_cast<const std::uint8_t*>(this->mapped_) +
+                                     index * bundleLocationRecordBytes;
+        Hash hash{};
+        std::copy_n(record, hash.size(), hash.begin());
+        return {hash, BundleLocation{readU64(record + 32), readU64(record + 40)}};
+    }
+
+    std::optional<BundleLocation> find(const Hash& hash) const {
+        std::size_t first = 0;
+        std::size_t last = this->count_;
+        while (first < last) {
+            const std::size_t middle = first + (last - first) / 2;
+            const std::uint8_t* record = static_cast<const std::uint8_t*>(this->mapped_) +
+                                         middle * bundleLocationRecordBytes;
+            if (std::memcmp(record, hash.data(), hash.size()) < 0) first = middle + 1;
+            else last = middle;
+        }
+        if (first >= this->count_) return std::nullopt;
+        const std::uint8_t* record = static_cast<const std::uint8_t*>(this->mapped_) +
+                                     first * bundleLocationRecordBytes;
+        if (std::memcmp(record, hash.data(), hash.size()) != 0) return std::nullopt;
+        return BundleLocation{readU64(record + 32), readU64(record + 40)};
+    }
+
+private:
+    int fd_ = -1;
+    std::size_t count_ = 0;
+    void* mapped_ = nullptr;
+};
+
+// Preflight checksums use a fixed-size scratch buffer, even when the bundle
+// contains a large value object. Typed graph validation still decodes those
+// objects later; the first pass never needs to materialize their payloads.
+Hash sha256FileRegion(int fd, std::uint64_t offset, std::uint64_t length) {
+    using DigestContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+    DigestContext context(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    require(context != nullptr && EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) == 1,
+            "initialize bundle SHA-256 failed");
+    std::array<std::uint8_t, 64 * 1024> buffer{};
+    while (length != 0) {
+        const std::size_t chunk = static_cast<std::size_t>(
+            std::min<std::uint64_t>(length, buffer.size()));
+        readExact(fd, buffer.data(), chunk, offset);
+        require(EVP_DigestUpdate(context.get(), buffer.data(), chunk) == 1,
+                "update bundle SHA-256 failed");
+        offset += chunk;
+        length -= chunk;
+    }
+    Hash result{};
+    unsigned int digestSize = 0;
+    require(EVP_DigestFinal_ex(context.get(), result.data(), &digestSize) == 1 &&
+            digestSize == result.size(), "finalize bundle SHA-256 failed");
+    return result;
 }
 
 void syncDirectory(const std::filesystem::path& directory) {
@@ -2350,11 +2480,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 "invalid replication bundle object count");
         require(limits.maxObjects == 0 || count <= limits.maxObjects,
                 "bundle transfer limit: object count exceeded");
-        struct BundleLocation {
-            std::uint64_t offset = 0;
-            std::uint64_t size = 0;
-        };
-        std::map<Hash, BundleLocation> entries;
+        BundleLocationIndex entries(count);
         std::uint64_t offset = headerBytes;
         Hash previous{};
         for (std::uint64_t index = 0; index < count; ++index) {
@@ -2372,31 +2498,32 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                     "replication bundle object exceeds bounds");
             require(limits.maxObjectBytes == 0 || size <= limits.maxObjectBytes,
                     "bundle transfer limit: individual object exceeded");
-            Bytes payload(static_cast<std::size_t>(size));
-            if (!payload.empty()) readExact(fd, payload.data(), payload.size(), offset);
-            require(sha256(payload) == hash, "replication bundle SHA-256 mismatch");
-            entries.emplace(hash, BundleLocation{offset, size});
+            require(sha256FileRegion(fd, offset, size) == hash,
+                    "replication bundle SHA-256 mismatch");
+            entries.append(hash, BundleLocation{offset, size});
             offset += size;
             previous = hash;
         }
         require(offset == fileSize, "replication bundle contains trailing bytes");
+        entries.finalize();
         const auto containsLocally = [&](const Hash& hash) {
             return this->blockStore_ ? this->blockStore_->contains(hash)
                                       : this->index_.contains(hash);
         };
-        require(entries.contains(incoming) || (incremental && containsLocally(incoming)),
+        require(entries.find(incoming).has_value() ||
+                    (incremental && containsLocally(incoming)),
                 "replication bundle lacks tip revision");
         const auto bundleObject = [&](const Hash& hash) -> Bytes {
-            const std::map<Hash, BundleLocation>::const_iterator it = entries.find(hash);
-            if (it == entries.end()) {
+            const std::optional<BundleLocation> location = entries.find(hash);
+            if (!location) {
                 require(incremental && containsLocally(hash),
                         "incremental replication bundle is missing a referenced object");
                 const Bytes local = load(hash);
                 require(sha256(local) == hash, "local replication object SHA-256 mismatch");
                 return local;
             }
-            Bytes object(static_cast<std::size_t>(it->second.size));
-            if (!object.empty()) readExact(fd, object.data(), object.size(), it->second.offset);
+            Bytes object(static_cast<std::size_t>(location->size));
+            if (!object.empty()) readExact(fd, object.data(), object.size(), location->offset);
             require(sha256(object) == hash, "replication bundle changed during import");
             return object;
         };
@@ -2407,7 +2534,8 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         // a single leaf). Parent checks can therefore use one representative
         // key without revisiting descendants in each ancestor context.
         const LogicalVerification verification = verifyLogicalGraph({incoming}, bundleObject);
-        for (const std::pair<const Hash, BundleLocation>& entry : entries) {
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const std::pair<Hash, BundleLocation> entry = entries.at(index);
             require(verification.objects.contains(entry.first),
                     "replication bundle contains unreachable objects");
         }
@@ -2439,7 +2567,8 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             return BundleImportResult{status, previousHead, 0};
         }
         std::uint64_t imported = 0;
-        for (const std::pair<const Hash, BundleLocation>& entry : entries) {
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const std::pair<Hash, BundleLocation> entry = entries.at(index);
             const bool present = this->blockStore_
                 ? this->blockStore_->contains(entry.first) : this->index_.contains(entry.first);
             if (present) continue;

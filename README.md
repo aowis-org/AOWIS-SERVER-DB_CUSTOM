@@ -105,7 +105,7 @@ Portable bundles exchange immutable branches between independent repositories, i
   /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The same bundle format works through the bounded HTTP synchronization endpoints. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer keeps its hash-to-file-offset index in a private temporary file and checks bundle SHA-256 incrementally with 64 KiB scratch space; full logical verification still uses history-proportional memory. The same bundle format works through the bounded HTTP synchronization endpoints. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 
