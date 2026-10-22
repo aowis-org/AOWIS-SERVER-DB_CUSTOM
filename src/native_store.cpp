@@ -323,7 +323,8 @@ public:
         return {hash, BundleLocation{readU64(record + 32), readU64(record + 40)}};
     }
 
-    std::optional<BundleLocation> find(const Hash& hash) const {
+    std::optional<std::size_t> ordinal(const Hash& hash) const {
+        if (this->count_ == 0) return std::nullopt;
         std::size_t first = 0;
         std::size_t last = this->count_;
         while (first < last) {
@@ -337,13 +338,88 @@ public:
         const std::uint8_t* record = static_cast<const std::uint8_t*>(this->mapped_) +
                                      first * bundleLocationRecordBytes;
         if (std::memcmp(record, hash.data(), hash.size()) != 0) return std::nullopt;
-        return BundleLocation{readU64(record + 32), readU64(record + 40)};
+        return first;
+    }
+
+    std::optional<BundleLocation> find(const Hash& hash) const {
+        const std::optional<std::size_t> index = ordinal(hash);
+        if (!index) return std::nullopt;
+        return at(*index).second;
     }
 
 private:
     int fd_ = -1;
     std::size_t count_ = 0;
     void* mapped_ = nullptr;
+};
+
+// A type mask for each hash in the sorted bundle index. Keeping these bytes
+// in an unlinked, shared file mapping avoids allocating a separate red-black
+// tree node (and a duplicate reachable-object set node) for every transferred
+// object. Cold pages can be reclaimed by the OS during very large imports.
+class BundleVisitMarks {
+public:
+    explicit BundleVisitMarks(std::size_t count) : count_(count) {
+        if (count == 0) return;
+        const std::filesystem::path temporaryName =
+            std::filesystem::temp_directory_path() / "aowis-db-bundle-marks-XXXXXX";
+        const std::string name = temporaryName.string();
+        std::vector<char> writableName(name.begin(), name.end());
+        writableName.push_back('\0');
+        this->fd_ = ::mkstemp(writableName.data());
+        systemCall(this->fd_ >= 0, "create temporary verification marks");
+        try {
+            systemCall(::unlink(writableName.data()) == 0, "unlink temporary verification marks");
+            systemCall(::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) == 0,
+                       "mark temporary verification marks close-on-exec");
+            require(count <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()),
+                    "verification marks exceed file address limits");
+            // ftruncate() can leave sparse pages whose first write would
+            // SIGBUS under ENOSPC. Reserve the temporary storage now so a
+            // full disk produces a catchable import error before publication.
+            const int allocation = ::posix_fallocate(this->fd_, 0,
+                                                      static_cast<off_t>(count));
+            if (allocation != 0) {
+                errno = allocation;
+                systemCall(false, "reserve temporary verification marks");
+            }
+            void* const mapped = ::mmap(nullptr, count, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, this->fd_, 0);
+            systemCall(mapped != MAP_FAILED, "map temporary verification marks");
+            this->mapped_ = static_cast<std::uint8_t*>(mapped);
+        } catch (...) {
+            ::close(this->fd_);
+            this->fd_ = -1;
+            throw;
+        }
+    }
+
+    ~BundleVisitMarks() {
+        if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->count_);
+        if (this->fd_ >= 0) ::close(this->fd_);
+    }
+    BundleVisitMarks(const BundleVisitMarks&) = delete;
+    BundleVisitMarks& operator=(const BundleVisitMarks&) = delete;
+
+    std::uint8_t at(std::size_t index) const {
+        require(index < this->count_, "verification mark index out of bounds");
+        return this->mapped_[index];
+    }
+
+    void mark(std::size_t index, std::uint8_t bits) {
+        require(index < this->count_, "verification mark index out of bounds");
+        require(bits != 0, "empty verification mark");
+        if (this->mapped_[index] == 0) ++this->marked_;
+        this->mapped_[index] = bits;
+    }
+
+    std::uint64_t markedCount() const { return this->marked_; }
+
+private:
+    int fd_ = -1;
+    std::size_t count_ = 0;
+    std::uint8_t* mapped_ = nullptr;
+    std::uint64_t marked_ = 0;
 };
 
 // Preflight checksums use a fixed-size scratch buffer, even when the bundle
@@ -427,15 +503,25 @@ int nibbleHex(char character) {
 // already persisted locally. A valid SHA-256 hash is not proof of a valid
 // typed revision graph, trie, or reverse-reference index.
 struct LogicalVerification {
-    std::set<Hash> objects;
+    std::uint64_t reachableObjects = 0;
     std::set<Hash> revisions;
     std::uint64_t treeNodes = 0;
     std::uint64_t modelSnapshots = 0;
 };
 
+// Only imported bundle hashes use external visitation marks. Incremental
+// bundles also reference existing local hashes, which retain the normal map
+// fallback so all ancestors and object types are checked without exceptions.
+struct ExternalVerificationMarks {
+    std::function<std::optional<std::uint8_t>(const Hash&)> read;
+    std::function<void(const Hash&, std::uint8_t)> write;
+    std::function<std::uint64_t()> markedCount;
+};
+
 LogicalVerification verifyLogicalGraph(
         const std::vector<Hash>& tips,
-        const std::function<Bytes(const Hash&)>& objectByHash) {
+        const std::function<Bytes(const Hash&)>& objectByHash,
+        const ExternalVerificationMarks& externalMarks = {}) {
     enum class Kind {
         Revision, RawTree, ModelTree, ReferenceTree,
         RawValue, ModelValue, ReferenceValue
@@ -451,6 +537,24 @@ LogicalVerification verifyLogicalGraph(
         pending.emplace_back(tip, Kind::Revision);
     }
     std::map<Hash, std::uint8_t> checkedKinds;
+    const std::function<std::uint8_t(const Hash&)> readKinds = [&](const Hash& hash) {
+        if (externalMarks.read) {
+            const std::optional<std::uint8_t> bits = externalMarks.read(hash);
+            if (bits) return *bits;
+        }
+        const std::map<Hash, std::uint8_t>::const_iterator found = checkedKinds.find(hash);
+        return found == checkedKinds.end() ? std::uint8_t{0} : found->second;
+    };
+    const std::function<void(const Hash&, Kind)> markKind = [&](const Hash& hash, Kind kind) {
+        const unsigned bit = 1U << static_cast<unsigned>(kind);
+        const std::uint8_t bits = static_cast<std::uint8_t>(
+            static_cast<unsigned>(readKinds(hash)) | bit);
+        if (externalMarks.read && externalMarks.write && externalMarks.read(hash)) {
+            externalMarks.write(hash, bits);
+        } else {
+            checkedKinds[hash] = bits;
+        }
+    };
     std::set<Hash> verifiedRevisions;
     std::map<std::pair<Hash, Kind>, TreeSummary> verifiedTrees;
     std::set<std::pair<Hash, Kind>> visitingTrees;
@@ -517,9 +621,7 @@ LogicalVerification verifyLogicalGraph(
             }
             visitingTrees.erase(identity);
             verifiedTrees.emplace(identity, result);
-            const unsigned bit = 1U << static_cast<unsigned>(kind);
-            checkedKinds[hash] = static_cast<std::uint8_t>(
-                static_cast<unsigned>(checkedKinds[hash]) | bit);
+            markKind(hash, kind);
             return result;
         } catch (const std::exception& error) {
             throw std::runtime_error("tree " + toHex(hash) + ": " + error.what());
@@ -530,14 +632,13 @@ LogicalVerification verifyLogicalGraph(
         pending.pop_back();
         if (isZero(next.first)) continue;
         const unsigned bit = 1U << static_cast<unsigned>(next.second);
-        if ((static_cast<unsigned>(checkedKinds[next.first]) & bit) != 0U) continue;
+        if ((static_cast<unsigned>(readKinds(next.first)) & bit) != 0U) continue;
         if (next.second == Kind::RawTree || next.second == Kind::ModelTree ||
             next.second == Kind::ReferenceTree) {
             (void)verifyTree(next.first, next.second, 0);
             continue;
         }
-        checkedKinds[next.first] = static_cast<std::uint8_t>(
-            static_cast<unsigned>(checkedKinds[next.first]) | bit);
+        markKind(next.first, next.second);
         const Bytes object = objectByHash(next.first);
         if (next.second == Kind::Revision) {
             require(object.size() >= 67 && object[0] == 'S',
@@ -652,9 +753,8 @@ LogicalVerification verifyLogicalGraph(
         }
     }
     LogicalVerification summary{};
-    for (const std::pair<const Hash, std::uint8_t>& entry : checkedKinds) {
-        summary.objects.insert(entry.first);
-    }
+    summary.reachableObjects = static_cast<std::uint64_t>(checkedKinds.size()) +
+        (externalMarks.markedCount ? externalMarks.markedCount() : 0);
     summary.revisions = std::move(verifiedRevisions);
     summary.treeNodes = static_cast<std::uint64_t>(verifiedTrees.size());
     summary.modelSnapshots = static_cast<std::uint64_t>(verifiedModelSnapshots.size());
@@ -2293,7 +2393,7 @@ VerificationReport Repository::verifyRepository() {
     VerificationReport result{};
     result.branches = static_cast<std::uint64_t>(tips.size());
     result.revisions = static_cast<std::uint64_t>(graph.revisions.size());
-    result.reachableObjects = static_cast<std::uint64_t>(graph.objects.size());
+    result.reachableObjects = graph.reachableObjects;
     result.treeNodes = graph.treeNodes;
     result.modelSnapshots = graph.modelSnapshots;
     result.physicalObjects = this->blockStore_ ? this->blockStore_->stats().objects :
@@ -2533,10 +2633,24 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         // keys have the prefix preceding the root branch depth (or that it is
         // a single leaf). Parent checks can therefore use one representative
         // key without revisiting descendants in each ancestor context.
-        const LogicalVerification verification = verifyLogicalGraph({incoming}, bundleObject);
+        BundleVisitMarks visitMarks(entries.size());
+        const ExternalVerificationMarks externalMarks{
+            [&](const Hash& hash) -> std::optional<std::uint8_t> {
+                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
+                if (!ordinal) return std::nullopt;
+                return visitMarks.at(*ordinal);
+            },
+            [&](const Hash& hash, std::uint8_t bits) {
+                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
+                require(ordinal.has_value(), "missing hash in bundle visitation index");
+                visitMarks.mark(*ordinal, bits);
+            },
+            [&]() { return visitMarks.markedCount(); }
+        };
+        const LogicalVerification verification =
+            verifyLogicalGraph({incoming}, bundleObject, externalMarks);
         for (std::size_t index = 0; index < entries.size(); ++index) {
-            const std::pair<Hash, BundleLocation> entry = entries.at(index);
-            require(verification.objects.contains(entry.first),
+            require(visitMarks.at(index) != 0,
                     "replication bundle contains unreachable objects");
         }
         if (incremental) {

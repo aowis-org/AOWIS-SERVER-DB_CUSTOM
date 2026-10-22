@@ -1,6 +1,10 @@
 #include "aowis/native/native_store.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
+#include <iterator>
+#include <map>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +20,7 @@ namespace {
 using aowis::native::BundleImportStatus;
 using aowis::native::BundleImportResult;
 using aowis::native::Bytes;
+using aowis::native::Change;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::PhysicalStore;
@@ -65,6 +70,64 @@ private:
     std::filesystem::path directory_;
 };
 
+std::uint64_t readU64(const Bytes& bytes, std::size_t position) {
+    check(position <= bytes.size() && bytes.size() - position >= 8,
+          "invalid bundle test fixture integer offset");
+    std::uint64_t value = 0;
+    for (unsigned index = 0; index < 8; ++index)
+        value = (value << 8U) | bytes[position + index];
+    return value;
+}
+
+void appendU64(Bytes& bytes, std::uint64_t value) {
+    for (unsigned index = 0; index < 8; ++index)
+        bytes.push_back(static_cast<std::uint8_t>(value >> (56U - 8U * index)));
+}
+
+// Forge a bundle with an additional VALID, correctly hashed but unreachable
+// payload. The reachability mask must reject it without publishing anything.
+void appendUnreachableObject(const std::filesystem::path& source,
+                             const std::filesystem::path& destination) {
+    std::ifstream input(source, std::ios::binary);
+    check(input.good(), "open valid bundle for orphan injection");
+    const Bytes original((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+    check(original.size() >= 48 && original[0] == 'A' && original[7] == '1',
+          "expected full bundle fixture");
+    const std::uint64_t count = readU64(original, 40);
+    std::map<Hash, Bytes> objects;
+    std::size_t offset = 48;
+    for (std::uint64_t index = 0; index < count; ++index) {
+        check(offset <= original.size() && original.size() - offset >= 40,
+              "truncated valid bundle fixture");
+        Hash hash{};
+        std::copy_n(original.begin() + static_cast<std::ptrdiff_t>(offset),
+                    hash.size(), hash.begin());
+        const std::uint64_t size = readU64(original, offset + 32);
+        offset += 40;
+        check(size <= original.size() - offset, "invalid original bundle entry length");
+        objects.emplace(hash, Bytes(original.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    original.begin() + static_cast<std::ptrdiff_t>(offset + size)));
+        offset += static_cast<std::size_t>(size);
+    }
+    check(offset == original.size(), "trailing bytes in valid bundle fixture");
+    const Bytes orphan{'V', 'o', 'r', 'p', 'h', 'a', 'n', 0x7d};
+    check(objects.emplace(aowis::native::sha256(orphan), orphan).second,
+          "unexpected orphan hash collision");
+    Bytes output(original.begin(), original.begin() + 40);
+    appendU64(output, static_cast<std::uint64_t>(objects.size()));
+    for (const std::pair<const Hash, Bytes>& entry : objects) {
+        output.insert(output.end(), entry.first.begin(), entry.first.end());
+        appendU64(output, entry.second.size());
+        output.insert(output.end(), entry.second.begin(), entry.second.end());
+    }
+    std::ofstream file(destination, std::ios::binary);
+    check(file.good(), "open forged bundle output");
+    file.write(reinterpret_cast<const char*>(output.data()),
+               static_cast<std::streamsize>(output.size()));
+    check(file.good(), "write forged bundle output");
+}
+
 void corruptTail(const std::filesystem::path& source,
                  const std::filesystem::path& destination) {
     std::filesystem::copy_file(source, destination);
@@ -82,11 +145,15 @@ void corruptTail(const std::filesystem::path& source,
 }
 
 void rejectWithoutPublication(Repository& receiver, const std::filesystem::path& bundle,
-                              std::string_view branch) {
+                              std::string_view branch,
+                              std::string_view expectedReason = {}) {
     const std::uint64_t objectsBefore = receiver.objectCount();
     try {
         (void)receiver.importBranchBundle(bundle, branch);
-    } catch (const std::runtime_error&) {
+    } catch (const std::runtime_error& error) {
+        check(expectedReason.empty() ||
+              std::string_view(error.what()).find(expectedReason) != std::string_view::npos,
+              "forged bundle rejected for an unexpected reason");
         check(receiver.objectCount() == objectsBefore,
               "invalid transfer wrote objects before passing preflight");
         check(receiver.listBranches().empty(),
@@ -113,6 +180,17 @@ void exercise(PhysicalStore sourceBackend, PhysicalStore destinationBackend) {
         Bytes payload(97 + (index % 23) * 73, static_cast<std::uint8_t>(index));
         (void)source.commit("main", {{key, std::move(payload)}});
     }
+    // A broad batch adds thousands of distinct objects without requiring
+    // thousands of fsyncs; checks the mapped mark table under hash churn.
+    std::vector<Change> batch;
+    for (unsigned index = 0; index < 1200; ++index) {
+        Key key{};
+        key[0] = 0xf2;
+        key[14] = static_cast<std::uint8_t>(index >> 8U);
+        key[15] = static_cast<std::uint8_t>(index);
+        batch.push_back(Change{key, Bytes(32 + index % 17, static_cast<std::uint8_t>(index))});
+    }
+    (void)source.commit("main", batch);
     // Include a much larger single object to exercise chunked hashing.
     Key largeKey{};
     largeKey[0] = 0xf1;
@@ -122,13 +200,18 @@ void exercise(PhysicalStore sourceBackend, PhysicalStore destinationBackend) {
     source.exportBranchBundle("main", full);
     check(std::filesystem::file_size(full) > 2U * 1024U * 1024U,
           "full bundle fixture should include large object");
-    check(source.objectCount() > 600, "insufficient historical objects for index exercise");
+    check(source.objectCount() > 3000, "insufficient objects for mapped visitation exercise");
 
     const BundleImportResult created = destination.importBranchBundle(full, "remote");
     check(created.status == BundleImportStatus::Created && created.head == firstTip &&
           created.objectsImported > 600, "full file-backed import was incomplete");
     temporaryIndex.checkEmpty();
     (void)destination.verifyRepository();
+
+    const std::filesystem::path orphan = temporary.path() / "orphan.aowbundle";
+    appendUnreachableObject(full, orphan);
+    rejectWithoutPublication(rejected, orphan, "remote", "unreachable objects");
+    temporaryIndex.checkEmpty();
 
     const std::filesystem::path corrupted = temporary.path() / "corrupt.aowbundle";
     corruptTail(full, corrupted);
