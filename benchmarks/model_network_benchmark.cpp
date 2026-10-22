@@ -68,8 +68,8 @@ double elapsed(std::chrono::steady_clock::time_point start) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 6) {
-        std::cerr << "Usage: aowis-native-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10] [block]\n"
+    if (argc < 2 || argc > 5) {
+        std::cerr << "Usage: aowis-native-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10]\n"
                   << "Synthetic network-shaped typed-model fixture, NOT a canonical model codec benchmark.\n";
         return 2;
     }
@@ -79,11 +79,7 @@ int main(int argc, char** argv) {
         const std::uint64_t pipes = argc >= 3 ? positive(argv[2]) : 1000;
         const std::uint64_t revisions = argc >= 4 ? positive(argv[3]) : 10;
         const std::uint64_t edits = argc >= 5 ? positive(argv[4]) : 10;
-        const bool blocks = argc == 6 && std::string(argv[5]) == "block";
-        if (argc == 6 && !blocks) throw std::runtime_error("unknown storage mode (expected block)");
-        const aowis::native::PhysicalStore engine = blocks
-            ? aowis::native::PhysicalStore::ExperimentalBlocks
-            : aowis::native::PhysicalStore::Stage7Pack;
+        const aowis::native::PhysicalStore engine = aowis::native::PhysicalStore::Pack;
         if (pipes > 1000000 || revisions > 10000 || edits > pipes) {
             throw std::runtime_error("invalid size or edits exceed pipe count");
         }
@@ -161,7 +157,7 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point verifying = std::chrono::steady_clock::now();
         reopened.verifyPack();
         const double verifyMs = elapsed(verifying);
-        std::cout << (blocks ? "engine=native-experimental-blocks\n" : "engine=native-v0\n")
+        std::cout << "engine=native-pack\n"
                   << "fixture=synthetic-hydraulic-topology\n"
                   << "codec=synthetic-not-serialized\n"
                   << "pipes=" << pipes << "\nnodes=" << pipes + 1
@@ -175,8 +171,7 @@ int main(int argc, char** argv) {
                   << "\ndiff_ms=" << diffMs << "\ndiff_objects=" << differenceCount
                   << "\nscan_ms=" << scanMs << "\npack_bytes=" << packBytes
                   << "\npack_objects=" << packObjects
-                  << "\nindex_bytes=" << std::filesystem::file_size(blocks
-                         ? path / "blocks" / "candidate.idx" : path / "objects.idx")
+                  << "\nindex_bytes=" << std::filesystem::file_size(path / "objects.idx")
                   << "\nreopen_ms=" << reopenMs << "\nverify_ms=" << verifyMs << '\n';
 #ifdef __linux__
         // Linux reports ru_maxrss in KiB. Capture the whole benchmark process

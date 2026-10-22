@@ -225,8 +225,7 @@ void testBackupAndSidecars(PhysicalStore backend) {
     }
     // Index sidecars are reconstructible. Simulate a crash that leaves only an
     // incomplete index suffix; object packs and commit markers remain intact.
-    const std::filesystem::path index = backend == PhysicalStore::Stage7Pack
-        ? origin / "objects.idx" : origin / "blocks" / "candidate.idx";
+    const std::filesystem::path index = origin / "objects.idx";
     const std::uintmax_t oldSize = std::filesystem::file_size(index);
     expect(oldSize > 16, "fixture lacks an index");
     std::filesystem::resize_file(index, oldSize - 7);
@@ -265,11 +264,7 @@ void verifyLocking(PhysicalStore backend) {
     expect(::read(ready[0], &confirmed, 1) == 1 && confirmed == 'Y',
            "child could not open independent repository handle");
     bool refused = false;
-    if (backend == PhysicalStore::ExperimentalBlocks) {
-        // Block storage requires exclusive lifetime ownership even for reads.
-        try { Repository unexpected(directory.path / "repo", backend); }
-        catch (const std::exception&) { refused = true; }
-    } else {
+    {
         Repository repository(directory.path / "repo", backend);
         try { (void)repository.compact(); }
         catch (const std::exception&) { refused = true; }
@@ -292,9 +287,7 @@ void testInterruptedCompactionHandle(PhysicalStore backend, bool afterSwitch) {
     baseline(path, backend, false);
     {
         Repository repository(path, backend);
-        const char* point = backend == PhysicalStore::Stage7Pack
-            ? (afterSwitch ? "compact.pack.after.pointer" : "compact.pack.before.pointer")
-            : (afterSwitch ? "compact.block.after.pointer" : "compact.block.before.pointer");
+        const char* point = (afterSwitch ? "compact.pack.after.pointer" : "compact.pack.before.pointer");
         ::setenv("AOWIS_NATIVE_TEST_FAULT", point, 1);
         ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
         bool failed = false;
@@ -321,15 +314,7 @@ void runBackend(PhysicalStore backend) {
         "pack.after.body",
         "pack.before.fsync", "pack.after.fsync"
     };
-    const std::vector<std::string_view> blockPre{
-        "block.before.header", "block.after.header", "block.partial.body",
-        "block.after.body", "block.partial.manifest",
-        "block.before.pack.fsync", "block.after.pack.fsync",
-        "block.after.index.fsync", "block.before.manifest.rename",
-        "block.after.manifest.rename", "block.after.manifest.dirsync"
-    };
-    const bool block = backend == PhysicalStore::ExperimentalBlocks;
-    const std::vector<std::string_view>& checkpoints = block ? blockPre : packPre;
+    const std::vector<std::string_view>& checkpoints = packPre;
     for (std::string_view point : checkpoints) {
         for (bool crash : {true, false}) runFault(point, crash, backend, false, false, false);
     }
@@ -346,9 +331,9 @@ void runBackend(PhysicalStore backend) {
         runFault(point, true, backend, true, false, point == "ref.after.rename");
     }
     for (bool crash : {true, false}) {
-        runFault(block ? "compact.block.before.pointer" : "compact.pack.before.pointer",
+        runFault("compact.pack.before.pointer",
                  crash, backend, false, true, false);
-        runFault(block ? "compact.block.after.pointer" : "compact.pack.after.pointer",
+        runFault("compact.pack.after.pointer",
                  crash, backend, false, true, false);
     }
     for (std::string_view point : {"ref.before.rename", "ref.after.rename",
@@ -357,7 +342,7 @@ void runBackend(PhysicalStore backend) {
             runImportFault(point, crash, backend, point == "ref.after.rename");
         }
     }
-    runImportFault(block ? "block.after.manifest.rename" : "pack.after.fsync",
+    runImportFault("pack.after.fsync",
                    true, backend, false);
     testBackupAndSidecars(backend);
     testInterruptedCompactionHandle(backend, false);
@@ -368,9 +353,8 @@ void runBackend(PhysicalStore backend) {
 
 int main() {
     try {
-        runBackend(PhysicalStore::Stage7Pack);
-        runBackend(PhysicalStore::ExperimentalBlocks);
-        std::cout << "Recovery, injected ENOSPC/crashes and locking: passed on both backends\n";
+        runBackend(PhysicalStore::Pack);
+        std::cout << "Recovery, injected ENOSPC/crashes and locking: passed on pack storage\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Native recovery test failed: " << error.what() << '\n';

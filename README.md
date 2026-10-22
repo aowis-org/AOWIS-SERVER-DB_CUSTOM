@@ -34,7 +34,7 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | Area | Available today |
 |---|---|
 | Native storage | Immutable SHA-256 objects, copy-on-write Merkle UUID index, durable branch refs, recoverable index, integrity verification, offline compaction |
-| Physical storage | Append-only object packs (`PhysicalStore::Stage7Pack`, default) and block-packed storage (`PhysicalStore::ExperimentalBlocks`, opt-in) |
+| Physical storage | One append-only content-addressed object pack, with a reconstructible sidecar index |
 | Model serialization | Native-owned `ModelCodec<T>` for AOWIS model definitions; configure-time schema coverage check for 68 persisted structures |
 | Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, indexed lookup/edit/delete |
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
@@ -69,7 +69,7 @@ Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraul
 
 // Use the native repository directly from C++.
 aowis::native::Repository repository("/path/to/repository",
-                                     aowis::native::PhysicalStore::Stage7Pack);
+                                     aowis::native::PhysicalStore::Pack);
 repository.createBranch("main");
 // Use aowis::native::hydraulic::saveHydraulicNetwork(),
 // loadHydraulicNetwork(), editHydraulicNetwork() and mergeHydraulicBranches()
@@ -82,7 +82,7 @@ For model semantics, query APIs and safe indexed edit rules, see [hydraulic pers
 
 ## Repository storage and maintenance
 
-The default repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. Both supported physical backends share the same logical object and revision identities, but **their directories are not interchangeable**.
+Each repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. The pack is the sole supported physical repository format. An obsolete experimental block repository is rejected rather than silently opened as a pack; before applying this patch, export any such pre-release repository with the older executable and import its bundle afterward.
 
 ```bash
 ./build-linux/aowis-native-verify /path/to/repository             # full (default)
@@ -90,17 +90,17 @@ The default repository uses an append-only content pack and rebuildable index. E
 ./build-linux/aowis-native-compact /path/to/repository
 ```
 
-`aowis-native-verify` now performs complete **native storage** verification by default: physical objects, published branch/revision ancestry, canonical Merkle trees, and exact model-to-reverse-reference consistency. The optional `--physical` mode checks only physical stored objects. Bundle imports reuse the same logical validator, rejecting malformed history before publication. This does not yet check application-specific hydraulic semantics. See [repository verification](docs/repository-verification.md). Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
+`aowis-native-verify` now performs complete **native storage** verification by default: physical objects, published branch/revision ancestry, canonical Merkle trees, and exact model-to-reverse-reference consistency. The optional `--physical` mode checks only physical stored objects. Bundle imports reuse the same logical validator, rejecting malformed history before publication. This does not yet check application-specific hydraulic semantics. See [repository verification](docs/repository-verification.md). Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md).
 
-The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for both backends; they do not simulate storage-device power failure.
+The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
 
 ## Offline repository synchronization
 
-Portable bundles exchange immutable branches between independent repositories, including when the sender and receiver use different physical storage formats. Import verifies the graph before creating or fast-forwarding a branch and **never silently overwrites divergent work**.
+Portable bundles exchange immutable branches between independent repositories, without transferring physical storage pages. Import verifies the graph before creating or fast-forwarding a branch and **never silently overwrites divergent work**.
 
 ```bash
 ./build-linux/aowis-native-sync export \
-  /path/to/source blocks main /tmp/main.aowbundle
+  /path/to/source pack main /tmp/main.aowbundle
 ./build-linux/aowis-native-sync import \
   /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
@@ -114,10 +114,10 @@ Every benchmark creates its own repository. Supply a **nonexistent child directo
 ```bash
 run_root="$(mktemp -d /tmp/aowis-db-custom-bench.XXXXXXXX)"
 ./build-linux/aowis-native-hydraulic-edit-benchmark \
-  "$run_root/repository" 100000 20 3 block
+  "$run_root/repository" 100000 20 3
 ```
 
-The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. A dedicated `aowis-native-merge-history-benchmark` measures ancestry/diff/conflict processing without a durable merge commit, using configurable shared/divergent histories on either backend. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
+The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. A dedicated `aowis-native-merge-history-benchmark` measures ancestry/diff/conflict processing without a durable merge commit, using configurable shared/divergent histories on the pack backend. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
 
 ## Recovery testing and operational limits
 
@@ -160,4 +160,4 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 
 The HTTP server exposes canonical hydraulic network reads/writes, revision-pinned entity queries, atomic edits, revision diffs and validated hydraulic merges when built with the AOWIS model codec. See [HTTP service](docs/native-database-service.md) and [OpenAPI](docs/db-http-api.yaml) for implemented routes and request limits.
 
-The [pack-versus-block benchmark](docs/benchmark-plan.md#pack-versus-block-decision-benchmark) compares identical native model and canonical hydraulic workloads before selecting a single physical backend.
+The [benchmark guide](docs/benchmark-plan.md) covers canonical hydraulic operations, replication, recovery, and maintenance on the native pack backend.

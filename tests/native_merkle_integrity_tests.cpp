@@ -374,17 +374,11 @@ void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore targetSto
 
 int main() {
     try {
-        testMalformedTrees(PhysicalStore::Stage7Pack);
-        testMalformedTrees(PhysicalStore::ExperimentalBlocks);
-        testValidCompressedAndSharedTrees(PhysicalStore::Stage7Pack);
-        testValidCompressedAndSharedTrees(PhysicalStore::ExperimentalBlocks);
-        testValidNonzeroCompressedPrefix(PhysicalStore::Stage7Pack);
-        testValidNonzeroCompressedPrefix(PhysicalStore::ExperimentalBlocks);
-        testValidMaximumTrieDepth(PhysicalStore::Stage7Pack);
-        testValidMaximumTrieDepth(PhysicalStore::ExperimentalBlocks);
-        testMalformedIncremental(PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks);
-        testMalformedIncremental(PhysicalStore::ExperimentalBlocks, PhysicalStore::Stage7Pack);
-        testMalformedIncremental(PhysicalStore::Stage7Pack, PhysicalStore::Stage7Pack);
+        testMalformedTrees(PhysicalStore::Pack);
+        testValidCompressedAndSharedTrees(PhysicalStore::Pack);
+        testValidNonzeroCompressedPrefix(PhysicalStore::Pack);
+        testValidMaximumTrieDepth(PhysicalStore::Pack);
+        testMalformedIncremental(PhysicalStore::Pack, PhysicalStore::Pack);
         std::cout << "AOWIS native Merkle integrity tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

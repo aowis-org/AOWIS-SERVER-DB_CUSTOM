@@ -177,7 +177,7 @@ void testRevisionMarks(PhysicalStore sourceBackend, PhysicalStore destinationBac
 int main() {
     try {
         const std::array<PhysicalStore, 2> backends{
-            PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks};
+            PhysicalStore::Pack, PhysicalStore::Pack};
         for (PhysicalStore sourceBackend : backends) {
             for (PhysicalStore destinationBackend : backends) {
                 testRevisionMarks(sourceBackend, destinationBackend, false);

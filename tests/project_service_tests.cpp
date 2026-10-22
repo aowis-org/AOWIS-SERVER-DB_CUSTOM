@@ -180,8 +180,7 @@ void exerciseUnsafeCatalogue() {
 
 int main() {
     try {
-        exerciseBackend(PhysicalStore::Stage7Pack);
-        exerciseBackend(PhysicalStore::ExperimentalBlocks);
+        exerciseBackend(PhysicalStore::Pack);
         exerciseUnsafeCatalogue();
         std::cout << "Project catalogue and lifecycle tests passed\n";
         return 0;

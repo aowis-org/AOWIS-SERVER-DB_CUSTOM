@@ -35,7 +35,7 @@ def main():
         if "Fixture model/pack: commit 1/4" not in progress.stderr:
             raise AssertionError("per-commit preparation progress is missing")
         manifest = json.loads((fixtures / "manifest.json").read_text(encoding="utf-8"))
-        if len(manifest["fixtures"]) != 4:
+        if len(manifest["fixtures"]) != 2:
             raise AssertionError("fixture preparation did not cover all source combinations")
         if "already exists" not in run(prepare, success=False).stderr:
             raise AssertionError("preparing fixtures can overwrite existing data")
@@ -43,13 +43,13 @@ def main():
                                                    "--mode", "imports", "--fixture-dir", str(fixtures),
                                                    "--objects", "100", "--commits", "4",
                                                    "--payload-bytes", "32", "--kinds", "both",
-                                                   "--backends", "both", "--repeats", "1"],
+                                                   "--backends", "pack", "--repeats", "1"],
                                                   success=False).stderr:
             raise AssertionError("mismatched fixtures were accepted")
         run(imported)
         with results.open(newline="", encoding="utf-8") as stream:
             rows = list(csv.DictReader(stream))
-        if len(rows) != 16 or any(int(row["import_peak_rss_kib"]) <= 0 for row in rows):
+        if len(rows) != 4 or any(int(row["import_peak_rss_kib"]) <= 0 for row in rows):
             raise AssertionError("split benchmark produced incomplete import results")
         # Profile data comes from inside the native importer, not from the
         # independent post-import audit or Python launcher. Every phase must

@@ -273,7 +273,7 @@ void testLongSharedHistory(PhysicalStore backend) {
 int main() {
     try {
         for (const PhysicalStore backend :
-             {PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks}) {
+             {PhysicalStore::Pack}) {
             testRandomizedMergeDag(backend, false);
             testRandomizedMergeDag(backend, true);
             testCrissCross(backend);

@@ -66,8 +66,8 @@ void exercise(const std::filesystem::path& cli,
     const std::filesystem::path destinationPath = temp.path / "destination";
     const std::filesystem::path bundle = temp.path / "full.aowbundle";
     const std::filesystem::path delta = temp.path / "incremental.aowbundle";
-    const std::string sourceMode = sourceFormat == PhysicalStore::Stage7Pack ? "pack" : "blocks";
-    const std::string destinationMode = destinationFormat == PhysicalStore::Stage7Pack ? "pack" : "blocks";
+    const std::string sourceMode = "pack";
+    const std::string destinationMode = "pack";
     aowis::native::Hash base{};
     aowis::native::Hash tip{};
     aowis::native::Key key{};
@@ -118,8 +118,7 @@ int main(int argc, char** argv) {
     try {
         expect(argc == 2, "usage: native_sync_cli_tests SYNC_CLI");
         const std::filesystem::path cli = std::filesystem::absolute(argv[1]);
-        exercise(cli, PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks);
-        exercise(cli, PhysicalStore::ExperimentalBlocks, PhysicalStore::Stage7Pack);
+        exercise(cli, PhysicalStore::Pack, PhysicalStore::Pack);
         std::cout << "Offline synchronization CLI tests passed\n";
         return 0;
     } catch (const std::exception& error) {

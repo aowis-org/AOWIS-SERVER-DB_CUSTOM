@@ -197,8 +197,7 @@ void exerciseCli(const std::filesystem::path& accessCli) {
 int main(int argc, char** argv) {
     try {
         expect(argc == 2, "pass the access CLI path");
-        exercise(PhysicalStore::Stage7Pack);
-        exercise(PhysicalStore::ExperimentalBlocks);
+        exercise(PhysicalStore::Pack);
         exerciseCli(std::filesystem::absolute(argv[1]));
         std::cout << "Native access-policy tests passed\n";
         return 0;

@@ -7,7 +7,7 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 1. **Model definitions and codec:** `AOWIS-SERVER-MODEL` (Git submodule) defines model types; this repository's `ModelCodec<T>` serializes them and checks a 68-structure schema contract.
 2. **Domain persistence:** the hydraulic adapter validates `NetworkHydraulic`, persists network metadata, up to 256 ordered UUIDs per membership chunk, and one independently addressed record per top-level entity.
 3. **Logical object store:** content-addressed immutable values, compressed 16-way UUID Merkle trie, persistent reverse-reference index, revision DAG and named branch refs.
-4. **Physical store:** default append-only object pack with derived index; optional block-packed backend. Both represent the same logical objects and revisions, but their directories cannot be mixed.
+4. **Physical store:** append-only content-addressed object pack with a derived/rebuildable index.
 5. **Service boundary:** `aowis-server-db` uses Qt QHttpServer over HTTP/TCP with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Only catalogue/branch/history operations are HTTP-accessible so far.
 
 ## Logical identities and history
@@ -36,9 +36,19 @@ Object records use an `AOBJ` header and typed canonical bytes. Index entries con
 
 `aowis-native-verify` performs physical verification of all stored objects and, by default, traverses every published branch's complete history to validate Merkle structure, typed native records and exact reverse-reference consistency. `--physical` limits verification to physical storage only. The same immutable logical verifier is used during bundle import and on-disk audits. Application-specific hydraulic semantic validation is outside this native storage check; see [repository verification](repository-verification.md). CRC32 is an accidental-corruption check for index entries, **not a signature or authentication mechanism**.
 
-## Block-packed storage
+## Physical storage
 
-`PhysicalStore::ExperimentalBlocks` groups small content-addressed objects into blocks to reduce physical overhead while preserving the same logical hashes and revision roots. Block-level verification, an independent derived object-location index, writable atomic batches, and offline compaction exist. It is still explicitly experimental. Use `PhysicalStore::Stage7Pack` for the default backend and `ExperimentalBlocks` only when deliberately selected. See [block storage](block-pack-experiment.md).
+Every repository uses the same append-only content pack. Object hashes identify
+immutable logical content, while the physical index maps hashes to pack offsets.
+An index suffix lost during a crash is reconstructed by scanning the verified
+pack tail. Compaction writes and verifies a replacement pack before atomically
+publishing its generation pointer. Existing repository handles become unusable
+if that pointer switches and the operation subsequently fails; reopen them
+before retrying writes.
+
+Directories with the obsolete pre-release `storage.format` block marker are
+rejected explicitly. Use an older build to export such a repository to a
+portable bundle before upgrading, then import into a new pack repository.
 
 ## Publication, durability and failure handling
 
@@ -49,7 +59,7 @@ Object records use an `AOBJ` header and typed canonical bytes. Index entries con
 
 ## Concurrency and physical limits
 
-Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. The block backend permits one open repository handle at a time. The HTTP service owns/manages one repository handle per project centrally, avoiding competing block-backend handles. The database and server are Linux/POSIX-oriented and not yet production hardened.
+Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. Pack repositories permit coordinated concurrent handles; compaction requires exclusive repository lifetime ownership. The HTTP service manages repository handles centrally. The database and server are Linux/POSIX-oriented and not yet production hardened.
 
 ## Replication independence
 

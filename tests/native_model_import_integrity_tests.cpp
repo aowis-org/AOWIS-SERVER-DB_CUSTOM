@@ -659,8 +659,7 @@ void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore destinati
 
 int main() {
     try {
-        for (PhysicalStore backend : {PhysicalStore::Stage7Pack,
-                                      PhysicalStore::ExperimentalBlocks}) {
+        for (PhysicalStore backend : {PhysicalStore::Pack}) {
             testMalformedFull(backend);
             testReproducedUnsafeDeletion(backend);
             testValidCyclesAndHistory(backend);
@@ -668,10 +667,8 @@ int main() {
             testHistoricalReferenceDeltas(backend);
             testDeepSharedModelHistory(backend);
         }
-        for (PhysicalStore source : {PhysicalStore::Stage7Pack,
-                                     PhysicalStore::ExperimentalBlocks}) {
-            for (PhysicalStore destination : {PhysicalStore::Stage7Pack,
-                                              PhysicalStore::ExperimentalBlocks}) {
+        for (PhysicalStore source : {PhysicalStore::Pack}) {
+            for (PhysicalStore destination : {PhysicalStore::Pack}) {
                 testMalformedIncremental(source, destination);
             }
         }

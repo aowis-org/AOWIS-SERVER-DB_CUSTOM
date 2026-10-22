@@ -48,7 +48,7 @@ double elapsedMs(const std::chrono::steady_clock::time_point start) {
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     if (argc < 3 || argc > 6) {
-        std::cerr << "usage: aowis-native-hydraulic-edit-benchmark NEW_REPOSITORY PIPES [SCALAR_EDITS=20] [TOPOLOGY_EDITS=3] [block]\n";
+        std::cerr << "usage: aowis-native-hydraulic-edit-benchmark NEW_REPOSITORY PIPES [SCALAR_EDITS=20] [TOPOLOGY_EDITS=3]\n";
         return 2;
     }
     try {
@@ -60,8 +60,9 @@ int main(int argc, char** argv) {
         const int topologyEdits = argc >= 5 ? std::stoi(argv[4]) : 3;
         if (pipeCount < 2 || pipeCount > 1000000 || scalarEdits < 1 || topologyEdits < 1)
             throw std::runtime_error("invalid benchmark counts");
-        const native::PhysicalStore physical = argc >= 6 && std::string(argv[5]) == "block"
-            ? native::PhysicalStore::ExperimentalBlocks : native::PhysicalStore::Stage7Pack;
+        if (argc != 3 && argc != 4 && argc != 5)
+            throw std::runtime_error("unexpected benchmark arguments");
+        const native::PhysicalStore physical = native::PhysicalStore::Pack;
 
         NetworkHydraulic network;
         network.uuid = uuid(1);
@@ -315,7 +316,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("missing indexed network root");
         const std::uint64_t peakRssKiB = peakResidentKiB();
         std::cout << std::fixed << std::setprecision(3)
-                  << "engine=" << (physical == native::PhysicalStore::ExperimentalBlocks ? "blocks" : "stage7") << '\n'
+                  << "engine=" << ("pack") << '\n'
                   << "fixture=canonical-hydraulic-network\n"
                   << "pipes=" << pipeCount << '\n'
                   << "scalar_edits=" << scalarEdits << '\n'

@@ -74,8 +74,8 @@ double elapsed(const std::chrono::steady_clock::time_point start) {
 
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
-    if (argc < 2 || argc > 6) {
-        std::cerr << "Usage: aowis-native-hydraulic-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10] [block]\n"
+    if (argc < 2 || argc > 5) {
+        std::cerr << "Usage: aowis-native-hydraulic-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10]\n"
                   << "Real native model codec bytes and content-addressed native model storage.\n";
         return 2;
     }
@@ -85,11 +85,7 @@ int main(int argc, char** argv) {
         const std::uint64_t pipes = argc > 2 ? positive(argv[2]) : 1000;
         const std::uint64_t revisions = argc > 3 ? positive(argv[3]) : 10;
         const std::uint64_t edits = argc > 4 ? positive(argv[4]) : 10;
-        const bool blocks = argc == 6 && std::string(argv[5]) == "block";
-        if (argc == 6 && !blocks) throw std::runtime_error("unknown storage format (expected block)");
-        const aowis::native::PhysicalStore engine = blocks
-            ? aowis::native::PhysicalStore::ExperimentalBlocks
-            : aowis::native::PhysicalStore::Stage7Pack;
+        const aowis::native::PhysicalStore engine = aowis::native::PhysicalStore::Pack;
         if (pipes > 1000000 || revisions > 10000 || edits > pipes) {
             throw std::runtime_error("invalid size or edits exceed pipe count");
         }
@@ -176,7 +172,7 @@ int main(int argc, char** argv) {
         const aowis::native::Revision final = store->head("main");
         const std::uint64_t packBytes = store->packSize();
         const std::uint64_t packedObjects = store->objectCount();
-        store.reset();  // Block store intentionally permits one writable handle.
+        store.reset(); // Close the repository before reopening for verification.
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
         Repository reopened(directory, engine);
         if (reopened.head("main").root != final.root) throw std::runtime_error("reopen root mismatch");
@@ -185,7 +181,7 @@ int main(int argc, char** argv) {
         reopened.verifyPack();
         const double verifyMs = elapsed(verifying);
 
-        std::cout << (blocks ? "engine=native-experimental-blocks\n" : "engine=native-v0\n")
+        std::cout << "engine=native-pack\n"
                   << "fixture=model-hydraulic-topology\ncodec=native-model-canonical\n"
                   << "pipes=" << pipes << "\nnodes=" << pipes + 1
                   << "\nobjects=" << 2 * pipes + 1 << "\nrevisions=" << revisions
@@ -202,8 +198,7 @@ int main(int argc, char** argv) {
                   << "\nscan_decode_ms=" << scanMs
                   << "\npack_bytes=" << packBytes
                   << "\npack_objects=" << packedObjects
-                  << "\nindex_bytes=" << std::filesystem::file_size(blocks
-                         ? directory / "blocks" / "candidate.idx" : directory / "objects.idx")
+                  << "\nindex_bytes=" << std::filesystem::file_size(directory / "objects.idx")
                   << "\nreopen_ms=" << reopenMs << "\nverify_ms=" << verifyMs << '\n';
 #ifdef __linux__
         // Linux reports ru_maxrss in KiB. Capture the whole benchmark process

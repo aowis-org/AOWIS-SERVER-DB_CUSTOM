@@ -107,10 +107,7 @@ void exercise(PhysicalStore senderStore, PhysicalStore receiverStore) {
 
 int main() {
     try {
-        exercise(PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks);
-        exercise(PhysicalStore::ExperimentalBlocks, PhysicalStore::Stage7Pack);
-        exercise(PhysicalStore::Stage7Pack, PhysicalStore::Stage7Pack);
-        exercise(PhysicalStore::ExperimentalBlocks, PhysicalStore::ExperimentalBlocks);
+        exercise(PhysicalStore::Pack, PhysicalStore::Pack);
         std::cout << "AOWIS native bundle limit tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

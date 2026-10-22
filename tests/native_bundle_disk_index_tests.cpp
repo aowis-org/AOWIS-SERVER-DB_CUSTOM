@@ -328,7 +328,7 @@ int main(int argc, char** argv) {
             std::string_view(argv[1]) == "--shared-kinds-only";
         check(argc == 1 || sharedOnly, "invalid bundle disk-index test arguments");
         const std::array<PhysicalStore, 2> backends{
-            PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks};
+            PhysicalStore::Pack, PhysicalStore::Pack};
         for (PhysicalStore source : backends) {
             for (PhysicalStore destination : backends) {
                 if (!sharedOnly) exercise(source, destination);

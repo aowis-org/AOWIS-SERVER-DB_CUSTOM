@@ -14,17 +14,17 @@ using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 PhysicalStore parseStorage(std::string_view mode) {
-    if (mode == "pack") return PhysicalStore::Stage7Pack;
-    if (mode == "blocks") return PhysicalStore::ExperimentalBlocks;
-    throw std::runtime_error("storage mode must be pack or blocks");
+    if (mode == "pack") return PhysicalStore::Pack;
+    
+    throw std::runtime_error("storage mode must be pack");
 }
 
 void usage() {
     std::cerr <<
-        "Usage: aowis-native-sync head REPOSITORY pack|blocks BRANCH\n"
-        "       aowis-native-sync export REPOSITORY pack|blocks BRANCH BUNDLE\n"
-        "       aowis-native-sync export-incremental REPOSITORY pack|blocks BRANCH BASE_REVISION BUNDLE\n"
-        "       aowis-native-sync import REPOSITORY pack|blocks BUNDLE LOCAL_BRANCH\n";
+        "Usage: aowis-native-sync head REPOSITORY pack BRANCH\n"
+        "       aowis-native-sync export REPOSITORY pack BRANCH BUNDLE\n"
+        "       aowis-native-sync export-incremental REPOSITORY pack BRANCH BASE_REVISION BUNDLE\n"
+        "       aowis-native-sync import REPOSITORY pack BUNDLE LOCAL_BRANCH\n";
 }
 
 } // namespace

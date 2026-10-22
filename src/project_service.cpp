@@ -109,7 +109,7 @@ void syncDirectory(const std::filesystem::path& path) {
 
 void writeManifest(const std::filesystem::path& path, const ProjectInfo& info) {
     const std::string body = "AOWIS-PROJECT-1\n" + info.id + "\n" +
-        (info.storage == PhysicalStore::Stage7Pack ? "pack\n" : "blocks\n") +
+        "pack\n" +
         encodeName(info.name) + "\n";
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     syscallChecked(fd >= 0, "create project manifest");
@@ -150,8 +150,8 @@ ProjectInfo readManifest(const std::filesystem::path& projectDirectory) {
     check(ProjectService::validProjectId(info.id) &&
           projectDirectory.filename().string() == info.id, "project manifest UUID mismatch");
     const std::string format = body.substr(second + 1, third - second - 1);
-    check(format == "pack" || format == "blocks", "invalid project storage format");
-    info.storage = format == "pack" ? PhysicalStore::Stage7Pack : PhysicalStore::ExperimentalBlocks;
+    check(format == "pack", "unsupported project storage format");
+    info.storage = PhysicalStore::Pack;
     info.name = decodeName(body.substr(third + 1, body.size() - third - 2));
     return info;
 }
@@ -235,7 +235,7 @@ ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore s
     ensureHealthy();
     if (!validName(name)) throw ProjectError(ProjectErrorKind::InvalidInput,
                                             "project name must contain 1..200 non-control bytes");
-    if (storage != PhysicalStore::Stage7Pack && storage != PhysicalStore::ExperimentalBlocks)
+    if (storage != PhysicalStore::Pack)
         throw ProjectError(ProjectErrorKind::InvalidInput, "unsupported storage backend");
     ProjectInfo info;
     info.name = std::string(name);
@@ -374,8 +374,7 @@ Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
     try { return repositoryEntry(projectId).repository->revision(id); }
     catch (const std::runtime_error& error) {
         const std::string_view message(error.what());
-        if (message.find("referenced content is missing from pack") != std::string_view::npos ||
-            message.find("referenced content missing from block store") != std::string_view::npos)
+        if (message.find("referenced content is missing from pack") != std::string_view::npos)
             throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
         throw;
     }

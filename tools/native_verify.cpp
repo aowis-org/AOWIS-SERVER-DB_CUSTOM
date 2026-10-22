@@ -22,13 +22,13 @@ int main(int argc, char** argv) {
     }
     try {
         const bool blocks = std::filesystem::exists(directory / "storage.format");
+        if (blocks) throw std::runtime_error("obsolete block storage is not supported");
         if (!blocks && !std::filesystem::exists(directory / "objects.pack") &&
             !std::filesystem::exists(directory / "objects.current")) {
             throw std::runtime_error("repository has no objects.pack");
         }
         aowis::native::Repository repository(directory,
-            blocks ? aowis::native::PhysicalStore::ExperimentalBlocks
-                   : aowis::native::PhysicalStore::Stage7Pack);
+            aowis::native::PhysicalStore::Pack);
         if (physicalOnly) {
             repository.verifyPack();
             std::cout << "Physical integrity verified: " << repository.objectCount()

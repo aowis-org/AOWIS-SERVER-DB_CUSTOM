@@ -189,16 +189,13 @@ struct MergeResult {
 // Linux/POSIX prototype. All operations on one instance are thread-safe;
 // processes using the same repository serialize operations with flock(2).
 // A successful commit syncs its append-only pack before publishing its ref.
-class BlockStorePrototype;
-
-// Stage-7 is the default. The block store is explicitly experimental and
-// currently permits only one repository handle at a time.
-enum class PhysicalStore { Stage7Pack, ExperimentalBlocks };
+// The database uses one append-only, content-addressed pack backend.
+enum class PhysicalStore { Pack };
 
 class Repository final {
 public:
     explicit Repository(std::filesystem::path directory,
-                        PhysicalStore storage = PhysicalStore::Stage7Pack);
+                        PhysicalStore storage = PhysicalStore::Pack);
     ~Repository();
     Repository(const Repository&) = delete;
     Repository& operator=(const Repository&) = delete;
@@ -292,8 +289,6 @@ private:
     };
 
     std::filesystem::path directory_;
-    PhysicalStore storage_ = PhysicalStore::Stage7Pack;
-    std::unique_ptr<BlockStorePrototype> blockStore_;
     int lockFd_ = -1;
     int lifetimeFd_ = -1;
     std::string packToken_;
@@ -310,12 +305,6 @@ private:
         }
     };
     std::unordered_map<Hash, Location, HashHasher> index_;
-    // Unpublished immutable nodes produced while assembling one block-backed
-    // revision. They are persisted together before its branch ref is moved.
-    std::unordered_map<Hash, Bytes, HashHasher> stagedObjects_;
-    // Bound unpublished payload retention for large block-backed commits.
-    // Flushed content is durable but unreachable until the branch ref advances.
-    std::size_t stagedBytes_ = 0;
     std::uint64_t scanOffset_ = 0;
     std::uint64_t indexReadOffset_ = 0;
     bool needsReopen_ = false; // fatal failure after publishing a compaction pointer

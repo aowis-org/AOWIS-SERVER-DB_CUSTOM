@@ -155,10 +155,10 @@ int main() {
         for (unsigned source = 0; source < 2; ++source) {
             for (unsigned destination = 0; destination < 2; ++destination) {
                 TemporaryRoot root;
-                testPair(source == 0 ? PhysicalStore::Stage7Pack :
-                         PhysicalStore::ExperimentalBlocks,
-                         destination == 0 ? PhysicalStore::Stage7Pack :
-                         PhysicalStore::ExperimentalBlocks, root.path());
+                testPair(source == 0 ? PhysicalStore::Pack :
+                         PhysicalStore::Pack,
+                         destination == 0 ? PhysicalStore::Pack :
+                         PhysicalStore::Pack, root.path());
             }
         }
     } catch (const std::exception& error) {

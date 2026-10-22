@@ -53,7 +53,7 @@ An implemented incremental export supplies a known base revision as a `base` que
 ## Repository and server lifecycle
 
 - Persist a server-side **project catalogue** mapping UUIDs to administrator-controlled repository directories. The project catalogue uses durable UUID-named directories with atomic project publication and tested restart recovery.
-- Decide and document repository-handle lifetime, the block backend's single-handle constraint, concurrent request handling, graceful shutdown and safe offline maintenance. Never promise online compaction before it is implemented.
+- Decide and document repository-handle lifetime, concurrent request handling, graceful shutdown and safe offline maintenance. Never promise online compaction before it is implemented.
 - Use configuration for bind address, port, project data root and logging; align with other AOWIS servers' conventions rather than invent per-request filesystem routing.
 - Maintain the [OpenAPI specification](db-http-api.yaml) alongside implemented endpoints and test them over real local TCP on both physical backends.
 - Keep a storage-agnostic native C++ façade so embedding the database in the AOWIS standalone build does not require TCP/HTTP.

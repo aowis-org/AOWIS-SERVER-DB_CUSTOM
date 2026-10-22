@@ -99,7 +99,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
                target.get("remote_main", key(3)) == bytes("on-feature") &&
                target.getAtRevision(base, key(1)) == bytes("original") &&
                !target.getAtRevision(base, key(2)),
-               "cross-backend replication changed historical contents");
+               "independent repository replication changed historical contents");
         expect(target.revision(mergeTip).parents.size() == 2 &&
                target.revision(mergeTip).id == mergeTip,
                "replication did not preserve two-parent merge history");
@@ -420,18 +420,14 @@ void testIncrementalBundles(PhysicalStore sourceStore, PhysicalStore destination
 
 int main() {
     try {
-        testPortableBundles(PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks);
-        testPortableBundles(PhysicalStore::ExperimentalBlocks, PhysicalStore::Stage7Pack);
-        testPortableBundles(PhysicalStore::Stage7Pack, PhysicalStore::Stage7Pack);
-        testIncrementalBundles(PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks);
-        testIncrementalBundles(PhysicalStore::ExperimentalBlocks, PhysicalStore::Stage7Pack);
-        testIncrementalBundles(PhysicalStore::Stage7Pack, PhysicalStore::Stage7Pack);
-        testIncrementalModelReferences(PhysicalStore::Stage7Pack,
-                                       PhysicalStore::ExperimentalBlocks);
-        testIncrementalModelReferences(PhysicalStore::ExperimentalBlocks,
-                                       PhysicalStore::Stage7Pack);
-        testMergeParentIncremental(PhysicalStore::Stage7Pack,
-                                   PhysicalStore::ExperimentalBlocks);
+        testPortableBundles(PhysicalStore::Pack, PhysicalStore::Pack);
+        testIncrementalBundles(PhysicalStore::Pack, PhysicalStore::Pack);
+        testIncrementalModelReferences(PhysicalStore::Pack,
+                                       PhysicalStore::Pack);
+        testIncrementalModelReferences(PhysicalStore::Pack,
+                                       PhysicalStore::Pack);
+        testMergeParentIncremental(PhysicalStore::Pack,
+                                   PhysicalStore::Pack);
         std::cout << "AOWIS native offline sync tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

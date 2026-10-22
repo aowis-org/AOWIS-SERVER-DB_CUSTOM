@@ -2428,27 +2428,17 @@ void exerciseCallerPinnedWrites(native::PhysicalStore physical) {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
-        exerciseEmptyRawBranch(native::PhysicalStore::Stage7Pack);
-        exerciseEmptyRawBranch(native::PhysicalStore::ExperimentalBlocks);
-        exercise(native::PhysicalStore::Stage7Pack);
-        exercise(native::PhysicalStore::ExperimentalBlocks);
-        exerciseChunkBoundaries(native::PhysicalStore::Stage7Pack);
-        exerciseChunkBoundaries(native::PhysicalStore::ExperimentalBlocks);
-        exerciseDependentMembership(native::PhysicalStore::Stage7Pack);
-        exerciseDependentMembership(native::PhysicalStore::ExperimentalBlocks);
-        exerciseDependentUpdates(native::PhysicalStore::Stage7Pack);
-        exerciseDependentUpdates(native::PhysicalStore::ExperimentalBlocks);
-        exerciseHydraulicMerging(native::PhysicalStore::Stage7Pack);
-        exerciseHydraulicMerging(native::PhysicalStore::ExperimentalBlocks);
-        exerciseStructuralMergeChoices(native::PhysicalStore::Stage7Pack);
-        exerciseStructuralMergeChoices(native::PhysicalStore::ExperimentalBlocks);
-        exerciseCoordinatedMembershipMerges(native::PhysicalStore::Stage7Pack);
-        exerciseCoordinatedMembershipMerges(native::PhysicalStore::ExperimentalBlocks);
-        exerciseSnapshotReads(native::PhysicalStore::Stage7Pack);
-        exerciseSnapshotReads(native::PhysicalStore::ExperimentalBlocks);
-        exerciseCallerPinnedWrites(native::PhysicalStore::Stage7Pack);
-        exerciseCallerPinnedWrites(native::PhysicalStore::ExperimentalBlocks);
-        std::cout << "Complete hydraulic network persistence tests passed on both backends\n";
+        exerciseEmptyRawBranch(native::PhysicalStore::Pack);
+        exercise(native::PhysicalStore::Pack);
+        exerciseChunkBoundaries(native::PhysicalStore::Pack);
+        exerciseDependentMembership(native::PhysicalStore::Pack);
+        exerciseDependentUpdates(native::PhysicalStore::Pack);
+        exerciseHydraulicMerging(native::PhysicalStore::Pack);
+        exerciseStructuralMergeChoices(native::PhysicalStore::Pack);
+        exerciseCoordinatedMembershipMerges(native::PhysicalStore::Pack);
+        exerciseSnapshotReads(native::PhysicalStore::Pack);
+        exerciseCallerPinnedWrites(native::PhysicalStore::Pack);
+        std::cout << "Complete hydraulic network persistence tests passed on pack backend\n";
         return 0;
     } catch (const std::exception& failure) {
         std::cerr << "Hydraulic network persistence test failed: " << failure.what() << '\n';

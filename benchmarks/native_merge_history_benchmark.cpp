@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
     try {
         if (argc != 5) {
             std::cerr << "Usage: " << argv[0]
-                      << " NEW_REPOSITORY_DIR SHARED_COMMITS DIVERGENT_COMMITS pack|block\n";
+                      << " NEW_REPOSITORY_DIR SHARED_COMMITS DIVERGENT_COMMITS pack\n";
             return EXIT_FAILURE;
         }
         const std::filesystem::path directory(argv[1]);
@@ -67,11 +67,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("requested history exceeds supported benchmark UUID range");
         }
         const std::string backendName(argv[4]);
-        if (backendName != "pack" && backendName != "block") {
-            throw std::runtime_error("physical backend must be pack or block");
+        if (backendName != "pack") {
+            throw std::runtime_error("physical backend must be pack");
         }
-        const PhysicalStore backend = backendName == "pack"
-            ? PhysicalStore::Stage7Pack : PhysicalStore::ExperimentalBlocks;
+        const PhysicalStore backend = PhysicalStore::Pack;
         Repository repository(directory, backend);
         repository.createBranch("main");
         for (std::uint32_t index = 1; index <= shared; ++index) {

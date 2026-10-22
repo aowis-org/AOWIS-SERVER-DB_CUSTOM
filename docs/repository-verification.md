@@ -14,7 +14,7 @@ The AOWIS native database provides read-only physical and logical verification f
 
 ## What full verification checks
 
-1. **Physical objects:** The pack backend checks every stored record's SHA-256, framing and index correspondence; the block backend verifies committed blocks and their object hashes. This includes unreachable objects, not just published history.
+1. **Physical objects:** The object-pack verifier checks every stored record's SHA-256, framing and index correspondence. This includes unreachable objects, not just published history.
 2. **Published history:** Every branch head points to a correctly typed revision; all reachable parents, including both parents of merges, exist and have valid serialized revision metadata. Multiple branches and shared ancestry are accepted.
 3. **Merkle structure:** Every tree reachable from a revision has canonical leaves/branches, legal compressed prefixes and depth ordering, correct UUID-to-child-slot paths and nonzero leaf value hashes. Associated raw/model/index payload objects must have the expected type and structure.
 4. **Model graph:** Every model-indexed revision has canonical model records, valid nonzero/non-self dependencies to existing model UUIDs, and a reverse-reference index exactly matching the model records. Historical revisions are checked, not just current branch tips. Shared immutable model snapshots are verified only once during a check.

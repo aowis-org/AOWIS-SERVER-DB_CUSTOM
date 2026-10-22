@@ -141,8 +141,7 @@ QJsonObject revisionJson(const Revision& revision) {
 QJsonObject projectJson(const ProjectInfo& project) {
     return QJsonObject{{"id", QString::fromStdString(project.id)},
                        {"name", QString::fromStdString(project.name)},
-                       {"storage", project.storage == PhysicalStore::Stage7Pack ?
-                                    QStringLiteral("pack") : QStringLiteral("blocks")}};
+                       {"storage", QStringLiteral("pack")}};
 }
 
 
@@ -351,9 +350,8 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             PhysicalStore storage = defaultStorage;
             if (object.contains("storage")) {
                 const std::string requested = requiredString(object, "storage");
-                requireInput(requested == "pack" || requested == "blocks", "invalid storage backend");
-                storage = requested == "pack" ? PhysicalStore::Stage7Pack :
-                                                 PhysicalStore::ExperimentalBlocks;
+                requireInput(requested == "pack", "invalid storage backend");
+                storage = PhysicalStore::Pack;
             }
             return QHttpServerResponse(projectJson(service.createProject(name, storage)), Status::Created);
         });

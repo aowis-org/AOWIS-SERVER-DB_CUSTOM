@@ -299,16 +299,15 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
 }
 #endif
 
-// Real TCP bundle transfer: full/incremental, cross-backend, corrupt/truncated,
+// Real TCP bundle transfer: full/incremental between independent repositories, corrupt/truncated,
 // stale/divergent branches, transfer limits, and idempotent retry.
 void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
                        const QString& sourceId, aowis::native::PhysicalStore backend) {
     namespace native = aowis::native;
-    const QString opposite = backend == native::PhysicalStore::Stage7Pack ?
-        QStringLiteral("blocks") : QStringLiteral("pack");
+    const QString recipientFormat = QStringLiteral("pack");
     const Response destination = client.call("POST", "/api/v1/projects",
-        QJsonObject{{"name", "Cross-backend recipient"}, {"storage", opposite}});
-    check(destination.status == 201, "cross-backend destination creation failed");
+        QJsonObject{{"name", "Replication recipient"}, {"storage", recipientFormat}});
+    check(destination.status == 201, "destination creation failed");
     const QString destinationId = destination.json.value("id").toString();
     const QString from = QStringLiteral("/api/v1/projects/") + sourceId + "/branches/sync_demo";
     const QString to = QStringLiteral("/api/v1/projects/") + destinationId + "/branches/tracking";
@@ -374,7 +373,7 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
     check(imported.status == 201 && first.value("status").toString() == QStringLiteral("created") &&
           first.value("head").toString() == firstHead &&
           first.value("objectsImported").toInteger() > 0,
-          "cross-backend initial bundle import failed");
+          "initial bundle import failed");
     const BinaryResponse repeated = client.callRaw("POST", to + "/bundle", bundle.body);
     const QJsonObject repeatJson = QJsonDocument::fromJson(repeated.body).object();
     check(repeated.status == 200 && repeatJson.value("status").toString() == QStringLiteral("up_to_date") &&
@@ -391,7 +390,7 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
     const QJsonObject advancedJson = QJsonDocument::fromJson(advanced.body).object();
     check(advanced.status == 200 && advancedJson.value("status").toString() == QStringLiteral("fast_forward") &&
           advancedJson.value("head").toString() == nextHead,
-          "incremental cross-backend import failed");
+          "incremental import failed");
     check(client.call("GET", to + "/head").json.value("id").toString() == nextHead,
           "destination branch did not fast-forward");
     service.withRepository(destinationId.toStdString(), [&](native::Repository& repository) {
@@ -442,7 +441,7 @@ void exercise(aowis::native::PhysicalStore backend) {
         firstId = first.json.value("id").toString();
         check(first.json.value("name").toString() == "Hydraulik Ü", "project name wrong");
         check(first.json.value("storage").toString() ==
-            (backend == aowis::native::PhysicalStore::Stage7Pack ? "pack" : "blocks"),
+            "pack",
             "incorrect selected backend");
         const Response second = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Independent"}});
         check(second.status == 201 && second.json.value("id").toString() != firstId,
@@ -510,7 +509,7 @@ void exercise(aowis::native::PhysicalStore backend) {
 
 // Exercise the real executable's startup/shutdown path, not just its route handlers.
 // A listener incorrectly allocated on the stack crashes during a clean shutdown.
-void exerciseServerShutdown(const QString& executable, const QString& backend) {
+void exerciseServerShutdown(const QString& executable) {
     TemporaryRoot root;
     QTcpServer reservation;
     check(reservation.listen(QHostAddress::LocalHost, 0), "unable to reserve test port");
@@ -521,8 +520,7 @@ void exerciseServerShutdown(const QString& executable, const QString& backend) {
     process.setProgram(executable);
     process.setArguments({QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
                           QStringLiteral("--port"), QString::number(port),
-                          QStringLiteral("--data-root"), QString::fromStdString(root.root().string()),
-                          QStringLiteral("--backend"), backend});
+                          QStringLiteral("--data-root"), QString::fromStdString(root.root().string())});
     process.start();
     try {
         check(process.waitForStarted(5000), "database HTTP executable did not start");
@@ -539,13 +537,17 @@ void exerciseServerShutdown(const QString& executable, const QString& backend) {
             }
             QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
         }
-        check(listening, "database HTTP executable did not accept connections");
+        if (!listening) {
+            const std::string diagnostics = process.readAllStandardError().toStdString();
+            throw std::runtime_error("database HTTP executable did not accept connections" +
+                                     (diagnostics.empty() ? std::string() : ": " + diagnostics));
+        }
         Client client(port);
         check(client.call("GET", "/api/v1/health").status == 200,
               "database HTTP executable health endpoint failed");
         const Response created = client.call("POST", "/api/v1/projects",
                                               QJsonObject{{"name", "Shutdown test"}});
-        check(created.status == 201 && created.json.value("storage").toString() == backend,
+        check(created.status == 201 && created.json.value("storage").toString() == "pack",
               "database HTTP executable did not create a project on the selected backend");
         process.terminate();
         check(process.waitForFinished(5000), "database HTTP executable did not shut down");
@@ -565,10 +567,8 @@ int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     try {
         check(argc == 2, "expected path to aowis-server-db executable");
-        exercise(aowis::native::PhysicalStore::Stage7Pack);
-        exercise(aowis::native::PhysicalStore::ExperimentalBlocks);
-        exerciseServerShutdown(QString::fromLocal8Bit(argv[1]), QStringLiteral("pack"));
-        exerciseServerShutdown(QString::fromLocal8Bit(argv[1]), QStringLiteral("blocks"));
+        exercise(aowis::native::PhysicalStore::Pack);
+        exerciseServerShutdown(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
         return 0;
     } catch (const std::exception& error) {

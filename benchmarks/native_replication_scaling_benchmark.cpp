@@ -45,9 +45,8 @@ std::uint32_t positiveNumber(const char* text, const char* label) {
 }
 
 PhysicalStore backend(std::string_view value) {
-    if (value == "pack") return PhysicalStore::Stage7Pack;
-    if (value == "block") return PhysicalStore::ExperimentalBlocks;
-    throw std::runtime_error("backend must be pack or block");
+    if (value == "pack") return PhysicalStore::Pack;
+    throw std::runtime_error("backend must be pack");
 }
 
 Key key(std::uint32_t sequence) {
@@ -274,8 +273,8 @@ int main(int argc, char** argv) {
             import(argv[2], argv[3], argv[1], argv[4]);
         } else {
             std::cerr << "Usage:\n  " << argv[0]
-                      << " prepare NEW_FIXTURE OBJECTS COMMITS PAYLOAD_BYTES pack|block raw|model\n  "
-                      << argv[0] << " import-full|import-base|import-delta FIXTURE DESTINATION pack|block\n";
+                      << " prepare NEW_FIXTURE OBJECTS COMMITS PAYLOAD_BYTES pack raw|model\n  "
+                      << argv[0] << " import-full|import-base|import-delta FIXTURE DESTINATION pack\n";
             return EXIT_FAILURE;
         }
         return EXIT_SUCCESS;

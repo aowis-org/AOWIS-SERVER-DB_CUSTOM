@@ -1,5 +1,4 @@
 #include "aowis/native/native_store.h"
-#include "aowis/native/block_store_prototype.h"
 #include <fcntl.h>
 #include <sys/file.h>
 
@@ -643,331 +642,14 @@ void testMultipleConnections() {
 // preserve exact revision identities. It may durably write unreachable chunks
 // before publishing the branch ref; an interrupted ref publication must still
 // leave the previous committed tree intact and readable after reopening.
-void testLargeBlockCommitAndPublicationFailure() {
-    using aowis::native::PhysicalStore;
-    TemporaryRepo test("bounded-staging");
-    const std::filesystem::path loosePath = test.directory / "loose";
-    const std::filesystem::path blockPath = test.directory / "blocks";
-    std::vector<Change> changes;
-    for (std::uint64_t i = 1; i <= 48; ++i) {
-        Bytes bytes(200000);
-        for (std::size_t j = 0; j < bytes.size(); ++j) {
-            bytes[j] = static_cast<std::uint8_t>((i * 37U + j * 13U + (j >> 7U)) & 255U);
-        }
-        for (unsigned n = 0; n < 8; ++n) {
-            bytes[n] = static_cast<std::uint8_t>(i >> (n * 8U));
-        }
-        changes.push_back(Change{key(i), std::move(bytes)});
-    }
-    Hash expectedRoot{};
-    {
-        Repository loose(loosePath);
-        Repository blocks(blockPath, PhysicalStore::ExperimentalBlocks);
-        loose.createBranch("main");
-        blocks.createBranch("main");
-        const Revision lhs = loose.commit("main", changes);
-        const Revision rhs = blocks.commit("main", changes);
-        expect(lhs.id == rhs.id && lhs.root == rhs.root,
-               "bounded block staging changed canonical revision identity");
-        expectedRoot = rhs.root;
-        expect(blocks.get("main", key(48)) == changes[47].value,
-               "large block commit lost a published value");
-        const std::uint64_t before = blocks.packSize();
-        // The second commit again exceeds the staging window. Its objects
-        // can be durable, but the branch head must not be published.
-        std::vector<Change> replacement = changes;
-        for (Change& entry : replacement) {
-            (*entry.value)[15] ^= 0x7fU;
-        }
-        const std::filesystem::path obstruction = blockPath / "refs" / "heads" / ".main.tmp";
-        std::filesystem::create_directory(obstruction);
-        bool rejected = false;
-        try { blocks.commit("main", replacement); }
-        catch (const std::runtime_error&) { rejected = true; }
-        expect(rejected && blocks.head("main").root == expectedRoot,
-               "failed large-commit ref publication changed the branch head");
-        expect(blocks.packSize() > before,
-               "failed large-commit test did not write any unreachable data");
-        expect(blocks.get("main", key(48)) == changes[47].value,
-               "failed large-commit publication changed old model content");
-        std::filesystem::remove(obstruction);
-        blocks.verifyPack();
-    }
-    {
-        Repository blocks(blockPath, PhysicalStore::ExperimentalBlocks);
-        expect(blocks.head("main").root == expectedRoot &&
-               blocks.get("main", key(1)) == changes[0].value,
-               "reopened large block repository lost committed history");
-        blocks.commit("main", {{key(49), value("subsequent-commit")}});
-        expect(blocks.get("main", key(49)) == value("subsequent-commit"),
-               "block repository cannot continue after orphaned writes");
-        blocks.verifyPack();
-    }
-}
 
-// Stage-16: a block generation is published only after every reachable
-// revision, both Merkle roots and their immutable payloads are retained.
-void testBlockCompactionRetentionAndRecovery() {
-    using aowis::native::ModelRecord;
-    using aowis::native::ModelChange;
-    using aowis::native::PhysicalStore;
-    TemporaryRepo test("block-generation-compaction");
-    const std::filesystem::path blocks = test.directory / "blocks";
-    const Key nodeA = key(200), nodeB = key(201), pipe = key(202);
-    const ModelRecord junction{1, {}, value("junction")};
-    const ModelRecord link{4, {nodeA, nodeB}, value("pipe")};
-    Hash mainBefore{};
-    Hash featureBefore{};
-    {
-        Repository repository(test.directory, PhysicalStore::ExperimentalBlocks);
-        repository.createBranch("main");
-        repository.commitModel("main", {{nodeA, junction}, {nodeB, junction}, {pipe, link}});
-        mainBefore = repository.head("main").id;
-        repository.createBranch("feature", "main");
-        repository.commitModel("feature", {{pipe, ModelRecord{4, {nodeA}, value("rewired")}}});
-        featureBefore = repository.head("feature").id;
-        const std::filesystem::path obstructed =
-            test.directory / "refs" / "heads" / ".main.tmp";
-        std::filesystem::create_directory(obstructed);
-        bool failed = false;
-        try {
-            repository.commitModel("main", {
-                {key(299), ModelRecord{1, {}, value("orphan-after-failed-ref")}}
-            });
-        } catch (const std::runtime_error&) { failed = true; }
-        std::filesystem::remove(obstructed);
-        expect(failed && repository.head("main").id == mainBefore,
-               "test did not create unreachable content safely");
-        const std::uint64_t objectsBefore = repository.objectCount();
-        const aowis::native::CompactionStats stats = repository.compact();
-        expect(stats.objectsBefore == objectsBefore &&
-               stats.objectsAfter < stats.objectsBefore &&
-               stats.packBytesAfter < stats.packBytesBefore &&
-               stats.indexBytesAfter < stats.indexBytesBefore,
-               "block compaction did not reclaim orphan objects");
-        expect(repository.head("main").id == mainBefore &&
-               repository.head("feature").id == featureBefore,
-               "block compaction altered branch heads");
-        expect(repository.getModel("main", pipe)->payload == link.payload &&
-               repository.getModel("feature", pipe)->payload == value("rewired") &&
-               repository.referencingModel("main", nodeB) == std::vector<Key>{pipe} &&
-               repository.referencingModel("feature", nodeB).empty(),
-               "block compaction lost historical model or reference data");
-        repository.verifyPack();
-        const aowis::native::CompactionStats again = repository.compact();
-        expect(again.objectsBefore == again.objectsAfter,
-               "repeat block compaction removed retained content");
-        repository.commitModel("main", {{key(300), junction}});
-        repository.verifyPack();
-    }
-    const std::filesystem::path active =
-        aowis::native::BlockStorePrototype::activeDirectory(blocks);
-    expect(active != blocks && std::filesystem::exists(blocks / "candidate.active"),
-           "block compaction did not switch active generation");
-    std::filesystem::remove(active / "candidate.idx");
-    {
-        Repository reopened(test.directory, PhysicalStore::ExperimentalBlocks);
-        expect(reopened.head("feature").id == featureBefore &&
-               reopened.getModel("feature", pipe)->payload == value("rewired") &&
-               reopened.getModel("main", key(300)).has_value(),
-               "reopened compacted blocks lost revision history or later edits");
-        reopened.verifyPack();
-    }
-    // A tampered active-generation pointer must never fall back to the old
-    // pre-compaction pack, which could silently resurrect obsolete objects.
-    {
-        std::ofstream pointer(blocks / "candidate.active", std::ios::trunc);
-        pointer << "AOBGEN1 ../../../../evil\n";
-    }
-    bool badPointerRejected = false;
-    try { Repository broken(test.directory, PhysicalStore::ExperimentalBlocks); }
-    catch (const std::runtime_error&) { badPointerRejected = true; }
-    expect(badPointerRejected, "malformed block generation pointer was accepted");
-}
 
-void testBlockCompactionRequiresExclusiveLifetime() {
-    using aowis::native::PhysicalStore;
-    TemporaryRepo test("block-generation-lock");
-    Repository first(test.directory, PhysicalStore::ExperimentalBlocks);
-    first.createBranch("main");
-    // BlockStorePrototype rejects concurrent handles; the lifetime lock must
-    // also prevent future multi-reader implementations from compacting behind
-    // a second process's descriptor.
-    const int extra = ::open((test.directory / "maintenance.lock").c_str(), O_RDWR);
-    expect(extra >= 0, "cannot open extra maintenance lock");
-    expect(::flock(extra, LOCK_SH | LOCK_NB) == 0, "cannot acquire extra lifetime lock");
-    bool rejected = false;
-    try { (void)first.compact(); }
-    catch (const std::runtime_error&) { rejected = true; }
-    ::flock(extra, LOCK_UN);
-    ::close(extra);
-    expect(rejected, "block compaction ignored another maintenance handle");
-    (void)first.compact();
-    first.verifyPack();
-}
 
-void testBlockCompactionPublicationFailure() {
-    using aowis::native::PhysicalStore;
-    TemporaryRepo test("block-generation-publish-failure");
-    Hash original{};
-    {
-        Repository repo(test.directory, PhysicalStore::ExperimentalBlocks);
-        repo.createBranch("main");
-        repo.commit("main", {{key(1), value("keep")}});
-        original = repo.head("main").id;
-        // Publishing a pointer must fail before the committed generation can
-        // become active. The old branch is still readable and writable.
-        std::filesystem::create_directory(test.directory / "blocks" /
-                                         "candidate.active.pending");
-        bool failed = false;
-        try { (void)repo.compact(); }
-        catch (const std::runtime_error&) { failed = true; }
-        expect(failed && repo.head("main").id == original &&
-               repo.get("main", key(1)) == value("keep") &&
-               !std::filesystem::exists(test.directory / "blocks" / "candidate.active"),
-               "failed pointer publication changed authoritative block store");
-        std::filesystem::remove(test.directory / "blocks" / "candidate.active.pending");
-        repo.verifyPack();
-        (void)repo.compact();
-        expect(repo.head("main").id == original, "retry changed committed history");
-    }
-    Repository reopened(test.directory, PhysicalStore::ExperimentalBlocks);
-    expect(reopened.get("main", key(1)) == value("keep"),
-           "retry after failed publication lost committed model");
-}
 
-// Both backends must publish the EXACT SAME content-addressed revision DAG.
-// A failed ref rename after a durable block batch is allowed to leave orphan
-// objects, but must not advance the branch head.
-void testExperimentalBlockRevisionPublication() {
-    using aowis::native::PhysicalStore;
-    using aowis::native::ModelRecord;
-    using aowis::native::ModelChange;
-    TemporaryRepo test("block-revisions");
-    const std::filesystem::path loosePath = test.directory / "loose";
-    const std::filesystem::path blocksPath = test.directory / "blocks";
-    const Key nodeA = key(20), nodeB = key(21), pipe = key(22);
-    const ModelRecord junction{1, {}, value("node-model-opaque")};
-    const ModelRecord link{4, {nodeA, nodeB}, value("pipe-model-opaque")};
-    const std::vector<ModelChange> initial{
-        {pipe, link}, {nodeA, junction}, {nodeB, junction}
-    };
-    Hash original{};
-    Hash afterEdit{};
-    {
-        Repository loose(loosePath);
-        Repository blocks(blocksPath, PhysicalStore::ExperimentalBlocks);
-        loose.createBranch("main");
-        blocks.createBranch("main");
-        expect(loose.head("main").id == blocks.head("main").id,
-               "empty revision differs between pack layouts");
-        loose.commitModel("main", initial);
-        blocks.commitModel("main", initial);
-        const Revision first = loose.head("main");
-        expect(first.id == blocks.head("main").id &&
-               first.root == blocks.head("main").root &&
-               first.referencesRoot == blocks.head("main").referencesRoot,
-               "initial model roots or revision identity differ between stores");
-        original = first.id;
-        loose.createBranch("feature", "main");
-        blocks.createBranch("feature", "main");
-        const std::vector<ModelChange> update{
-            {pipe, ModelRecord{4, {nodeA}, value("pipe-moved")}}
-        };
-        loose.commitModel("feature", update);
-        blocks.commitModel("feature", update);
-        afterEdit = loose.head("feature").id;
-        expect(afterEdit == blocks.head("feature").id,
-               "experimental block revision differs from Stage-7 revision");
-        expect(loose.referencingModel("feature", nodeB) ==
-               blocks.referencingModel("feature", nodeB),
-               "reverse-reference index differs between physical stores");
-        const std::vector<aowis::native::Difference> left = loose.diff("main", "feature");
-        const std::vector<aowis::native::Difference> right = blocks.diff("main", "feature");
-        expect(left.size() == 1 && right.size() == 1 &&
-               left[0].key == right[0].key && left[0].before == right[0].before &&
-               left[0].after == right[0].after, "model diff differs by physical store");
-        expect(blocks.getModel("main", pipe)->payload == link.payload,
-               "branch cloning lost the original model");
-        expect(blocks.getModel("feature", pipe)->payload == value("pipe-moved"),
-               "feature branch model update was lost");
-        // Failed validation must never change the branch root or append data.
-        const std::uint64_t beforeBad = blocks.packSize();
-        bool invalidRejected = false;
-        try { blocks.commitModel("main", {{nodeA, std::nullopt}}); }
-        catch (const std::runtime_error&) { invalidRejected = true; }
-        expect(invalidRejected && blocks.head("main").id == original &&
-               blocks.packSize() == beforeBad, "failed validation published block data");
-        // Force publication to fail AFTER the block store has committed objects.
-        const std::filesystem::path obstruction = blocksPath / "refs" / "heads" / ".main.tmp";
-        std::filesystem::create_directory(obstruction);
-        bool publicationRejected = false;
-        try {
-            blocks.commitModel("main", {
-                {key(90), ModelRecord{1, {}, value("unpublished-object")}}
-            });
-        } catch (const std::runtime_error&) { publicationRejected = true; }
-        expect(publicationRejected && blocks.head("main").id == original,
-               "failed ref publication changed the block branch head");
-        std::filesystem::remove(obstruction);
-        blocks.verifyPack();
-        expect(blocks.packSize() > beforeBad,
-               "test did not durably write objects before refused ref publication");
-        // Experiment must not accidentally open as a Stage-7 repository.
-        bool rejectedWrongStorage = false;
-        try { Repository wrong(blocksPath); }
-        catch (const std::runtime_error&) { rejectedWrongStorage = true; }
-        expect(rejectedWrongStorage, "block repository opened as legacy Stage-7 pack");
-    }
-    {
-        Repository reopened(blocksPath, PhysicalStore::ExperimentalBlocks);
-        expect(reopened.head("main").id == original &&
-               reopened.head("feature").id == afterEdit,
-               "reopening after failed branch publish changed committed refs");
-        expect(reopened.referencingModel("feature", nodeB).empty(),
-               "reopened block reverse refs differ");
-        reopened.commitModel("main", {{key(91), ModelRecord{1, {}, value("published")}}});
-        expect(reopened.head("main").id != original,
-               "valid block-backed commit did not advance branch head");
-        reopened.verifyPack();
-        bool concurrentRejected = false;
-        try { Repository another(blocksPath, PhysicalStore::ExperimentalBlocks); }
-        catch (const std::runtime_error&) { concurrentRejected = true; }
-        expect(concurrentRejected, "block backend failed to enforce single-handle limitation");
-    }
-    // A torn, *unpublished* pack suffix must be discarded on startup.
-    const std::filesystem::path pack = blocksPath / "blocks" / "candidate.pack";
-    const std::uint64_t committed = std::filesystem::file_size(pack);
-    {
-        std::ofstream tail(pack, std::ios::app | std::ios::binary);
-        tail << "torn-uncommitted-tail";
-    }
-    {
-        Repository recovered(blocksPath, PhysicalStore::ExperimentalBlocks);
-        expect(std::filesystem::file_size(pack) == committed,
-               "uncommitted block tail survived reopening");
-        recovered.verifyPack();
-    }
-    bool rejectedWrongStorage = false;
-    try { Repository wrong(loosePath, PhysicalStore::ExperimentalBlocks); }
-    catch (const std::runtime_error&) { rejectedWrongStorage = true; }
-    expect(rejectedWrongStorage, "existing Stage-7 repository opened in block mode");
-    // Losing the authoritative committed-length marker must fail closed. It
-    // cannot be treated as a first-time activation of an offline candidate.
-    std::filesystem::remove(blocksPath / "blocks" / "candidate.current");
-    bool missingMarkerRejected = false;
-    try { Repository wrong(blocksPath, PhysicalStore::ExperimentalBlocks); }
-    catch (const std::runtime_error&) { missingMarkerRejected = true; }
-    expect(missingMarkerRejected, "missing block commit marker was silently reconstructed");
-}
 
-// Large canonical model batches must produce identical content-addressed roots
-// whether the caller lends or transfers ownership of its encoded payloads.
-// Raw commits must continue to accept repeated keys with last-write-wins.
 void testMoveAwareModelAndRawCommits() {
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo test("move-aware-commits");
         Repository repository(test.directory, physical);
         repository.createBranch("borrowed");
@@ -1015,8 +697,7 @@ void testMoveAwareModelAndRawCommits() {
 
 void testModelExpectedBranchHead() {
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo test("expected-model-head");
         Repository repository(test.directory, physical);
         repository.createBranch("main");
@@ -1047,8 +728,7 @@ void testModelExpectedBranchHead() {
 // Exercise both physical stores and verify that compaction retains old roots.
 void testHistoricalRevisionApis() {
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo test("historical-revision-api");
         Hash initial{};
         Hash first{};
@@ -1180,8 +860,7 @@ void testThreeWayBranchMerges() {
     using aowis::native::ModelChange;
     using aowis::native::ModelRecord;
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo test("branch-merging");
         Hash firstMerge{};
         Hash sourceOnly{};
@@ -1247,8 +926,7 @@ void testThreeWayBranchMerges() {
 void testMergeConflictsAndFastForward() {
     using aowis::native::MergeStatus;
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo test("merge-conflicts");
         Repository repository(test.directory, physical);
         repository.createBranch("main");
@@ -1324,8 +1002,7 @@ void testIndexedModelMerges() {
     using aowis::native::MergeStatus;
     using aowis::native::ModelRecord;
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo test("indexed-model-merge");
         Repository repository(test.directory, physical);
         repository.createBranch("main");
@@ -1406,8 +1083,7 @@ void testMergeHooksAndSemanticPreflight() {
     using aowis::native::MergeResolution;
     using aowis::native::ModelRecord;
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo fixture("merge-candidate-hooks");
         Repository repository(fixture.directory, physical);
         repository.createBranch("main");
@@ -1517,8 +1193,7 @@ void testWholeObjectMergeChoices() {
     using aowis::native::MergeStatus;
     using aowis::native::ModelRecord;
     for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo temporary("merge-object-choices");
         {
             Repository repository(temporary.directory, physical);
@@ -1612,8 +1287,7 @@ void testMergeCandidateReconciliation() {
     using aowis::native::MergeCandidate;
     using aowis::native::ModelRecord;
     for (const aowis::native::PhysicalStore storage :
-         {aowis::native::PhysicalStore::Stage7Pack,
-          aowis::native::PhysicalStore::ExperimentalBlocks}) {
+         {aowis::native::PhysicalStore::Pack}) {
         TemporaryRepo temporary("merge-candidate-reconciliation");
         Repository repository(temporary.directory, storage);
         repository.createBranch("main");
@@ -1672,17 +1346,12 @@ int main() {
         testPersistentPackIndex();
         testCompactionAndRetainedHistory();
         testCompactionRequiresExclusiveLifetime();
-        testBlockCompactionRetentionAndRecovery();
-        testBlockCompactionRequiresExclusiveLifetime();
-        testBlockCompactionPublicationFailure();
         testMixedEditsAgainstReference();
         testBatchCanonicalRootsAndBranchIndependence();
         testMultipleConnections();
         testTypedModelRecordsAndReferences();
         testTypedModelConcurrentHandles();
         testDurableReverseReferences();
-        testExperimentalBlockRevisionPublication();
-        testLargeBlockCommitAndPublicationFailure();
         testModelExpectedBranchHead();
         testMoveAwareModelAndRawCommits();
         testHistoricalRevisionApis();

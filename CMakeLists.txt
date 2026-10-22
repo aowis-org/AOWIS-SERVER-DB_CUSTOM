@@ -8,8 +8,6 @@ add_library(aowis-native-store STATIC
     src/native_store.cpp
     src/model_record.cpp
     src/access_policy.cpp
-    src/pack_experiment.cpp
-    src/block_store_prototype.cpp
 )
 target_compile_features(aowis-native-store PUBLIC cxx_std_20)
 target_include_directories(aowis-native-store PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -28,12 +26,6 @@ target_link_libraries(aowis-native-project-service PUBLIC aowis-native-store)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(aowis-native-project-service PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 endif()
-
-add_executable(aowis-native-pack-experiment tools/native_pack_experiment.cpp)
-target_link_libraries(aowis-native-pack-experiment PRIVATE aowis-native-store)
-
-add_executable(aowis-native-block-store-benchmark tools/native_block_store_benchmark.cpp)
-target_link_libraries(aowis-native-block-store-benchmark PRIVATE aowis-native-store)
 
 add_executable(aowis-native-access tools/native_access.cpp)
 target_link_libraries(aowis-native-access PRIVATE aowis-native-store)
@@ -57,21 +49,11 @@ add_executable(aowis-native-replication-scaling-benchmark
     benchmarks/native_replication_scaling_benchmark.cpp)
 target_link_libraries(aowis-native-replication-scaling-benchmark PRIVATE aowis-native-store)
 
-add_executable(aowis-native-backend-comparison-benchmark
-    benchmarks/native_backend_comparison_benchmark.cpp)
-target_link_libraries(aowis-native-backend-comparison-benchmark PRIVATE aowis-native-store)
-
 add_executable(aowis-native-model-benchmark benchmarks/model_network_benchmark.cpp)
 target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME aowis-native-backend-comparison-tests
-        COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/backend_comparison_tests.py"
-            --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_physical_backends.py"
-            --binary "$<TARGET_FILE:aowis-native-backend-comparison-benchmark>")
-    set_tests_properties(aowis-native-backend-comparison-tests PROPERTIES LABELS "aowis")
     add_test(NAME aowis-native-replication-benchmark-smoke
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_replication_scaling.py"
@@ -89,9 +71,7 @@ if(BUILD_TESTING)
         src/native_store.cpp
         src/model_record.cpp
         src/access_policy.cpp
-        src/pack_experiment.cpp
-        src/block_store_prototype.cpp
-    )
+            )
     target_compile_features(aowis-native-store-fault-tests PUBLIC cxx_std_20)
     target_include_directories(aowis-native-store-fault-tests PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_link_libraries(aowis-native-store-fault-tests PUBLIC OpenSSL::Crypto)
@@ -103,14 +83,16 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-project-service-tests PRIVATE aowis-native-project-service)
     add_test(NAME aowis-native-project-service-tests COMMAND aowis-native-project-service-tests)
     set_tests_properties(aowis-native-project-service-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-native-pack-operational-stress-tests
+        tests/native_pack_operational_stress_tests.cpp)
+    target_link_libraries(aowis-native-pack-operational-stress-tests PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-pack-operational-stress-tests
+        COMMAND aowis-native-pack-operational-stress-tests)
+    set_tests_properties(aowis-native-pack-operational-stress-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-recovery-tests tests/native_recovery_tests.cpp)
     target_link_libraries(aowis-native-recovery-tests PRIVATE aowis-native-store-fault-tests)
     add_test(NAME aowis-native-recovery-tests COMMAND aowis-native-recovery-tests)
     set_tests_properties(aowis-native-recovery-tests PROPERTIES LABELS "aowis")
-    add_executable(aowis-native-pack-experiment-tests tests/pack_experiment_tests.cpp)
-    target_link_libraries(aowis-native-pack-experiment-tests PRIVATE aowis-native-store)
-    add_test(NAME aowis-native-pack-experiment-tests COMMAND aowis-native-pack-experiment-tests)
-    set_tests_properties(aowis-native-pack-experiment-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-sync-cli-tests tests/native_sync_cli_tests.cpp)
     target_link_libraries(aowis-native-sync-cli-tests PRIVATE aowis-native-store)
     add_dependencies(aowis-native-sync-cli-tests aowis-native-sync)
@@ -176,7 +158,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-backend-comparison-benchmark aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
@@ -239,14 +221,6 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
         target_link_libraries(aowis-native-hydraulic-edit-benchmark PRIVATE aowis-native-hydraulic)
         if(BUILD_TESTING)
             add_dependencies(aowis-db-tests aowis-native-hydraulic-edit-benchmark)
-            add_test(NAME aowis-native-hydraulic-backend-comparison-smoke
-                COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_physical_backends.py"
-                    --model-binary "$<TARGET_FILE:aowis-native-backend-comparison-benchmark>"
-                    --hydraulic-binary "$<TARGET_FILE:aowis-native-hydraulic-edit-benchmark>"
-                    --scenario hydraulic --smoke)
-            set_tests_properties(aowis-native-hydraulic-backend-comparison-smoke
-                PROPERTIES LABELS "aowis")
         endif()
         if(BUILD_TESTING)
             add_executable(aowis-native-model-codec-tests tests/v5_codec_tests.cpp)

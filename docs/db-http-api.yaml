@@ -44,7 +44,7 @@ paths:
               required: [name]
               properties:
                 name: {type: string, minLength: 1, maxLength: 200}
-                storage: {type: string, enum: [pack, blocks]}
+                storage: {type: string, enum: [pack]}
       responses:
         '201':
           description: Project and initial main branch published
@@ -413,7 +413,7 @@ components:
       properties:
         id: {type: string, format: uuid}
         name: {type: string}
-        storage: {type: string, enum: [pack, blocks]}
+        storage: {type: string, enum: [pack]}
     Revision:
       type: object
       required: [id, root, referencesRoot, modelIndexed, parents]

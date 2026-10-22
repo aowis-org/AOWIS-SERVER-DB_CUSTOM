@@ -1,5 +1,4 @@
 #include "aowis/native/native_store.h"
-#include "aowis/native/block_store_prototype.h"
 #include "native_test_faults.h"
 
 #include <openssl/evp.h>
@@ -1360,7 +1359,8 @@ Hash sha256(const Bytes& value) {
 }
 
 Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
-    : directory_(std::move(directory)), storage_(storage) {
+    : directory_(std::move(directory)) {
+    require(storage == PhysicalStore::Pack, "unsupported storage backend");
     std::filesystem::create_directories(this->directory_ / "refs" / "heads");
     this->lifetimeFd_ = ::open((this->directory_ / "maintenance.lock").c_str(),
                                O_CREAT | O_RDWR | O_CLOEXEC, 0644);
@@ -1374,49 +1374,9 @@ Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
         // Prevent either constructor from silently opening the wrong physical
         // repository type (or creating a second, disconnected object pack).
         const std::filesystem::path format = this->directory_ / "storage.format";
-        if (this->storage_ == PhysicalStore::ExperimentalBlocks) {
-            if (!std::filesystem::exists(format)) {
-                require(!std::filesystem::exists(this->directory_ / "objects.pack") &&
-                        !std::filesystem::exists(this->directory_ / "objects.current") &&
-                        std::filesystem::is_empty(this->directory_ / "refs" / "heads"),
-                        "block mode requires a fresh repository");
-                const std::filesystem::path blocks = this->directory_ / "blocks";
-                if (!std::filesystem::exists(blocks)) BlockStorePrototype::createEmpty(blocks);
-                // Format marker precedes any published ref. A crash before
-                // publication can only leave a harmless empty block directory.
-                const int marker = ::open(format.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-                systemCall(marker >= 0, "create block repository format marker");
-                try {
-                    constexpr char signature[] = "AOWIS-BLOCK-EXPERIMENT-1\n";
-                    writeExact(marker, reinterpret_cast<const std::uint8_t*>(signature),
-                               sizeof(signature) - 1, 0);
-                    systemCall(::fsync(marker) == 0, "sync block repository format marker");
-                } catch (...) { ::close(marker); throw; }
-                ::close(marker);
-                syncDirectory(this->directory_);
-            }
-            std::ifstream marker(format, std::ios::binary);
-            std::string signature;
-            std::getline(marker, signature);
-            require(signature == "AOWIS-BLOCK-EXPERIMENT-1" && marker.good(),
-                    "repository physical storage format mismatch");
-            // Missing commit markers are recoverable only for an entirely
-            // empty, never-published repository. Once any ref exists, do NOT
-            // reactivate an arbitrary candidate pack: it may contain crash
-            // tails that were never committed.
-            const std::filesystem::path activeBlocks =
-                BlockStorePrototype::activeDirectory(this->directory_ / "blocks");
-            const std::filesystem::path markerPath = activeBlocks / "candidate.current";
-            if (!std::filesystem::exists(markerPath)) {
-                require(std::filesystem::is_empty(this->directory_ / "refs" / "heads") &&
-                        std::filesystem::file_size(activeBlocks / "candidate.pack") == 0,
-                        "committed block marker missing from an initialized repository");
-            }
-            this->blockStore_ = std::make_unique<BlockStorePrototype>(this->directory_ / "blocks");
-        } else {
-            require(!std::filesystem::exists(format) &&
-                    !std::filesystem::exists(this->directory_ / "blocks"),
-                    "repository uses experimental block storage; select it explicitly");
+        require(!std::filesystem::exists(this->directory_ / "storage.format") &&
+                !std::filesystem::exists(this->directory_ / "blocks"),
+                "repository uses obsolete block storage; export its history with an older build");
             this->packToken_ = activePackToken(this->directory_);
             const int flags = O_RDWR | O_CLOEXEC | (this->packToken_.empty() ? O_CREAT : 0);
             this->packFd_ = ::open(packPath(this->directory_, this->packToken_, false).c_str(),
@@ -1426,7 +1386,6 @@ Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
                                     flags | O_CREAT, 0644);
             systemCall(this->indexFd_ >= 0, "open active content index");
             refreshIndex();
-        }
         syncDirectory(this->directory_);
         syncDirectory(this->directory_ / "refs");
     } catch (...) {
@@ -1498,7 +1457,6 @@ void Repository::rebuildIndex() {
 
 void Repository::refreshIndex() {
     require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
-    if (this->blockStore_) return; // block store owns its committed index
     // A preceding operation could have written objects before throwing;
     // make its orphan records discoverable by other processes too.
     if (!this->pendingIndex_.empty()) syncPack();
@@ -1568,14 +1526,6 @@ void Repository::refreshIndex() {
 
 Bytes Repository::load(const Hash& hash) {
     require(!isZero(hash), "attempted to load empty tree hash");
-    if (this->blockStore_) {
-        const std::unordered_map<Hash, Bytes, HashHasher>::const_iterator pending =
-            this->stagedObjects_.find(hash);
-        if (pending != this->stagedObjects_.end()) return pending->second;
-        const std::optional<Bytes> object = this->blockStore_->get(hash);
-        require(object.has_value(), "referenced content missing from block store");
-        return *object;
-    }
     std::unordered_map<Hash, Location, HashHasher>::const_iterator it = this->index_.find(hash);
     require(it != this->index_.end(), "referenced content is missing from pack");
     Bytes payload(static_cast<std::size_t>(it->second.size));
@@ -1587,17 +1537,6 @@ Bytes Repository::load(const Hash& hash) {
 Hash Repository::store(const Bytes& bytes) {
     require(bytes.size() <= maxObjectBytes, "content object exceeds size limit");
     Hash hash = sha256(bytes);
-    if (this->blockStore_) {
-        if (!this->blockStore_->contains(hash)) {
-            const std::pair<std::unordered_map<Hash, Bytes, HashHasher>::iterator, bool> inserted =
-                this->stagedObjects_.try_emplace(hash, bytes);
-            if (inserted.second) {
-                this->stagedBytes_ += inserted.first->second.size();
-                if (this->stagedBytes_ >= stagedFlushThreshold) syncPack();
-            }
-        }
-        return hash;
-    }
     if (this->index_.contains(hash)) return hash;
     std::array<std::uint8_t, headerSize> header{};
     header[0] = 'A'; header[1] = 'O'; header[2] = 'B'; header[3] = 'J'; header[4] = 1;
@@ -1621,43 +1560,13 @@ Hash Repository::store(const Bytes& bytes) {
     return hash;
 }
 
-// Moving newly encoded objects into the unpublished block batch avoids a
-// second heap allocation and payload copy for every Merkle node and record.
-// The existing Stage 7 writer continues using the original immutable input.
+// Reuse the same content-addressed append path for both value categories.
 Hash Repository::store(Bytes&& bytes) {
-    if (!this->blockStore_) return store(static_cast<const Bytes&>(bytes));
-    require(bytes.size() <= maxObjectBytes, "content object exceeds size limit");
-    const Hash hash = sha256(bytes);
-    if (!this->blockStore_->contains(hash)) {
-        const std::pair<std::unordered_map<Hash, Bytes, HashHasher>::iterator, bool> inserted =
-            this->stagedObjects_.try_emplace(hash, std::move(bytes));
-        if (inserted.second) {
-            this->stagedBytes_ += inserted.first->second.size();
-            if (this->stagedBytes_ >= stagedFlushThreshold) syncPack();
-        }
-    }
-    return hash;
+    return store(static_cast<const Bytes&>(bytes));
 }
 
 void Repository::syncPack() {
-    if (this->blockStore_) {
-        if (this->stagedObjects_.empty()) return;
-        // Do not expose a branch head until all its tree nodes, model blobs
-        // and revision object are durably published by candidate.current.
-        // store() already computed SHA-256 for every immutable staged value.
-        // Pass references to those bytes instead of copying the entire batch
-        // and hashing it a second time inside the physical block store.
-        std::vector<std::pair<Hash, const Bytes*>> batch;
-        batch.reserve(this->stagedObjects_.size());
-        for (const std::pair<const Hash, Bytes>& entry : this->stagedObjects_) {
-            batch.emplace_back(entry.first, &entry.second);
-        }
-        this->blockStore_->putHashedBatch(batch);
-        this->stagedObjects_.clear();
-        this->stagedBytes_ = 0;
-        return;
-    }
-    // Branch durability depends on the pack, not on this reconstructible
+    // Branch durability depends on the pack,    // Branch durability depends on the pack, not on this reconstructible
     // sidecar. The index may lag across a crash; refreshIndex hashes the
     // uncovered durable pack suffix to rebuild it on the next open.
     detail::faultCheckpoint("pack.before.fsync");
@@ -2531,8 +2440,6 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
         result.status = MergeStatus::Merged;
         return result;
     } catch (...) {
-        this->stagedObjects_.clear();
-        this->stagedBytes_ = 0;
         throw;
     }
 }
@@ -2544,8 +2451,6 @@ Revision Repository::commit(std::string_view branch, const std::vector<Change>& 
     try {
         return commitLocked(branch, changes);
     } catch (...) {
-        this->stagedObjects_.clear();
-        this->stagedBytes_ = 0;
         throw;
     }
 }
@@ -2616,8 +2521,6 @@ Revision Repository::commitModel(std::string_view branch, std::vector<ModelChang
     try {
         return commitModelLocked(branch, std::move(changes), expectedHead, std::nullopt);
     } catch (...) {
-        this->stagedObjects_.clear();
-        this->stagedBytes_ = 0;
         throw;
     }
 }
@@ -2888,7 +2791,6 @@ void Repository::verifyPack() {
 
 void Repository::verifyPackLocked() {
     require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
-    if (this->blockStore_) { this->blockStore_->verify(); return; }
     refreshIndex();
     std::uint64_t position = 0;
     std::uint64_t checked = 0;
@@ -2927,7 +2829,7 @@ VerificationReport Repository::verifyRepository() {
     // Neither stage mutates branch heads or rewrites invalid object graphs.
     verifyPackLocked();
     require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
-    if (!this->blockStore_) refreshIndex();
+    refreshIndex();
 
     const std::filesystem::path heads = this->directory_ / "refs" / "heads";
     std::vector<Hash> tips;
@@ -2963,15 +2865,13 @@ VerificationReport Repository::verifyRepository() {
     result.reachableObjects = graph.reachableObjects;
     result.treeNodes = graph.treeNodes;
     result.modelSnapshots = graph.modelSnapshots;
-    result.physicalObjects = this->blockStore_ ? this->blockStore_->stats().objects :
-        static_cast<std::uint64_t>(this->index_.size());
+    result.physicalObjects = static_cast<std::uint64_t>(this->index_.size());
     return result;
 }
 
 std::uint64_t Repository::objectCount() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
-    if (this->blockStore_) return this->blockStore_->stats().objects;
     refreshIndex();
     return static_cast<std::uint64_t>(this->index_.size());
 }
@@ -2979,13 +2879,12 @@ std::uint64_t Repository::objectCount() {
 std::uint64_t Repository::packSize() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
-    if (this->blockStore_) return this->blockStore_->stats().packBytes;
     refreshIndex();
     return this->scanOffset_;
 }
 
-// Portable offline replication intentionally transfers logical immutable objects,
-// never physical pack/index pages. This makes cross-backend imports possible.
+// Portable offline replication transfers logical immutable objects, never
+// physical pack/index pages. Separate repositories retain identical identities.
 void Repository::exportBranchBundle(std::string_view branch,
                                     const std::filesystem::path& bundlePath, BundleLimits limits) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
@@ -3136,8 +3035,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         if (incremental) {
             readExact(fd, recipientBase.data(), recipientBase.size(), bundleHeaderBytes);
             require(!isZero(recipientBase), "incremental bundle has zero base revision");
-            const bool known = this->blockStore_ ? this->blockStore_->contains(recipientBase)
-                                                  : this->index_.contains(recipientBase);
+            const bool known = this->index_.contains(recipientBase);
             require(known, "incremental bundle base revision is missing locally");
             (void)readRevision(recipientBase); // Must be a real revision, not another object.
         }
@@ -3181,8 +3079,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         }
         const ImportClock::time_point graphStart = ImportClock::now();
         const auto containsLocally = [&](const Hash& hash) {
-            return this->blockStore_ ? this->blockStore_->contains(hash)
-                                      : this->index_.contains(hash);
+            return this->index_.contains(hash);
         };
         require(entries.find(incoming).has_value() ||
                     (incremental && containsLocally(incoming)),
@@ -3284,8 +3181,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             previousHead = branchHead(localBranch);
             if (previousHead == incoming ||
                 // A previous import may already have advanced past this tip.
-                ((this->blockStore_ ? this->blockStore_->contains(incoming) :
-                                      this->index_.contains(incoming)) &&
+                (this->index_.contains(incoming) &&
                  revisionReachableFrom(previousHead, incoming))) {
                 status = BundleImportStatus::UpToDate;
             } else {
@@ -3308,8 +3204,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         std::uint64_t imported = 0;
         for (std::size_t index = 0; index < entries.size(); ++index) {
             const std::pair<Hash, BundleLocation> entry = entries.at(index);
-            const bool present = this->blockStore_
-                ? this->blockStore_->contains(entry.first) : this->index_.contains(entry.first);
+            const bool present = this->index_.contains(entry.first);
             if (present) continue;
             Bytes payload = bundleObject(entry.first);
             require(store(std::move(payload)) == entry.first,
@@ -3340,24 +3235,17 @@ CompactionStats Repository::compact() {
     ScopedFileLock locked(this->lockFd_);
     ScopedMaintenanceExclusive alone(this->lifetimeFd_);
     require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
-    if (!this->blockStore_) refreshIndex();
+    refreshIndex();
 
     CompactionStats stats{};
-    if (this->blockStore_) {
-        const BlockStorePrototype::Stats before = this->blockStore_->stats();
-        stats.objectsBefore = before.objects;
-        stats.packBytesBefore = before.packBytes;
-        stats.indexBytesBefore = before.indexBytes;
-    } else {
-        stats.objectsBefore = static_cast<std::uint64_t>(this->index_.size());
-        stats.packBytesBefore = this->scanOffset_;
-        struct stat oldIndex{};
-        systemCall(::fstat(this->indexFd_, &oldIndex) == 0, "stat content index");
-        require(oldIndex.st_size >= 0, "invalid index size");
-        stats.indexBytesBefore = static_cast<std::uint64_t>(oldIndex.st_size);
-    }
+    stats.objectsBefore = static_cast<std::uint64_t>(this->index_.size());
+    stats.packBytesBefore = this->scanOffset_;
+    struct stat oldIndex{};
+    systemCall(::fstat(this->indexFd_, &oldIndex) == 0, "stat content index");
+    require(oldIndex.st_size >= 0, "invalid index size");
+    stats.indexBytesBefore = static_cast<std::uint64_t>(oldIndex.st_size);
 
-    // The retention policy is intentionally conservative: preserve EVERY
+    // The retention policy is intentionally conservative:    // The retention policy is intentionally conservative: preserve EVERY
     // revision on the parent chain of EVERY branch head, plus both trees and
     // every leaf payload (including reverse-reference index values).
     enum class ReachableKind { Revision, Tree, Value };
@@ -3399,102 +3287,6 @@ CompactionStats Repository::compact() {
         }
     }
     require(reachable.size() <= stats.objectsBefore, "invalid reachable object count");
-    if (this->blockStore_) {
-        // Publish an entirely new, verified generation before retiring the old
-        // one. Branch references remain untouched and are protected by the
-        // repository-wide lifetime/operation locks throughout maintenance.
-        const std::filesystem::path blocksDir = this->directory_ / "blocks";
-        const std::filesystem::path oldActive = this->blockStore_->activeDataDirectory();
-        std::array<std::uint8_t, 16> nonce{};
-        require(RAND_bytes(nonce.data(), static_cast<int>(nonce.size())) == 1,
-                "cannot generate block generation token");
-        constexpr char hex[] = "0123456789abcdef";
-        std::string token;
-        token.reserve(nonce.size() * 2);
-        for (const std::uint8_t byte : nonce) {
-            token += hex[byte >> 4];
-            token += hex[byte & 15];
-        }
-        const std::filesystem::path nextDirectory = blocksDir / ("generation-" + token);
-        const std::filesystem::path pending = blocksDir / "candidate.active.pending";
-        bool published = false;
-        bool pendingOwned = false;
-        try {
-            BlockStorePrototype::createEmpty(nextDirectory);
-            {
-                BlockStorePrototype replacement(nextDirectory);
-                // Deterministic order makes compaction reproducible. Memory
-                // stays bounded even when hundreds of thousands of objects
-                // remain reachable through retained historical revisions.
-                std::vector<Hash> sorted(reachable.begin(), reachable.end());
-                std::sort(sorted.begin(), sorted.end());
-                std::vector<Bytes> batch;
-                std::size_t bytes = 0;
-                for (const Hash& hash : sorted) {
-                    Bytes payload = load(hash); // SHA-256 validated on every read
-                    bytes += payload.size();
-                    batch.emplace_back(std::move(payload));
-                    if (bytes >= 4U * 1024U * 1024U) {
-                        replacement.putBatch(batch);
-                        batch.clear();
-                        bytes = 0;
-                    }
-                }
-                if (!batch.empty()) replacement.putBatch(batch);
-                replacement.verify();
-                const BlockStorePrototype::Stats after = replacement.stats();
-                stats.objectsAfter = after.objects;
-                stats.packBytesAfter = after.packBytes;
-                stats.indexBytesAfter = after.indexBytes;
-                require(stats.objectsAfter == reachable.size(),
-                        "compacted block object count differs from retention set");
-            }
-            syncDirectory(blocksDir);
-            detail::faultCheckpoint("compact.block.before.pointer");
-            const std::string pointer = "AOBGEN1 " + token + "\n";
-            const int fd = ::open(pending.c_str(), O_WRONLY | O_CREAT | O_EXCL |
-                                  O_NOFOLLOW | O_CLOEXEC, 0600);
-            systemCall(fd >= 0, "create pending block generation pointer");
-            pendingOwned = true;
-            try {
-                writeExact(fd, reinterpret_cast<const std::uint8_t*>(pointer.data()),
-                           pointer.size(), 0);
-                systemCall(::fsync(fd) == 0, "sync pending block generation pointer");
-            } catch (...) { ::close(fd); throw; }
-            systemCall(::close(fd) == 0, "close pending block generation pointer");
-            systemCall(::rename(pending.c_str(), (blocksDir / "candidate.active").c_str()) == 0,
-                       "publish block generation pointer");
-            published = true;
-            detail::faultCheckpoint("compact.block.after.pointer");
-            syncDirectory(blocksDir);
-            // New generation is now authoritative. Reopen before reclaiming
-            // the old one; failure here must not delete either generation.
-            this->blockStore_.reset();
-            this->blockStore_ = std::make_unique<BlockStorePrototype>(blocksDir);
-            if (oldActive == blocksDir) {
-                std::filesystem::remove(blocksDir / "candidate.pack");
-                std::filesystem::remove(blocksDir / "candidate.idx");
-                std::filesystem::remove(blocksDir / "candidate.current");
-            } else {
-                std::filesystem::remove_all(oldActive);
-            }
-            syncDirectory(blocksDir);
-        } catch (...) {
-            if (!published) {
-                std::error_code ignored;
-                if (pendingOwned) std::filesystem::remove(pending, ignored);
-                std::filesystem::remove_all(nextDirectory, ignored);
-            } else {
-                // The pointer can have changed even though compact() failed.
-                // A stale handle must NEVER publish objects to the old pack.
-                this->needsReopen_ = true;
-                this->blockStore_.reset();
-            }
-            throw;
-        }
-        return stats;
-    }
-
     std::array<std::uint8_t, 16> random{};
     require(RAND_bytes(random.data(), static_cast<int>(random.size())) == 1,
             "failed to generate pack generation identifier");

@@ -14,14 +14,14 @@ A base revision must be in the sender's ancestry and complete in the recipient's
 
 ```bash
 ./build-linux/aowis-native-sync export \
-  /path/to/source blocks main /tmp/main.aowbundle
+  /path/to/source pack main /tmp/main.aowbundle
 ./build-linux/aowis-native-sync import \
   /path/to/destination pack /tmp/main.aowbundle remote_main
 
 base="$(./build-linux/aowis-native-sync head \
   /path/to/destination pack remote_main)"
 ./build-linux/aowis-native-sync export-incremental \
-  /path/to/source blocks main "$base" /tmp/update.aowbundle
+  /path/to/source pack main "$base" /tmp/update.aowbundle
 ./build-linux/aowis-native-sync import \
   /path/to/destination pack /tmp/update.aowbundle remote_main
 ```
@@ -30,7 +30,7 @@ Imports verify object hashes, structural record types, revision ancestry and obj
 
 Model-indexed revisions undergo an additional semantic consistency check: canonical model-record encoding and sorted unique dependency UUIDs, nonzero/self-reference rules, live dependency targets, and *exact* equality between model-derived incoming references and the stored reverse-reference Merkle index. Every revision reachable from the imported tip is included, even old historical revisions or locally supplied ancestors of an incremental bundle. Every first model snapshot after a raw revision is checked in full; subsequent snapshots with a verified model-indexed parent validate Merkle differences in both the model and reverse-reference trees. Unchanged content-addressed subtrees inherit only the independently verified parent snapshot invariants. Changed model edges must exactly equal changed reverse-index edges, newly introduced targets must exist, and deleting a still-referenced UUID is rejected even if its referrers are unchanged. Both merge parents are verified before the merge revision; ancestry is traversed iteratively, avoiding C++ recursion over long histories. Immutable snapshots with the same pair of roots are checked once per import. Invalid histories are rejected before any imported data or branch ref is written; imported hashes are never silently rewritten to repair history. Both physical backends use the same rules.
 
-**Integrity scope:** Imported bundles and persisted repositories use the same generic logical validation. `aowis-native-verify` performs full on-disk physical and logical verification by default (`--physical` restricts it to physical checks). Neither the importer nor this checker validates opaque domain-specific hydraulic semantics. The import location index, per-object logical visitation/type marks, and imported Merkle-tree summaries are file-backed and automatically discarded; the first-pass SHA-256 scan uses a fixed 64 KiB scratch buffer. Local objects referenced by incremental bundles still use in-memory fallback maps for visitation state and Merkle summaries. Revision ancestry and snapshot-root bookkeeping retain state proportional to history size. The baseline full-snapshot reference verifier sorts dependency edges in 8,192-entry memory chunks and merges file-backed sorted runs. Later revisions compare only changed Merkle paths, model references, and reverse-reference entries against an already verified parent, without retaining a complete in-memory edge map. Deterministic crash-recovery tests exist, but actual power-loss behavior still needs field validation. See [repository verification](repository-verification.md). Missing objects, invalid baselines and branch divergence are rejected. Exported IDs remain the same across pack and block physical backends.
+**Integrity scope:** Imported bundles and persisted repositories use the same generic logical validation. `aowis-native-verify` performs full on-disk physical and logical verification by default (`--physical` restricts it to physical checks). Neither the importer nor this checker validates opaque domain-specific hydraulic semantics. The import location index, per-object logical visitation/type marks, and imported Merkle-tree summaries are file-backed and automatically discarded; the first-pass SHA-256 scan uses a fixed 64 KiB scratch buffer. Local objects referenced by incremental bundles still use in-memory fallback maps for visitation state and Merkle summaries. Revision ancestry and snapshot-root bookkeeping retain state proportional to history size. The baseline full-snapshot reference verifier sorts dependency edges in 8,192-entry memory chunks and merges file-backed sorted runs. Later revisions compare only changed Merkle paths, model references, and reverse-reference entries against an already verified parent, without retaining a complete in-memory edge map. Deterministic crash-recovery tests exist, but actual power-loss behavior still needs field validation. See [repository verification](repository-verification.md). Missing objects, invalid baselines and branch divergence are rejected. Object hashes and revision identities remain portable between independent pack repositories.
 
 ## Branch collaboration
 

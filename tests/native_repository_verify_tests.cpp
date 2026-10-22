@@ -1,5 +1,4 @@
 #include "aowis/native/native_store.h"
-#include "aowis/native/block_store_prototype.h"
 
 #include <algorithm>
 #include <array>
@@ -20,7 +19,6 @@
 #include <vector>
 
 namespace {
-using aowis::native::BlockStorePrototype;
 using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
@@ -121,15 +119,6 @@ struct ForgedObjects {
 // Both physical stores must still pass their independent checksum verification.
 void inject(const std::filesystem::path& directory, PhysicalStore backend,
             const ForgedObjects& forged) {
-    if (backend == PhysicalStore::ExperimentalBlocks) {
-        BlockStorePrototype store(directory / "blocks");
-        std::vector<Bytes> objects;
-        for (const std::pair<const Hash, Bytes>& entry : forged.entries) {
-            objects.push_back(entry.second);
-        }
-        (void)store.putBatch(objects);
-        return;
-    }
     std::ofstream output(directory / "objects.pack", std::ios::binary | std::ios::app);
     expect(output.good(), "cannot append forged pack objects");
     for (const std::pair<const Hash, Bytes>& entry : forged.entries) {
@@ -298,17 +287,17 @@ void testValidHistories(PhysicalStore backend) {
 
 void testCrossBackend() {
     TemporaryDirectory temp("transfer");
-    Repository original(temp.path / "pack", PhysicalStore::Stage7Pack);
+    Repository original(temp.path / "pack", PhysicalStore::Pack);
     original.createBranch("models");
     (void)original.commitModel("models", {
         {key(1), ModelRecord{1, {}, Bytes{'a'}}},
         {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}});
     original.exportBranchBundle("models", temp.path / "history.bundle");
-    Repository destination(temp.path / "blocks", PhysicalStore::ExperimentalBlocks);
+    Repository destination(temp.path / "recipient", PhysicalStore::Pack);
     destination.importBranchBundle(temp.path / "history.bundle", "models");
     expect(destination.verifyRepository().revisions ==
                original.verifyRepository().revisions,
-           "full verification differs after cross-backend replication");
+           "full verification differs after independent repository replication");
 }
 
 // Physical storage corruption must not be mistaken for a logical failure.
@@ -322,9 +311,7 @@ void testPhysicalCorruption(PhysicalStore backend) {
         (void)repo.commit("stable", {{key(5), Bytes{'x', 'y', 'z'}}});
         (void)repo.verifyRepository();
     }
-    const std::filesystem::path pack = backend == PhysicalStore::ExperimentalBlocks ?
-        BlockStorePrototype::activeDirectory(directory / "blocks") / "candidate.pack" :
-        directory / "objects.pack";
+    const std::filesystem::path pack = directory / "objects.pack";
     expect(std::filesystem::file_size(pack) > 0, "no pack data to corrupt");
     std::fstream stream(pack, std::ios::in | std::ios::out | std::ios::binary);
     expect(stream.good(), "cannot open pack for test corruption");
@@ -399,8 +386,7 @@ void testCli(const std::string& executable, PhysicalStore backend) {
 int main(int argc, char** argv) {
     try {
         expect(argc == 2, "repository verifier test requires CLI executable");
-        for (PhysicalStore backend : {PhysicalStore::Stage7Pack,
-                                      PhysicalStore::ExperimentalBlocks}) {
+        for (PhysicalStore backend : {PhysicalStore::Pack}) {
             testValidHistories(backend);
             for (const std::pair<Fault, std::string>& entry :
                  std::vector<std::pair<Fault, std::string>>{

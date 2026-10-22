@@ -251,7 +251,7 @@ def main():
     parser.add_argument("--payload-bytes", type=int, default=96)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--kinds", choices=("model", "raw", "both"), default="both")
-    parser.add_argument("--backends", choices=("pack", "block", "both"), default="both")
+    parser.add_argument("--backends", choices=("pack",), default="pack")
     parser.add_argument("--output", type=Path, help="Write import CSV (default: stdout)")
     parser.add_argument("--work-root", type=Path,
                         help="Parent of fresh, uniquely created benchmark working directories")
@@ -275,7 +275,7 @@ def main():
         args.payload_bytes = 32
         args.repeats = 1
         args.kinds = "both"
-        args.backends = "both"
+        args.backends = "pack"
     if not (2 <= args.commits <= args.objects < 0xFFFFFFFF and
             4 <= args.payload_bytes <= 1024 * 1024 and 1 <= args.repeats <= 100):
         parser.error("require 2 <= commits <= objects < 2^32-1, 4 <= payload <= 1 MiB and 1 <= repeats <= 100")
@@ -289,7 +289,7 @@ def main():
         parser.error("--output is for import measurements, not fixture preparation")
     binary = args.binary.resolve(strict=True)
     kinds = ["model", "raw"] if args.kinds == "both" else [args.kinds]
-    backends = ["pack", "block"] if args.backends == "both" else [args.backends]
+    backends = [args.backends]
 
     if args.work_root is not None:
         args.work_root.mkdir(parents=True, exist_ok=True)

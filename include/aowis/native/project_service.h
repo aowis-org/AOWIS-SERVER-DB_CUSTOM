@@ -19,7 +19,7 @@ namespace aowis::native {
 struct ProjectInfo {
     std::string id;
     std::string name;
-    PhysicalStore storage = PhysicalStore::Stage7Pack;
+    PhysicalStore storage = PhysicalStore::Pack;
 };
 
 enum class ProjectErrorKind { InvalidInput, NotFound, Conflict, Unavailable };
