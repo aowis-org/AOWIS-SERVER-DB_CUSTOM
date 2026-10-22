@@ -251,3 +251,22 @@ physical disk I/O). Those observations identify a verification hotspot, but
 larger and cold-cache measurements must establish how much can safely be saved
 before changing integrity rules. The independent `verify_ms` audit is always
 separate and is **not** included in any of the `profile_*` phases.
+
+### Model-reference verification and incremental history
+
+Imported histories are checked for canonical model records, existing dependency
+targets and exact consistency of the reverse-reference index. The importer
+validates the first model-indexed snapshot in full and thereafter compares
+immutable Merkle subtrees against an already validated model-indexed parent.
+Changed outgoing and incoming edges must agree exactly, and deleting any
+still-referenced target is invalid even when its referrers were not edited.
+Merge parents are each checked before the merged revision.
+
+For performance comparisons, benchmark the same deterministic fixture and
+physical backend with identical import/verification settings in separately
+built revisions of the code. Compare `profile_model_references_ms`, full and
+incremental `import_ms`, `profile_local_reads`, peak RSS and scratch space.
+The verification time reported in `verify_ms` is a **separate comprehensive
+post-import audit**, not part of `import_ms`. Larger record updates can fall
+back to merging all leaves of a structurally rewritten subtree; measure those
+cases separately from narrow incremental edits.

@@ -1004,72 +1004,304 @@ LogicalVerification verifyLogicalGraph(
             }
             return false;
         };
-    const std::function<void(const Hash&)> checkModelRevision = [&](const Hash& revisionId) {
+    // Enumerate only changes between two previously structurally validated
+    // Merkle trees. Identical immutable subtrees need no further I/O. A split
+    // or compressed prefix can change during an insertion/deletion; in that
+    // case merge the two subtree leaf streams instead of assuming their
+    // branches have matching shapes.
+    using OptionalValueHash = std::optional<Hash>;
+    using LeafChangeVisitor = std::function<void(
+        const Key&, const OptionalValueHash&, const OptionalValueHash&)>;
+    const std::function<void(const Hash&, const Hash&, const LeafChangeVisitor&)> diffLeaves =
+        [&](const Hash& oldRoot, const Hash& newRoot,
+            const LeafChangeVisitor& visitor) {
+            const std::function<void(const Hash&, const Hash&)> walk =
+                [&](const Hash& before, const Hash& after) {
+                    if (before == after) return;
+                    // Matching branches are structurally compatible, so only
+                    // child hashes that actually changed need examination.
+                    if (!isZero(before) && !isZero(after)) {
+                        const Bytes oldNode = objectByHash(before);
+                        const Bytes newNode = objectByHash(after);
+                        if (oldNode[0] == 'B' && newNode[0] == 'B' &&
+                            std::equal(oldNode.begin() + 1, oldNode.begin() + 18,
+                                       newNode.begin() + 1)) {
+                            for (unsigned slot = 0; slot < 16; ++slot) {
+                                walk(readHash(oldNode, 18 + 32U * slot),
+                                     readHash(newNode, 18 + 32U * slot));
+                            }
+                            return;
+                        }
+                    }
+                    // Structural rewrites occur only at affected trie nodes.
+                    // Fall back to an ordered merge of their leaf sets;
+                    // neither side needs to be a branch or even nonempty.
+                    std::vector<std::pair<Key, Hash>> beforeLeaves;
+                    std::vector<std::pair<Key, Hash>> afterLeaves;
+                    visitLeaves(before, [&](const Key& key, const Hash& value) {
+                        beforeLeaves.emplace_back(key, value);
+                    });
+                    visitLeaves(after, [&](const Key& key, const Hash& value) {
+                        afterLeaves.emplace_back(key, value);
+                    });
+                    std::size_t i = 0;
+                    std::size_t j = 0;
+                    while (i < beforeLeaves.size() || j < afterLeaves.size()) {
+                        if (j == afterLeaves.size() ||
+                            (i < beforeLeaves.size() &&
+                             beforeLeaves[i].first < afterLeaves[j].first)) {
+                            visitor(beforeLeaves[i].first, beforeLeaves[i].second,
+                                    std::nullopt);
+                            ++i;
+                        } else if (i == beforeLeaves.size() ||
+                                   afterLeaves[j].first < beforeLeaves[i].first) {
+                            visitor(afterLeaves[j].first, std::nullopt,
+                                    afterLeaves[j].second);
+                            ++j;
+                        } else {
+                            if (beforeLeaves[i].second != afterLeaves[j].second) {
+                                visitor(beforeLeaves[i].first, beforeLeaves[i].second,
+                                        afterLeaves[j].second);
+                            }
+                            ++i;
+                            ++j;
+                        }
+                    }
+                };
+            walk(oldRoot, newRoot);
+        };
+
+    // The edge delta of the model records must equal the edge delta of the
+    // reverse index. This is sufficient when the parent snapshot has already
+    // been verified, and also catches missing/extra index entries even if
+    // every individual leaf and hash is well-formed.
+    using ReferenceEdge = SortedReferenceEdges::Edge;
+    using EdgeChanges = std::map<ReferenceEdge, int>;
+    const std::function<void(EdgeChanges&, const Key&, const Key&, int)> changeEdge =
+        [&](EdgeChanges& changes, const Key& target, const Key& source, int direction) {
+            ReferenceEdge edge{};
+            std::copy(target.begin(), target.end(), edge.begin());
+            std::copy(source.begin(), source.end(), edge.begin() + 16);
+            const int change = changes[edge] + direction;
+            if (change == 0) changes.erase(edge);
+            else changes[edge] = change;
+        };
+
+    // Validate ancestors before their descendants, independent of bundle hash
+    // sort order. A revision with an indexed parent can reuse that parent's
+    // established reference consistency, including merge second-parents.
+    // The high bit is unused by the seven structural kinds. Imported
+    // revisions reuse their file-backed mark rather than adding another
+    // heap-allocated set for semantic verification.
+    constexpr std::uint8_t modelRevisionChecked = 0x80U;
+    std::set<Hash> processedLocalModelRevisions;
+    const std::function<bool(const Hash&)> modelRevisionDone = [&](const Hash& id) {
+        if (externalMarks.read) {
+            const std::optional<std::uint8_t> bits = externalMarks.read(id);
+            if (bits && ((*bits & modelRevisionChecked) != 0U)) return true;
+        }
+        return processedLocalModelRevisions.contains(id);
+    };
+    const std::function<void(const Hash&)> markModelRevisionDone = [&](const Hash& id) {
+        if (externalMarks.read && externalMarks.write) {
+            const std::optional<std::uint8_t> bits = externalMarks.read(id);
+            if (bits) {
+                externalMarks.write(id, static_cast<std::uint8_t>(*bits | modelRevisionChecked));
+                return;
+            }
+        }
+        processedLocalModelRevisions.insert(id);
+    };
+    const std::function<void(const Hash&)> checkVerifiedRevision = [&](const Hash& revisionId) {
         try {
             const Bytes encodedRevision = objectByHash(revisionId);
-            if (encodedRevision[65] == 0) return;
+            const unsigned parentCount = encodedRevision[66];
+            std::optional<std::pair<Hash, Hash>> parentSnapshot;
+            for (unsigned i = 0; i < parentCount; ++i) {
+                const Hash parentId = readHash(encodedRevision, 67 + 32U * i);
+                // The caller visits parents in postorder, without recursion.
+                const Bytes parent = objectByHash(parentId);
+                if (parent[65] == 1 && !parentSnapshot) {
+                    parentSnapshot = std::make_pair(readHash(parent, 1),
+                                                    readHash(parent, 33));
+                }
+            }
+            if (encodedRevision[65] == 0) {
+                markModelRevisionDone(revisionId);
+                return;
+            }
             const Hash modelRoot = readHash(encodedRevision, 1);
             const Hash referenceRoot = readHash(encodedRevision, 33);
-            if (!verifiedModelSnapshots.emplace(modelRoot, referenceRoot).second) return;
+            const std::pair<Hash, Hash> snapshot{modelRoot, referenceRoot};
+            if (verifiedModelSnapshots.contains(snapshot)) {
+                markModelRevisionDone(revisionId);
+                return;
+            }
 
-            SortedReferenceEdges expected;
-            visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
-                require(source != Key{}, "bundled model tree contains zero UUID");
-                const Bytes stored = objectByHash(value);
-                require(!stored.empty() && stored.front() == 'V',
-                        "invalid bundled model value");
-                const Bytes envelope(stored.begin() + 1, stored.end());
-                const ModelRecord record = decodeModelRecord(envelope);
-                require(encodeModelRecord(record) == envelope,
-                        "noncanonical bundled model references");
-                for (const Key& target : record.references) {
-                    require(target != Key{} && target != source,
-                            "invalid bundled model UUID reference");
-                    expected.append(target, source);
+            if (parentSnapshot && verifiedModelSnapshots.contains(*parentSnapshot)) {
+                EdgeChanges modelChanges;
+                EdgeChanges indexChanges;
+                std::vector<Key> deletedModels;
+                const std::function<std::vector<Key>(const Hash&, bool)> references =
+                    [&](const Hash& value, bool canonical) {
+                        if (isZero(value)) return std::vector<Key>{};
+                        const Bytes stored = objectByHash(value);
+                        require(!stored.empty() && stored.front() == 'V',
+                                "invalid bundled model value");
+                        const Bytes envelope(stored.begin() + 1, stored.end());
+                        const ModelRecord record = decodeModelRecord(envelope);
+                        if (canonical) {
+                            require(encodeModelRecord(record) == envelope,
+                                    "noncanonical bundled model references");
+                        }
+                        return record.references;
+                    };
+                diffLeaves(parentSnapshot->first, modelRoot,
+                           [&](const Key& source, const OptionalValueHash& oldValue,
+                               const OptionalValueHash& newValue) {
+                    require(source != Key{}, "bundled model tree contains zero UUID");
+                    if (oldValue && !newValue) deletedModels.push_back(source);
+                    if (oldValue) {
+                        for (const Key& target : references(*oldValue, false)) {
+                            changeEdge(modelChanges, target, source, -1);
+                        }
+                    }
+                    if (newValue) {
+                        for (const Key& target : references(*newValue, true)) {
+                            require(target != Key{} && target != source,
+                                    "invalid bundled model UUID reference");
+                            changeEdge(modelChanges, target, source, 1);
+                        }
+                    }
+                });
+                diffLeaves(parentSnapshot->second, referenceRoot,
+                           [&](const Key& target, const OptionalValueHash& oldValue,
+                               const OptionalValueHash& newValue) {
+                    require(target != Key{},
+                            "bundled incoming-reference target is zero");
+                    if (oldValue) {
+                        for (const Key& source : decodeReferrers(objectByHash(*oldValue))) {
+                            changeEdge(indexChanges, target, source, -1);
+                        }
+                    }
+                    if (newValue) {
+                        for (const Key& source : decodeReferrers(objectByHash(*newValue))) {
+                            changeEdge(indexChanges, target, source, 1);
+                        }
+                    }
+                });
+                if (modelChanges != indexChanges) {
+                    const bool onlyMissingFromUnchangedModel = modelChanges.empty() &&
+                        !indexChanges.empty() &&
+                        std::all_of(indexChanges.begin(), indexChanges.end(),
+                            [](const std::pair<const ReferenceEdge, int>& edge) {
+                                return edge.second < 0;
+                            });
+                    throw std::runtime_error(onlyMissingFromUnchangedModel
+                        ? "bundled reverse-reference index is missing model references"
+                        : "bundled reverse-reference index does not match model records");
                 }
-            });
-            expected.finalize();
-
-            // Both streams are ordered lexicographically by (target, source).
-            // Equality requires every model-derived edge to appear in the
-            // reverse index and prohibits invented or duplicated edges.
-            std::optional<SortedReferenceEdges::Edge> nextExpected = expected.next();
-            std::optional<Key> checkedTarget;
-            const std::function<void()> checkTarget = [&] {
-                if (!nextExpected) return;
-                Key target{};
-                std::copy_n(nextExpected->begin(), 16, target.begin());
-                if (checkedTarget && *checkedTarget == target) return;
-                require(containsModel(modelRoot, target),
-                        "bundled model reference target does not exist");
-                checkedTarget = target;
-            };
-            visitLeaves(referenceRoot, [&](const Key& target, const Hash& value) {
-                require(target != Key{}, "bundled incoming-reference target is zero");
-                const std::vector<Key> actual = decodeReferrers(objectByHash(value));
-                for (const Key& source : actual) {
-                    checkTarget();
-                    SortedReferenceEdges::Edge matching{};
-                    std::copy(target.begin(), target.end(), matching.begin());
-                    std::copy(source.begin(), source.end(), matching.begin() + 16);
-                    require(nextExpected && *nextExpected == matching,
+                // A changed model may introduce a new dependency. An unchanged
+                // model may still refer to a deleted target: checking the
+                // resulting incoming index for every deleted UUID catches it.
+                std::optional<Key> previousTarget;
+                for (const std::pair<const ReferenceEdge, int>& edge : modelChanges) {
+                    if (edge.second <= 0) continue;
+                    Key target{};
+                    std::copy_n(edge.first.begin(), 16, target.begin());
+                    if (previousTarget && *previousTarget == target) continue;
+                    require(containsModel(modelRoot, target),
+                            "bundled model reference target does not exist");
+                    previousTarget = target;
+                }
+                for (const Key& deleted : deletedModels) {
+                    require(!containsModel(referenceRoot, deleted),
+                            "bundled model reference target does not exist");
+                }
+            } else {
+                // First indexed revision after a raw branch (or a history
+                // without an indexed parent): establish a complete baseline.
+                SortedReferenceEdges expected;
+                visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
+                    require(source != Key{}, "bundled model tree contains zero UUID");
+                    const Bytes stored = objectByHash(value);
+                    require(!stored.empty() && stored.front() == 'V',
+                            "invalid bundled model value");
+                    const Bytes envelope(stored.begin() + 1, stored.end());
+                    const ModelRecord record = decodeModelRecord(envelope);
+                    require(encodeModelRecord(record) == envelope,
+                            "noncanonical bundled model references");
+                    for (const Key& target : record.references) {
+                        require(target != Key{} && target != source,
+                                "invalid bundled model UUID reference");
+                        expected.append(target, source);
+                    }
+                });
+                expected.finalize();
+                std::optional<SortedReferenceEdges::Edge> nextExpected = expected.next();
+                std::optional<Key> checkedTarget;
+                const std::function<void()> checkTarget = [&] {
+                    if (!nextExpected) return;
+                    Key target{};
+                    std::copy_n(nextExpected->begin(), 16, target.begin());
+                    if (checkedTarget && *checkedTarget == target) return;
+                    require(containsModel(modelRoot, target),
+                            "bundled model reference target does not exist");
+                    checkedTarget = target;
+                };
+                visitLeaves(referenceRoot, [&](const Key& target, const Hash& value) {
+                    require(target != Key{}, "bundled incoming-reference target is zero");
+                    const std::vector<Key> actual = decodeReferrers(objectByHash(value));
+                    for (const Key& source : actual) {
+                        checkTarget();
+                        SortedReferenceEdges::Edge matching{};
+                        std::copy(target.begin(), target.end(), matching.begin());
+                        std::copy(source.begin(), source.end(), matching.begin() + 16);
+                        require(nextExpected && *nextExpected == matching,
+                                "bundled reverse-reference index does not match model records");
+                        nextExpected = expected.next();
+                    }
+                    if (nextExpected && std::equal(target.begin(), target.end(),
+                                                   nextExpected->begin())) {
+                        throw std::runtime_error(
                             "bundled reverse-reference index does not match model records");
-                    nextExpected = expected.next();
-                }
-                // A remaining edge for this same target means that the index
-                // omitted one of its sources, not an entirely missing target.
-                if (nextExpected && std::equal(target.begin(), target.end(),
-                                               nextExpected->begin())) {
-                    throw std::runtime_error(
-                        "bundled reverse-reference index does not match model records");
-                }
-            });
-            checkTarget();
-            require(!nextExpected,
-                    "bundled reverse-reference index is missing model references");
+                    }
+                });
+                checkTarget();
+                require(!nextExpected,
+                        "bundled reverse-reference index is missing model references");
+            }
+            verifiedModelSnapshots.insert(snapshot);
+            markModelRevisionDone(revisionId);
         } catch (const std::exception& error) {
             throw std::runtime_error("model revision " + toHex(revisionId) +
                                      ": " + error.what());
+        }
+    };
+    // Use an explicit postorder stack: histories can contain hundreds of
+    // thousands of commits, so recursive parent walking risks stack overflow.
+    const std::function<void(const Hash&)> checkModelRevision = [&](const Hash& tip) {
+        std::vector<std::pair<Hash, bool>> work{{tip, false}};
+        std::set<Hash> active;
+        while (!work.empty()) {
+            const std::pair<Hash, bool> frame = work.back();
+            work.pop_back();
+            if (modelRevisionDone(frame.first)) continue;
+            if (frame.second) {
+                checkVerifiedRevision(frame.first);
+                active.erase(frame.first);
+                continue;
+            }
+            require(active.insert(frame.first).second,
+                    "cyclic bundled revision ancestry");
+            work.emplace_back(frame.first, true);
+            const Bytes revision = objectByHash(frame.first);
+            for (unsigned i = 0; i < revision[66]; ++i) {
+                const Hash parent = readHash(revision, 67 + 32U * i);
+                if (!modelRevisionDone(parent)) {
+                    work.emplace_back(parent, false);
+                }
+            }
         }
     };
     for (const Hash& revisionId : localRevisions) checkModelRevision(revisionId);

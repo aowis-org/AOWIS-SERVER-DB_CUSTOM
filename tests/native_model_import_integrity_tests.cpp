@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -476,6 +477,148 @@ void testLargeReferenceGraph(PhysicalStore store) {
            "reference sorting left temporary files after invalid import");
 }
 
+// Revision IDs are hash-sorted in the bundle, not ancestry-sorted. The
+// verifier must resolve parents before children without a recursive C++ call
+// stack, even when thousands of revisions share the same immutable roots.
+void testDeepSharedModelHistory(PhysicalStore backend) {
+    TemporaryDirectory temporary("deep-model-history");
+    BundleBuilder builder;
+    const Hash value = builder.modelValue({});
+    const Hash modelRoot = builder.tree({{key(1), value}});
+    Hash tip = builder.revision(modelRoot, Hash{});
+    for (unsigned i = 0; i < 2500; ++i) {
+        tip = builder.revision(modelRoot, Hash{}, tip);
+    }
+    const std::filesystem::path bundle = temporary.path / "long.bundle";
+    builder.write(bundle, tip);
+    Repository receiver(temporary.path / "receiver", backend);
+    expect(receiver.importBranchBundle(bundle, "models").head == tip,
+           "deep history model import failed");
+    expect(receiver.verifyRepository().revisions == 2501,
+           "deep history lost revision ancestry");
+}
+
+// Independent, correctly hashed historical snapshots exercise the differential
+// validator's trust boundary: a consistent parent alone must never make a
+// forged child safe, particularly when it deletes a still-referenced UUID.
+void testHistoricalReferenceDeltas(PhysicalStore backend) {
+    TemporaryDirectory temporary("reference-deltas");
+    BundleBuilder builder;
+    const Hash empty = builder.modelValue({});
+    const Hash depends = builder.modelValue({key(1)});
+    const Hash dependsOnMissing = builder.modelValue({key(9)});
+    const Hash incomingTwo = builder.incomingValue({key(2)});
+    const Hash incomingTwoThree = builder.incomingValue({key(2), key(3)});
+    std::map<Key, Hash> baseModels{{key(1), empty}, {key(2), depends}};
+    std::map<Key, Hash> baseIndex{{key(1), incomingTwo}};
+    const Hash baseModelRoot = builder.tree(baseModels);
+    const Hash baseRefRoot = builder.tree(baseIndex);
+    const Hash parent = builder.revision(baseModelRoot, baseRefRoot);
+
+    struct Case { std::string label; Hash tip; bool valid; };
+    std::vector<Case> cases;
+    {
+        std::map<Key, Hash> models = baseModels;
+        models.emplace(key(3), depends);
+        // A changed model with a missing incoming edge must be rejected.
+        cases.push_back({"new dependent absent from reverse index",
+                         builder.revision(builder.tree(models), baseRefRoot, parent), false});
+        std::map<Key, Hash> correct = baseIndex;
+        correct[key(1)] = incomingTwoThree;
+        cases.push_back({"correct added dependent",
+                         builder.revision(builder.tree(models), builder.tree(correct), parent), true});
+    }
+    {
+        std::map<Key, Hash> models = baseModels;
+        models.erase(key(1));
+        // The referencing model at UUID 2 is unchanged. The old reverse
+        // index still records that incoming edge, so deleting 1 is illegal.
+        cases.push_back({"delete referenced target without index change",
+                         builder.revision(builder.tree(models), baseRefRoot, parent), false});
+        cases.push_back({"delete referenced target and hide incoming edges",
+                         builder.revision(builder.tree(models), Hash{}, parent), false});
+    }
+    {
+        std::map<Key, Hash> models = baseModels;
+        models[key(2)] = dependsOnMissing;
+        std::map<Key, Hash> refs{{key(9), builder.incomingValue({key(2)})}};
+        cases.push_back({"changed dependent points to nonexistent model",
+                         builder.revision(builder.tree(models), builder.tree(refs), parent), false});
+    }
+    {
+        // An unchanged dependency set may accompany an updated record value.
+        // This is a valid differential update with no reference-index edits.
+        std::map<Key, Hash> models = baseModels;
+        models[key(2)] = builder.add([] {
+            Bytes value{'V'};
+            const Bytes record = aowis::native::encodeModelRecord(
+                ModelRecord{1, {key(1)}, Bytes{'n', 'e', 'w'}});
+            value.insert(value.end(), record.begin(), record.end());
+            return value;
+        }());
+        cases.push_back({"payload-only edit",
+                         builder.revision(builder.tree(models), baseRefRoot, parent), true});
+    }
+    {
+        std::map<Key, Hash> models = baseModels;
+        models.erase(key(2));
+        cases.push_back({"remove dependent and its incoming edge",
+                         builder.revision(builder.tree(models), Hash{}, parent), true});
+    }
+    {
+        // A valid merge tip cannot launder a poisoned second-parent revision.
+        const Hash bad = builder.revision(baseModelRoot, Hash{}, parent);
+        cases.push_back({"poisoned second merge parent",
+                         builder.revision(baseModelRoot, baseRefRoot, parent, bad), false});
+    }
+    for (const Case& fixture : cases) {
+        const std::filesystem::path bundle = temporary.path / (fixture.label + ".bundle");
+        // BundleBuilder accumulates cases; export only the objects reachable
+        // from this particular tip, exactly as a real branch export does.
+        BundleBuilder filtered;
+        const std::function<void(const Hash&)> include = [&](const Hash& hash) {
+            if (hash == Hash{} || filtered.objects.contains(hash)) return;
+            const Bytes& object = builder.objects.at(hash);
+            filtered.objects.emplace(hash, object);
+            const std::function<Hash(std::size_t)> hashAt = [&](std::size_t offset) {
+                Hash child{};
+                std::copy_n(object.begin() + static_cast<std::ptrdiff_t>(offset),
+                            32, child.begin());
+                return child;
+            };
+            if (object[0] == 'S') {
+                include(hashAt(1));
+                include(hashAt(33));
+                for (unsigned i = 0; i < object[66]; ++i) include(hashAt(67 + 32U * i));
+            } else if (object[0] == 'B') {
+                for (unsigned i = 0; i < 16; ++i) include(hashAt(18 + 32U * i));
+            } else if (object[0] == 'L') {
+                include(hashAt(17));
+            }
+        };
+        include(fixture.tip);
+        filtered.write(bundle, fixture.tip);
+        Repository receiver(temporary.path / fixture.label, backend);
+        const std::uint64_t initialObjects = receiver.objectCount();
+        if (fixture.valid) {
+            expect(receiver.importBranchBundle(bundle, "models").head == fixture.tip,
+                   "valid historical model delta was rejected: " + fixture.label);
+            expect(receiver.verifyRepository().revisions >= 2,
+                   "valid historical history failed independent verification");
+        } else {
+            bool rejected = false;
+            try {
+                (void)receiver.importBranchBundle(bundle, "models");
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            expect(rejected && receiver.listBranches().empty() &&
+                   receiver.objectCount() == initialObjects,
+                   "invalid historical reference delta accepted: " + fixture.label);
+        }
+    }
+}
+
 void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore destinationStore) {
     TemporaryDirectory temporary("incremental");
     Repository source(temporary.path / "source", sourceStore);
@@ -522,6 +665,8 @@ int main() {
             testReproducedUnsafeDeletion(backend);
             testValidCyclesAndHistory(backend);
             testLargeReferenceGraph(backend);
+            testHistoricalReferenceDeltas(backend);
+            testDeepSharedModelHistory(backend);
         }
         for (PhysicalStore source : {PhysicalStore::Stage7Pack,
                                      PhysicalStore::ExperimentalBlocks}) {
