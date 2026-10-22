@@ -91,6 +91,29 @@ public:
         reply->deleteLater();
         return BinaryResponse{status, payload, contentType};
     }
+    // Abort a bundle response after its first readable bytes. The server must
+    // release the device-owned temporary directory even on disconnect.
+    void abortDownload(const QString& path) {
+        QNetworkRequest request(QUrl(this->base_ + path));
+        QNetworkReply* reply = this->manager_.get(request);
+        QEventLoop loop;
+        QTimer timer;
+        timer.setSingleShot(true);
+        bool receivedBody = false;
+        QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&]() {
+            if (reply->bytesAvailable() > 0) {
+                receivedBody = true;
+                reply->abort();
+                loop.quit();
+            }
+        });
+        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+        timer.start(5000);
+        loop.exec();
+        check(timer.isActive() && receivedBody, "streamed download did not produce bytes");
+        reply->deleteLater();
+    }
 private:
     QString base_;
     quint16 port_;
@@ -291,15 +314,24 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
     const QString to = QStringLiteral("/api/v1/projects/") + destinationId + "/branches/tracking";
     native::Key item{};
     item[15] = 37;
+    native::Key largeItem{};
+    largeItem[15] = 38;
+    native::Bytes largePayload(512 * 1024, static_cast<std::uint8_t>(0x5c));
     service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
         repository.createBranch("sync_demo");
-        (void)repository.commit("sync_demo", {{item, native::Bytes{'o', 'n', 'e'}}});
+        (void)repository.commit("sync_demo", {{item, native::Bytes{'o', 'n', 'e'}},
+                                               {largeItem, largePayload}});
     });
     const QString firstHead = client.call("GET", from + "/head").json.value("id").toString();
     const BinaryResponse bundle = client.callRaw("GET", from + "/bundle");
-    check(bundle.status == 200 && bundle.body.size() > 80 &&
+    check(bundle.status == 200 && bundle.body.size() > 512 * 1024 &&
           bundle.contentType.startsWith("application/vnd.aowis.bundle"),
-          "full bundle transfer failed");
+          "large file-backed bundle download failed");
+    check(client.callRaw("GET", from + "/bundle").body == bundle.body,
+          "repeated file-backed bundle export changed bytes");
+    client.abortDownload(from + "/bundle");
+    check(client.callRaw("GET", from + "/bundle").body == bundle.body,
+          "download after client cancellation changed bytes");
     check(client.callRaw("GET", from + "/bundle?base=invalid").status == 400,
           "malformed base hash accepted");
     check(client.callRaw("GET", from + "/bundle?base=" + QString(64, QChar('f'))).status == 409,

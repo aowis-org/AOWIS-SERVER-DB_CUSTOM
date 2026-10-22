@@ -4,7 +4,7 @@
 
 This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-db` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
-> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Preview-only merges and unbounded/streaming transfers remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
+> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads stream from temporary files; uploads still buffer complete request bodies. Preview-only merges and end-to-end streaming uploads remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
 ## System overview
 
@@ -105,7 +105,7 @@ Portable bundles exchange immutable branches between independent repositories, i
   /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private temporary files for its hash-to-offset index and one-byte-per-imported-object logical visitation marks, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately and their mappings are evictable. Merkle summaries, revision ancestry and reference-consistency verification still use memory proportional to the validated history/model. The same bundle format works through the bounded HTTP synchronization endpoints. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private temporary files for its hash-to-offset index and one-byte-per-imported-object logical visitation marks, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately and their mappings are evictable. Merkle summaries, revision ancestry and reference-consistency verification still use memory proportional to the validated history/model. The same bundle format works through the bounded HTTP synchronization endpoints; downloads are served from a file-backed QIODevice without a second full-size response buffer. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 

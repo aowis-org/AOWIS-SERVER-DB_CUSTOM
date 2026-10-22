@@ -62,7 +62,7 @@ paths:
         Export the full portable immutable revision graph or an incremental
         delta relative to a base ancestor. The binary result is capped by
         configured transfer size, object-count and individual-object limits.
-        This initial endpoint buffers the response rather than streaming it.
+        The response is sent from an exported temporary file through a QIODevice; Qt reads the file in chunks and cleans up when the responder releases the device.
       parameters:
         - name: base
           in: query
