@@ -387,6 +387,95 @@ void testValidCyclesAndHistory(PhysicalStore store) {
     target.verifyPack();
 }
 
+// Exercise multiple externally sorted runs, including a reverse-index defect
+// after the in-memory sort threshold. Small fixtures do not exercise the
+// disk-backed merge, so this is deliberately >8,192 distinct edges.
+void testLargeReferenceGraph(PhysicalStore store) {
+    TemporaryDirectory temporary("large-reference-graph");
+    const std::filesystem::path scratch = temporary.path / "scratch";
+    std::filesystem::create_directories(scratch);
+    const char* previous = ::getenv("TMPDIR");
+    const std::optional<std::string> oldTmp = previous == nullptr ?
+        std::nullopt : std::optional<std::string>(previous);
+    expect(::setenv("TMPDIR", scratch.c_str(), 1) == 0, "set scratch path");
+    struct RestoreEnvironment {
+        std::optional<std::string> value;
+        ~RestoreEnvironment() {
+            if (this->value) ::setenv("TMPDIR", this->value->c_str(), 1);
+            else ::unsetenv("TMPDIR");
+        }
+    } restore{oldTmp};
+    BundleBuilder builder;
+    std::vector<Key> targets;
+    std::vector<Key> sources;
+    for (unsigned value = 1; value <= 64; ++value)
+        targets.push_back(key(static_cast<std::uint8_t>(value)));
+    for (unsigned value = 65; value <= 224; ++value)
+        sources.push_back(key(static_cast<std::uint8_t>(value)));
+    std::map<Key, Hash> models;
+    for (const Key& target : targets)
+        models.emplace(target, builder.modelValue({}));
+    for (const Key& source : sources)
+        models.emplace(source, builder.modelValue(targets));
+    const Hash root = builder.tree(models);
+    std::map<Key, Hash> incoming;
+    for (const Key& target : targets)
+        incoming.emplace(target, builder.incomingValue(sources));
+    const Hash valid = builder.revision(root, builder.tree(incoming));
+    builder.write(temporary.path / "valid.bundle", valid);
+    Repository receiver(temporary.path / "receiver", store);
+    expect(receiver.importBranchBundle(temporary.path / "valid.bundle", "models").head == valid,
+           "large reference graph import rejected");
+    expect(receiver.referencingModel("models", targets[17]).size() == sources.size(),
+           "large graph reverse index lost edges");
+    (void)receiver.verifyRepository();
+    expect(std::filesystem::is_empty(scratch),
+           "reference sorting left temporary files after valid import");
+
+    // If scratch space cannot be created, fail before importing any objects
+    // or publishing a branch. This exercises the external-sort failure path
+    // rather than allowing a fallback that silently skips verification.
+    Repository inaccessible(temporary.path / "inaccessible", store);
+    const std::filesystem::path absent = temporary.path / "missing-scratch";
+    expect(::setenv("TMPDIR", absent.c_str(), 1) == 0,
+           "set deliberately unavailable scratch path");
+    bool failedWithoutScratch = false;
+    try {
+        (void)inaccessible.importBranchBundle(temporary.path / "valid.bundle", "models");
+    } catch (const std::exception&) {
+        failedWithoutScratch = true;
+    }
+    expect(::setenv("TMPDIR", scratch.c_str(), 1) == 0,
+           "restore temporary reference-sort path");
+    expect(failedWithoutScratch && inaccessible.listBranches().empty() &&
+           inaccessible.objectCount() == 0,
+           "external-sort scratch failure allowed partial imported state");
+
+    // Change just one stored reverse index value while keeping every object
+    // hash and trie path valid. The sorted comparison must find the omission.
+    BundleBuilder forged;
+    std::map<Key, Hash> badModels;
+    for (const Key& target : targets)
+        badModels.emplace(target, forged.modelValue({}));
+    for (const Key& source : sources)
+        badModels.emplace(source, forged.modelValue(targets));
+    std::map<Key, Hash> badIncoming;
+    for (const Key& target : targets) {
+        std::vector<Key> actual = sources;
+        if (target == targets[37]) actual.erase(actual.begin() + 87);
+        badIncoming.emplace(target, forged.incomingValue(actual));
+    }
+    const Hash invalid = forged.revision(forged.tree(badModels), forged.tree(badIncoming));
+    forged.write(temporary.path / "forged.bundle", invalid);
+    Repository rejected(temporary.path / "rejected", store);
+    rejected.createBranch("stable");
+    (void)rejected.commit("stable", {{key(230), Bytes{'s'}}});
+    expectRejected(rejected, temporary.path / "forged.bundle", "large missing incoming edge",
+                   "does not match model records");
+    expect(std::filesystem::is_empty(scratch),
+           "reference sorting left temporary files after invalid import");
+}
+
 void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore destinationStore) {
     TemporaryDirectory temporary("incremental");
     Repository source(temporary.path / "source", sourceStore);
@@ -432,6 +521,7 @@ int main() {
             testMalformedFull(backend);
             testReproducedUnsafeDeletion(backend);
             testValidCyclesAndHistory(backend);
+            testLargeReferenceGraph(backend);
         }
         for (PhysicalStore source : {PhysicalStore::Stage7Pack,
                                      PhysicalStore::ExperimentalBlocks}) {

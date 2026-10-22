@@ -16,6 +16,7 @@
 #include <set>
 #include <limits>
 #include <memory>
+#include <queue>
 #include <sys/mman.h>
 #include <stdexcept>
 #include <unordered_set>
@@ -422,6 +423,134 @@ private:
     std::uint64_t marked_ = 0;
 };
 
+// The semantic model verifier must compare edges grouped by *target* UUID.
+// Scanning models produces them grouped by *source* UUID. Sort fixed-size
+// (target, source) records in bounded chunks and merge the runs from one
+// private, unlinked file. Large fan-in creates only one heap entry per run;
+// small snapshots avoid temporary files altogether.
+class SortedReferenceEdges {
+public:
+    using Edge = std::array<std::uint8_t, 32>;
+    static constexpr std::size_t chunkEdges = 8192;
+    static_assert(sizeof(Edge) == 32);
+
+    SortedReferenceEdges() { this->buffer_.reserve(chunkEdges); }
+    ~SortedReferenceEdges() {
+        if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->records_ * sizeof(Edge));
+        if (this->fd_ >= 0) ::close(this->fd_);
+    }
+    SortedReferenceEdges(const SortedReferenceEdges&) = delete;
+    SortedReferenceEdges& operator=(const SortedReferenceEdges&) = delete;
+
+    void append(const Key& target, const Key& source) {
+        require(!this->finalized_, "cannot append to finalized reference sorter");
+        Edge edge{};
+        std::copy(target.begin(), target.end(), edge.begin());
+        std::copy(source.begin(), source.end(), edge.begin() + 16);
+        this->buffer_.push_back(edge);
+        if (this->buffer_.size() == chunkEdges) flush();
+    }
+
+    void finalize() {
+        require(!this->finalized_, "reference sorter finalized twice");
+        this->finalized_ = true;
+        if (this->runs_.empty()) {
+            std::sort(this->buffer_.begin(), this->buffer_.end());
+            return;
+        }
+        flush();
+        require(this->records_ <= std::numeric_limits<std::size_t>::max() / sizeof(Edge),
+                "sorted references exceed addressable memory");
+        void* const mapped = ::mmap(nullptr, this->records_ * sizeof(Edge),
+                                    PROT_READ, MAP_SHARED, this->fd_, 0);
+        systemCall(mapped != MAP_FAILED, "map sorted model references");
+        this->mapped_ = mapped;
+        for (std::size_t index = 0; index < this->runs_.size(); ++index) {
+            const Run& run = this->runs_[index];
+            this->next_.push(Head{mappedEdge(run.start), index});
+        }
+    }
+
+    std::optional<Edge> next() {
+        require(this->finalized_, "reference sorter must be finalized");
+        if (this->runs_.empty()) {
+            if (this->cursor_ == this->buffer_.size()) return std::nullopt;
+            return this->buffer_[this->cursor_++];
+        }
+        if (this->next_.empty()) return std::nullopt;
+        const Head first = this->next_.top();
+        this->next_.pop();
+        Run& run = this->runs_[first.run];
+        ++run.used;
+        if (run.used != run.count) {
+            this->next_.push(Head{mappedEdge(run.start + run.used), first.run});
+        }
+        return first.edge;
+    }
+
+private:
+    struct Run {
+        std::size_t start = 0;
+        std::size_t count = 0;
+        std::size_t used = 0;
+    };
+    struct Head {
+        Edge edge{};
+        std::size_t run = 0;
+    };
+    struct GreaterHead {
+        bool operator()(const Head& left, const Head& right) const {
+            return left.edge > right.edge;
+        }
+    };
+
+    Edge mappedEdge(std::size_t ordinal) const {
+        const Edge* const entries = static_cast<const Edge*>(this->mapped_);
+        return entries[ordinal];
+    }
+
+    void flush() {
+        if (this->buffer_.empty()) return;
+        std::sort(this->buffer_.begin(), this->buffer_.end());
+        if (this->fd_ < 0) {
+            const std::filesystem::path pattern =
+                std::filesystem::temp_directory_path() / "aowis-db-reference-edges-XXXXXX";
+            const std::string name = pattern.string();
+            std::vector<char> writableName(name.begin(), name.end());
+            writableName.push_back('\0');
+            const int descriptor = ::mkstemp(writableName.data());
+            systemCall(descriptor >= 0, "create temporary model reference sorter");
+            if (::unlink(writableName.data()) != 0 ||
+                ::fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0) {
+                const int saved = errno;
+                ::close(descriptor);
+                errno = saved;
+                systemCall(false, "unlink or secure temporary model reference sorter");
+            }
+            this->fd_ = descriptor;
+        }
+        require(this->records_ <= static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max() / sizeof(Edge)) -
+                    this->buffer_.size(),
+                "temporary model reference sorter exceeds file size limit");
+        writeExact(this->fd_, reinterpret_cast<const std::uint8_t*>(this->buffer_.data()),
+                   this->buffer_.size() * sizeof(Edge),
+                   static_cast<std::uint64_t>(this->records_) * sizeof(Edge));
+        this->runs_.push_back(Run{this->records_, this->buffer_.size(), 0});
+        this->records_ += this->buffer_.size();
+        this->buffer_.clear();
+    }
+
+    int fd_ = -1;
+    void* mapped_ = nullptr;
+    bool finalized_ = false;
+    std::size_t records_ = 0;
+    std::size_t cursor_ = 0;
+    std::vector<Edge> buffer_;
+    std::vector<Run> runs_;
+    std::priority_queue<Head, std::vector<Head>, GreaterHead> next_;
+};
+
 // Preflight checksums use a fixed-size scratch buffer, even when the bundle
 // contains a large value object. Typed graph validation still decodes those
 // objects later; the first pass never needs to materialize their payloads.
@@ -678,11 +807,15 @@ LogicalVerification verifyLogicalGraph(
     // and locally supplied ancestors of incremental bundles. The same pair of immutable roots is checked
     // only once when multiple revisions share an unchanged snapshot.
     std::set<std::pair<Hash, Hash>> verifiedModelSnapshots;
+    // A verified canonical trie enumerates its leaf UUIDs in strict order
+    // when children are visited from slot 0 to 15. Besides eliminating a
+    // second model-key set, explicitly assert this invariant here.
     const std::function<void(const Hash&,
             const std::function<void(const Key&, const Hash&)>&)> visitLeaves =
         [&](const Hash& root,
             const std::function<void(const Key&, const Hash&)>& visitor) {
             std::vector<Hash> nodes;
+            std::optional<Key> previous;
             if (!isZero(root)) nodes.push_back(root);
             while (!nodes.empty()) {
                 const Hash current = nodes.back();
@@ -691,14 +824,33 @@ LogicalVerification verifyLogicalGraph(
                 if (node[0] == 'L') {
                     Key key{};
                     std::copy_n(node.begin() + 1, 16, key.begin());
+                    require(!previous || *previous < key,
+                            "bundled trie contains duplicate or unordered UUID");
+                    previous = key;
                     visitor(key, readHash(node, 17));
                 } else {
-                    for (unsigned slot = 0; slot < 16; ++slot) {
-                        const Hash child = readHash(node, 18 + 32U * slot);
+                    for (unsigned slot = 16; slot != 0; --slot) {
+                        const Hash child = readHash(node, 18 + 32U * (slot - 1U));
                         if (!isZero(child)) nodes.push_back(child);
                     }
                 }
             }
+        };
+    // Only ask for model existence once per distinct target, after sorting.
+    // This search reads at most one 32-nibble path and does not retain a set
+    // of all model UUIDs on the heap.
+    const std::function<bool(const Hash&, const Key&)> containsModel =
+        [&](const Hash& root, const Key& key) {
+            Hash current = root;
+            while (!isZero(current)) {
+                const Bytes node = objectByHash(current);
+                if (node[0] == 'L') {
+                    return std::equal(key.begin(), key.end(), node.begin() + 1);
+                }
+                const unsigned slot = nibble(key, node[1]);
+                current = readHash(node, 18 + 32U * slot);
+            }
+            return false;
         };
     for (const Hash& revisionId : verifiedRevisions) {
         try {
@@ -708,44 +860,60 @@ LogicalVerification verifyLogicalGraph(
             const Hash referenceRoot = readHash(encodedRevision, 33);
             if (!verifiedModelSnapshots.emplace(modelRoot, referenceRoot).second) continue;
 
-            std::set<Key> modelKeys;
-            std::map<Key, std::set<Key>> expectedIncoming;
+            SortedReferenceEdges expected;
             visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
                 require(source != Key{}, "bundled model tree contains zero UUID");
-                require(modelKeys.insert(source).second,
-                        "bundled model tree contains duplicate UUID");
                 const Bytes stored = objectByHash(value);
                 require(!stored.empty() && stored.front() == 'V',
                         "invalid bundled model value");
                 const Bytes envelope(stored.begin() + 1, stored.end());
                 const ModelRecord record = decodeModelRecord(envelope);
-                // An import must obey the same canonical encoding and UUID
-                // rules as commitModel(). In particular, binary searches of
-                // existing edges require strictly ordered, unique references.
                 require(encodeModelRecord(record) == envelope,
                         "noncanonical bundled model references");
                 for (const Key& target : record.references) {
                     require(target != Key{} && target != source,
                             "invalid bundled model UUID reference");
-                    expectedIncoming[target].insert(source);
+                    expected.append(target, source);
                 }
             });
-            for (const std::pair<const Key, std::set<Key>>& edge : expectedIncoming) {
-                require(modelKeys.contains(edge.first),
+            expected.finalize();
+
+            // Both streams are ordered lexicographically by (target, source).
+            // Equality requires every model-derived edge to appear in the
+            // reverse index and prohibits invented or duplicated edges.
+            std::optional<SortedReferenceEdges::Edge> nextExpected = expected.next();
+            std::optional<Key> checkedTarget;
+            const std::function<void()> checkTarget = [&] {
+                if (!nextExpected) return;
+                Key target{};
+                std::copy_n(nextExpected->begin(), 16, target.begin());
+                if (checkedTarget && *checkedTarget == target) return;
+                require(containsModel(modelRoot, target),
                         "bundled model reference target does not exist");
-            }
+                checkedTarget = target;
+            };
             visitLeaves(referenceRoot, [&](const Key& target, const Hash& value) {
                 require(target != Key{}, "bundled incoming-reference target is zero");
                 const std::vector<Key> actual = decodeReferrers(objectByHash(value));
-                const std::map<Key, std::set<Key>>::iterator expected =
-                    expectedIncoming.find(target);
-                require(expected != expectedIncoming.end() &&
-                        actual.size() == expected->second.size() &&
-                        std::equal(actual.begin(), actual.end(), expected->second.begin()),
+                for (const Key& source : actual) {
+                    checkTarget();
+                    SortedReferenceEdges::Edge matching{};
+                    std::copy(target.begin(), target.end(), matching.begin());
+                    std::copy(source.begin(), source.end(), matching.begin() + 16);
+                    require(nextExpected && *nextExpected == matching,
+                            "bundled reverse-reference index does not match model records");
+                    nextExpected = expected.next();
+                }
+                // A remaining edge for this same target means that the index
+                // omitted one of its sources, not an entirely missing target.
+                if (nextExpected && std::equal(target.begin(), target.end(),
+                                               nextExpected->begin())) {
+                    throw std::runtime_error(
                         "bundled reverse-reference index does not match model records");
-                expectedIncoming.erase(expected);
+                }
             });
-            require(expectedIncoming.empty(),
+            checkTarget();
+            require(!nextExpected,
                     "bundled reverse-reference index is missing model references");
         } catch (const std::exception& error) {
             throw std::runtime_error("model revision " + toHex(revisionId) +
