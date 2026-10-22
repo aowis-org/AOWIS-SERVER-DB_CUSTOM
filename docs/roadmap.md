@@ -1,55 +1,78 @@
 # AOWIS Versioned Model Database — development roadmap
 
-This roadmap covers planned capabilities for the AOWIS native database engine and service.
+The AOWIS database has one native storage engine, usable directly as a C++ library and, eventually, through a multi-project HTTP/TCP service. This roadmap prioritizes database correctness and recovery before introducing the network service.
 
 ## Current baseline
 
-The repository already implements content-addressed packs, immutable Merkle trees, canonical model serialization, complete hydraulic model persistence, indexed edits, history, branch merging with semantic validation, and full/incremental offline bundles. It also contains an optional, standalone provisional access-policy library and CLI. There is **no database service executable yet**. See the [README](../README.md) for exact current status.
+The repository implements immutable SHA-256 objects, copy-on-write Merkle UUID trees, revision-based atomic publication, model/reference indexes, hydraulic persistence, branches, merging, and full/incremental offline synchronization. Both native physical backends share the logical object and revision format.
 
-## Planned work
+Bundle imports check object hashes, reachable object types and graph completeness; they also validate canonical Merkle structure, including UUID-to-path correspondence, compressed prefixes, branch depth ordering, child slots and nonzero leaf targets. These validations precede object publication on both backends. Model-indexed imported revisions additionally require canonical model references, existing dependency targets, and exact equivalence between model-derived edges and the reverse-reference index (including historical and incremental revisions). **Repositories already on disk are not yet comprehensively verified**, so physical verification alone is not a full logical database integrity check.
 
-### 1. Establish REST service foundation
+The HTTP service executable is not yet implemented. The provisional access-policy library is not part of the planned HTTP service authorization model.
 
-- Build the REST service on the native engine and its existing bundle, integrity, revision, merge and direct-library APIs.
-- Implement `aowis-server-db` with **Qt QHttpServer** on configurable **HTTP/TCP** address and port; no HTTPS/TLS initially.
-- Implement a persistent multi-project catalogue, project UUID/name metadata, project create/list/read operations and repository lifecycle management.
-- Implement branch listing, creation/forking and health/readiness endpoints in the new REST resource hierarchy.
-- Add HTTP tests covering malformed requests, project isolation, persistence after restart and both native physical storage formats.
-- Do **not** enforce the current provisional user/role policy in the new service. Authentication and authorization are deferred for an AOWIS-wide design.
+## Implementation order
 
-### 2. Full model and version-control REST interface
+### 1. Cross-check model references during replication — implemented
 
-- Expose branch heads, revision details/history, historical model/entity reads and diffs.
-- Expose complete hydraulic network reads, indexed entity queries and validated atomic model edits.
-- Expose merge previews, field-level and structural choices, semantic diagnostics, and validated merge publication.
-- Require expected head/revision on all mutations to prevent unintended lost updates.
-- Specify JSON models, binary payload endpoints, pagination, limits, stable errors and OpenAPI contracts; keep handlers thin.
+- Independently reconstruct incoming-reference relationships for every model-indexed revision reachable from an imported tip and compare them exactly against the stored reverse-reference Merkle index.
+- Reject missing, extra, dangling, invalid zero/self and noncanonical dependency references, including invalid historical revisions; preserve original revision hashes.
+- Reuse verified immutable model/index root pairs across historical revisions within one import.
+- Regression-test SHA-256-valid forged histories and unsafe-deletion bypasses, full/incremental replication, and both physical backends (including cross-backend transfers).
 
-### 3. HTTP-based distributed synchronization
+### 2. Comprehensive repository verification
 
-- Reuse the portable branch bundle exporter/importer and incremental base-revision delta.
-- Provide binary HTTP export/import endpoints; protect against partial/corrupted transfers and unbounded resource use.
-- Define tracking-branch conventions and explicit conflict/merge workflow for divergent histories. Preserve SHA-256 object/revision IDs across replicas and physical formats.
-- Add cross-server HTTP integration tests including cold initial sync, fast-forward, divergent branches, two-parent history, retries and transfer corruption.
+- Extend the integrity checker from physical SHA-256/index verification to revision ancestry, canonical Merkle paths, model/reference consistency and, where available, typed hydraulic validation.
+- Distinguish verification levels and report actionable diagnostics; never claim full integrity when some layers did not run.
+- Keep repair and recovery explicit. Add independent corruption fixtures for every verification layer.
 
-### 4. Operational reliability and scalable model services
+### 3. Consistent snapshots and concurrency
 
-- Crash/power-loss fault injection, durable backup/restore, recovery verification, disk-full handling, graceful server shutdown and clear offline compaction lifecycle.
-- Concurrency model for multiple projects and simultaneous HTTP requests, including the experimental block backend's single-open-handle restriction.
-- Larger-scale benchmarks (imports, indexed edits, branch merges, object transfer and memory/CPU), profiling and performance regressions.
-- Finish remaining semantic merge cases as required by AOWIS workflows; improve project and revision administration and management APIs.
+- Pin one revision for all steps of a multi-object hydraulic network read, including membership traversal and entity materialization.
+- Keep optimistic expected-head checks on mutations; test simultaneous readers, writers, stale edits and old-revision reads.
 
-### 5. AOWIS-wide security integration (deliberately deferred)
+### 4. Crash recovery and fault injection
 
-- Design identity, authentication, sessions, service-to-service trust and user/role/group permissions **for the whole AOWIS platform**.
-- Integrate that unified security boundary with database project/branch operations; evaluate replacement/reuse of existing provisional access-policy code on its merits.
-- Introduce HTTPS/TLS via an appropriate production reverse-proxy architecture as part of that design; add audit and administrative controls.
+- Exercise failures and abrupt process termination at object writes, pack/index sync, branch-ref publication, block generation switches, bundle imports and compaction.
+- Verify each recovered repository with both physical and logical checks; cover disk-full conditions, multi-process locking, and backup/restore procedures.
+
+### 5. Multi-project HTTP server
+
+- Implement `aowis-server-db` using Qt QHttpServer with configurable bind address and TCP port.
+- Add a durable project catalogue, repository lifecycle manager, branch/project management and readiness endpoints.
+- Keep the native engine available as a direct C++ library and make HTTP handlers use the same application operations.
+- Defer authentication, authorization and transport TLS to the planned AOWIS-wide security architecture.
+
+### 6. Native model, history and merge REST API
+
+- Expose historical model/entity reads, diffs, atomic edit batches, network reads, branch history, merge previews, conflict resolutions and validated merge publication.
+- Require expected revision heads on writes; use stable errors and a published OpenAPI contract.
+- Test equivalence of HTTP operations and direct-library operations.
+
+### 7. HTTP synchronization and resource bounds
+
+- Transport full/incremental native bundles without changing content hashes or inventing a second persistence protocol.
+- Limit transfer size, object size/count, verification memory/work, temporary disk use and simultaneous transfers.
+- Verify that corrupted or incomplete transfers cannot modify the visible branch; test cross-backend synchronization and retries.
+
+### 8. Scalability and performance
+
+- Improve common-ancestor search for long histories and shared merge ancestry while preserving correct merge-base semantics.
+- Profile and bound bundle verification memory, using disk-backed structures or streaming where needed.
+- Benchmark representative 10k–1M hydraulic-entity projects, long revision histories, branching/merging, synchronization and compaction on both backends.
+- Use unique fresh temporary directories for every benchmark run.
+
+### 9. Build strictness, maintainability and release preparation
+
+- Fail CMake configuration when model codec support is requested but Qt6 is unavailable; retain an explicit native-only build mode.
+- Require Debug and Release builds and corresponding native/Qt-enabled tests, including adversarial regression coverage.
+- Eliminate obsolete development-stage names in public interfaces, apply the project's C++ conventions and keep documentation descriptive of the current architecture.
+- Establish and freeze the first public persistence format before introducing any historical migration machinery.
 
 ## Principles
 
-- One canonical native database engine for library and REST service use.
-- One canonical AOWIS model codec; do not create a serializer for REST.
-- C++ library use and REST server use expose the same model/storage semantics.
-- Database revisions and object integrity remain independent of transport.
-- Fail clearly on merge conflicts and unsupported semantics; never weaken validation as a shortcut.
-- Distinguish implemented capabilities from planned work in the README, documentation and tests. Define a stable persistence format before the first public release.
+- Use the native storage engine exclusively; do not add SQL adapters or a general-purpose SQL language.
+- Preserve immutable object and revision identities across physical backends and transport mechanisms.
+- Validate untrusted imports before publication. Hash correctness alone is not database correctness.
+- Prefer comprehensive regression, adversarial and fault-injection tests over optimistic production-readiness claims.
+- Never weaken model validation for benchmarking or expediency.
+- Keep implementation documentation synchronized with actual capabilities, especially when a feature is not yet implemented.

@@ -26,7 +26,11 @@ base="$(./build-linux/aowis-native-sync head \
   /path/to/destination pack /tmp/update.aowbundle remote_main
 ```
 
-Imports check object hashes, structural record types, Merkle/revision ancestry and graph completeness before publishing a branch. Missing objects, invalid baselines and branch divergence are rejected. Exported IDs remain the same across pack and block physical backends.
+Imports verify object hashes, structural record types, revision ancestry and object-graph completeness before publishing a branch. Merkle tries are additionally checked bottom-up: leaf UUIDs must follow their complete paths through all ancestor branches; compressed prefixes, branch-depth ordering, child slots, nonzero leaf value hashes and canonical prefix padding must be valid. These checks reject duplicate UUIDs and other correctly hashed but malformed tries. Immutable subtrees can be shared between revisions without validating their descendants repeatedly. Rejected bundles do not publish branch refs or append imported objects. The same checks apply to full and incremental imports and to both physical backends.
+
+Model-indexed revisions undergo an additional full logical check: canonical model-record encoding and sorted unique dependency UUIDs, nonzero/self-reference rules, live dependency targets, and *exact* equality between model-derived incoming references and the stored reverse-reference Merkle index. Every revision reachable from the imported tip is included, even old historical revisions or locally supplied ancestors of an incremental bundle. Immutable snapshots with the same pair of roots are checked once per import. Invalid histories are rejected before any imported data or branch ref is written; imported hashes are never silently rewritten to repair history. Both physical backends use the same rules.
+
+**Integrity scope:** A successful import now validates these generic native model/reference invariants, but it does not validate opaque domain-specific hydraulic semantics. `aowis-native-verify` still performs physical object verification, **not** comprehensive logical verification of repositories already on disk. Full on-disk verification, bounded-memory checks of very long histories, and recovery procedures are separate planned work. Missing objects, invalid baselines and branch divergence are rejected. Exported IDs remain the same across pack and block physical backends.
 
 ## Branch collaboration
 

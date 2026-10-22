@@ -39,7 +39,7 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, indexed lookup/edit/delete |
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
 | Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
-| Replication | Portable full/incremental `.aowbundle` exchange, SHA-256 and graph verification, fast-forward-only import, divergence protection |
+| Replication | Portable full/incremental `.aowbundle` exchange, SHA-256, object graph, canonical Merkle trie and model-reference index verification, fast-forward-only import, divergence protection |
 | Service | Multi-project HTTP/TCP REST server **planned; not yet implemented** |
 | Administrative access policy | Provisional UUID-based users/groups/roles/grants library and local CLI, **not currently enforced by any service** |
 
@@ -87,7 +87,7 @@ The default repository uses an append-only content pack and rebuildable index. E
 ./build-linux/aowis-native-compact /path/to/repository
 ```
 
-Verification checks stored object integrity. Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
+The current `aowis-native-verify` command checks physical stored-object integrity; comprehensive on-disk logical verification is still planned. Bundle imports additionally validate canonical Merkle structure and recompute model references for all reachable model-indexed revisions, rejecting any mismatch with the reverse-reference index before publication. Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md) and [block storage](docs/block-pack-experiment.md).
 
 The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, recovery drills and production hardening remain outstanding work.
 

@@ -53,7 +53,7 @@ The code currently relies on repository-level locking rather than general multi-
 
 ## Replication independence
 
-Portable `.aowbundle` files contain a complete reachable branch graph or a delta relative to a shared base revision. Import verifies object hashes and graph completeness before creating or fast-forwarding a branch. Divergent branch heads are refused. The transport format is independent of both disk layouts; HTTP synchronization is planned on top of this existing core. See [synchronization](offline-repository-synchronization.md).
+Portable `.aowbundle` files contain a complete reachable branch graph or a delta relative to a shared base revision. Import verifies object hashes, graph completeness and canonical Merkle trie structure (including path/UUID correspondence and branch-depth ordering) before creating or fast-forwarding a branch. Every imported model-indexed revision is checked against the exact reverse-reference mapping derived from its canonical model records, including historical revisions and locally borrowed incremental ancestors. Missing, extra and dangling references and noncanonical model reference lists are rejected before writes. Divergent branch heads are refused. The transport format is independent of both disk layouts; HTTP synchronization is planned on top of this existing core. See [synchronization](offline-repository-synchronization.md).
 
 ## API ownership
 

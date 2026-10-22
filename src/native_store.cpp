@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <set>
@@ -2068,24 +2069,106 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             require(sha256(object) == hash, "replication bundle changed during import");
             return object;
         };
-        // Validate every referenced object in its structural context, not
-        // merely that the hash exists. Some immutable objects may legitimately
-        // be shared between revisions or trees.
+        // A content hash authenticates bytes, not trie semantics. Verify each
+        // immutable subtree bottom-up, so a subtree shared between revisions
+        // is checked once per value type. The summary guarantees that ALL its
+        // keys have the prefix preceding the root branch depth (or that it is
+        // a single leaf). Parent checks can therefore use one representative
+        // key without revisiting descendants in each ancestor context.
         enum class Kind {
             Revision, RawTree, ModelTree, ReferenceTree,
             RawValue, ModelValue, ReferenceValue
         };
+        struct TreeSummary {
+            Key representative{};
+            bool leaf = false;
+            unsigned depth = 0;
+        };
         std::vector<std::pair<Hash, Kind>> pending{{incoming, Kind::Revision}};
         std::map<Hash, std::uint8_t> checkedKinds;
         std::set<Hash> incomingRevisions;
+        std::map<std::pair<Hash, Kind>, TreeSummary> verifiedTrees;
+        std::set<std::pair<Hash, Kind>> visitingTrees;
+        std::function<TreeSummary(const Hash&, Kind, unsigned)> verifyTree;
+        verifyTree = [&](const Hash& hash, Kind kind, unsigned minimumDepth) -> TreeSummary {
+            require(!isZero(hash), "zero bundled tree node");
+            const std::pair<Hash, Kind> identity{hash, kind};
+            const std::map<std::pair<Hash, Kind>, TreeSummary>::const_iterator previous =
+                verifiedTrees.find(identity);
+            if (previous != verifiedTrees.end()) {
+                require(previous->second.leaf || previous->second.depth >= minimumDepth,
+                        "invalid bundled compressed trie depth ordering");
+                return previous->second;
+            }
+            require(visitingTrees.insert(identity).second, "cyclic bundled trie");
+            const Bytes object = bundleObject(hash);
+            require(!object.empty(), "invalid bundled tree node");
+            TreeSummary result{};
+            if (object[0] == 'L') {
+                require(object.size() == 49, "invalid bundled leaf");
+                result.leaf = true;
+                std::copy_n(object.begin() + 1, 16, result.representative.begin());
+                const Hash value = readHash(object, 17);
+                require(!isZero(value), "bundled leaf contains zero value hash");
+                const Kind valueKind = kind == Kind::RawTree ? Kind::RawValue :
+                    kind == Kind::ModelTree ? Kind::ModelValue : Kind::ReferenceValue;
+                pending.emplace_back(value, valueKind);
+            } else if (object[0] == 'B') {
+                require(object.size() == 530 && object[1] < 32,
+                        "invalid bundled tree branch");
+                result.depth = object[1];
+                require(result.depth >= minimumDepth,
+                        "invalid bundled compressed trie depth ordering");
+                Key prefix{};
+                std::copy_n(object.begin() + 2, 16, prefix.begin());
+                // storeNode() clears all nibbles at or beyond the split depth.
+                // Requiring that representation also excludes equivalent but
+                // differently hashed encodings of one logical trie.
+                for (unsigned position = result.depth; position < 32; ++position) {
+                    require(nibble(prefix, position) == 0,
+                            "noncanonical bundled trie prefix");
+                }
+                unsigned children = 0;
+                for (unsigned slot = 0; slot < 16; ++slot) {
+                    const Hash child = readHash(object, 18 + 32U * slot);
+                    if (isZero(child)) continue;
+                    ++children;
+                    const TreeSummary descendant = verifyTree(child, kind, result.depth + 1U);
+                    require(descendant.leaf || descendant.depth > result.depth,
+                            "invalid bundled compressed trie depth ordering");
+                    for (unsigned position = 0; position < result.depth; ++position) {
+                        require(nibble(descendant.representative, position) ==
+                                    nibble(prefix, position),
+                                "bundled trie child violates compressed prefix");
+                    }
+                    require(nibble(descendant.representative, result.depth) == slot,
+                            "bundled trie child occupies wrong slot");
+                    if (children == 1) result.representative = descendant.representative;
+                }
+                require(children >= 2, "invalid bundled branch child count");
+            } else {
+                throw std::runtime_error("invalid bundled tree tag");
+            }
+            visitingTrees.erase(identity);
+            verifiedTrees.emplace(identity, result);
+            const unsigned bit = 1U << static_cast<unsigned>(kind);
+            checkedKinds[hash] = static_cast<std::uint8_t>(
+                static_cast<unsigned>(checkedKinds[hash]) | bit);
+            return result;
+        };
         while (!pending.empty()) {
             const std::pair<Hash, Kind> next = pending.back();
             pending.pop_back();
             if (isZero(next.first)) continue;
             const unsigned bit = 1U << static_cast<unsigned>(next.second);
-            std::uint8_t& bits = checkedKinds[next.first];
-            if ((static_cast<unsigned>(bits) & bit) != 0U) continue;
-            bits = static_cast<std::uint8_t>(static_cast<unsigned>(bits) | bit);
+            if ((static_cast<unsigned>(checkedKinds[next.first]) & bit) != 0U) continue;
+            if (next.second == Kind::RawTree || next.second == Kind::ModelTree ||
+                next.second == Kind::ReferenceTree) {
+                (void)verifyTree(next.first, next.second, 0);
+                continue;
+            }
+            checkedKinds[next.first] = static_cast<std::uint8_t>(
+                static_cast<unsigned>(checkedKinds[next.first]) | bit);
             const Bytes object = bundleObject(next.first);
             if (next.second == Kind::Revision) {
                 require(object.size() >= 67 && object[0] == 'S',
@@ -2106,27 +2189,6 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                     require(!isZero(parent), "zero parent in bundled revision");
                     pending.emplace_back(parent, Kind::Revision);
                 }
-            } else if (next.second == Kind::RawTree || next.second == Kind::ModelTree ||
-                       next.second == Kind::ReferenceTree) {
-                require(!object.empty(), "invalid bundled tree node");
-                if (object[0] == 'L') {
-                    require(object.size() == 49, "invalid bundled leaf");
-                    const Kind valueKind = next.second == Kind::RawTree ? Kind::RawValue :
-                        next.second == Kind::ModelTree ? Kind::ModelValue : Kind::ReferenceValue;
-                    pending.emplace_back(readHash(object, 17), valueKind);
-                } else if (object[0] == 'B') {
-                    require(object.size() == 530 && object[1] < 32,
-                            "invalid bundled tree branch");
-                    unsigned children = 0;
-                    for (std::size_t index = 0; index < 16; ++index) {
-                        const Hash child = readHash(object, 18 + 32 * index);
-                        if (!isZero(child)) ++children;
-                        pending.emplace_back(child, next.second);
-                    }
-                    require(children >= 2, "invalid bundled branch child count");
-                } else {
-                    throw std::runtime_error("invalid bundled tree tag");
-                }
             } else if (next.second == Kind::ReferenceValue) {
                 (void)decodeReferrers(object);
             } else {
@@ -2140,6 +2202,84 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         for (const std::pair<const Hash, BundleLocation>& entry : entries) {
             require(checkedKinds.contains(entry.first),
                     "replication bundle contains unreachable objects");
+        }
+        // Verify the semantic relationship between the two immutable indexes,
+        // not just their independent Merkle structure. Hash-valid imports can
+        // otherwise carry an omitted incoming edge, and a later ordinary
+        // commitModel() deletion would trust that poisoned reverse index.
+        //
+        // Include historical revisions (also locally provided ancestors of
+        // incremental bundles). The same pair of immutable roots is checked
+        // only once when multiple revisions share an unchanged snapshot.
+        std::set<std::pair<Hash, Hash>> verifiedModelSnapshots;
+        const std::function<void(const Hash&,
+                const std::function<void(const Key&, const Hash&)>&)> visitLeaves =
+            [&](const Hash& root,
+                const std::function<void(const Key&, const Hash&)>& visitor) {
+                std::vector<Hash> nodes;
+                if (!isZero(root)) nodes.push_back(root);
+                while (!nodes.empty()) {
+                    const Hash current = nodes.back();
+                    nodes.pop_back();
+                    const Bytes node = bundleObject(current);
+                    if (node[0] == 'L') {
+                        Key key{};
+                        std::copy_n(node.begin() + 1, 16, key.begin());
+                        visitor(key, readHash(node, 17));
+                    } else {
+                        for (unsigned slot = 0; slot < 16; ++slot) {
+                            const Hash child = readHash(node, 18 + 32U * slot);
+                            if (!isZero(child)) nodes.push_back(child);
+                        }
+                    }
+                }
+            };
+        for (const Hash& revisionId : incomingRevisions) {
+            const Bytes encodedRevision = bundleObject(revisionId);
+            if (encodedRevision[65] == 0) continue;
+            const Hash modelRoot = readHash(encodedRevision, 1);
+            const Hash referenceRoot = readHash(encodedRevision, 33);
+            if (!verifiedModelSnapshots.emplace(modelRoot, referenceRoot).second) continue;
+
+            std::set<Key> modelKeys;
+            std::map<Key, std::set<Key>> expectedIncoming;
+            visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
+                require(source != Key{}, "bundled model tree contains zero UUID");
+                require(modelKeys.insert(source).second,
+                        "bundled model tree contains duplicate UUID");
+                const Bytes stored = bundleObject(value);
+                require(!stored.empty() && stored.front() == 'V',
+                        "invalid bundled model value");
+                const Bytes envelope(stored.begin() + 1, stored.end());
+                const ModelRecord record = decodeModelRecord(envelope);
+                // An import must obey the same canonical encoding and UUID
+                // rules as commitModel(). In particular, binary searches of
+                // existing edges require strictly ordered, unique references.
+                require(encodeModelRecord(record) == envelope,
+                        "noncanonical bundled model references");
+                for (const Key& target : record.references) {
+                    require(target != Key{} && target != source,
+                            "invalid bundled model UUID reference");
+                    expectedIncoming[target].insert(source);
+                }
+            });
+            for (const std::pair<const Key, std::set<Key>>& edge : expectedIncoming) {
+                require(modelKeys.contains(edge.first),
+                        "bundled model reference target does not exist");
+            }
+            visitLeaves(referenceRoot, [&](const Key& target, const Hash& value) {
+                require(target != Key{}, "bundled incoming-reference target is zero");
+                const std::vector<Key> actual = decodeReferrers(bundleObject(value));
+                const std::map<Key, std::set<Key>>::iterator expected =
+                    expectedIncoming.find(target);
+                require(expected != expectedIncoming.end() &&
+                        actual.size() == expected->second.size() &&
+                        std::equal(actual.begin(), actual.end(), expected->second.begin()),
+                        "bundled reverse-reference index does not match model records");
+                expectedIncoming.erase(expected);
+            });
+            require(expectedIncoming.empty(),
+                    "bundled reverse-reference index is missing model references");
         }
         if (incremental) {
             require(incomingRevisions.contains(recipientBase),

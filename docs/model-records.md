@@ -16,7 +16,7 @@ The generic model-record layer stores a canonical model payload without interpre
 
 ## Scope of validation
 
-The generic store verifies **UUID existence and reference-index integrity**. It does not know whether a reference points to the correct type of hydraulic node or whether a demand-point assignment matches a pipe endpoint. Use `aowis::native::hydraulic` for real hydraulic network editing, validation and merging. Domain-specific relationships and network membership are described in [hydraulic persistence](native-hydraulic-network.md).
+Normal model commits enforce **UUID existence and reference-index integrity**. Portable model-bundle imports recompute all incoming edges from the canonical model records at each reachable historical revision, verify targets exist, and require an exact match with the separately stored reverse index. These validations run before any imported object is written. A separate comprehensive checker for repositories already on disk remains planned. It does not know whether a reference points to the correct type of hydraulic node or whether a demand-point assignment matches a pipe endpoint. Use `aowis::native::hydraulic` for real hydraulic network editing, validation and merging. Domain-specific relationships and network membership are described in [hydraulic persistence](native-hydraulic-network.md).
 
 ## Synthetic performance tool
 
