@@ -55,6 +55,8 @@ See the machine-readable [OpenAPI contract](db-http-api.yaml) for request/respon
 | GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` | Revision-pinned targeted entity |
 | POST | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` | Atomic validated entity edits, up to 128 changes |
 | POST | `/api/v1/projects/{projectId}/merges` | Semantic hydraulic three-way merge and explicit conflict choices |
+| GET | `/api/v1/projects/{projectId}/branches/{branch}/bundle[?base={revisionHash}]` | Binary full or incremental snapshot export |
+| POST | `/api/v1/projects/{projectId}/branches/{branch}/bundle` | Binary branch import; fast-forward or idempotent retry |
 
 Example:
 
@@ -76,10 +78,18 @@ Entity `type` is the numeric ordinal in `HydraulicEntityType` (0–17): pipe mat
 
 Semantic merges use `POST .../projects/{projectId}/merges` with `target`, `source`, `expectedTargetHead`, `expectedSourceHead`, and optional `fieldChoices` / `objectChoices`. Each choice identifies an actual conflict and selects `target` or `source`; all choices must match pinned tips. Successful merges return the resulting revision and status; unresolved conflicts return HTTP 409 with UUIDs, hashes and reasons **without changing either branch**. This endpoint executes a merge and is not a dry-run preview API.
 
-JSON payloads are limited to 8 MiB for network saves and entity edits (256 KiB for merges). Entity batches are limited to 128 changes; UUID lists to 10000 entries and diffs to 1000 changed UUIDs. Limits are enforced after Qt has already buffered HTTP requests, so they are **not** sufficient protection for an untrusted/public listener. Large network retrievals currently encode the full result in memory; paginated/streaming alternatives are part of the subsequent resource-hardening stage.
+JSON payloads are limited to 8 MiB for network saves and entity edits (256 KiB for merges). Entity batches are limited to 128 changes; UUID lists to 10000 entries and diffs to 1000 changed UUIDs. Endpoint-specific JSON limits are enforced after Qt buffers each request. Qt 6.11+ additionally enforces the configured global maximum body size during receive, but this alone is **not** sufficient protection for an untrusted/public listener. Large network retrievals currently encode the full result in memory; paginated/streaming alternatives are part of the subsequent resource-hardening stage.
 
-The service does not yet provide network enumeration, a dry-run merge preview, HTTP bundle synchronization, project deletion or runtime compaction. These follow in subsequent milestones. Bounds on HTTP buffering and concurrent requests require further hardening before untrusted or production traffic; current payload checks occur after Qt has buffered the request.
+The service does not yet provide network enumeration, a dry-run merge preview, project deletion or runtime compaction. These follow in subsequent milestones. Bundle bodies have configurable byte/object ceilings, including Qt 6.11+ parser-level maximum body size; true streaming and disk-backed verification still require further work.
 
 ## Verification and integration tests
 
 `aowis-native-project-service-tests` covers both physical storage formats, catalogue restart, project isolation, staged creation debris, malformed manifests, invalid path/ID inputs, multiple project/branch operations, concurrent creation and cross-process locking. When Qt HttpServer is installed, `aowis-native-http-tests` exercises the routes over real localhost TCP with Qt Network, including error codes, CRUD, pagination and restart. Both are part of `./compile_linux_tests.sh --both`.
+
+### Portable bundle replication over HTTP
+
+`GET /api/v1/projects/{id}/branches/{branch}/bundle` exports the same validated `.aowbundle` format used by `aowis-native-sync`. Add `?base=<64-character-revision-hash>` to omit immutable objects already reachable from that ancestor. `POST` the binary bundle to the corresponding endpoint on a destination project, choosing a tracking branch if you wish to preserve independent work; import never overwrites divergent history. The response is `{"status":"created|fast_forward|up_to_date","head":"...","objectsImported":N}`. Errors are JSON with 400 for malformed transfer, 409 for divergent history or invalid incremental base, and 413 for transfer ceilings.
+
+The `[sync]` INI section sets `max_transfer_mib` (default 32, range 1–256), `max_objects` (default 100000, range 1–1000000), and `max_object_mib` (default 8, range 1–64). The same values can be supplied as `--sync-max-mib`, `--sync-max-objects` and `--sync-max-object-mib`; an individual object may not exceed the transfer ceiling. For Qt >=6.11 the HTTP request parser also enforces `max_transfer_mib`, returning 413 before unbounded body buffering. The native importer/exporter independently enforces all ceilings even when called from C++.
+
+This is currently **bounded-buffer binary HTTP**, not streaming I/O: Qt stores the request and response bodies in memory, and import temporarily spools the request before full native validation. Graph verification is still O(reachable history) in CPU/metadata and transfers are performed synchronously; use the offline synchronization CLI for larger data until the streaming follow-up is implemented. No authentication or TLS has been added.

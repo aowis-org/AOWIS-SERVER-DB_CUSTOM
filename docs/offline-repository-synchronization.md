@@ -36,8 +36,27 @@ Model-indexed revisions undergo an additional full logical check: canonical mode
 
 Import into a dedicated tracking branch (for example `remote_main`), inspect it, and use generic or hydraulic-aware three-way merging into the working branch. A bundle import does not silently create a merge, rewrite history or resolve model conflicts.
 
-## HTTP transport direction
+## HTTP bundle synchronization
 
-The **bundle APIs, format and file-based CLI** are available now. HTTP transport will use project-scoped REST/binary transfer endpoints. The exact routes and streaming semantics are proposed in [REST design](rest-api-design.md), **not implemented yet**. The initial HTTP server will deliberately have no authentication, authorization enforcement or HTTPS pending AOWIS-wide security design.
+The same immutable `.aowbundle` format is available over HTTP, with project/branch scoping by ID rather than filesystem path:
+
+- `GET /api/v1/projects/{projectId}/branches/{branch}/bundle` exports a full bundle.
+- `GET .../bundle?base={revisionHash}` exports a delta relative to a known ancestor.
+- `POST .../bundle` accepts the binary body (`Content-Type: application/vnd.aowis.bundle`), creates or fast-forwards the target branch, and returns `created`, `fast_forward` or `up_to_date` with its new head and imported object count.
+
+For example, download from one server and import to another:
+
+```bash
+curl --fail -o update.aowbundle 'http://127.0.0.1:8755/api/v1/projects/PROJECT_ID/branches/main/bundle'
+curl --fail -X POST -H 'Content-Type: application/vnd.aowis.bundle' \
+  --data-binary @update.aowbundle \
+  'http://127.0.0.1:8756/api/v1/projects/OTHER_PROJECT_ID/branches/remote_main/bundle'
+```
+
+The importer performs the same hash, trie, revision and model/reference validation as offline imports before writing objects or publishing a branch. Reimports are idempotent; divergent histories are HTTP 409. Full/delta endpoints return HTTP 413 for configured transfer ceilings.
+
+**Current resource model:** This initial HTTP implementation buffers request and response bytes in Qt and stages import bodies in a unique private temporary directory. The default binary transfer ceilings are **32 MiB per bundle**, **100,000 objects** and **8 MiB per object**, configurable via `[sync]` and corresponding `--sync-*` CLI switches. Qt 6.11+ rejects bodies above the configured ceiling while receiving them; older Qt versions only enforce the route-level limit after Qt has buffered the body. Native import and export enforce all three ceilings independently. Verification uses memory proportional to transferred objects and reachable revision history; it is *not* constant-memory streaming and may be CPU-intensive for long histories. The existing native CLI remains the path for large transfers until true streaming and disk-backed validation are implemented. Concurrent HTTP handler execution is synchronous and can temporarily delay unrelated requests; do not treat these limits as an authorization/security boundary.
+
+The initial HTTP server deliberately has no authentication, authorization enforcement or HTTPS pending the AOWIS-wide security design.
 
 Portable bundles verify integrity through SHA-256, **not authorship or permission to publish**. The application service is responsible for future authorization after the unified security design exists.

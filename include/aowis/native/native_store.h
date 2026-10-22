@@ -117,6 +117,14 @@ struct MergeOptions {
 // immutable ancestry and both trees for a single branch tip. Imported branch
 // refs are created or fast-forwarded only; divergent history is never replaced.
 enum class BundleImportStatus { Created, FastForward, UpToDate };
+// Optional per-transfer ceilings. Zero disables that particular ceiling for
+// the existing offline API; HTTP always supplies finite limits.
+struct BundleLimits {
+    std::uint64_t maxBytes = 0;
+    std::uint64_t maxObjects = 0;
+    std::uint64_t maxObjectBytes = 0;
+};
+
 struct BundleImportResult {
     BundleImportStatus status = BundleImportStatus::UpToDate;
     Hash head{};
@@ -222,18 +230,19 @@ public:
     // A self-contained branch snapshot for offline transfer between independent
     // native repositories, including different physical storage backends.
     // Export refuses to replace an existing bundle file.
-    void exportBranchBundle(std::string_view branch, const std::filesystem::path& bundlePath);
+    void exportBranchBundle(std::string_view branch, const std::filesystem::path& bundlePath,
+                            BundleLimits limits = {});
     // Delta relative to a revision already present at the recipient. The base
     // must be an ancestor (through either merge parent) of the exported head.
     // Every object reachable from that base is omitted from the transfer.
     void exportIncrementalBranchBundle(std::string_view branch, const Hash& recipientBase,
-                                       const std::filesystem::path& bundlePath);
+                                       const std::filesystem::path& bundlePath, BundleLimits limits = {});
     // Import creates a new local branch or advances it only by fast-forward.
     // It never overwrites divergent local work or creates an implicit merge.
     // All bundle SHA-256 hashes and object graph edges are verified before
     // writing any objects or publishing a ref. Authorization is not provided.
     BundleImportResult importBranchBundle(const std::filesystem::path& bundlePath,
-                                          std::string_view localBranch);
+                                          std::string_view localBranch, BundleLimits limits = {});
 
     std::uint64_t packSize();
     std::uint64_t objectCount();
@@ -294,7 +303,7 @@ private:
     Bytes pendingIndex_;
 
     void exportBundleLocked(std::string_view branch, const std::filesystem::path& bundlePath,
-                            std::optional<Hash> recipientBase);
+                            std::optional<Hash> recipientBase, BundleLimits limits);
     void scanPackTail();
     void rebuildIndex();
 

@@ -1,6 +1,6 @@
 # AOWIS database REST API — implemented foundation and next capabilities
 
-**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-db` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](db-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and HTTP bundle synchronization remain planned.
+**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-db` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](db-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and streaming HTTP bundles remain planned; bounded buffered full/incremental bundles are implemented.
 
 ## Goals and deployment
 
@@ -12,9 +12,9 @@
 
 **Operational consequence:** the initial REST server is unauthenticated and unencrypted. Any client able to reach its configured listener can call its exposed operations. Deploy only on deliberately trusted/development networks and avoid sensitive content. Choosing a configurable public bind address is a feature, not a security guarantee.
 
-## Resources and suggested routes
+## Implemented and planned routes
 
-The service health, project, branch and revision metadata rows are implemented and documented by OpenAPI. The remaining rows are planned, not callable yet. The `/api/v1` prefix versions the HTTP interface, **not the model serialization format**.
+The table distinguishes implemented routes from the remaining proposed network-enumeration endpoint; the machine-readable OpenAPI specification documents actual operations. The `/api/v1` prefix versions the HTTP interface, **not the model serialization format**.
 
 | Operation | Proposed method and route |
 |---|---|
@@ -34,14 +34,14 @@ The service health, project, branch and revision metadata rows are implemented a
 | Read one entity | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` (implemented) |
 | Edit entities atomically | `POST /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` (implemented) |
 | Perform merge | `POST /api/v1/projects/{projectId}/merges` (implemented; conflicts returned without publication) |
-| Export branch bundle | `GET /api/v1/projects/{projectId}/sync/branches/{branch}/bundle` |
-| Import branch bundle | `POST /api/v1/projects/{projectId}/sync/branches/{branch}/bundle` |
+| Export branch bundle | `GET /api/v1/projects/{projectId}/branches/{branch}/bundle` |
+| Import branch bundle | `POST /api/v1/projects/{projectId}/branches/{branch}/bundle` |
 
-A proposed incremental export supplies a known base revision, for example as a `base` query parameter; the server must verify it is an ancestor of the requested branch head. We should avoid shipping full bundles where a correct delta is possible. The project ID is a UUID from the server catalogue, **never a client-provided filesystem path**.
+An implemented incremental export supplies a known base revision as a `base` query parameter; the native exporter verifies it is an ancestor of the requested branch head. We should avoid shipping full bundles where a correct delta is possible. The project ID is a UUID from the server catalogue, **never a client-provided filesystem path**.
 
 ## Response and request principles
 
-- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Binary streaming** for the *future* sync bundles. The current HTTP model API uses canonical ModelCodec bytes encoded as `payloadBase64` in JSON; this is a deliberately simple initial format, not streaming, and is limited to 8 MiB per mutation request.
+- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Bounded buffered binary bundles** for synchronization; true streaming remains future work. The current HTTP model API uses canonical ModelCodec bytes encoded as `payloadBase64` in JSON; this is a deliberately simple initial format, not streaming, and is limited to 8 MiB per mutation request.
 - Use appropriate HTTP status codes (`400` malformed input, `404` unknown resource, `409` revision conflict or divergence, `413` size limit, `422` semantic validation failure where appropriate, `5xx` internal/server errors). Provide stable machine-readable error codes and useful human-readable descriptions.
 - Pagination and limits for large collections/history. Use immutable revision IDs for reproducible historical reads, with explicit semantics when a branch moves.
 - Each **mutating** request identifies the expected branch-head revision (for example via an `If-Match`/ETag contract or an explicit expected revision field). Validate it under the same repository lock as publication. Return a conflict on stale writes; do not silently retry against a different model.
@@ -52,7 +52,7 @@ A proposed incremental export supplies a known base revision, for example as a `
 
 ## Repository and server lifecycle
 
-- Persist a server-side **project catalogue** mapping UUIDs to administrator-controlled repository directories. The catalogue storage format, project metadata fields and project-create atomicity still need a concrete design and tests.
+- Persist a server-side **project catalogue** mapping UUIDs to administrator-controlled repository directories. The project catalogue uses durable UUID-named directories with atomic project publication and tested restart recovery.
 - Decide and document repository-handle lifetime, the block backend's single-handle constraint, concurrent request handling, graceful shutdown and safe offline maintenance. Never promise online compaction before it is implemented.
 - Use configuration for bind address, port, project data root and logging; align with other AOWIS servers' conventions rather than invent per-request filesystem routing.
 - Maintain the [OpenAPI specification](db-http-api.yaml) alongside implemented endpoints and test them over real local TCP on both physical backends.
@@ -66,4 +66,4 @@ An AOWIS-wide security design will later specify identity/session lifecycle, tru
 
 ## Implementation sequence
 
-See [roadmap](roadmap.md). The configurable TCP/HTTP service, durable multi-project catalogue, canonical hydraulic editing and semantic merges have been implemented. Preview-only merges, HTTP synchronization and streaming/resource hardening follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.
+See [roadmap](roadmap.md). The configurable TCP/HTTP service, durable multi-project catalogue, canonical hydraulic editing and semantic merges have been implemented. Preview-only merges, streaming and further resource hardening follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.

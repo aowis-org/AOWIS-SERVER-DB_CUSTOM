@@ -5,6 +5,10 @@
 #include <QCoreApplication>
 #include <QHostAddress>
 #include <QHttpServer>
+#include <QtGlobal>
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+#include <QHttpServerConfiguration>
+#endif
 #include <QSettings>
 #include <QTcpServer>
 #include <QTimer>
@@ -58,6 +62,12 @@ int main(int argc, char** argv) {
     parser.addOption(dataRoot);
     parser.addOption(backend);
     parser.addOption(logFile);
+    const QCommandLineOption bundleMib("sync-max-mib", "Maximum transfer size in MiB (1..256)", "MiB");
+    const QCommandLineOption bundleObjects("sync-max-objects", "Maximum objects in a bundle (1..1000000)", "count");
+    const QCommandLineOption objectMib("sync-max-object-mib", "Maximum object size in MiB (1..64)", "MiB");
+    parser.addOption(bundleMib);
+    parser.addOption(bundleObjects);
+    parser.addOption(objectMib);
     parser.process(app);
 
     try {
@@ -74,6 +84,28 @@ int main(int argc, char** argv) {
         const QString logPath = parser.isSet(logFile) ? parser.value(logFile) :
             settings.value("logging/file", "").toString();
 
+        const QString transferMibValue = parser.isSet(bundleMib) ? parser.value(bundleMib) :
+            settings.value("sync/max_transfer_mib", 32).toString();
+        const QString countValue = parser.isSet(bundleObjects) ? parser.value(bundleObjects) :
+            settings.value("sync/max_objects", 100000).toString();
+        const QString objectMibValue = parser.isSet(objectMib) ? parser.value(objectMib) :
+            settings.value("sync/max_object_mib", 8).toString();
+        bool validTransfer = false;
+        bool validCount = false;
+        bool validObject = false;
+        const unsigned transferMib = transferMibValue.toUInt(&validTransfer);
+        const unsigned count = countValue.toUInt(&validCount);
+        const unsigned individualMib = objectMibValue.toUInt(&validObject);
+        if (!validTransfer || !validCount || !validObject || transferMib == 0 || transferMib > 256 ||
+            count == 0 || count > 1000000 || individualMib == 0 || individualMib > 64 ||
+            individualMib > transferMib) {
+            std::cerr << "Invalid synchronization transfer limits\n";
+            return 2;
+        }
+        const aowis::native::BundleLimits limits{
+            static_cast<std::uint64_t>(transferMib) * 1024ULL * 1024ULL,
+            static_cast<std::uint64_t>(count),
+            static_cast<std::uint64_t>(individualMib) * 1024ULL * 1024ULL};
         QHostAddress address;
         bool validPort = false;
         const unsigned requestedPort = portValue.toUInt(&validPort);
@@ -89,7 +121,12 @@ int main(int argc, char** argv) {
         ScopedErrorLog errorLog(logPath);
         aowis::native::ProjectService service(rootValue.toStdString());
         QHttpServer httpServer;
-        aowis::native::http::registerRoutes(httpServer, service, storage);
+        aowis::native::http::registerRoutes(httpServer, service, storage, limits);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+        QHttpServerConfiguration configuration = httpServer.configuration();
+        configuration.setMaximumBodySize(static_cast<qint64>(limits.maxBytes));
+        httpServer.setConfiguration(configuration);
+#endif
         // QHttpServer::bind() takes QObject ownership of the listener.
         // Never bind a stack-allocated QTcpServer: the HTTP server destroys its children.
         QTcpServer* tcpServer = new QTcpServer(&httpServer);

@@ -8,7 +8,7 @@ The repository implements immutable SHA-256 objects, copy-on-write Merkle UUID t
 
 Bundle imports check object hashes, reachable object types and graph completeness; they also validate canonical Merkle structure, including UUID-to-path correspondence, compressed prefixes, branch depth ordering, child slots and nonzero leaf targets. These validations precede object publication on both backends. Model-indexed imported revisions additionally require canonical model references, existing dependency targets, and exact equivalence between model-derived edges and the reverse-reference index (including historical and incremental revisions). The same generic logical validator is now available for existing repositories, with physical + logical verification the default mode of `aowis-native-verify`. Full native checks deliberately do not claim application-specific hydraulic semantic validation.
 
-The initial multi-project HTTP service executable is implemented, with project/catalogue, branch and history endpoints. Hydraulic network reads/writes, indexed entity edits, revision diffs and semantic merges now have HTTP routes; online replication remains a future milestone. The provisional access-policy library is not part of the planned HTTP service authorization model.
+The initial multi-project HTTP service executable is implemented, with project/catalogue, branch and history endpoints. Hydraulic network reads/writes, indexed entity edits, revision diffs and semantic merges now have HTTP routes; bounded full/incremental binary HTTP replication is implemented; true streaming remains a future milestone. The provisional access-policy library is not part of the planned HTTP service authorization model.
 
 ## Implementation order
 
@@ -54,11 +54,12 @@ The initial multi-project HTTP service executable is implemented, with project/c
 - Writes require expected branch heads enforced again at native publication; conflict responses preserve branch tips. API contracts include canonical ModelCodec payloads in Base64, not a duplicate JSON model schema.
 - Qt HTTP integration tests exercise canonical codec round trips, immutable history, stale-write rejection, errors, edits and semantic merge conflicts/choices on both physical backends.
 
-### 7. HTTP synchronization and resource bounds
+### 7. HTTP synchronization and resource bounds — bounded-buffer phase implemented
 
-- Transport full/incremental native bundles without changing content hashes or inventing a second persistence protocol.
-- Limit transfer size, object size/count, verification memory/work, temporary disk use and simultaneous transfers.
-- Verify that corrupted or incomplete transfers cannot modify the visible branch; test cross-backend synchronization and retries.
+- Implemented full/incremental binary `.aowbundle` export and import on project-scoped HTTP routes, preserving SHA-256 objects and existing native validation. A transfer creates, fast-forwards, or idempotently acknowledges an existing tracking branch; divergences return 409.
+- Configurable file byte/object-count/individual-object limits are enforced in native import/export and again at the HTTP boundary. Qt 6.11+ enforces maximum request-body size before full buffering. Downloads are also capped; temporary import files live in private unique directories.
+- Native adversarial tests exercise limit rejection without branch/object writes on both physical backends. Qt integration tests exercise full/incremental transfers between backend types, truncated/forged content, retries, conflicting branches and interrupted uploads.
+- **Still required:** true streaming upload/download, disk-backed graph-validation metadata for huge histories, CPU/time budgets, cancellation handling, explicit concurrent-transfer quotas, and robust large-repository benchmarks. The current HTTP implementation buffers complete transfer bodies and processes them synchronously.
 
 ### 8. Scalability and performance
 

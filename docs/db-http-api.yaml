@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: AOWIS Native Database Service API
   version: 1.0.0
-  description: Project/catalogue, revision, hydraulic persistence, entity edits, diffs and semantic merge API. Bundle synchronization remains a future milestone.
+  description: Project/catalogue, revision, hydraulic persistence, entity edits, diffs, semantic merging and bounded binary full/incremental bundle synchronization.
 servers:
   - url: http://127.0.0.1:8755/api/v1
 paths:
@@ -52,6 +52,59 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
         '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/{projectId}/branches/{branch}/bundle:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+    get:
+      operationId: exportBranchBundle
+      description: |
+        Export the full portable immutable revision graph or an incremental
+        delta relative to a base ancestor. The binary result is capped by
+        configured transfer size, object-count and individual-object limits.
+        This initial endpoint buffers the response rather than streaming it.
+      parameters:
+        - name: base
+          in: query
+          required: false
+          schema: {$ref: '#/components/schemas/RevisionHash'}
+      responses:
+        '200':
+          description: Full or incremental portable AOWIS bundle
+          content:
+            application/vnd.aowis.bundle:
+              schema: {type: string, format: binary}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {description: Export exceeds configured transfer limit}
+    post:
+      operationId: importBranchBundle
+      description: |
+        Validate a complete binary bundle and create or fast-forward the
+        destination branch atomically. Repeated imports return up_to_date.
+        Divergent history is never overwritten. The request is buffered
+        with an upper body size limit on Qt 6.11 and newer.
+      requestBody:
+        required: true
+        content:
+          application/vnd.aowis.bundle:
+            schema: {type: string, format: binary}
+      responses:
+        '200':
+          description: Existing branch fast-forwarded or already up-to-date
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BundleImportResult'}
+        '201':
+          description: Destination branch created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BundleImportResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {description: Upload exceeds configured transfer limit}
   /projects/{projectId}:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
@@ -346,6 +399,13 @@ components:
         uuid: {type: string, format: uuid}
         type: {type: integer, minimum: 0, maximum: 17}
         payloadBase64: {type: string, contentEncoding: base64}
+    BundleImportResult:
+      type: object
+      required: [status, head, objectsImported]
+      properties:
+        status: {type: string, enum: [created, fast_forward, up_to_date]}
+        head: {$ref: '#/components/schemas/RevisionHash'}
+        objectsImported: {type: integer, minimum: 0}
     RevisionHash: {type: string, pattern: '^[a-f0-9]{64}$'}
     Project:
       type: object

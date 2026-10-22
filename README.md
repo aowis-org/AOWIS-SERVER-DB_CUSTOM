@@ -4,7 +4,7 @@
 
 This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-db` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
-> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. HTTP bundle synchronization and preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
+> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Preview-only merges and unbounded/streaming transfers remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
 ## System overview
 
@@ -105,7 +105,7 @@ Portable bundles exchange immutable branches between independent repositories, i
   /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The **bundle format and validation algorithms are implemented today**; HTTP transfer endpoints will expose them in a later service stage. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The same bundle format works through the bounded HTTP synchronization endpoints. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 
@@ -131,12 +131,12 @@ The chosen server design is:
 
 - **`aowis-server-db`**, built on **Qt QHttpServer**, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
 - **Multiple projects**, each identified by UUID and owning an independent native versioned repository, managed by one process. Clients never supply server filesystem paths as project identifiers.
-- Implemented versioned REST resources for projects, branches and revision metadata, with JSON responses. Hydraulic networks/entities, merges/conflicts and binary full/incremental synchronization are future API additions.
+- Implemented versioned REST resources for projects, branches and revision metadata, with JSON responses. Hydraulic networks/entities, merges/conflicts and bounded binary full/incremental synchronization are available.
 - Revision-pinned hydraulic network/entity/membership reads (including historical APIs) and optimistic revision-head checks for mutations, preventing mixed snapshots and silent concurrent overwrites.
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
 - File-based synchronization and direct native C++ library access remain supported alongside the HTTP project service.
 
-The initial project/branch/revision API is implemented; HTTP model edits, merging and synchronization are planned. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/db-http-api.yaml) and the [roadmap](docs/roadmap.md).
+The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /api/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for incremental download); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/db-http-api.yaml) and the [roadmap](docs/roadmap.md).
 
 ## Documentation
 

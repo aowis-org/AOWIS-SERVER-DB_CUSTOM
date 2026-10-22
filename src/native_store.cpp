@@ -2184,25 +2184,25 @@ std::uint64_t Repository::packSize() {
 // Portable offline replication intentionally transfers logical immutable objects,
 // never physical pack/index pages. This makes cross-backend imports possible.
 void Repository::exportBranchBundle(std::string_view branch,
-                                    const std::filesystem::path& bundlePath) {
+                                    const std::filesystem::path& bundlePath, BundleLimits limits) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    exportBundleLocked(branch, bundlePath, std::nullopt);
+    exportBundleLocked(branch, bundlePath, std::nullopt, limits);
 }
 
 void Repository::exportIncrementalBranchBundle(std::string_view branch,
                                                const Hash& recipientBase,
-                                               const std::filesystem::path& bundlePath) {
+                                               const std::filesystem::path& bundlePath, BundleLimits limits) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    exportBundleLocked(branch, bundlePath, recipientBase);
+    exportBundleLocked(branch, bundlePath, recipientBase, limits);
 }
 
 void Repository::exportBundleLocked(std::string_view branch,
                                     const std::filesystem::path& bundlePath,
-                                    std::optional<Hash> recipientBase) {
+                                    std::optional<Hash> recipientBase, BundleLimits limits) {
     const Hash tip = branchHead(branch);
     // Scan the base's *complete* reachable graph. Objects shared by new
     // revisions (Merkle subtrees, values, reference indexes) need not travel.
@@ -2249,6 +2249,8 @@ void Repository::exportBundleLocked(std::string_view branch,
     }
     require(recipientBase.has_value() || !objects.empty(),
             "cannot export an empty revision graph");
+    require(limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
+            "bundle transfer limit: object count exceeded");
     const int fd = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL |
                           O_NOFOLLOW | O_CLOEXEC, 0600);
     systemCall(fd >= 0, "create replication bundle (must not already exist)");
@@ -2266,8 +2268,17 @@ void Repository::exportBundleLocked(std::string_view branch,
         }
         writeExact(fd, header.data(), header.size(), 0);
         std::uint64_t offset = headerSize;
+        require(limits.maxBytes == 0 || offset <= limits.maxBytes,
+                "bundle transfer limit: byte count exceeded");
         for (const Hash& hash : objects) {
             const Bytes bytes = load(hash);
+            require(limits.maxObjectBytes == 0 || bytes.size() <= limits.maxObjectBytes,
+                    "bundle transfer limit: individual object exceeded");
+            require(limits.maxBytes == 0 ||
+                    (offset <= limits.maxBytes &&
+                     bytes.size() <= limits.maxBytes - offset &&
+                     bundleEntryBytes <= limits.maxBytes - offset - bytes.size()),
+                    "bundle transfer limit: byte count exceeded");
             std::array<std::uint8_t, bundleEntryBytes> entry{};
             std::copy(hash.begin(), hash.end(), entry.begin());
             storeU64(entry.data() + 32, static_cast<std::uint64_t>(bytes.size()));
@@ -2290,7 +2301,7 @@ void Repository::exportBundleLocked(std::string_view branch,
 }
 
 BundleImportResult Repository::importBranchBundle(const std::filesystem::path& bundlePath,
-                                                   std::string_view localBranch) {
+                                                   std::string_view localBranch, BundleLimits limits) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -2304,6 +2315,8 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 static_cast<std::uint64_t>(metadata.st_size) >= bundleHeaderBytes,
                 "invalid replication bundle file");
         const std::uint64_t fileSize = static_cast<std::uint64_t>(metadata.st_size);
+        require(limits.maxBytes == 0 || fileSize <= limits.maxBytes,
+                "bundle transfer limit: byte count exceeded");
         std::array<std::uint8_t, bundleHeaderBytes> header{};
         readExact(fd, header.data(), header.size(), 0);
         const bool incremental = std::equal(incrementalBundleMagic.begin(),
@@ -2329,6 +2342,8 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         require((incremental || count != 0) &&
                 count <= (fileSize - headerBytes) / bundleEntryBytes,
                 "invalid replication bundle object count");
+        require(limits.maxObjects == 0 || count <= limits.maxObjects,
+                "bundle transfer limit: object count exceeded");
         struct BundleLocation {
             std::uint64_t offset = 0;
             std::uint64_t size = 0;
@@ -2349,6 +2364,8 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                     "replication bundle object hashes must be unique and sorted");
             require(size <= maxObjectBytes && size <= fileSize - offset,
                     "replication bundle object exceeds bounds");
+            require(limits.maxObjectBytes == 0 || size <= limits.maxObjectBytes,
+                    "bundle transfer limit: individual object exceeded");
             Bytes payload(static_cast<std::size_t>(size));
             if (!payload.empty()) readExact(fd, payload.data(), payload.size(), offset);
             require(sha256(payload) == hash, "replication bundle SHA-256 mismatch");

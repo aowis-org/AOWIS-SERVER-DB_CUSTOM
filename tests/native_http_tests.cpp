@@ -51,17 +51,32 @@ struct Response {
     int status = 0;
     QJsonObject json;
 };
+struct BinaryResponse {
+    int status = 0;
+    QByteArray body;
+    QByteArray contentType;
+};
 
 class Client {
 public:
     explicit Client(quint16 port)
-        : base_(QStringLiteral("http://127.0.0.1:%1").arg(port)) {}
+        : base_(QStringLiteral("http://127.0.0.1:%1").arg(port)), port_(port) {}
+    quint16 port() const { return this->port_; }
     Response call(const QByteArray& verb, const QString& path, const QJsonObject& body = {}) {
+        const BinaryResponse reply = callRaw(verb, path,
+            QJsonDocument(body).toJson(QJsonDocument::Compact), "application/json");
+        const QJsonDocument json = QJsonDocument::fromJson(reply.body);
+        check(json.isObject(), "HTTP response is not JSON");
+        return Response{reply.status, json.object()};
+    }
+    BinaryResponse callRaw(const QByteArray& verb, const QString& path,
+                           const QByteArray& bytes = QByteArray(),
+                           const QByteArray& mime = "application/vnd.aowis.bundle") {
         QNetworkRequest request(QUrl(this->base_ + path));
-        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        request.setHeader(QNetworkRequest::ContentTypeHeader, mime);
         QNetworkReply* reply = nullptr;
         if (verb == "GET") reply = this->manager_.get(request);
-        else reply = this->manager_.post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+        else reply = this->manager_.post(request, bytes);
         QEventLoop loop;
         QTimer timer;
         timer.setSingleShot(true);
@@ -70,15 +85,15 @@ public:
         timer.start(5000);
         loop.exec();
         check(timer.isActive() && reply->isFinished(), "HTTP request timed out");
-        const QByteArray bytes = reply->readAll();
+        const QByteArray payload = reply->readAll();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const QJsonDocument json = QJsonDocument::fromJson(bytes);
+        const QByteArray contentType = reply->header(QNetworkRequest::ContentTypeHeader).toByteArray();
         reply->deleteLater();
-        check(json.isObject(), "HTTP response is not JSON");
-        return Response{status, json.object()};
+        return BinaryResponse{status, payload, contentType};
     }
 private:
     QString base_;
+    quint16 port_;
     QNetworkAccessManager manager_;
 };
 
@@ -261,6 +276,110 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
 }
 #endif
 
+// Real TCP bundle transfer: full/incremental, cross-backend, corrupt/truncated,
+// stale/divergent branches, transfer limits, and idempotent retry.
+void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
+                       const QString& sourceId, aowis::native::PhysicalStore backend) {
+    namespace native = aowis::native;
+    const QString opposite = backend == native::PhysicalStore::Stage7Pack ?
+        QStringLiteral("blocks") : QStringLiteral("pack");
+    const Response destination = client.call("POST", "/api/v1/projects",
+        QJsonObject{{"name", "Cross-backend recipient"}, {"storage", opposite}});
+    check(destination.status == 201, "cross-backend destination creation failed");
+    const QString destinationId = destination.json.value("id").toString();
+    const QString from = QStringLiteral("/api/v1/projects/") + sourceId + "/branches/sync_demo";
+    const QString to = QStringLiteral("/api/v1/projects/") + destinationId + "/branches/tracking";
+    native::Key item{};
+    item[15] = 37;
+    service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
+        repository.createBranch("sync_demo");
+        (void)repository.commit("sync_demo", {{item, native::Bytes{'o', 'n', 'e'}}});
+    });
+    const QString firstHead = client.call("GET", from + "/head").json.value("id").toString();
+    const BinaryResponse bundle = client.callRaw("GET", from + "/bundle");
+    check(bundle.status == 200 && bundle.body.size() > 80 &&
+          bundle.contentType.startsWith("application/vnd.aowis.bundle"),
+          "full bundle transfer failed");
+    check(client.callRaw("GET", from + "/bundle?base=invalid").status == 400,
+          "malformed base hash accepted");
+    check(client.callRaw("GET", from + "/bundle?base=" + QString(64, QChar('f'))).status == 409,
+          "unknown export base accepted");
+    check(client.callRaw("GET", from + "/bundle?unexpected=1").status == 400,
+          "unknown bundle query argument accepted");
+    check(client.callRaw("GET", "/api/v1/projects/invalid/branches/sync_demo/bundle").status == 400,
+          "invalid project bundle URL accepted");
+    check(client.callRaw("POST", to + "/bundle", QByteArray()).status == 400,
+          "empty bundle import accepted");
+    check(client.callRaw("POST", to + "/bundle", QByteArray(1024 * 1024 + 1, 'x')).status == 413,
+          "oversized bundle upload accepted");
+    // Partial request body followed by disconnect must never invoke bundle publication.
+    {
+        QTcpSocket interrupted;
+        interrupted.connectToHost(QHostAddress::LocalHost, client.port());
+        check(interrupted.waitForConnected(2000), "unable to connect interrupted upload");
+        const QByteArray head = "POST " + to.toUtf8() +
+            "/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/vnd.aowis.bundle\r\n" +
+            "Content-Length: " + QByteArray::number(bundle.body.size()) + "\r\n\r\n";
+        interrupted.write(head + bundle.body.left(bundle.body.size() / 2));
+        check(interrupted.waitForBytesWritten(2000), "partial upload was not sent");
+        interrupted.abort();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+    }
+    check(client.call("GET", to + "/head").status == 404,
+          "disconnected partial request published a branch");
+    check(client.callRaw("POST", to + "/bundle", bundle.body.left(bundle.body.size() - 1)).status == 400,
+          "truncated bundle accepted");
+    QByteArray corrupted = bundle.body;
+    corrupted[corrupted.size() - 1] = static_cast<char>(corrupted.back() ^ 1);
+    check(client.callRaw("POST", to + "/bundle", corrupted).status == 400,
+          "corrupted bundle accepted");
+    check(client.call("GET", to + "/head").status == 404,
+          "invalid bundle published a branch");
+    const Response firstImport = client.call("POST", to + "/bundle", QJsonObject{});
+    check(firstImport.status == 400, "JSON is not a valid binary bundle");
+    const BinaryResponse imported = client.callRaw("POST", to + "/bundle", bundle.body);
+    const QJsonObject first = QJsonDocument::fromJson(imported.body).object();
+    check(imported.status == 201 && first.value("status").toString() == QStringLiteral("created") &&
+          first.value("head").toString() == firstHead &&
+          first.value("objectsImported").toInteger() > 0,
+          "cross-backend initial bundle import failed");
+    const BinaryResponse repeated = client.callRaw("POST", to + "/bundle", bundle.body);
+    const QJsonObject repeatJson = QJsonDocument::fromJson(repeated.body).object();
+    check(repeated.status == 200 && repeatJson.value("status").toString() == QStringLiteral("up_to_date") &&
+          repeatJson.value("objectsImported").toInteger() == 0,
+          "repeated bundle import was not idempotent");
+    service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
+        (void)repository.commit("sync_demo", {{item, native::Bytes{'t', 'w', 'o'}}});
+    });
+    const QString nextHead = client.call("GET", from + "/head").json.value("id").toString();
+    const BinaryResponse delta = client.callRaw("GET", from + "/bundle?base=" + firstHead);
+    check(delta.status == 200 && delta.body.startsWith("AOWSYNC2"),
+          "incremental binary bundle export failed");
+    const BinaryResponse advanced = client.callRaw("POST", to + "/bundle", delta.body);
+    const QJsonObject advancedJson = QJsonDocument::fromJson(advanced.body).object();
+    check(advanced.status == 200 && advancedJson.value("status").toString() == QStringLiteral("fast_forward") &&
+          advancedJson.value("head").toString() == nextHead,
+          "incremental cross-backend import failed");
+    check(client.call("GET", to + "/head").json.value("id").toString() == nextHead,
+          "destination branch did not fast-forward");
+    service.withRepository(destinationId.toStdString(), [&](native::Repository& repository) {
+        (void)repository.commit("tracking", {{item, native::Bytes{'d', 'e', 's', 't'}}});
+    });
+    const QString divergentHead = client.call("GET", to + "/head").json.value("id").toString();
+    service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
+        (void)repository.commit("sync_demo", {{item, native::Bytes{'n', 'e', 'x', 't'}}});
+    });
+    const BinaryResponse more = client.callRaw("GET", from + "/bundle?base=" + nextHead);
+    check(more.status == 200, "follow-up incremental export failed");
+    check(client.callRaw("POST", to + "/bundle", more.body).status == 409,
+          "divergent tracking history was overwritten");
+    check(client.call("GET", to + "/head").json.value("id").toString() == divergentHead,
+          "rejected bundle mutated divergent branch");
+    service.withRepository(destinationId.toStdString(), [&](native::Repository& repository) {
+        (void)repository.verifyRepository();
+    });
+}
+
 void exercise(aowis::native::PhysicalStore backend) {
     TemporaryRoot root;
     QString firstId;
@@ -272,7 +391,9 @@ void exercise(aowis::native::PhysicalStore backend) {
         // bind() reparents the listener to the HTTP server, which owns its lifetime.
         QTcpServer* tcp = new QTcpServer(&server);
         observedListener = tcp;
-        aowis::native::http::registerRoutes(server, service, backend);
+        aowis::native::http::registerRoutes(
+            server, service, backend, aowis::native::BundleLimits{1024ULL * 1024ULL, 10000ULL,
+                                                                    1024ULL * 1024ULL});
         check(tcp->listen(QHostAddress::LocalHost, 0) && server.bind(tcp), "unable to listen");
         check(tcp->parent() == &server, "HTTP listener must belong to the HTTP server");
         Client client(tcp->serverPort());
@@ -344,6 +465,7 @@ void exercise(aowis::native::PhysicalStore backend) {
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
         exerciseHydraulicApi(client, service, firstId, second.json.value("id").toString(), firstRevision);
 #endif
+        exerciseBundleApi(client, service, firstId, backend);
     }
     check(observedListener.isNull(), "HTTP server did not destroy its owned listener");
     {
