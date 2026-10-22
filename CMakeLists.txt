@@ -43,6 +43,26 @@ add_executable(aowis-native-model-benchmark benchmarks/model_network_benchmark.c
 target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
+    # Compile the engine a second time exclusively for fault-injection tests.
+    # Production targets never contain crash/failure injection hooks.
+    add_library(aowis-native-store-fault-tests STATIC
+        src/native_store.cpp
+        src/model_record.cpp
+        src/access_policy.cpp
+        src/pack_experiment.cpp
+        src/block_store_prototype.cpp
+    )
+    target_compile_features(aowis-native-store-fault-tests PUBLIC cxx_std_20)
+    target_include_directories(aowis-native-store-fault-tests PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(aowis-native-store-fault-tests PUBLIC OpenSSL::Crypto)
+    target_compile_definitions(aowis-native-store-fault-tests PRIVATE AOWIS_NATIVE_FAULT_TEST_BUILD)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(aowis-native-store-fault-tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    endif()
+    add_executable(aowis-native-recovery-tests tests/native_recovery_tests.cpp)
+    target_link_libraries(aowis-native-recovery-tests PRIVATE aowis-native-store-fault-tests)
+    add_test(NAME aowis-native-recovery-tests COMMAND aowis-native-recovery-tests)
+    set_tests_properties(aowis-native-recovery-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-pack-experiment-tests tests/pack_experiment_tests.cpp)
     target_link_libraries(aowis-native-pack-experiment-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-pack-experiment-tests COMMAND aowis-native-pack-experiment-tests)
@@ -83,7 +103,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-recovery-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-pack-experiment-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

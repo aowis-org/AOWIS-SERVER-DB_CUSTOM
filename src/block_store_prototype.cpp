@@ -1,5 +1,6 @@
 #include "aowis/native/block_store_prototype.h"
 #include "aowis/native/pack_experiment.h"
+#include "native_test_faults.h"
 
 #include <algorithm>
 #include <array>
@@ -281,6 +282,8 @@ void BlockStorePrototype::writeManifest(std::uint64_t packBytes,
     const int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     check(fd >= 0, "cannot open pending candidate marker");
     try {
+        detail::faultPartialWrite(fd, marker.data(), marker.size(), 0,
+                                  "block.partial.manifest");
         writeExact(fd, marker.data(), marker.size(), 0);
         flush(fd);
     } catch (...) {
@@ -288,9 +291,12 @@ void BlockStorePrototype::writeManifest(std::uint64_t packBytes,
         throw;
     }
     ::close(fd);
+    detail::faultCheckpoint("block.before.manifest.rename");
     check(::rename(temp.c_str(), (activeDir_ / "candidate.current").c_str()) == 0,
           "cannot publish candidate commit marker");
+    detail::faultCheckpoint("block.after.manifest.rename");
     syncDirectory(activeDir_);
+    detail::faultCheckpoint("block.after.manifest.dirsync");
 }
 
 void BlockStorePrototype::rebuildIndex(std::uint64_t committedPackBytes) {
@@ -431,8 +437,13 @@ void BlockStorePrototype::putHashedBatch(const std::vector<HashedBytes>& values)
         store32(head.data() + 8, static_cast<std::uint32_t>(body.size()));
         const Hash digest = sha256(body);
         std::copy(digest.begin(), digest.end(), head.begin() + 12);
+        detail::faultCheckpoint("block.before.header");
         writeExact(this->packFd_, head.data(), head.size(), packCursor);
+        detail::faultCheckpoint("block.after.header");
+        detail::faultPartialWrite(this->packFd_, body.data(), body.size(),
+                                  packCursor + blockHeaderBytes, "block.partial.body");
         writeExact(this->packFd_, body.data(), body.size(), packCursor + blockHeaderBytes);
+        detail::faultCheckpoint("block.after.body");
         indexBuffer.resize(inBlock.size() * indexEntryBytes);
         std::size_t slot = 0;
         for (std::size_t i = 0; i < inBlock.size(); ++i) {
@@ -466,8 +477,11 @@ void BlockStorePrototype::putHashedBatch(const std::vector<HashedBytes>& values)
         inBlock.push_back(i);
     }
     flushBlock();
+    detail::faultCheckpoint("block.before.pack.fsync");
     flush(this->packFd_);
+    detail::faultCheckpoint("block.after.pack.fsync");
     flush(this->indexFd_);
+    detail::faultCheckpoint("block.after.index.fsync");
     // Publish bytes durably before exposing their locations or any revision ref.
     writeManifest(packCursor, indexCursor,
                         static_cast<std::uint64_t>(this->locations_.size()) + pendingIndices.size(),

@@ -33,10 +33,12 @@ The HTTP service executable is not yet implemented. The provisional access-polic
 - Qt-enabled regression tests exercise historical root/chunk/record visibility, invalid/missing revisions, and concurrent writers/readers with whole-network generation markers on both physical backends.
 - Future: domain-specific semantic repository audits, and more systematic concurrency scheduling/fault injection as part of the crash-recovery stage.
 
-### 4. Crash recovery and fault injection
+### 4. Crash recovery and fault injection — implemented initial recovery matrix
 
-- Exercise failures and abrupt process termination at object writes, pack/index sync, branch-ref publication, block generation switches, bundle imports and compaction.
-- Verify each recovered repository with both physical and logical checks; cover disk-full conditions, multi-process locking, and backup/restore procedures.
+- A dedicated recovery-test engine (never shipped) injects abrupt `_exit()` and simulated `ENOSPC` at object writes, pack/index synchronization, branch-ref publication, block commit-marker publication, incremental import and compaction generation switches. Torn object/marker/ref writes are also exercised.
+- Subprocess recovery on both physical backends checks the recovered head (old before publication, new after), complete native logical + physical verification, model/reference consistency, and successful subsequent commits or import retries. Tests also cover damaged derived indexes, offline copy/restore and cross-process handle restrictions.
+- **Fixed:** a failed pack compaction after switching the generation pointer could leave a writable handle bound to the old pack. After a post-switch error, either backend now requires reopening; the recovery suite exercises this on the original handle.
+- **Still required:** real power-loss tests (including filesystem cache/device behavior), sustained disk-exhaustion scenarios and a documented external backup/restore operational procedure. Deterministic process termination and injected `ENOSPC` cannot prove power-failure durability across every filesystem or storage device.
 
 ### 5. Multi-project HTTP server
 

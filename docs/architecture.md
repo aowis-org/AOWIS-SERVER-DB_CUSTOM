@@ -44,8 +44,8 @@ Object records use an `AOBJ` header and typed canonical bytes. Index entries con
 
 - Repository operations coordinate using POSIX locks. Commits preflight references and optimistic expected-head checks under the same lock as branch publication.
 - Newly encoded immutable objects are appended, flushed with `fsync`, and only then does the engine atomically publish a synced branch ref. An interrupted commit may leave unreachable objects but should not expose an incompletely flushed revision through a published ref on supported filesystems.
-- Offline compaction retains **all** objects reachable from every branch's revision ancestry (including merge parents and both Merkle indexes). The replacement generation is synchronized before the active-generation pointer is published.
-- Compaction requires exclusive lifetime access; do not compact a live service repository. Independent backup, restore verification, fault-injection and online maintenance are not yet complete.
+- Offline compaction retains **all** objects reachable from every branch's revision ancestry (including merge parents and both Merkle indexes). The replacement generation is synchronized before the active-generation pointer is published. If compaction fails after switching this pointer, the in-memory repository handle is invalidated and must be reopened before any further commit; continuing to write the old pack is prohibited.
+- Compaction requires exclusive lifetime access; do not compact a live service repository. Deterministic process-crash and simulated write-failure recovery tests cover both physical backends and offline backup/restore; device-level power-loss validation, operational backup procedures and online maintenance remain outstanding.
 
 ## Concurrency and physical limits
 

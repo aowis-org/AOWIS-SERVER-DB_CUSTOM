@@ -1,5 +1,6 @@
 #include "aowis/native/native_store.h"
 #include "aowis/native/block_store_prototype.h"
+#include "native_test_faults.h"
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -699,6 +700,7 @@ void Repository::rebuildIndex() {
 }
 
 void Repository::refreshIndex() {
+    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
     if (this->blockStore_) return; // block store owns its committed index
     // A preceding operation could have written objects before throwing;
     // make its orphan records discoverable by other processes too.
@@ -805,8 +807,15 @@ Hash Repository::store(const Bytes& bytes) {
     std::copy(hash.begin(), hash.end(), header.begin() + 5);
     storeU64(header.data() + 37, static_cast<std::uint64_t>(bytes.size()));
     std::uint64_t offset = this->scanOffset_;
+    detail::faultCheckpoint("pack.before.header");
     writeExact(this->packFd_, header.data(), header.size(), offset);
-    if (!bytes.empty()) writeExact(this->packFd_, bytes.data(), bytes.size(), offset + headerSize);
+    detail::faultCheckpoint("pack.after.header");
+    if (!bytes.empty()) {
+        detail::faultPartialWrite(this->packFd_, bytes.data(), bytes.size(),
+                                  offset + headerSize, "pack.partial.body");
+        writeExact(this->packFd_, bytes.data(), bytes.size(), offset + headerSize);
+    }
+    detail::faultCheckpoint("pack.after.body");
     this->index_.emplace(hash, Location{offset + headerSize, bytes.size()});
     const std::array<std::uint8_t, indexEntrySize> entry =
         encodeIndexEntry(hash, offset + headerSize, bytes.size());
@@ -854,7 +863,9 @@ void Repository::syncPack() {
     // Branch durability depends on the pack, not on this reconstructible
     // sidecar. The index may lag across a crash; refreshIndex hashes the
     // uncovered durable pack suffix to rebuild it on the next open.
+    detail::faultCheckpoint("pack.before.fsync");
     systemCall(::fsync(this->packFd_) == 0, "fsync content pack");
+    detail::faultCheckpoint("pack.after.fsync");
     if (!this->pendingIndex_.empty()) {
         writeExact(this->indexFd_, this->pendingIndex_.data(),
                    this->pendingIndex_.size(), this->indexReadOffset_);
@@ -1194,12 +1205,19 @@ void Repository::publishRef(std::string_view branch, const Hash& commitHash, boo
     systemCall(fd >= 0, "open temporary branch ref");
     try {
         const std::string value = toHex(commitHash) + "\n";
+        detail::faultPartialWrite(fd, reinterpret_cast<const std::uint8_t*>(value.data()),
+                                  value.size(), 0, "ref.partial.temp");
         writeExact(fd, reinterpret_cast<const std::uint8_t*>(value.data()), value.size(), 0);
+        detail::faultCheckpoint("ref.before.fsync");
         systemCall(::fsync(fd) == 0, "fsync temporary branch ref");
+        detail::faultCheckpoint("ref.after.fsync");
         systemCall(::close(fd) == 0, "close temporary branch ref");
         fd = -1;
+        detail::faultCheckpoint("ref.before.rename");
         systemCall(::rename(temporary.c_str(), final.c_str()) == 0, "publish branch ref");
+        detail::faultCheckpoint("ref.after.rename");
         syncDirectory(heads);
+        detail::faultCheckpoint("ref.after.dirsync");
     } catch (...) {
         if (fd >= 0) ::close(fd);
         throw;
@@ -2066,6 +2084,7 @@ void Repository::verifyPack() {
 }
 
 void Repository::verifyPackLocked() {
+    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
     if (this->blockStore_) { this->blockStore_->verify(); return; }
     refreshIndex();
     std::uint64_t position = 0;
@@ -2104,6 +2123,7 @@ VerificationReport Repository::verifyRepository() {
     // Verify all physical objects, including unreachable ones, first.
     // Neither stage mutates branch heads or rewrites invalid object graphs.
     verifyPackLocked();
+    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
     if (!this->blockStore_) refreshIndex();
 
     const std::filesystem::path heads = this->directory_ / "refs" / "heads";
@@ -2406,6 +2426,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             ++imported;
         }
         syncPack(); // durable objects before an atomic branch-ref update
+        detail::faultCheckpoint("import.after.sync");
         publishRef(localBranch, incoming, !exists);
         ::close(fd);
         return BundleImportResult{status, incoming, imported};
@@ -2419,6 +2440,7 @@ CompactionStats Repository::compact() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     ScopedMaintenanceExclusive alone(this->lifetimeFd_);
+    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
     if (!this->blockStore_) refreshIndex();
 
     CompactionStats stats{};
@@ -2529,6 +2551,7 @@ CompactionStats Repository::compact() {
                         "compacted block object count differs from retention set");
             }
             syncDirectory(blocksDir);
+            detail::faultCheckpoint("compact.block.before.pointer");
             const std::string pointer = "AOBGEN1 " + token + "\n";
             const int fd = ::open(pending.c_str(), O_WRONLY | O_CREAT | O_EXCL |
                                   O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -2543,6 +2566,7 @@ CompactionStats Repository::compact() {
             systemCall(::rename(pending.c_str(), (blocksDir / "candidate.active").c_str()) == 0,
                        "publish block generation pointer");
             published = true;
+            detail::faultCheckpoint("compact.block.after.pointer");
             syncDirectory(blocksDir);
             // New generation is now authoritative. Reopen before reclaiming
             // the old one; failure here must not delete either generation.
@@ -2562,8 +2586,9 @@ CompactionStats Repository::compact() {
                 if (pendingOwned) std::filesystem::remove(pending, ignored);
                 std::filesystem::remove_all(nextDirectory, ignored);
             } else {
-                // Failure after publication must not allow use of a handle
-                // possibly tied to the retired generation.
+                // The pointer can have changed even though compact() failed.
+                // A stale handle must NEVER publish objects to the old pack.
+                this->needsReopen_ = true;
                 this->blockStore_.reset();
             }
             throw;
@@ -2638,6 +2663,7 @@ CompactionStats Repository::compact() {
         systemCall(::fsync(newPackFd) == 0, "sync compacted pack");
         systemCall(::fsync(newIndexFd) == 0, "sync compacted index");
         syncDirectory(this->directory_);
+        detail::faultCheckpoint("compact.pack.before.pointer");
 
         markerFd = ::open(markerTemp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
         systemCall(markerFd >= 0, "create temporary active-pack marker");
@@ -2651,6 +2677,7 @@ CompactionStats Repository::compact() {
                             (this->directory_ / "objects.current").c_str()) == 0,
                    "publish active-pack marker");
         published = true;
+        detail::faultCheckpoint("compact.pack.after.pointer");
         syncDirectory(this->directory_);
 
         const std::filesystem::path oldPack =
@@ -2680,6 +2707,11 @@ CompactionStats Repository::compact() {
             (void)::unlink(markerTemp.c_str());
             (void)::unlink(nextPack.c_str());
             (void)::unlink(nextIndex.c_str());
+        } else {
+            // The active pointer may now select a different immutable pack.
+            // Continuing on the previous open descriptors could commit refs
+            // to objects invisible after restart. Require a new handle.
+            this->needsReopen_ = true;
         }
         throw;
     }

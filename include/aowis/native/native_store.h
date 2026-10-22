@@ -290,6 +290,7 @@ private:
     std::size_t stagedBytes_ = 0;
     std::uint64_t scanOffset_ = 0;
     std::uint64_t indexReadOffset_ = 0;
+    bool needsReopen_ = false; // fatal failure after publishing a compaction pointer
     Bytes pendingIndex_;
 
     void exportBundleLocked(std::string_view branch, const std::filesystem::path& bundlePath,
