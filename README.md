@@ -159,3 +159,5 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 
 
 The HTTP server exposes canonical hydraulic network reads/writes, revision-pinned entity queries, atomic edits, revision diffs and validated hydraulic merges when built with the AOWIS model codec. See [HTTP service](docs/native-database-service.md) and [OpenAPI](docs/db-http-api.yaml) for implemented routes and request limits.
+
+The [pack-versus-block benchmark](docs/benchmark-plan.md#pack-versus-block-decision-benchmark) compares identical native model and canonical hydraulic workloads before selecting a single physical backend.

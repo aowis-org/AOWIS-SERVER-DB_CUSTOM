@@ -146,6 +146,73 @@ upload buffering, concurrent transfers, physical power loss or hydraulic
 semantic parsing. It establishes a baseline for identifying the next memory
 bottleneck without altering the database engine.
 
+## Pack-versus-block decision benchmark
+
+Run the **same completed model workflow** on both physical backends, checking
+that the resulting immutable revision SHA-256 ID, record count and history size
+match. A separate process performs scan, full native logical verification,
+compaction, reopen and another verification. The complementary canonical
+hydraulic benchmark uses the real shared AOWIS model codec and measures
+full-network save, scalar/topology edits, membership changes, catalogue changes,
+physical element updates and control/dependency edits. It does not time a
+hydraulic-specific *semantic merge*: the separate native model scenario covers
+branch merges, and semantic correctness is covered by hydraulic regression tests.
+
+After `./compile_linux_tests.sh --both`, from the repository root:
+
+```bash
+# Persist the CSV outside the disposable benchmark repositories.
+results_dir="$(mktemp -d /tmp/aowis-backend-results.XXXXXXXX)"
+python3 tools/benchmark_physical_backends.py \
+  --model-binary ./build-linux-tests-release/aowis-native-backend-comparison-benchmark \
+  --hydraulic-binary ./build-linux-tests-release/aowis-native-hydraulic-edit-benchmark \
+  --scenario both --pipes 1000 --edits 6 --scalar-edits 6 \
+  --topology-edits 2 --repeats 3 --output "$results_dir/1k.csv"
+```
+
+For the important full-size comparison, re-run the exact same command with
+`--pipes 100000` and a different `--output "$results_dir/100k.csv"`.
+Do not reuse a previous CSV name: the runner refuses to overwrite data.
+Large canonical hydraulic fixtures involve building full Qt model structures in
+memory, and may take significantly longer than the raw-model comparison.
+Individual benchmark repositories are freshly generated under unpredictable
+private temporary paths; they are cleaned up after completion or interruption.
+Each completed CSV row is flushed immediately so interrupted runs still leave
+partial data. **Do not compare partial sets of backend repetitions.**
+The normal Qt-enabled CTest suite includes an additional tiny real-hydraulic
+pack/block comparison. Native-only builds run the synthetic-model comparison
+regression without requiring Qt.
+
+The runner alternates pack/block execution order by repetition, reports median
+values without declaring a winner, and refuses to accept unequal final revision
+identities or entity/revision counts. CTest includes a small both-backend
+comparison, using the native model benchmark even when Qt is unavailable.
+The `--scenario hydraulic` command requires a Qt-enabled build and does not
+silently substitute synthetic payloads.
+
+`initial_ms` and `import_ms` respectively measure native indexed-model seeding
+and canonical hydraulic full-network saving; these are **different workloads**.
+Model `edit_mean_ms` covers one of two independent branch edits, with an
+explicit two-parent merge measured as `merge_ms`. Hydraulic indexed edit
+statistics come directly from the canonical hydraulic benchmark. The `inspect`
+process records full Merkle enumeration (`scan_ms`), comprehensive logical
+integrity audit (`audit_ms`), compaction (`compact_ms`), reopened repository
+(`reopen_ms`), post-compaction audit (`post_compact_verify_ms`), data-pack bytes,
+and **whole repository disk bytes** including indexes, refs and metadata.
+`create_peak_rss_kib` and `inspect_peak_rss_kib` are separate process
+high-water marks from Linux `/proc/self/status` (`VmHWM`), not incremental
+memory consumed by a single operation. Revisions that share object content may
+show no reclaimable compaction garbage; storage bytes are still recorded both
+before and after.
+
+The comparison deliberately excludes HTTP overhead, OS cold-cache simulation,
+power-loss behavior and concurrent handle contention. The block backend still
+has a more restrictive repository-handle lifetime policy. A backend-selection
+decision requires testing under representative hardware and file systems,
+profiling larger histories, long-run durability/recovery, and measuring both
+performance **and** maintenance complexity; this script does not delete either
+backend or claim that a small benchmark establishes a winner.
+
 ## Comparing storage backends
 
 ```bash

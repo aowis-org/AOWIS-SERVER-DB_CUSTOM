@@ -6,11 +6,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
+#include <fstream>
+#include <sstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <sys/resource.h>
 
 namespace native = aowis::native;
 namespace hydraulic = aowis::native::hydraulic;
@@ -24,6 +25,19 @@ QUuid uuid(std::uint32_t value) {
         key[15 - i] = static_cast<std::uint8_t>(value >> (8 * i));
     }
     return hydraulic::uuidFromKey(key);
+}
+
+std::uint64_t peakResidentKiB() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (!line.starts_with("VmHWM:")) continue;
+        std::istringstream parts(line.substr(6));
+        std::uint64_t peak = 0;
+        std::string units;
+        if (parts >> peak >> units && peak > 0 && units == "kB") return peak;
+    }
+    throw std::runtime_error("Linux VmHWM is unavailable for memory measurement");
 }
 
 double elapsedMs(const std::chrono::steady_clock::time_point start) {
@@ -299,8 +313,7 @@ int main(int argc, char** argv) {
             "main", hydraulic::keyFromUuid(network.uuid));
         if (!networkRoot || networkRoot->kind != hydraulic::hydraulicNetworkKind)
             throw std::runtime_error("missing indexed network root");
-        struct rusage usage{};
-        if (getrusage(RUSAGE_SELF, &usage) != 0) throw std::runtime_error("getrusage failed");
+        const std::uint64_t peakRssKiB = peakResidentKiB();
         std::cout << std::fixed << std::setprecision(3)
                   << "engine=" << (physical == native::PhysicalStore::ExperimentalBlocks ? "blocks" : "stage7") << '\n'
                   << "fixture=canonical-hydraulic-network\n"
@@ -323,7 +336,7 @@ int main(int argc, char** argv) {
                   << "indexed_dependent_update_batch_ms=" << dependentUpdateMs << '\n'
                   << "indexed_dependent_delete_batch_ms=" << dependentDeleteMs << '\n'
                   << "network_membership_chunk_count=" << networkRoot->references.size() << '\n'
-                  << "peak_rss_kib=" << usage.ru_maxrss << '\n';
+                  << "peak_rss_kib=" << peakRssKiB << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "hydraulic edit benchmark failed: " << error.what() << '\n';
