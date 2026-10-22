@@ -17,7 +17,7 @@ The **18 top-level collections** are: pipe materials; time patterns; tank volume
 - A persisted reverse-reference index records required UUID dependencies and enables bounded ownership and deletion checks.
 - The network membership manifest has an internal binary format marker (`ANX5`); it is **not** an API namespace or user-facing name. Formats are still pre-release.
 
-`validateHydraulicNetworkWithDependencies()` extracts compact UUID dependency pairs while validating model semantics, without constructing a large per-entity hash-of-sets graph. The detailed diagnostic reference API remains available. Whole-network loading checks membership, object kinds and UUIDs, canonical outgoing references, and semantic consistency.
+`validateHydraulicNetworkWithDependencies()` extracts compact UUID dependency pairs while validating model semantics, without constructing a large per-entity hash-of-sets graph. The detailed diagnostic reference API remains available. Whole-network loading checks membership, object kinds and UUIDs, canonical outgoing references, and semantic consistency. Each complete load pins one immutable revision before reading the root, membership chunks or any entity, so concurrent commits cannot produce a mixed-generation aggregate.
 
 ## Complete network operations
 
@@ -32,6 +32,11 @@ QString error;
 const std::optional<NetworkHydraulic> loaded =
     aowis::native::hydraulic::loadHydraulicNetwork(
         repository, "main", network.uuid, &error);
+
+// Explicit, reproducible historical read (does not follow a moving branch).
+const std::optional<NetworkHydraulic> historical =
+    aowis::native::hydraulic::loadHydraulicNetworkAtRevision(
+        repository, revision.id, network.uuid, &error);
 ```
 
 `saveHydraulicNetwork()` validates and replaces one complete network atomically, without changing other networks on the branch. It encodes all incoming top-level entities and is therefore a **full-network operation**. The native store performs reference and expected-head checks before publishing one new revision. Whole-network operations still require substantial work and memory proportional to the network size.
@@ -47,7 +52,7 @@ const auto pipeIds = aowis::native::hydraulic::listHydraulicEntityIds(
     aowis::native::hydraulic::HydraulicEntityType::Pipe, &error);
 ```
 
-`loadHydraulicEntity()` uses the reverse-reference membership index to find a single entity without reconstructing the network. It validates the requested record's type and canonical UUID; it does not perform a full network semantic audit on each read. `listHydraulicEntityIds()` returns one selected collection in its original order, without decoding every entity payload. A missing network/member returns `std::nullopt`; a corrupt or inconsistent stored object is an error. These operations check for concurrent branch-head movement.
+`loadHydraulicEntity()` uses the reverse-reference membership index to find a single entity without reconstructing the network. It validates the requested record's type and canonical UUID; it does not perform a full network semantic audit on each read. `listHydraulicEntityIds()` returns one selected collection in its original order, without decoding every entity payload. A missing network/member returns `std::nullopt`; a corrupt or inconsistent stored object is an error. Branch-oriented queries pin a revision on entry; they never combine records from different branch heads. The corresponding `loadHydraulicEntityAtRevision()` and `listHydraulicEntityIdsAtRevision()` APIs accept an explicit revision hash, so several separate queries can be made against the same historical snapshot. A branch may advance between two *different* branch-oriented calls; clients requiring a consistent multi-call view must obtain the branch head once and pass its revision ID to each call.
 
 ## Atomic indexed editing
 
@@ -62,6 +67,8 @@ const auto revision = aowis::native::hydraulic::editHydraulicNetwork(
 ```
 
 `HydraulicEntity` is a variant of exactly those 18 persisted top-level types. An upsert supplies an object whose embedded UUID matches the change key. A deletion supplies `std::nullopt`. New members append to their collection; updates preserve the prior position. An atomic batch may include interdependent additions/deletions, and an identical/empty batch does not advance history.
+
+Full saves and full-validation edit fallbacks read their starting membership and models at an immutable expected-head revision, then reject stale publication with the existing atomic compare-and-commit check. Indexed edit preparation continues using optimistic expected-head protection.
 
 The editor re-encodes only changed entities when its indexed rules can prove validity. It reuses unchanged membership chunks, rewriting affected chunks (and the root only when chunk-descriptor membership changes). It also updates outgoing/incoming reference edges atomically. It verifies the expected branch head so a concurrent change cannot silently be overwritten.
 
@@ -90,4 +97,4 @@ Hydraulic branches should use `mergeHydraulicBranches()` rather than the generic
 
 The serializer, ordered membership and persistent reference-index formats are common to both native physical backends. Indexed entity reads and suitable edits avoid decoding the whole network, while full saves, fallbacks and proposed merged-snapshot validation still work over the whole aggregate. Solver feasibility and arbitrary conflicting membership reorder resolution remain separate work. This is a native-library capability; **the planned REST routes for these operations are not implemented yet**. See [REST design](rest-api-design.md).
 
-Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-native-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity and validated merging on both storage backends.
+Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-native-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency on both storage backends.

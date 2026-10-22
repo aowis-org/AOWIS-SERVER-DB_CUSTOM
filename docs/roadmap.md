@@ -26,10 +26,12 @@ The HTTP service executable is not yet implemented. The provisional access-polic
 - Adversarial tests inject hash-valid logical corruption directly into both physical backends and check correct rejection, physical/logical separation, CLI status codes, valid merges and compaction.
 - Future: a separate domain-aware semantic audit, bounded-memory verification and fault-injection/recovery procedures.
 
-### 3. Consistent snapshots and concurrency
+### 3. Consistent snapshots and concurrency — implemented
 
-- Pin one revision for all steps of a multi-object hydraulic network read, including membership traversal and entity materialization.
-- Keep optimistic expected-head checks on mutations; test simultaneous readers, writers, stale edits and old-revision reads.
+- Branch-based hydraulic network loads and targeted member/ID-list queries capture one revision before reading any root, membership chunks, reverse-reference indexes or entities. Explicit `*AtRevision()` APIs permit stable historical snapshots and multi-call consistency while branch heads advance.
+- Complete saves and conservative edit fallbacks use their starting revision for preparation; `commitModel()` still atomically checks the expected head at publication. Indexed edits retain the same stale-writer protection.
+- Qt-enabled regression tests exercise historical root/chunk/record visibility, invalid/missing revisions, and concurrent writers/readers with whole-network generation markers on both physical backends.
+- Future: domain-specific semantic repository audits, and more systematic concurrency scheduling/fault injection as part of the crash-recovery stage.
 
 ### 4. Crash recovery and fault injection
 

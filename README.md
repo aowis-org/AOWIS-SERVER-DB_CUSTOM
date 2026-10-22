@@ -124,7 +124,7 @@ The chosen server design is:
 - **`aowis-server-db`**, built on **Qt QHttpServer**, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
 - **Multiple projects**, each identified by UUID and owning an independent native versioned repository, managed by one process. Clients never supply server filesystem paths as project identifiers.
 - Versioned REST resources for projects, branches, revisions, hydraulic networks/entities, merges/conflicts and full/incremental synchronization; JSON for normal operations and binary streams for large data.
-- Optimistic revision-head checks for mutations so concurrent users do not silently overwrite changes.
+- Revision-pinned hydraulic network/entity/membership reads (including historical APIs) and optimistic revision-head checks for mutations, preventing mixed snapshots and silent concurrent overwrites.
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
 - File-based synchronization and direct native C++ library access remain supported alongside the planned REST service.
 

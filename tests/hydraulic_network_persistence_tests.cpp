@@ -5,6 +5,10 @@
 #include <QCoreApplication>
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -157,6 +161,76 @@ NetworkHydraulic requiredLoad(native::Repository& repository, std::string_view b
         hydraulic::loadHydraulicNetwork(repository, branch, id, &error);
     if (!loaded) throw std::runtime_error("network load failed: " + error.toStdString());
     return *loaded;
+}
+
+NetworkHydraulic requiredLoadAtRevision(native::Repository& repository,
+                                         const native::Hash& revisionId, const QUuid& networkId) {
+    QString error;
+    const std::optional<NetworkHydraulic> loaded =
+        hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkId, &error);
+    if (!loaded) throw std::runtime_error("historical network load failed: " + error.toStdString());
+    return *loaded;
+}
+
+// First model publication starts from an empty, non-model-indexed genesis
+// revision. Historical model APIs must remain strict without preventing that
+// first save or treating an untouched branch as a corrupted network.
+void exerciseEmptyRawBranch(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        native::Repository repository(folder, physical);
+        repository.createBranch("main");
+        const native::Revision initial = repository.head("main");
+        require(!initial.modelIndexed && initial.root == native::Hash{},
+                "new branch should start with an empty raw revision");
+
+        QString error = QStringLiteral("old error");
+        require(!hydraulic::loadHydraulicNetwork(repository, "main", uuid(1), &error) &&
+                error.isEmpty(), "new branch network lookup did not return clean not-found");
+        error = QStringLiteral("old error");
+        require(!hydraulic::listHydraulicEntityIds(
+                    repository, "main", uuid(1), hydraulic::HydraulicEntityType::MapLabel,
+                    &error) && error.isEmpty(),
+                "new branch membership lookup did not return clean not-found");
+        require(!hydraulic::listHydraulicEntityIds(
+                    repository, "main", uuid(1),
+                    static_cast<hydraulic::HydraulicEntityType>(999), &error) && !error.isEmpty(),
+                "invalid collection selector passed on an empty branch");
+        error = QStringLiteral("old error");
+        require(!hydraulic::loadHydraulicEntity(repository, "main", uuid(1), uuid(28), &error) &&
+                error.isEmpty(), "new branch entity lookup did not return clean not-found");
+
+        require(!hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, initial.id, uuid(1), &error) && !error.isEmpty(),
+                "explicit historical model read unexpectedly accepted a raw revision");
+
+        const NetworkHydraulic network = completeNetwork();
+        const native::Revision saved = hydraulic::saveHydraulicNetwork(repository, "main", network);
+        require(saved.modelIndexed && saved.id != initial.id,
+                "first hydraulic save did not publish a model-indexed revision");
+        compareNetworks(network, requiredLoad(repository, "main", network.uuid));
+        compareNetworks(network, requiredLoadAtRevision(repository, saved.id, network.uuid));
+        (void)repository.verifyRepository();
+
+        repository.createBranch("raw");
+        repository.commit("raw", {{hydraulic::keyFromUuid(uuid(9000)),
+                                   native::Bytes{'r', 'a', 'w'}}});
+        const native::Hash rawHead = repository.head("raw").id;
+        bool rejected = false;
+        try {
+            (void)hydraulic::saveHydraulicNetwork(repository, "raw", network);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected && repository.head("raw").id == rawHead,
+                "hydraulic save accepted populated raw branch or advanced its head");
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
 }
 
 void exercise(native::PhysicalStore physical) {
@@ -2123,11 +2197,186 @@ void exerciseCoordinatedMembershipMerges(native::PhysicalStore physical) {
     std::filesystem::remove_all(folder, ignored);
 }
 
+
+// A revision is an immutable read boundary: branch movement must never
+// combine metadata, membership, and model payloads from different commits.
+void exerciseSnapshotReads(native::PhysicalStore physical) {
+    const std::filesystem::path folder = tempDir();
+    try {
+        native::Repository repository(folder, physical);
+        repository.createBranch("main");
+        NetworkHydraulic initial = completeNetwork();
+        initial.title_line_1 = QStringLiteral("0");
+        initial.nodes_junctions[0].metadata.description = QStringLiteral("0");
+        initial.map_labels[0].text = QStringLiteral("0");
+        const native::Revision original = hydraulic::saveHydraulicNetwork(repository, "main", initial);
+
+        QString error = QStringLiteral("stale error");
+        const std::optional<NetworkHydraulic> originalCopy =
+            hydraulic::loadHydraulicNetworkAtRevision(repository, original.id, initial.uuid, &error);
+        require(originalCopy.has_value() && error.isEmpty(), "cannot read original revision");
+        compareNetworks(initial, *originalCopy);
+        const std::optional<QList<QUuid>> originalLabels =
+            hydraulic::listHydraulicEntityIdsAtRevision(repository, original.id, initial.uuid,
+                                                       hydraulic::HydraulicEntityType::MapLabel, &error);
+        require(originalLabels && originalLabels->size() == 1 &&
+                originalLabels->first() == uuid(28) && error.isEmpty(),
+                "original membership list is incorrect");
+        const std::optional<hydraulic::HydraulicEntity> originalLabel =
+            hydraulic::loadHydraulicEntityAtRevision(repository, original.id, initial.uuid, uuid(28), &error);
+        require(originalLabel && std::get_if<HydraulicMapLabel>(&*originalLabel) != nullptr &&
+                std::get<HydraulicMapLabel>(*originalLabel).text == QStringLiteral("0") && error.isEmpty(),
+                "original targeted read is incorrect");
+
+        NetworkHydraulic updated = initial;
+        updated.title_line_1 = QStringLiteral("2");
+        updated.nodes_junctions[0].metadata.description = QStringLiteral("2");
+        updated.map_labels[0].text = QStringLiteral("2");
+        HydraulicMapLabel additional = item<HydraulicMapLabel>(299);
+        additional.anchor_node_uuid = uuid(20);
+        additional.text = QStringLiteral("extra");
+        updated.map_labels.append(additional);
+        const native::Revision second = hydraulic::saveHydraulicNetwork(repository, "main", updated);
+        require(second.id != original.id, "updated network did not advance branch");
+
+        compareNetworks(initial, requiredLoadAtRevision(repository, original.id, initial.uuid));
+        compareNetworks(updated, requiredLoadAtRevision(repository, second.id, initial.uuid));
+        const std::optional<QList<QUuid>> before =
+            hydraulic::listHydraulicEntityIdsAtRevision(repository, original.id, initial.uuid,
+                                                       hydraulic::HydraulicEntityType::MapLabel, &error);
+        const std::optional<QList<QUuid>> after =
+            hydraulic::listHydraulicEntityIdsAtRevision(repository, second.id, initial.uuid,
+                                                       hydraulic::HydraulicEntityType::MapLabel, &error);
+        require(before && before->size() == 1 && after && after->size() == 2,
+                "membership lists did not honor requested revision");
+        require(!hydraulic::loadHydraulicEntityAtRevision(
+                    repository, original.id, initial.uuid, additional.uuid, &error) && error.isEmpty(),
+                "future entity was visible in historical revision");
+        const std::optional<hydraulic::HydraulicEntity> inserted =
+            hydraulic::loadHydraulicEntityAtRevision(
+                repository, second.id, initial.uuid, additional.uuid, &error);
+        require(inserted && std::get_if<HydraulicMapLabel>(&*inserted) != nullptr && error.isEmpty(),
+                "new member missing in new revision");
+        require(!hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, original.id, uuid(98765), &error) && error.isEmpty(),
+                "missing historical network did not clear error");
+        require(!hydraulic::listHydraulicEntityIdsAtRevision(
+                    repository, original.id, uuid(98765),
+                    hydraulic::HydraulicEntityType::MapLabel, &error) && error.isEmpty(),
+                "missing historical network list did not clear error");
+        require(!hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, native::Hash{}, initial.uuid, &error) && !error.isEmpty(),
+                "invalid revision was not rejected");
+        error.clear();
+        require(!hydraulic::listHydraulicEntityIdsAtRevision(
+                    repository, original.id, initial.uuid,
+                    static_cast<hydraulic::HydraulicEntityType>(999), &error) && !error.isEmpty(),
+                "invalid collection was not rejected");
+
+        // Concurrent writers repeatedly replace every snapshot marker and
+        // sometimes rewrite collection membership. Each returned aggregate
+        // must belong wholly to one generation, including its member count.
+        std::atomic<bool> begin{false};
+        std::atomic<int> readerChecks{0};
+        std::exception_ptr failure;
+        std::mutex failureMutex;
+        const std::function<void(std::exception_ptr)> reportFailure =
+            [&failure, &failureMutex](std::exception_ptr errorPtr) {
+                std::lock_guard<std::mutex> guarded(failureMutex);
+                if (!failure) failure = errorPtr;
+            };
+        const std::function<void()> reader = [&]() {
+            try {
+                while (!begin.load()) std::this_thread::yield();
+                for (int iteration = 0; iteration < 100; ++iteration) {
+                    QString readError;
+                    const std::optional<NetworkHydraulic> observed =
+                        hydraulic::loadHydraulicNetwork(repository, "main", initial.uuid, &readError);
+                    require(observed && readError.isEmpty(), "concurrent network read failed");
+                    const QString marker = observed->title_line_1;
+                    bool numeric = false;
+                    const int generation = marker.toInt(&numeric);
+                    require(numeric && generation >= 2 && generation <= 40,
+                            "invalid generation marker in concurrent read");
+                    require(observed->nodes_junctions[0].metadata.description == marker &&
+                            observed->map_labels[0].text == marker,
+                            "mixed network entity generations in one read");
+                    require(observed->map_labels.size() == (generation % 2 == 0 ? 2 : 1),
+                            "mixed network manifest and metadata generations");
+                    if (iteration % 5 == 0) {
+                        // A second branch read may select a newer revision,
+                        // but must still return an internally valid member.
+                        const std::optional<hydraulic::HydraulicEntity> targeted =
+                            hydraulic::loadHydraulicEntity(
+                                repository, "main", initial.uuid, uuid(28), &readError);
+                        require(targeted && std::get_if<HydraulicMapLabel>(&*targeted) != nullptr &&
+                                readError.isEmpty(), "concurrent targeted lookup failed");
+                        const QString entityMarker = std::get<HydraulicMapLabel>(*targeted).text;
+                        bool validMarker = false;
+                        const int entityGeneration = entityMarker.toInt(&validMarker);
+                        require(validMarker && entityGeneration >= 2 && entityGeneration <= 40,
+                                "concurrent targeted lookup returned an invalid generation");
+                        const std::optional<QList<QUuid>> listed =
+                            hydraulic::listHydraulicEntityIds(
+                                repository, "main", initial.uuid,
+                                hydraulic::HydraulicEntityType::MapLabel, &readError);
+                        require(listed && (listed->size() == 1 || listed->size() == 2) &&
+                                listed->first() == uuid(28) && readError.isEmpty(),
+                                "concurrent membership listing failed");
+                        compareNetworks(initial, requiredLoadAtRevision(
+                            repository, original.id, initial.uuid));
+                    }
+                    ++readerChecks;
+                    std::this_thread::yield();
+                }
+            } catch (...) {
+                reportFailure(std::current_exception());
+            }
+        };
+        // 'updated' corresponds to generation 2; start at generation 3.
+        std::thread firstReader(reader);
+        std::thread secondReader(reader);
+        std::thread writer([&]() {
+            try {
+                begin.store(true);
+                for (int generation = 3; generation <= 40; ++generation) {
+                    updated.title_line_1 = QString::number(generation);
+                    updated.nodes_junctions[0].metadata.description = QString::number(generation);
+                    updated.map_labels[0].text = QString::number(generation);
+                    if (generation % 2 != 0) updated.map_labels.removeLast();
+                    else if (updated.map_labels.size() == 1) updated.map_labels.append(additional);
+                    (void)hydraulic::saveHydraulicNetwork(repository, "main", updated);
+                    std::this_thread::yield();
+                }
+            } catch (...) {
+                reportFailure(std::current_exception());
+            }
+        });
+        firstReader.join();
+        secondReader.join();
+        writer.join();
+        if (failure) std::rethrow_exception(failure);
+        require(readerChecks == 200, "concurrent snapshot readers did not finish");
+        compareNetworks(initial, requiredLoadAtRevision(repository, original.id, initial.uuid));
+        compareNetworks(updated, requiredLoad(repository, "main", initial.uuid));
+        require(repository.verifyRepository().revisions >= 40,
+                "concurrent writes did not preserve valid historical revisions");
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
+        exerciseEmptyRawBranch(native::PhysicalStore::Stage7Pack);
+        exerciseEmptyRawBranch(native::PhysicalStore::ExperimentalBlocks);
         exercise(native::PhysicalStore::Stage7Pack);
         exercise(native::PhysicalStore::ExperimentalBlocks);
         exerciseChunkBoundaries(native::PhysicalStore::Stage7Pack);
@@ -2142,6 +2391,8 @@ int main(int argc, char** argv) {
         exerciseStructuralMergeChoices(native::PhysicalStore::ExperimentalBlocks);
         exerciseCoordinatedMembershipMerges(native::PhysicalStore::Stage7Pack);
         exerciseCoordinatedMembershipMerges(native::PhysicalStore::ExperimentalBlocks);
+        exerciseSnapshotReads(native::PhysicalStore::Stage7Pack);
+        exerciseSnapshotReads(native::PhysicalStore::ExperimentalBlocks);
         std::cout << "Complete hydraulic network persistence tests passed on both backends\n";
         return 0;
     } catch (const std::exception& failure) {

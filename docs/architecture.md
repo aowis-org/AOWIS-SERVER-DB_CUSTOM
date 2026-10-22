@@ -49,7 +49,7 @@ Object records use an `AOBJ` header and typed canonical bytes. Index entries con
 
 ## Concurrency and physical limits
 
-The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. The block backend permits one open repository handle at a time. An HTTP service managing multiple projects must own/manage their repository handles centrally, rather than repeatedly opening competing handles. The database and server are Linux/POSIX-oriented and not yet production hardened.
+Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. The block backend permits one open repository handle at a time. An HTTP service managing multiple projects must own/manage their repository handles centrally, rather than repeatedly opening competing handles. The database and server are Linux/POSIX-oriented and not yet production hardened.
 
 ## Replication independence
 
