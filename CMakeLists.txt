@@ -121,6 +121,11 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-bundle-disk-index-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-bundle-disk-index-tests COMMAND aowis-native-bundle-disk-index-tests)
     set_tests_properties(aowis-native-bundle-disk-index-tests PROPERTIES LABELS "aowis")
+    # Separate, cheap cross-kind trie-cache regression; also useful under
+    # sanitizers without executing the long large-bundle stress fixture.
+    add_test(NAME aowis-native-bundle-shared-trie-tests
+        COMMAND aowis-native-bundle-disk-index-tests --shared-kinds-only)
+    set_tests_properties(aowis-native-bundle-shared-trie-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-sync-tests tests/native_sync_tests.cpp)
     target_link_libraries(aowis-native-sync-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-sync-tests COMMAND aowis-native-sync-tests)

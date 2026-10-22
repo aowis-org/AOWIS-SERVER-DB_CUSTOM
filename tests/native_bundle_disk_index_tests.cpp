@@ -23,6 +23,8 @@ using aowis::native::Bytes;
 using aowis::native::Change;
 using aowis::native::Hash;
 using aowis::native::Key;
+using aowis::native::ModelRecord;
+using aowis::native::ModelChange;
 using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
@@ -163,6 +165,58 @@ void rejectWithoutPublication(Repository& receiver, const std::filesystem::path&
     throw std::runtime_error("corrupted transfer accepted");
 }
 
+// The same immutable trie hash may occur in a raw ancestor and a later
+// model-indexed revision. Summaries MUST remain distinct by tree kind, since
+// both kinds validate leaf values differently. This also forces retrieval of
+// cached summaries while walking the two historical revisions.
+void exerciseSharedTreesAcrossKinds(PhysicalStore sourceBackend,
+                                    PhysicalStore destinationBackend) {
+    TemporaryRoot temporary;
+    ScopedTemporaryIndexDirectory temporaryIndex(temporary.path() / "scratch");
+    Repository source(temporary.path() / "source", sourceBackend);
+    Repository destination(temporary.path() / "destination", destinationBackend);
+    source.createBranch("main");
+    Key first{};
+    Key second{};
+    first.back() = 0x23;
+    second.back() = 0x34;
+    const ModelRecord one{1, {}, Bytes{'a', 'b', 'c'}};
+    const ModelRecord two{2, {}, Bytes{'d', 'e', 'f'}};
+    const aowis::native::Revision raw = source.commit("main", {
+        Change{first, aowis::native::encodeModelRecord(one)},
+        Change{second, aowis::native::encodeModelRecord(two)}});
+    (void)source.commit("main", {Change{first, std::nullopt},
+                                  Change{second, std::nullopt}});
+    const aowis::native::Revision model = source.commitModel("main", {
+        ModelChange{first, one}, ModelChange{second, two}});
+    check(raw.root == model.root && raw.root != Hash{},
+          "shared-tree fixture did not reuse identical immutable trie objects");
+    check(!raw.modelIndexed && model.modelIndexed,
+          "shared-tree fixture must cross raw/model revision kinds");
+    const std::filesystem::path bundle = temporary.path() / "shared-kinds.aowbundle";
+    source.exportBranchBundle("main", bundle);
+    const BundleImportResult imported = destination.importBranchBundle(bundle, "main");
+    check(imported.status == BundleImportStatus::Created && imported.head == model.id,
+          "shared raw/model tree transfer failed");
+    check(destination.revision(raw.id).root == destination.head("main").root,
+          "imported shared trie roots differ");
+    check(destination.getAtRevision(raw.id, first) ==
+          std::optional<Bytes>(aowis::native::encodeModelRecord(one)),
+          "raw historical record differs after shared-tree import");
+    const std::optional<ModelRecord> restored =
+        destination.getModelAtRevision(model.id, second);
+    check(restored.has_value() && restored->kind == two.kind &&
+          restored->references == two.references && restored->payload == two.payload,
+          "model historical record differs after shared-tree import");
+    const aowis::native::VerificationReport originalReport = source.verifyRepository();
+    const aowis::native::VerificationReport importedReport = destination.verifyRepository();
+    check(originalReport.revisions == importedReport.revisions &&
+          originalReport.treeNodes == importedReport.treeNodes &&
+          originalReport.modelSnapshots == importedReport.modelSnapshots,
+          "file-backed import altered logical integrity statistics");
+    temporaryIndex.checkEmpty();
+}
+
 void exercise(PhysicalStore sourceBackend, PhysicalStore destinationBackend) {
     TemporaryRoot temporary;
     ScopedTemporaryIndexDirectory temporaryIndex(temporary.path() / "scratch");
@@ -206,7 +260,12 @@ void exercise(PhysicalStore sourceBackend, PhysicalStore destinationBackend) {
     check(created.status == BundleImportStatus::Created && created.head == firstTip &&
           created.objectsImported > 600, "full file-backed import was incomplete");
     temporaryIndex.checkEmpty();
-    (void)destination.verifyRepository();
+    const aowis::native::VerificationReport originalReport = source.verifyRepository();
+    const aowis::native::VerificationReport importedReport = destination.verifyRepository();
+    check(originalReport.revisions == importedReport.revisions &&
+          originalReport.treeNodes == importedReport.treeNodes &&
+          originalReport.modelSnapshots == importedReport.modelSnapshots,
+          "file-backed trie cache changed logical verification statistics");
 
     const std::filesystem::path orphan = temporary.path() / "orphan.aowbundle";
     appendUnreachableObject(full, orphan);
@@ -263,13 +322,19 @@ void exercise(PhysicalStore sourceBackend, PhysicalStore destinationBackend) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool sharedOnly = argc == 2 &&
+            std::string_view(argv[1]) == "--shared-kinds-only";
+        check(argc == 1 || sharedOnly, "invalid bundle disk-index test arguments");
         const std::array<PhysicalStore, 2> backends{
             PhysicalStore::Stage7Pack, PhysicalStore::ExperimentalBlocks};
-        for (PhysicalStore source : backends)
-            for (PhysicalStore destination : backends)
-                exercise(source, destination);
+        for (PhysicalStore source : backends) {
+            for (PhysicalStore destination : backends) {
+                if (!sharedOnly) exercise(source, destination);
+                exerciseSharedTreesAcrossKinds(source, destination);
+            }
+        }
         std::cout << "AOWIS native bundle disk-index tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

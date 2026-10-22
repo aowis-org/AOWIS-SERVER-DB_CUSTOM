@@ -423,6 +423,106 @@ private:
     std::uint64_t marked_ = 0;
 };
 
+// A verified trie summary consists of one representative UUID and the root
+// depth (or a leaf flag). During large bundle imports there can be many more
+// summaries than reachable revisions. Keep summaries for transferred objects
+// in a private, disk-backed table indexed by the sorted bundle object ordinal.
+// A hash may be interpreted as a raw, model, or reference tree, so each kind
+// has an independent slot: leaf VALUE validation depends on that kind.
+struct TreeSummary {
+    Key representative{};
+    bool leaf = false;
+    unsigned depth = 0;
+};
+
+class BundleTreeSummaries {
+public:
+    static constexpr std::size_t slotBytes = 20;
+    static constexpr std::size_t kinds = 3;
+    static constexpr std::size_t entryBytes = slotBytes * kinds;
+
+    explicit BundleTreeSummaries(std::size_t count) : count_(count) {
+        if (count == 0) return;
+        require(count <= std::numeric_limits<std::size_t>::max() / entryBytes &&
+                    count <= static_cast<std::uint64_t>(
+                        std::numeric_limits<off_t>::max()) / entryBytes,
+                "replication trie summary table exceeds file address limits");
+        const std::filesystem::path temporaryName =
+            std::filesystem::temp_directory_path() / "aowis-db-tree-summaries-XXXXXX";
+        const std::string name = temporaryName.string();
+        std::vector<char> writableName(name.begin(), name.end());
+        writableName.push_back('\0');
+        this->fd_ = ::mkstemp(writableName.data());
+        systemCall(this->fd_ >= 0, "create temporary trie summary table");
+        try {
+            systemCall(::unlink(writableName.data()) == 0,
+                       "unlink temporary trie summary table");
+            systemCall(::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) == 0,
+                       "mark trie summary table close-on-exec");
+            const std::size_t bytes = count * entryBytes;
+            // A sparse mapped file can SIGBUS on first access under ENOSPC.
+            // Reserve its blocks up front and fail the import cleanly instead.
+            const int allocation = ::posix_fallocate(this->fd_, 0, static_cast<off_t>(bytes));
+            if (allocation != 0) {
+                errno = allocation;
+                systemCall(false, "reserve temporary trie summary table");
+            }
+            void* const mapped = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, this->fd_, 0);
+            systemCall(mapped != MAP_FAILED, "map temporary trie summary table");
+            this->mapped_ = static_cast<std::uint8_t*>(mapped);
+        } catch (...) {
+            ::close(this->fd_);
+            this->fd_ = -1;
+            throw;
+        }
+    }
+
+    ~BundleTreeSummaries() {
+        if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->count_ * entryBytes);
+        if (this->fd_ >= 0) ::close(this->fd_);
+    }
+    BundleTreeSummaries(const BundleTreeSummaries&) = delete;
+    BundleTreeSummaries& operator=(const BundleTreeSummaries&) = delete;
+
+    std::optional<TreeSummary> read(std::size_t ordinal, unsigned kind) const {
+        const std::uint8_t* slot = slotAt(ordinal, kind);
+        if (slot[0] == 0) return std::nullopt;
+        TreeSummary summary{};
+        std::copy_n(slot + 4, summary.representative.size(), summary.representative.begin());
+        summary.leaf = slot[1] != 0;
+        summary.depth = slot[2];
+        return summary;
+    }
+
+    void write(std::size_t ordinal, unsigned kind, const TreeSummary& summary) {
+        std::uint8_t* slot = slotAt(ordinal, kind);
+        require(slot[0] == 0, "duplicate replication trie summary");
+        require(summary.depth < 32, "invalid replication trie summary depth");
+        // Set the validity byte last: a failed verification never caches a
+        // partially written summary, even if an import throws during parsing.
+        slot[1] = summary.leaf ? 1 : 0;
+        slot[2] = static_cast<std::uint8_t>(summary.depth);
+        std::copy(summary.representative.begin(), summary.representative.end(), slot + 4);
+        slot[0] = 1;
+        ++this->saved_;
+    }
+
+    std::uint64_t size() const { return this->saved_; }
+
+private:
+    std::uint8_t* slotAt(std::size_t ordinal, unsigned kind) const {
+        require(ordinal < this->count_ && kind < kinds && this->mapped_ != nullptr,
+                "replication trie summary lookup out of range");
+        return this->mapped_ + ordinal * entryBytes + kind * slotBytes;
+    }
+
+    int fd_ = -1;
+    std::size_t count_ = 0;
+    std::uint8_t* mapped_ = nullptr;
+    std::uint64_t saved_ = 0;
+};
+
 // The semantic model verifier must compare edges grouped by *target* UUID.
 // Scanning models produces them grouped by *source* UUID. Sort fixed-size
 // (target, source) records in bounded chunks and merge the runs from one
@@ -645,6 +745,9 @@ struct ExternalVerificationMarks {
     std::function<std::optional<std::uint8_t>(const Hash&)> read;
     std::function<void(const Hash&, std::uint8_t)> write;
     std::function<std::uint64_t()> markedCount;
+    std::function<std::optional<TreeSummary>(const Hash&, unsigned)> readTree;
+    std::function<void(const Hash&, unsigned, const TreeSummary&)> writeTree;
+    std::function<std::uint64_t()> treeCount;
 };
 
 LogicalVerification verifyLogicalGraph(
@@ -654,11 +757,6 @@ LogicalVerification verifyLogicalGraph(
     enum class Kind {
         Revision, RawTree, ModelTree, ReferenceTree,
         RawValue, ModelValue, ReferenceValue
-    };
-    struct TreeSummary {
-        Key representative{};
-        bool leaf = false;
-        unsigned depth = 0;
     };
     std::vector<std::pair<Hash, Kind>> pending;
     for (const Hash& tip : tips) {
@@ -692,6 +790,17 @@ LogicalVerification verifyLogicalGraph(
         try {
             require(!isZero(hash), "zero bundled tree node");
             const std::pair<Hash, Kind> identity{hash, kind};
+            const unsigned treeKind = static_cast<unsigned>(kind) -
+                static_cast<unsigned>(Kind::RawTree);
+            // Imported nodes live in the file-backed table. Locally resident
+            // ancestors of incremental bundles use the ordinary map fallback.
+            const std::optional<TreeSummary> cached = externalMarks.readTree
+                ? externalMarks.readTree(hash, treeKind) : std::nullopt;
+            if (cached) {
+                require(cached->leaf || cached->depth >= minimumDepth,
+                        "invalid bundled compressed trie depth ordering");
+                return *cached;
+            }
             const std::map<std::pair<Hash, Kind>, TreeSummary>::const_iterator previous =
                 verifiedTrees.find(identity);
             if (previous != verifiedTrees.end()) {
@@ -749,7 +858,12 @@ LogicalVerification verifyLogicalGraph(
                 throw std::runtime_error("invalid bundled tree tag");
             }
             visitingTrees.erase(identity);
-            verifiedTrees.emplace(identity, result);
+            if (externalMarks.writeTree && externalMarks.read &&
+                externalMarks.read(hash).has_value()) {
+                externalMarks.writeTree(hash, treeKind, result);
+            } else {
+                verifiedTrees.emplace(identity, result);
+            }
             markKind(hash, kind);
             return result;
         } catch (const std::exception& error) {
@@ -924,7 +1038,8 @@ LogicalVerification verifyLogicalGraph(
     summary.reachableObjects = static_cast<std::uint64_t>(checkedKinds.size()) +
         (externalMarks.markedCount ? externalMarks.markedCount() : 0);
     summary.revisions = std::move(verifiedRevisions);
-    summary.treeNodes = static_cast<std::uint64_t>(verifiedTrees.size());
+    summary.treeNodes = static_cast<std::uint64_t>(verifiedTrees.size()) +
+        (externalMarks.treeCount ? externalMarks.treeCount() : 0);
     summary.modelSnapshots = static_cast<std::uint64_t>(verifiedModelSnapshots.size());
     return summary;
 }
@@ -2802,6 +2917,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         // a single leaf). Parent checks can therefore use one representative
         // key without revisiting descendants in each ancestor context.
         BundleVisitMarks visitMarks(entries.size());
+        BundleTreeSummaries treeSummaries(entries.size());
         const ExternalVerificationMarks externalMarks{
             [&](const Hash& hash) -> std::optional<std::uint8_t> {
                 const std::optional<std::size_t> ordinal = entries.ordinal(hash);
@@ -2813,7 +2929,18 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 require(ordinal.has_value(), "missing hash in bundle visitation index");
                 visitMarks.mark(*ordinal, bits);
             },
-            [&]() { return visitMarks.markedCount(); }
+            [&]() { return visitMarks.markedCount(); },
+            [&](const Hash& hash, unsigned kind) -> std::optional<TreeSummary> {
+                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
+                if (!ordinal) return std::nullopt;
+                return treeSummaries.read(*ordinal, kind);
+            },
+            [&](const Hash& hash, unsigned kind, const TreeSummary& summary) {
+                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
+                require(ordinal.has_value(), "missing hash in bundle trie summary index");
+                treeSummaries.write(*ordinal, kind, summary);
+            },
+            [&]() { return treeSummaries.size(); }
         };
         const LogicalVerification verification =
             verifyLogicalGraph({incoming}, bundleObject, externalMarks);
