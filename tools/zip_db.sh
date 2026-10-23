@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Package the current project, including uncommitted and newly added files,
-# without bundling .git or ignored/generated build artifacts.
+# Package the complete checked-out project, including changes and non-ignored
+# untracked files in every initialized submodule (and nested submodules).
+# Gitlinks contain commit IDs, not source files; recurse into each worktree.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
 project_parent="$(dirname -- "$project_root")"
@@ -36,52 +37,72 @@ if [[ "$output_path" != *.zip ]]; then
     exit 1
 fi
 
-# Build the archive outside the worktree. Move it into place only on success.
+# Create the archive outside the worktree and replace the destination only
+# after successful discovery and packaging. A missing submodule must not leave
+# behind an apparently complete snapshot.
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 tmp_archive="$tmp_dir/db.zip"
-
 files=()
-while IFS= read -r -d '' relative_path; do
-    [[ -f "$project_root/$relative_path" ]] || continue
 
-    # Never package private environment files or key material by accident.
-    case "/$relative_path" in
-        */.env|*/.env.*|*.pem|*.key|*.p12|*.pfx) continue ;;
-    esac
+collect_worktree() {
+    local worktree="$1"
+    local prefix="$2"  # Path relative to the project root; empty at the top.
+    local file_list index_list relative_path project_path entry metadata mode stage
+    local submodule_root submodule_path git_root
 
-    [[ "$project_root/$relative_path" != "$output_path" ]] || continue
-
-    if [[ "$relative_path" == *$'\n'* ]]; then
-        printf 'Error: filenames containing newlines cannot be archived.\n' >&2
-        exit 1
-    fi
-
-    files+=("$project_name/$relative_path")
-done < <(git -C "$project_root" ls-files -z --cached --others --exclude-standard)
-
-# Include the checked-out Model submodule sources: the superproject index
-# contains only a gitlink, so the loop above intentionally skips its tree.
-model_rel="external/AOWIS-SERVER-MODEL"
-if [[ "$(git -C "$project_root" ls-files --stage -- "$model_rel")" == '160000 '* ]]; then
-    model_root="$project_root/$model_rel"
-    if [[ ! -f "$model_root/CMakeLists.txt" ]] ||
-       [[ "$(git -C "$model_root" rev-parse --show-toplevel 2>/dev/null)" != "$model_root" ]]; then
-        printf 'Error: Model submodule not initialized. Run ./git_submodule_init.sh first.\n' >&2
-        exit 1
-    fi
+    # Check the command's exit status: failures inside process substitutions
+    # would otherwise be masked by the surrounding while loop.
+    file_list="$(mktemp "$tmp_dir/files.XXXXXX")"
+    git -C "$worktree" ls-files -z --cached --others --exclude-standard > "$file_list"
     while IFS= read -r -d '' relative_path; do
-        [[ -f "$model_root/$relative_path" ]] || continue
-        case "/$relative_path" in
+        [[ -f "$worktree/$relative_path" ]] || continue
+        project_path="${prefix:+$prefix/}$relative_path"
+
+        # Never package private environment files or key material by accident.
+        case "/$project_path" in
             */.env|*/.env.*|*.pem|*.key|*.p12|*.pfx) continue ;;
         esac
-        if [[ "$relative_path" == *$'\n'* ]]; then
+        if [[ "$project_path" == *$'\n'* ]]; then
             printf 'Error: filenames containing newlines cannot be archived.\n' >&2
-            exit 1
+            return 1
         fi
-        files+=("$project_name/$model_rel/$relative_path")
-    done < <(git -C "$model_root" ls-files -z --cached --others --exclude-standard)
-fi
+        [[ "$worktree/$relative_path" != "$output_path" ]] || continue
+        files+=("$project_name/$project_path")
+    done < "$file_list"
+
+    # Discover every gitlink from the index, rather than relying on hardcoded
+    # submodule names or .gitmodules text (which alone does not pin a commit).
+    index_list="$(mktemp "$tmp_dir/gitlinks.XXXXXX")"
+    git -C "$worktree" ls-files --stage -z > "$index_list"
+    while IFS= read -r -d '' entry; do
+        metadata="${entry%%$'\t'*}"
+        mode="${metadata%% *}"
+        [[ "$mode" == 160000 ]] || continue
+        stage="${metadata##* }"
+        relative_path="${entry#*$'\t'}"
+        submodule_path="${prefix:+$prefix/}$relative_path"
+        if [[ "$stage" != 0 || "$submodule_path" == *$'\n'* ]]; then
+            printf 'Error: unresolved or invalid submodule gitlink: %s\n' "$submodule_path" >&2
+            return 1
+        fi
+
+        submodule_root="$worktree/$relative_path"
+        # Without its own Git worktree, `git -C` could silently fall back to
+        # the parent repo and cause a partial or incorrect ZIP.
+        git_root="$(git -C "$submodule_root" rev-parse --show-toplevel 2>/dev/null)" || {
+            printf 'Error: submodule %s is not initialized; run git submodule update --init --recursive.\n' "$submodule_path" >&2
+            return 1
+        }
+        if [[ "$(cd -- "$git_root" && pwd -P)" != "$(cd -- "$submodule_root" && pwd -P)" ]]; then
+            printf 'Error: submodule %s is not initialized; run git submodule update --init --recursive.\n' "$submodule_path" >&2
+            return 1
+        fi
+        collect_worktree "$submodule_root" "$submodule_path"
+    done < "$index_list"
+}
+
+collect_worktree "$project_root" ""
 
 if [[ ${#files[@]} -eq 0 ]]; then
     printf 'Error: no project files found to archive.\n' >&2

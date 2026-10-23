@@ -54,6 +54,17 @@ target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    # Packaging must include the working-tree files of every Git submodule,
+    # including recursive submodules. The test creates disposable Git repos.
+    find_program(AOWIS_TEST_GIT_EXECUTABLE git)
+    find_program(AOWIS_TEST_ZIP_EXECUTABLE zip)
+    if(AOWIS_TEST_GIT_EXECUTABLE AND AOWIS_TEST_ZIP_EXECUTABLE)
+        add_test(NAME aowis-native-zip-submodule-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/zip_submodule_tests.py"
+                --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/zip_db.sh")
+        set_tests_properties(aowis-native-zip-submodule-tests PROPERTIES LABELS "aowis")
+    endif()
     add_test(NAME aowis-native-replication-benchmark-smoke
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_replication_scaling.py"
