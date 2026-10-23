@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -73,6 +74,17 @@ void expectKind(StorageErrorKind expected, const std::string& label,
         throw std::runtime_error(label + ": untyped exception: " + error.what());
     }
     throw std::runtime_error(label + ": no exception");
+}
+
+// Offset of the pack record (AOBJ\1 | SHA-256 | size | payload) of `hash`.
+std::uint64_t packRecordOffset(const std::filesystem::path& pack, const Hash& hash) {
+    std::ifstream stream(pack, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    std::string header{'A', 'O', 'B', 'J', '\x01'};
+    header.append(reinterpret_cast<const char*>(hash.data()), hash.size());
+    const std::size_t position = bytes.find(header);
+    expect(position != std::string::npos, "object record not found in pack");
+    return static_cast<std::uint64_t>(position);
 }
 
 void flipByte(const std::filesystem::path& file, std::uint64_t offset) {
@@ -203,7 +215,9 @@ void testImportKinds() {
             Repository target(path);
             target.importBranchBundle(directory.path / "base.bundle", "main");
         }
-        flipByte(path / "objects.pack", 45U + 1U); // body of the first imported object
+        // Incremental verification reads only the boundary of the local
+        // graph; the base revision is always part of it.
+        flipByte(path / "objects.pack", packRecordOffset(path / "objects.pack", base) + 45U + 1U);
         Repository target(path);
         expectKind(StorageErrorKind::Corruption, "local damage during incremental import",
                    [&] { (void)target.importBranchBundle(directory.path / "delta.bundle", "main"); });

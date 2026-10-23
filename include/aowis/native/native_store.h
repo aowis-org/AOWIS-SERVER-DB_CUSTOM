@@ -9,6 +9,7 @@
 #include <mutex>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -283,13 +284,20 @@ public:
                             BundleLimits limits = {});
     // Delta relative to a revision already present at the recipient. The base
     // must be an ancestor (through either merge parent) of the exported head.
-    // Every object reachable from that base is omitted from the transfer.
+    // Carries the revisions not reachable from the base and, per revision, the
+    // trie objects that differ from one of its parents. Reads only the base's
+    // revision ancestry and the changed trie paths. May include objects the
+    // recipient already holds (e.g. a restored older snapshot); those are not
+    // stored twice.
     void exportIncrementalBranchBundle(std::string_view branch, const Hash& recipientBase,
                                        const std::filesystem::path& bundlePath, BundleLimits limits = {});
     // Import creates a new local branch or advances it only by fast-forward.
     // It never overwrites divergent local work or creates an implicit merge.
     // All bundle SHA-256 hashes and object graph edges are verified before
     // writing any objects or publishing a ref. Authorization is not provided.
+    // Objects an incremental bundle references but does not carry must exist
+    // locally; they were verified when stored and are checked only where they
+    // attach to bundled objects, so the work follows the delta, not history.
     BundleImportResult importBranchBundle(const std::filesystem::path& bundlePath,
                                           std::string_view localBranch, BundleLimits limits = {},
                                           BundleImportProfile* profile = nullptr);
@@ -394,6 +402,10 @@ private:
                     std::size_t limit = std::numeric_limits<std::size_t>::max());
     void diffWholeSubtree(const Hash& root, bool added, std::vector<Difference>& output,
                           std::size_t limit);
+    // Incremental export: objects reachable from `tip` but not held by a
+    // recipient of `base`, collected per new revision by a trie delta.
+    std::set<Hash> collectDelta(const Hash& tip, const Hash& base);
+    void collectTreeDelta(const Hash& before, const Hash& after, std::set<Hash>& output);
     Revision commitLocked(std::string_view branch, const std::vector<Change>& changes,
                           std::optional<Hash> referencesRoot = std::nullopt,
                           std::optional<Hash> mergeParent = std::nullopt);

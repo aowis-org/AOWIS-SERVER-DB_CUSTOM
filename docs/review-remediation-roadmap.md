@@ -23,7 +23,7 @@ Style findings about `auto` are out of scope by decision.
 | 3 | `aowis-db-custom-request-bounds` | F5 unbounded bodies, F9 late caps, F10a branch scoping | Medium | 2 | done |
 | 4 | `aowis-db-custom-scratch-storage` | F6 scratch files on tmpfs | Medium | – | done |
 | 5 | `aowis-db-custom-httplib-server` | Replace QHttpServer (F5 on all Qt versions, streaming uploads) | Medium | 2, 3, 4 | done |
-| 6 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | open |
+| 6 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | done |
 | 7 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 5 | open |
 | 8 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | open |
 | 9 | `aowis-db-custom-cleanup` | F12 tidy-ups | Low | – | open |
@@ -136,8 +136,9 @@ Implemented in `aowis-db-custom-typed-errors`:
     report failures as text, so the service treats them as 500 even when the
     cause was I/O or ENOSPC (Phase 9).
   - A structurally invalid **local** object reached by an incremental import
-    is reported as `InvalidInput`; this disappears with Phase 6, which stops
-    re-verifying local objects.
+    is reported as `InvalidInput`; resolved in Phase 6: local objects are no
+    longer re-verified, damaged ones fail their SHA-256 check (`Corruption`),
+    and a bundle that grafts a wrong-kind local object is `InvalidInput`.
   - The HTTP spool/export temp-file failures are `Io` because Qt hides errno
     (Phase 4; done there).
 
@@ -409,7 +410,53 @@ Scope:
 
 ---
 
-## Phase 6: Incremental synchronization cost (Medium, needs Phase 1)
+## Phase 6: Incremental synchronization cost (Medium, needs Phase 1) — done
+
+Implemented in `aowis-db-custom-incremental-sync`:
+- Import: a hash referenced by the bundle but not carried in it, and stored
+  locally, is a trusted **boundary** (`ExternalVerificationMarks::trustedLocal`):
+  - a local trie node gives its parent summary from one read (leaf UUID, or
+    branch depth plus canonical prefix); depth ordering, slot and prefix are
+    checked against the bundled parent as before;
+  - model and reverse-index value kinds of grafted subtrees are enforced by
+    the semantic diff against the verified parent snapshot (every changed
+    leaf is decoded); a local subtree used as a raw tree is checked by
+    descending to one leaf (stored subtrees are homogeneous: `V` or `INR1`);
+  - a local revision must be a valid revision object; its snapshot counts as
+    verified and its ancestry is not walked;
+  - base and fast-forward checks: in the bundle, a boundary, or (fallback,
+    only then reads local history) an ancestor of a boundary.
+- Export: `collectDelta` reads the base's revision ancestry only. Each new
+  revision's trees are walked against one parent's trees (a parent the
+  recipient holds is preferred), aligning compressed tries where a branch
+  split or collapsed. No pruning across revisions: that was found unsound by
+  the random-history test (two revisions can justify each other's skips).
+- Result: a 1-record delta on a 2,000-record model reads 106 local objects at
+  both 50 and 400 commits of history (was ~9,400 / ~100,000); the bundle has
+  17 objects.
+- Trade-off: the bundle is a superset of the minimal one when a revision
+  restores content held by an older revision (e.g. an undo of a large
+  deletion). The importer does not store such objects twice.
+- Tests: new `aowis-native-incremental-sync-tests`:
+  - local reads equal at 50 and 400 commits and bounded; small bundles;
+  - trie shape changes (deep splits, collapses, a 40-key subtree moving up
+    and down, empty tree, restored snapshot, multi-revision and empty deltas);
+  - six random model histories with merges and an eager and a lagging
+    recipient, each delta reproducing the source exactly, then full verify;
+  - forged bundles grafting local objects: reverse-index trie as raw or model
+    tree, model trie as reverse index, bundled leaf with a local `INR1` value,
+    local leaf in the wrong slot, local branch not deeper than its parent,
+    local tree node as parent revision, base not an ancestor; plus a valid
+    graft (local model trie as raw tree) as positive control;
+  - fast-forward where the old head lies below a boundary, repeated and older
+    deltas (up to date), divergence (`Conflict`), older held base.
+  - `native_error_kind_tests` local-damage case now damages the base revision
+    (always read) instead of an arbitrary object.
+  - Nine mutations (raw-kind descent, trust off, ancestry fallback, value
+    emission, boundary snapshot, boundary marked done, cross-revision pruning,
+    trie alignment both ways) were each caught.
+
+Original analysis:
 
 **F3. Incremental import and export scale with total history.**
 Measured with a 4-object delta (ASan build):

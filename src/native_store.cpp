@@ -807,18 +807,20 @@ struct LogicalVerification {
     // revisions instead use the file-backed visitation marks by bundle ordinal.
     std::set<Hash> localRevisions;
     std::function<bool(const Hash&)> containsBundledRevision;
+    // Trusted local revisions referenced by bundled revisions. Their own
+    // ancestry was not walked; see ExternalVerificationMarks::trustedLocal.
+    std::set<Hash> boundaryRevisions;
     std::uint64_t treeNodes = 0;
     std::uint64_t modelSnapshots = 0;
 
     bool containsRevision(const Hash& hash) const {
-        return this->localRevisions.contains(hash) ||
+        return this->localRevisions.contains(hash) || this->boundaryRevisions.contains(hash) ||
                (this->containsBundledRevision && this->containsBundledRevision(hash));
     }
 };
 
 // Only imported bundle hashes use external visitation marks. Incremental
-// bundles also reference existing local hashes, which retain the normal map
-// fallback so all ancestors and object types are checked without exceptions.
+// bundles also reference existing local hashes, which use the map fallback.
 struct ExternalVerificationMarks {
     std::function<std::optional<std::uint8_t>(const Hash&)> read;
     std::function<void(const Hash&, std::uint8_t)> write;
@@ -830,6 +832,12 @@ struct ExternalVerificationMarks {
     // sorted bundle index, selecting only entries marked as revision objects.
     // No separate std::set<Hash> is needed for those entries.
     std::function<void(const std::function<void(const Hash&)>&)> forEachRevision;
+    // Objects already stored in this repository passed verification when
+    // they were committed or imported. Such a hash (absent from the bundle)
+    // is a boundary: its node is read and checked against its position, but
+    // the subtree or ancestry below it is not walked again. This keeps an
+    // incremental import proportional to the delta, not to the history.
+    std::function<bool(const Hash&)> trustedLocal;
 };
 
 struct LogicalVerificationProfile {
@@ -877,9 +885,62 @@ LogicalVerification verifyLogicalGraph(
         }
     };
     std::set<Hash> localRevisions;
+    std::set<Hash> boundaryRevisions;
+    // Semantic (model/reverse-index) state. Trusted boundary revisions enter
+    // it directly: their snapshots are verified, their ancestry is done.
+    std::set<std::pair<Hash, Hash>> verifiedModelSnapshots;
+    std::set<Hash> processedLocalModelRevisions;
+    const std::function<bool(const Hash&)> trusted = [&](const Hash& hash) {
+        return externalMarks.trustedLocal && externalMarks.trustedLocal(hash);
+    };
     std::uint64_t verifiedRevisionCount = 0;
     std::map<std::pair<Hash, Kind>, TreeSummary> verifiedTrees;
     std::set<std::pair<Hash, Kind>> visitingTrees;
+    // A trusted local subtree is internally canonical, so one node gives
+    // the summary its parent needs: a leaf's key, or a branch's depth and
+    // canonical prefix (all nibbles before the depth are shared, the parent
+    // only compares positions up to its own, smaller depth).
+    //
+    // Value kinds: every model or reference leaf that differs from the
+    // verified parent snapshot is decoded by the semantic phase below, so a
+    // grafted subtree of the wrong kind is caught there. Raw trees have no
+    // semantic phase. Values of a stored subtree are homogeneous ('V' raw or
+    // model values vs. INR1 referrer lists), so one leaf decides its kind.
+    const std::function<TreeSummary(const Hash&, Kind, unsigned)> trustedTreeSummary =
+        [&](const Hash& hash, Kind kind, unsigned minimumDepth) {
+            Bytes node = objectByHash(hash);
+            TreeSummary result{};
+            const std::function<void(const Bytes&)> checkNode = [](const Bytes& candidate) {
+                require(Err::Corruption, (candidate.size() == 49 && candidate[0] == 'L') ||
+                            (candidate.size() == 530 && candidate[0] == 'B' && candidate[1] < 32),
+                        "referenced local object is not a tree node");
+            };
+            checkNode(node);
+            if (node[0] == 'L') {
+                result.leaf = true;
+                std::copy_n(node.begin() + 1, 16, result.representative.begin());
+            } else {
+                result.depth = node[1];
+                require(Err::Corruption, result.depth >= minimumDepth,
+                        "invalid bundled compressed trie depth ordering");
+                std::copy_n(node.begin() + 2, 16, result.representative.begin());
+            }
+            if (kind == Kind::RawTree) {
+                while (node[0] == 'B') {
+                    Hash child{};
+                    for (unsigned slot = 0; slot < 16 && isZero(child); ++slot) {
+                        child = readHash(node, 18 + 32U * slot);
+                    }
+                    require(Err::Corruption, !isZero(child), "referenced local branch is empty");
+                    node = objectByHash(child);
+                    checkNode(node);
+                }
+                const Bytes value = objectByHash(readHash(node, 17));
+                require(Err::Corruption, !value.empty() && value[0] == 'V',
+                        "referenced local subtree is not a raw value tree");
+            }
+            return result;
+        };
     std::function<TreeSummary(const Hash&, Kind, unsigned)> verifyTree;
     verifyTree = [&](const Hash& hash, Kind kind, unsigned minimumDepth) -> TreeSummary {
         try {
@@ -902,6 +963,12 @@ LogicalVerification verifyLogicalGraph(
                 require(Err::Corruption, previous->second.leaf || previous->second.depth >= minimumDepth,
                         "invalid bundled compressed trie depth ordering");
                 return previous->second;
+            }
+            if (trusted(hash)) {
+                const TreeSummary result = trustedTreeSummary(hash, kind, minimumDepth);
+                verifiedTrees.emplace(identity, result);
+                markKind(hash, kind);
+                return result;
             }
             require(Err::Corruption, visitingTrees.insert(identity).second, "cyclic bundled trie");
             const Bytes object = objectByHash(hash);
@@ -990,6 +1057,12 @@ LogicalVerification verifyLogicalGraph(
             const Hash referenceRoot = readHash(object, 33);
             require(Err::Corruption, object[65] == 1 || isZero(referenceRoot),
                     "raw bundled revision has reference index");
+            if (trusted(next.first)) {
+                boundaryRevisions.insert(next.first);
+                if (object[65] == 1) verifiedModelSnapshots.emplace(root, referenceRoot);
+                processedLocalModelRevisions.insert(next.first);
+                continue;
+            }
             ++verifiedRevisionCount;
             // The bundle's visitation bitmap is already keyed by content
             // hash. Avoid retaining each imported revision a second time.
@@ -1024,10 +1097,9 @@ LogicalVerification verifyLogicalGraph(
     // otherwise carry an omitted incoming edge, and a later ordinary
     // commitModel() deletion would trust that poisoned reverse index.
     //
-    // Include every reachable historical revision, including merge parents
-    // and locally supplied ancestors of incremental bundles. The same pair of immutable roots is checked
-    // only once when multiple revisions share an unchanged snapshot.
-    std::set<std::pair<Hash, Hash>> verifiedModelSnapshots;
+    // Include every walked revision, including merge parents. Trusted local
+    // boundary revisions are already verified snapshots. The same pair of
+    // immutable roots is checked only once when revisions share a snapshot.
     // A verified canonical trie enumerates its leaf UUIDs in strict order
     // when children are visited from slot 0 to 15. Besides eliminating a
     // second model-key set, explicitly assert this invariant here.
@@ -1163,7 +1235,6 @@ LogicalVerification verifyLogicalGraph(
     // revisions reuse their file-backed mark rather than adding another
     // heap-allocated set for semantic verification.
     constexpr std::uint8_t modelRevisionChecked = 0x80U;
-    std::set<Hash> processedLocalModelRevisions;
     const std::function<bool(const Hash&)> modelRevisionDone = [&](const Hash& id) {
         if (externalMarks.read) {
             const std::optional<std::uint8_t> bits = externalMarks.read(id);
@@ -1383,6 +1454,7 @@ LogicalVerification verifyLogicalGraph(
         (externalMarks.markedCount ? externalMarks.markedCount() : 0);
     summary.revisionCount = verifiedRevisionCount;
     summary.localRevisions = std::move(localRevisions);
+    summary.boundaryRevisions = std::move(boundaryRevisions);
     if (externalMarks.read) {
         const std::function<std::optional<std::uint8_t>(const Hash&)> read = externalMarks.read;
         summary.containsBundledRevision = [read](const Hash& hash) {
@@ -3180,6 +3252,83 @@ void Repository::exportIncrementalBranchBundle(std::string_view branch,
     exportBundleLocked(branch, &bundlePath, -1, recipientBase, limits);
 }
 
+// Objects of `after` that are not part of the tree `before`, found by walking
+// both tries in parallel. Identical subtree hashes are skipped without I/O;
+// where an insertion or deletion changed the trie shape, `before` is aligned
+// to the level of `after`. Skipping happens only for hashes proven present
+// in `before`, so a misaligned comparison costs bytes, never correctness.
+void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::set<Hash>& output) {
+    // No pruning at nodes already emitted for another revision: that walk
+    // relied on ITS parent's tree, which may in turn rely on this one.
+    if (isZero(after) || before == after) return;
+    const TreeNode node = readNode(after);
+    const unsigned depth = node.leaf ? 32U : node.depth;
+    const Key& prefix = node.leaf ? node.key : node.prefix;
+    Hash aligned = before;
+    std::optional<TreeNode> old;
+    while (!isZero(aligned)) {
+        old = readNode(aligned);
+        if (old->leaf || old->depth >= depth) break;
+        aligned = old->children[nibble(prefix, old->depth)]; // descend to after's level
+        old.reset();
+    }
+    if (aligned == after) return;
+    output.insert(after);
+    if (node.leaf) {
+        if (!old || !old->leaf || old->value != node.value) output.insert(node.value);
+        return;
+    }
+    for (unsigned slot = 0; slot < 16; ++slot) {
+        Hash oldChild{};
+        if (old && !old->leaf && old->depth == node.depth) {
+            oldChild = old->children[slot];
+        } else if (old) { // `old` is deeper: it lies within one slot of `after`
+            const Key& oldPrefix = old->leaf ? old->key : old->prefix;
+            if (nibble(oldPrefix, node.depth) == slot) oldChild = aligned;
+        }
+        collectTreeDelta(oldChild, node.children[slot], output);
+    }
+}
+
+// Incremental bundle content: the revisions reachable from `tip` but not from
+// `base`, plus for each of them the tree objects that differ from one of its
+// parents. Work is proportional to the new revisions and their changes, not
+// to the size of the trees: only the base's revision ancestry is read.
+// The recipient holds the base's complete graph. Each new revision's walk is
+// complete relative to its chosen parent, so by induction over the ancestry
+// every object of a new revision is emitted or held by the recipient.
+std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base) {
+    std::unordered_set<Hash, HashHasher> known;
+    std::vector<Hash> pending{base};
+    while (!pending.empty()) {
+        const Hash current = pending.back();
+        pending.pop_back();
+        if (!known.insert(current).second) continue;
+        for (const Hash& parent : readRevision(current).parents) pending.push_back(parent);
+    }
+    std::set<Hash> output;
+    std::unordered_set<Hash, HashHasher> visited;
+    pending.assign(1, tip);
+    while (!pending.empty()) {
+        const Hash current = pending.back();
+        pending.pop_back();
+        if (known.contains(current) || !visited.insert(current).second) continue;
+        const Revision revision = readRevision(current);
+        output.insert(current);
+        // Prefer a parent the recipient already holds: its trees need no
+        // transfer and the new revision's diff against it is the smallest.
+        Revision parent{};
+        for (const Hash& candidate : revision.parents) {
+            if (known.contains(candidate)) { parent = readRevision(candidate); break; }
+        }
+        if (isZero(parent.id) && !revision.parents.empty()) parent = readRevision(revision.parents.front());
+        collectTreeDelta(parent.root, revision.root, output);
+        collectTreeDelta(parent.referencesRoot, revision.referencesRoot, output);
+        for (const Hash& candidate : revision.parents) pending.push_back(candidate);
+    }
+    return output;
+}
+
 // Writes to a new file at *bundlePath (O_EXCL, removed on failure) or, when
 // bundlePath is null, to the caller's empty descriptor targetFd (truncated
 // back to empty on failure; the caller keeps ownership).
@@ -3187,8 +3336,7 @@ void Repository::exportBundleLocked(std::string_view branch,
                                     const std::filesystem::path* bundlePath, int targetFd,
                                     std::optional<Hash> recipientBase, BundleLimits limits) {
     const Hash tip = branchHead(branch);
-    // Scan the base's *complete* reachable graph. Objects shared by new
-    // revisions (Merkle subtrees, values, reference indexes) need not travel.
+    // A full bundle carries the complete reachable graph of the tip.
     const auto collectObjects = [&](const Hash& revisionTip) {
         enum class Kind { Revision, Tree, Value };
         std::vector<std::pair<Hash, Kind>> pending{{revisionTip, Kind::Revision}};
@@ -3225,11 +3373,8 @@ void Repository::exportBundleLocked(std::string_view branch,
         require(Err::Conflict, !isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
                 "incremental export base is not an ancestor of the source branch");
     }
-    std::set<Hash> objects = collectObjects(tip);
-    if (recipientBase) {
-        const std::set<Hash> knownObjects = collectObjects(*recipientBase);
-        for (const Hash& known : knownObjects) objects.erase(known);
-    }
+    const std::set<Hash> objects = recipientBase ? collectDelta(tip, *recipientBase)
+                                                 : collectObjects(tip);
     require(Err::InvalidInput, recipientBase.has_value() || !objects.empty(),
             "cannot export an empty revision graph");
     require(Err::LimitExceeded, limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
@@ -3468,6 +3613,9 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
                         visitor(entries.at(ordinal).first);
                     }
                 }
+            },
+            [&](const Hash& hash) {
+                return incremental && !entries.find(hash).has_value() && containsLocally(hash);
             }
         };
         LogicalVerificationProfile graphProfile{};
@@ -3491,8 +3639,32 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
             require(Err::InvalidInput, visitMarks.at(index) != 0,
                     "replication bundle contains unreachable objects");
         }
+        // Boundary revisions were not walked. Usually the base (and a
+        // fast-forwarded head) is itself a boundary; otherwise search the
+        // local ancestry below the boundaries, once for all candidates.
+        std::optional<std::unordered_set<Hash, HashHasher>> boundaryAncestry;
+        const std::function<bool(const Hash&)> includesRevision = [&](const Hash& candidate) {
+            if (verification.containsRevision(candidate)) return true;
+            if (!boundaryAncestry) {
+                boundaryAncestry.emplace();
+                std::vector<Hash> pending(verification.boundaryRevisions.begin(),
+                                          verification.boundaryRevisions.end());
+                try {
+                    while (!pending.empty()) {
+                        const Hash current = pending.back();
+                        pending.pop_back();
+                        if (!boundaryAncestry->insert(current).second) continue;
+                        for (const Hash& parent : readRevision(current).parents) pending.push_back(parent);
+                    }
+                } catch (const StorageError& error) {
+                    throw StorageError(error.kind(), "local revision ancestry: " +
+                                       std::string(error.what()));
+                }
+            }
+            return boundaryAncestry->contains(candidate);
+        };
         if (incremental) {
-            require(Err::InvalidInput, verification.containsRevision(recipientBase),
+            require(Err::InvalidInput, includesRevision(recipientBase),
                     "incremental bundle base is not an ancestor of incoming revision");
         }
         if (profile != nullptr) {
@@ -3512,7 +3684,7 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
                  revisionReachableFrom(previousHead, incoming))) {
                 status = BundleImportStatus::UpToDate;
             } else {
-                require(Err::Conflict, verification.containsRevision(previousHead),
+                require(Err::Conflict, includesRevision(previousHead),
                         "replication would overwrite divergent branch history");
                 status = BundleImportStatus::FastForward;
             }
