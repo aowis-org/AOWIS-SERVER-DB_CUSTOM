@@ -1329,6 +1329,108 @@ void testMergeCandidateReconciliation() {
     }
 }
 
+
+// A fast-forward is still a publication: optional domain validation must see
+// the complete source model snapshot under the same publication lock.
+void testFastForwardSemanticPreflight() {
+    using aowis::native::MergeCandidate;
+    using aowis::native::MergeOptions;
+    using aowis::native::MergeStatus;
+    using aowis::native::ModelChange;
+    using aowis::native::ModelRecord;
+    TemporaryRepo test("fast-forward-validation");
+    Repository repository(test.directory);
+    repository.createBranch("main");
+    repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("baseline")}}});
+    repository.createBranch("feature", "main");
+    const Hash baseline = repository.head("main").id;
+    const Hash source = repository.commitModel("feature", {
+        {key(1), ModelRecord{1, {}, value("updated")}},
+        {key(2), ModelRecord{2, {key(1)}, value("additional")}}}).id;
+    const std::uint64_t bytes = repository.packSize();
+    int validations = 0;
+    MergeOptions options;
+    options.expectedTargetHead = baseline;
+    options.expectedSourceHead = source;
+    options.validate = [&](const MergeCandidate& candidate) -> std::optional<std::string> {
+        ++validations;
+        expect(candidate.get(key(1)) && candidate.get(key(1))->payload == value("updated") &&
+               candidate.get(key(2)) && candidate.get(key(2))->references == std::vector<Key>{key(1)},
+               "fast-forward validator did not see the source tip");
+        std::vector<Key> keys;
+        candidate.forEach([&](const Key& id, const ModelRecord& record) {
+            keys.push_back(id);
+            expect(record.payload == (id == key(1) ? value("updated") : value("additional")),
+                   "fast-forward traversal returned wrong payload");
+        });
+        expect(keys == std::vector<Key>({key(1), key(2)}),
+               "fast-forward validator did not traverse source records in UUID order");
+        return std::string("domain failure");
+    };
+    const aowis::native::MergeResult rejected = repository.mergeBranches("main", "feature", options);
+    expect(rejected.status == MergeStatus::Conflicts && rejected.base == baseline &&
+           rejected.conflicts.size() == 1 && rejected.conflicts[0].reason == "domain failure" &&
+           validations == 1 && repository.head("main").id == baseline &&
+           repository.head("feature").id == source && repository.packSize() == bytes,
+           "invalid fast-forward published a target or wrote objects");
+
+    options.validate = [&](const MergeCandidate&) -> std::optional<std::string> {
+        ++validations;
+        return std::nullopt;
+    };
+    options.expectedSourceHead = baseline;
+    bool stale = false;
+    try { (void)repository.mergeBranches("main", "feature", options); }
+    catch (const aowis::native::StorageError&) { stale = true; }
+    expect(stale && validations == 1 && repository.head("main").id == baseline &&
+           repository.packSize() == bytes, "stale source pin reached fast-forward validator");
+    options.expectedSourceHead = source;
+    options.expectedTargetHead = source;
+    stale = false;
+    try { (void)repository.mergeBranches("main", "feature", options); }
+    catch (const aowis::native::StorageError&) { stale = true; }
+    expect(stale && validations == 1 && repository.head("main").id == baseline &&
+           repository.packSize() == bytes, "stale target pin reached fast-forward validator");
+    options.expectedTargetHead = baseline;
+    const aowis::native::MergeResult accepted = repository.mergeBranches("main", "feature", options);
+    expect(accepted.status == MergeStatus::FastForward && accepted.revision.id == source &&
+           accepted.revision.parents.size() == 1 && validations == 2 &&
+           repository.head("main").id == source && repository.head("feature").id == source &&
+           repository.packSize() == bytes,
+           "valid fast-forward did not reuse the source revision without pack writes");
+    options.expectedTargetHead = source;
+    const aowis::native::MergeResult same = repository.mergeBranches("main", "feature", options);
+    expect(same.status == MergeStatus::UpToDate && validations == 2 &&
+           repository.packSize() == bytes,
+           "equal-head no-op unexpectedly revalidated an existing snapshot");
+    repository.commitModel("main", {{key(3), ModelRecord{1, {}, value("more")}}});
+    const aowis::native::MergeResult incorporated = repository.mergeBranches("main", "feature");
+    expect(incorporated.status == MergeStatus::UpToDate, "source ancestor not up-to-date");
+    options.expectedTargetHead = repository.head("main").id;
+    const aowis::native::MergeResult incorporatedValidated =
+        repository.mergeBranches("main", "feature", options);
+    expect(incorporatedValidated.status == MergeStatus::UpToDate && validations == 2,
+           "incorporated source unexpectedly invoked validator");
+    repository.verifyPack();
+
+    // A typed semantic validator must not accidentally accept an untyped
+    // source merely because the merge can reuse its physical revision.
+    repository.createBranch("raw-main");
+    repository.createBranch("raw-source", "raw-main");
+    repository.commit("raw-source", {{key(20), value("raw")}});
+    const Hash rawBefore = repository.head("raw-main").id;
+    const std::uint64_t rawBytes = repository.packSize();
+    MergeOptions rawOptions;
+    rawOptions.validate = [](const MergeCandidate&) -> std::optional<std::string> {
+        throw std::runtime_error("raw snapshot must not be given to model validator");
+    };
+    const aowis::native::MergeResult raw =
+        repository.mergeBranches("raw-main", "raw-source", rawOptions);
+    expect(raw.status == MergeStatus::Conflicts && !raw.conflicts.empty() &&
+           repository.head("raw-main").id == rawBefore && repository.packSize() == rawBytes,
+           "untyped fast-forward silently bypassed model validation");
+}
+
 int main() {
     try {
         testEmptyAndBranches();
@@ -1350,6 +1452,7 @@ int main() {
         testMergeConflictsAndFastForward();
         testIndexedModelMerges();
         testMergeHooksAndSemanticPreflight();
+        testFastForwardSemanticPreflight();
         testWholeObjectMergeChoices();
         testMergeCandidateReconciliation();
         std::cout << "AOWIS native storage tests: passed\n";

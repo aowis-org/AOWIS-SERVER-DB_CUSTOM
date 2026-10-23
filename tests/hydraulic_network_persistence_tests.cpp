@@ -2419,6 +2419,96 @@ void exerciseCallerPinnedWrites() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+
+// A fast-forward's source may have been written by the generic storage API
+// rather than by the hydraulic adapter. The adapter must reject that history
+// if its model records cannot form a valid complete hydraulic network.
+void exerciseHydraulicFastForwardValidation() {
+    const std::filesystem::path folder = tempDir();
+    try {
+        native::Repository repository(folder);
+        repository.createBranch("main");
+        const NetworkHydraulic baseline = completeNetwork();
+        const native::Revision initial = hydraulic::saveHydraulicNetwork(repository, "main", baseline);
+        repository.createBranch("ff-target", "main");
+        repository.createBranch("ff-source", "ff-target");
+        HydraulicNodeJunction junction = baseline.nodes_junctions[0];
+        junction.elevation_m += 5.0;
+        const native::Revision validTip = hydraulic::editHydraulicNetwork(repository,
+            "ff-source", baseline.uuid, {{junction.uuid, hydraulic::HydraulicEntity{junction}}});
+        const std::uint64_t validBytes = repository.packSize();
+        hydraulic::HydraulicMergeSelections validPins;
+        validPins.expectedTargetHead = initial.id;
+        validPins.expectedSourceHead = validTip.id;
+        const native::MergeResult valid = hydraulic::mergeHydraulicBranches(
+            repository, "ff-target", "ff-source", validPins);
+        require(valid.status == native::MergeStatus::FastForward &&
+                valid.revision.id == validTip.id &&
+                repository.head("ff-target").id == validTip.id &&
+                repository.head("ff-source").id == validTip.id &&
+                repository.packSize() == validBytes,
+                "valid hydraulic fast-forward did not reuse source revision");
+        NetworkHydraulic expected = baseline;
+        expected.nodes_junctions[0] = junction;
+        compareNetworks(expected, requiredLoad(repository, "ff-target", baseline.uuid));
+        validPins.expectedTargetHead = validTip.id;
+        require(hydraulic::mergeHydraulicBranches(repository, "ff-target", "ff-source",
+                validPins).status == native::MergeStatus::UpToDate,
+                "equal-tip hydraulic no-op unexpectedly failed");
+
+        repository.createBranch("bad-target", "main");
+        repository.createBranch("bad-source", "bad-target");
+        const native::Key member = hydraulic::keyFromUuid(baseline.nodes_junctions[0].uuid);
+        const native::Key orphan = hydraulic::keyFromUuid(uuid(9999));
+        const std::optional<native::ModelRecord> original = repository.getModel("bad-source", member);
+        require(original.has_value(), "missing canonical hydraulic fixture record");
+        // This is accepted by the generic native index, but not by hydraulic
+        // membership/ownership validation. A bundle import can similarly
+        // supply a generic model-indexed source snapshot.
+        const native::Revision badTip = repository.commitModel("bad-source", {{orphan, *original}});
+        const std::uint64_t badBytes = repository.packSize();
+        hydraulic::HydraulicMergeSelections badPins;
+        badPins.expectedTargetHead = initial.id;
+        badPins.expectedSourceHead = badTip.id;
+        const native::MergeResult invalid = hydraulic::mergeHydraulicBranches(
+            repository, "bad-target", "bad-source", badPins);
+        require(invalid.status == native::MergeStatus::Conflicts &&
+                !invalid.conflicts.empty() &&
+                repository.head("bad-target").id == initial.id &&
+                repository.head("bad-source").id == badTip.id &&
+                repository.packSize() == badBytes,
+                "hydraulic fast-forward accepted orphan model record or modified the pack");
+        badPins.expectedSourceHead = initial.id;
+        bool staleRejected = false;
+        try { (void)hydraulic::mergeHydraulicBranches(
+            repository, "bad-target", "bad-source", badPins); }
+        catch (const native::StorageError& error) {
+            staleRejected = error.kind() == native::StorageErrorKind::Conflict;
+        }
+        require(staleRejected && repository.head("bad-target").id == initial.id &&
+                repository.packSize() == badBytes,
+                "stale hydraulic fast-forward source pin was not rejected");
+        badPins.expectedSourceHead = badTip.id;
+        badPins.expectedTargetHead = badTip.id;
+        staleRejected = false;
+        try { (void)hydraulic::mergeHydraulicBranches(
+            repository, "bad-target", "bad-source", badPins); }
+        catch (const native::StorageError& error) {
+            staleRejected = error.kind() == native::StorageErrorKind::Conflict;
+        }
+        require(staleRejected && repository.head("bad-target").id == initial.id &&
+                repository.packSize() == badBytes,
+                "stale hydraulic fast-forward target pin was not rejected");
+        repository.verifyPack();
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2430,6 +2520,7 @@ int main(int argc, char** argv) {
         exerciseDependentMembership();
         exerciseDependentUpdates();
         exerciseHydraulicMerging();
+        exerciseHydraulicFastForwardValidation();
         exerciseStructuralMergeChoices();
         exerciseCoordinatedMembershipMerges();
         exerciseSnapshotReads();

@@ -9,7 +9,7 @@
 - `MergeStatus::Merged`: divergent compatible changes produce one new two-parent revision (`previous target head`, `source head`), preserving both histories.
 - `MergeStatus::Conflicts`: conflicting UUID updates/deletions are returned with hashes and reasons; no branch head is moved.
 
-Both parents are traversed to determine ancestry. A unique lowest common ancestor is required; ambiguous criss-cross merge bases are rejected rather than guessed.
+Both parents are traversed to determine ancestry. A unique lowest common ancestor is required; ambiguous criss-cross merge bases are rejected rather than guessed. When `MergeOptions::validate` is provided, a model-indexed fast-forward candidate is validated before publishing the source tip as the target. A rejected validation returns `Conflicts` without writing or advancing either branch; a non-model-indexed fast-forward cannot satisfy a model validator. `UpToDate` does not invoke the validator because it does not publish a new snapshot. Optimistic head pins and unused-selection checks still apply in all cases.
 
 ## Generic merge rules
 

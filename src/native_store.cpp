@@ -2415,10 +2415,53 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
         require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
         if (!sourceVisited.insert(current).second) continue;
         if (current == targetHead.id) {
-            // The target is an ancestor of the source: preserve the
-            // source revision identity rather than creating a new merge.
+            // The target is an ancestor of the source. When the caller has
+            // supplied domain validation, the source snapshot is the entire
+            // proposed result and must be checked BEFORE publishing its ref.
+            // This does not create a revision or modify the source branch.
             checkSelections();
             result.base = targetHead.id;
+            if (options.validate) {
+                // A domain validator expects typed model records; a raw
+                // snapshot must never bypass it through a fast-forward.
+                if (!sourceHead.modelIndexed) {
+                    result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
+                        std::nullopt, std::nullopt,
+                        "cannot validate a non-model-indexed source snapshot"});
+                    result.status = MergeStatus::Conflicts;
+                    return result;
+                }
+                const std::function<std::optional<ModelRecord>(const Key&)> readSource =
+                    [this, &sourceHead](const Key& key) -> std::optional<ModelRecord> {
+                        const std::optional<Hash> hash = lookup(sourceHead.root, key);
+                        if (!hash) return std::nullopt;
+                        const Bytes value = load(*hash);
+                        require(Err::Corruption, !value.empty() && value.front() == 'V',
+                                "invalid model envelope in fast-forward validation");
+                        return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
+                    };
+                const MergeCandidate candidate{
+                    readSource,
+                    [this, &sourceHead](
+                        const std::function<void(const Key&, const ModelRecord&)>& visitor) {
+                        std::vector<std::pair<Key, Hash>> hashes;
+                        listHashes(sourceHead.root, hashes);
+                        for (const std::pair<Key, Hash>& entry : hashes) {
+                            const Bytes value = load(entry.second);
+                            require(Err::Corruption, !value.empty() && value.front() == 'V',
+                                    "invalid model envelope in fast-forward validation");
+                            visitor(entry.first,
+                                    decodeModelRecord(Bytes(value.begin() + 1, value.end())));
+                        }
+                    }
+                };
+                if (const std::optional<std::string> invalid = options.validate(candidate)) {
+                    result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
+                        std::nullopt, std::nullopt, *invalid});
+                    result.status = MergeStatus::Conflicts;
+                    return result;
+                }
+            }
             publishRef(target, sourceHead.id, false);
             result.status = MergeStatus::FastForward;
             result.revision = sourceHead;

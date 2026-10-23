@@ -103,8 +103,6 @@ struct MergeOptions {
     // merge. Called before any pack writes, including fast-forward publication.
     // Must be pure with respect to the Repository; cannot call its methods.
     std::function<std::optional<std::string>()> checkSelections;
-    // Return a nonempty diagnostic on semantic failure. Invoked before any
-    // object bytes or branch refs are written; cannot call Repository methods.
     // Optional model-aware reconciliation of coordinated changes. Operates on a
     // private copy-on-write candidate BEFORE reference and semantic preflight.
     // `set` changes candidate records only; nothing is written until every
@@ -114,6 +112,12 @@ struct MergeOptions {
         const std::function<void(const Key&, std::optional<ModelRecord>)>& set,
         const std::function<std::optional<ModelRecord>(const Key&)>& target,
         const std::function<std::optional<ModelRecord>(const Key&)>& source)> reconcile;
+    // Return a nonempty diagnostic on semantic failure. Invoked on divergent
+    // candidate merges AND fast-forwards (against the immutable source tip)
+    // before any object bytes or branch refs are written. Up-to-date merges
+    // do not revalidate an already incorporated snapshot. The source tip must
+    // be model-indexed when validate is supplied for a fast-forward. Callbacks
+    // cannot call Repository methods while its lock is held.
     std::function<std::optional<std::string>(const MergeCandidate&)> validate;
 };
 

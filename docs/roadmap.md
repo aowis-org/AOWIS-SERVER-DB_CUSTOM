@@ -15,23 +15,14 @@ system is planned in this project; AOWIS-wide security is a separate design.
 
 ## P0 — Semantic correctness before new database features
 
-### 1. Validate hydraulic fast-forward merges
+### 1. Validate hydraulic fast-forward merges — implemented
 
-The native merge currently calls `MergeOptions::validate` on a newly synthesized
-three-way candidate, but a fast-forward returns after publishing the source
-head without calling the validator. Generic native commits and imported
-histories are not guaranteed to obey hydraulic domain invariants.
-
-- Run the hydraulic candidate validator **before publication** when a source
-  revision would fast-forward the target. Define and document the behavior of
-  `UpToDate` separately; it must not silently promise revalidation it does not do.
-- Ensure an invalid source snapshot leaves both heads unchanged; do not create
-  any visible revision on rejection.
-- Test valid, invalid, stale-head and same-head scenarios through the hydraulic
-  API and HTTP adapter, not only through the generic native merge API.
-
-**Exit criterion:** all successful hydraulic merge statuses preserve the
-agreed domain-validity contract; failures leave heads intact.
+Native fast-forwards with `MergeOptions::validate` check the model-indexed
+source snapshot under the publication lock and reject invalid candidates
+without writing or moving refs. The hydraulic adapter supplies its full network
+validator. `UpToDate` is explicitly a no-op, not a revalidation operation.
+Native, hydraulic and HTTP regression cases cover valid and invalid sources,
+stale head pins and equal-head merges. Keep this invariant in future changes.
 
 ### 2. Make export limits effective during traversal
 

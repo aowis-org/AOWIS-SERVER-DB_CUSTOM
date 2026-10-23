@@ -99,10 +99,16 @@ bytes, detects cross-network ownership collisions and orphaned records, revalida
 against canonically extracted model dependencies. Any failure blocks publication.
 
 The plain `Repository::mergeBranches()` remains a Qt-free generic object merge
-with no hydraulic validation. AOWIS should use the hydraulic-specific API for
-branches containing hydraulic networks. Fast-forwards and up-to-date merges
-adopt already immutable source history and do not validate a new combined
-snapshot. This API does not implement recursive merge-base synthesis, unconstrained
-multi-object topology reconciliation, or solver feasibility validation.
+with no **implicit** hydraulic validation. AOWIS should use the hydraulic-specific
+API for branches containing hydraulic networks. **Fast-forwards validate the
+complete immutable source snapshot before publishing the target reference**;
+an invalid snapshot returns `Conflicts` and leaves both heads and the pack
+unchanged. A source snapshot that is not model-indexed is rejected when a
+validator is supplied. **Up-to-date** results (equal heads or a source already
+incorporated in target history) are no-ops and deliberately do not revalidate
+the existing target. Explicit pinned heads and unused-selection checks still
+run before either result. This API does not implement recursive merge-base
+synthesis, unconstrained multi-object topology reconciliation, or solver
+feasibility validation.
 Candidate-wide semantic validation still takes O(network size) and is not an
 indexed edit operation.

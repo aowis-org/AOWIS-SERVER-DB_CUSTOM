@@ -398,6 +398,78 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
         QJsonObject{{"target", "main"}, {"source", "http_feature"},
                     {"expectedTargetHead", createdHead}, {"expectedSourceHead", editedHead}}).status == 409,
           "stale merge tip accepted");
+    // HTTP fast-forwards must validate source records even when they were
+    // committed through the generic native library instead of hydraulic APIs.
+    check(client.call("POST", prefix + "/branches",
+        QJsonObject{{"name", "http-ff-target"}, {"fromBranch", "main"}}).status == 201,
+        "cannot create HTTP fast-forward target");
+    check(client.call("POST", prefix + "/branches",
+        QJsonObject{{"name", "http-ff-source"}, {"fromBranch", "main"}}).status == 201,
+        "cannot create HTTP fast-forward source");
+    HydraulicNodeJunction ffJunction = junction;
+    ffJunction.elevation_m = 527;
+    const QString ffPayload = QString::fromLatin1(
+        native::ModelCodec<HydraulicNodeJunction>::encode(ffJunction).toBase64());
+    const Response ffEdit = client.call("POST",
+        prefix + "/branches/http-ff-source/networks/" + networkId + "/edits",
+        QJsonObject{{"expectedHead", editedHead}, {"changes", QJsonArray{QJsonObject{
+            {"uuid", junctionId}, {"type", 9}, {"payloadBase64", ffPayload}}}}});
+    check(ffEdit.status == 200, "cannot prepare valid hydraulic HTTP fast-forward");
+    const QString ffTip = ffEdit.json.value("revision").toObject().value("id").toString();
+    check(ffTip.size() == 64 && ffTip != editedHead,
+          "valid hydraulic HTTP fast-forward source did not advance");
+    check(client.call("POST", prefix + "/merges", QJsonObject{
+        {"target", "http-ff-target"}, {"source", "http-ff-source"},
+        {"expectedTargetHead", editedHead}, {"expectedSourceHead", editedHead}}).status == 409,
+        "stale HTTP fast-forward source pin accepted");
+    const Response ffMerge = client.call("POST", prefix + "/merges", QJsonObject{
+        {"target", "http-ff-target"}, {"source", "http-ff-source"},
+        {"expectedTargetHead", editedHead}, {"expectedSourceHead", ffTip}});
+    check(ffMerge.status == 200 && ffMerge.json.value("status").toString() == "fast_forward" &&
+          client.call("GET", prefix + "/branches/http-ff-target/head")
+              .json.value("id").toString() == ffTip,
+          "valid hydraulic HTTP fast-forward failed");
+    check(client.call("POST", prefix + "/merges", QJsonObject{
+        {"target", "http-ff-target"}, {"source", "http-ff-source"},
+        {"expectedTargetHead", ffTip}, {"expectedSourceHead", ffTip}})
+          .json.value("status").toString() == "up_to_date",
+          "equal-tip HTTP fast-forward was not a no-op");
+
+    check(client.call("POST", prefix + "/branches",
+        QJsonObject{{"name", "http-bad-target"}, {"fromBranch", "main"}}).status == 201,
+        "cannot create invalid HTTP fast-forward target");
+    check(client.call("POST", prefix + "/branches",
+        QJsonObject{{"name", "http-bad-source"}, {"fromBranch", "main"}}).status == 201,
+        "cannot create invalid HTTP fast-forward source");
+    QString invalidTip;
+    std::uint64_t invalidBytes = 0;
+    service.withRepository(projectId.toStdString(), [&](native::Repository& repository) {
+        const std::optional<native::ModelRecord> record = repository.getModel(
+            "http-bad-source", native::hydraulic::keyFromUuid(junctionUuid));
+        check(record.has_value(), "missing network member for invalid HTTP merge fixture");
+        const native::Key orphan = native::hydraulic::keyFromUuid(QUuid::createUuid());
+        invalidTip = QString::fromStdString(native::toHex(repository.commitModel(
+            "http-bad-source", {{orphan, *record}}).id));
+        invalidBytes = repository.packSize();
+    });
+    check(client.call("POST", prefix + "/merges", QJsonObject{
+        {"target", "http-bad-target"}, {"source", "http-bad-source"},
+        {"expectedTargetHead", ffTip}, {"expectedSourceHead", invalidTip}}).status == 409,
+        "stale HTTP fast-forward target pin accepted");
+    const Response badMerge = client.call("POST", prefix + "/merges", QJsonObject{
+        {"target", "http-bad-target"}, {"source", "http-bad-source"},
+        {"expectedTargetHead", editedHead}, {"expectedSourceHead", invalidTip}});
+    check(badMerge.status == 409 && badMerge.json.value("status").toString() == "conflicts" &&
+          !badMerge.json.value("conflicts").toArray().isEmpty() &&
+          client.call("GET", prefix + "/branches/http-bad-target/head")
+              .json.value("id").toString() == editedHead &&
+          client.call("GET", prefix + "/branches/http-bad-source/head")
+              .json.value("id").toString() == invalidTip,
+          "invalid hydraulic HTTP fast-forward advanced a branch");
+    service.withRepository(projectId.toStdString(), [&](native::Repository& repository) {
+        check(repository.packSize() == invalidBytes,
+              "rejected HTTP fast-forward appended pack objects");
+    });
     // Divergent edits to the same canonical field must remain conflicts until
     // a client explicitly selects one side. Neither branch moves on conflict.
     junction.elevation_m = 101;
