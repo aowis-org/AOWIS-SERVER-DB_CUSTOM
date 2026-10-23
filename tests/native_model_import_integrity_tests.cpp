@@ -397,12 +397,13 @@ void testValidCyclesAndHistory(PhysicalStore store) {
 // disk-backed merge, so this is deliberately >8,192 distinct edges.
 void testLargeReferenceGraph(PhysicalStore store) {
     TemporaryDirectory temporary("large-reference-graph");
-    const std::filesystem::path scratch = temporary.path / "scratch";
-    std::filesystem::create_directories(scratch);
+    // Scratch files live in <repository>/tmp (review F6). A nonexistent
+    // TMPDIR proves that external sorting no longer depends on it.
     const char* previous = ::getenv("TMPDIR");
     const std::optional<std::string> oldTmp = previous == nullptr ?
         std::nullopt : std::optional<std::string>(previous);
-    expect(::setenv("TMPDIR", scratch.c_str(), 1) == 0, "set scratch path");
+    expect(::setenv("TMPDIR", (temporary.path / "no-such-tmpdir").c_str(), 1) == 0,
+           "set unusable TMPDIR");
     struct RestoreEnvironment {
         std::optional<std::string> value;
         ~RestoreEnvironment() {
@@ -434,24 +435,22 @@ void testLargeReferenceGraph(PhysicalStore store) {
     expect(receiver.referencingModel("models", targets[17]).size() == sources.size(),
            "large graph reverse index lost edges");
     (void)receiver.verifyRepository();
-    expect(std::filesystem::is_empty(scratch),
+    expect(std::filesystem::is_empty(receiver.scratchDirectory()),
            "reference sorting left temporary files after valid import");
 
     // If scratch space cannot be created, fail before importing any objects
     // or publishing a branch. This exercises the external-sort failure path
     // rather than allowing a fallback that silently skips verification.
     Repository inaccessible(temporary.path / "inaccessible", store);
-    const std::filesystem::path absent = temporary.path / "missing-scratch";
-    expect(::setenv("TMPDIR", absent.c_str(), 1) == 0,
-           "set deliberately unavailable scratch path");
+    const std::filesystem::path unusable = inaccessible.scratchDirectory();
+    std::filesystem::remove(unusable);
+    { std::ofstream blocker(unusable); } // a regular file where the directory belongs
     bool failedWithoutScratch = false;
     try {
         (void)inaccessible.importBranchBundle(temporary.path / "valid.bundle", "models");
     } catch (const std::exception&) {
         failedWithoutScratch = true;
     }
-    expect(::setenv("TMPDIR", scratch.c_str(), 1) == 0,
-           "restore temporary reference-sort path");
     expect(failedWithoutScratch && inaccessible.listBranches().empty() &&
            inaccessible.objectCount() == 0,
            "external-sort scratch failure allowed partial imported state");
@@ -477,7 +476,7 @@ void testLargeReferenceGraph(PhysicalStore store) {
     (void)rejected.commit("stable", {{key(230), Bytes{'s'}}});
     expectRejected(rejected, temporary.path / "forged.bundle", "large missing incoming edge",
                    "does not match model records");
-    expect(std::filesystem::is_empty(scratch),
+    expect(std::filesystem::is_empty(rejected.scratchDirectory()),
            "reference sorting left temporary files after invalid import");
 }
 

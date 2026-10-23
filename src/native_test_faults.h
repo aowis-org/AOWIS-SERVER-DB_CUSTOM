@@ -52,4 +52,14 @@ inline void faultPartialWrite(int fd, const std::uint8_t* bytes, std::size_t siz
     (void)fd; (void)bytes; (void)size; (void)offset; (void)name;
 #endif
 }
+// Recovery tests force the named mkostemp() fallback that is otherwise only
+// used on filesystems without O_TMPFILE support.
+inline bool forceNamedScratchFiles() {
+#ifdef AOWIS_NATIVE_FAULT_TEST_BUILD
+    const char* forced = ::getenv("AOWIS_NATIVE_TEST_NAMED_SCRATCH");
+    return forced != nullptr && std::strcmp(forced, "1") == 0;
+#else
+    return false;
+#endif
+}
 } // namespace aowis::native::detail

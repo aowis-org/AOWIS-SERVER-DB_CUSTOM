@@ -95,6 +95,34 @@ public:
     }
 }
 
+// Scratch files live in <repository>/tmp: same filesystem as the pack (real
+// disk, evictable page cache), never TMPDIR, which is often a RAM-backed
+// tmpfs. O_TMPFILE files have no name at all; the fallback creates a named
+// file and unlinks it at once. Leftovers of that fallback are removed when
+// the repository is opened (they cannot be in use, see Repository()).
+constexpr std::string_view scratchPrefix = "aowis-scratch-";
+
+int createScratchFile(const std::filesystem::path& directory, std::string_view purpose) {
+    if (!detail::forceNamedScratchFiles()) {
+        const int anonymous = ::open(directory.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+        if (anonymous >= 0) return anonymous;
+        // Filesystems without O_TMPFILE support report one of these.
+        if (errno != EOPNOTSUPP && errno != EISDIR && errno != EINVAL)
+            throwSystemError("create scratch file for " + std::string(purpose));
+    }
+    std::string name = (directory / (std::string(scratchPrefix) + std::string(purpose) + "-XXXXXX")).string();
+    const int fd = ::mkostemp(name.data(), O_CLOEXEC);
+    systemCall(fd >= 0, "create scratch file for " + std::string(purpose));
+    // ENOENT: a concurrently opening handle already removed the leftover.
+    if (::unlink(name.c_str()) != 0 && errno != ENOENT) {
+        const int saved = errno;
+        ::close(fd);
+        errno = saved;
+        throwSystemError("unlink scratch file for " + std::string(purpose));
+    }
+    return fd;
+}
+
 // Every open Repository holds a shared lifetime lock. Maintenance requires
 // exclusive ownership: otherwise an existing process could keep writing to
 // file descriptors referencing a retired pack after the pointer is switched.
@@ -293,31 +321,11 @@ struct BundleLocation {
 
 class BundleLocationIndex {
 public:
-    explicit BundleLocationIndex(std::uint64_t capacity) {
+    BundleLocationIndex(std::uint64_t capacity, const std::filesystem::path& scratch) {
         require(Err::LimitExceeded, capacity <= std::numeric_limits<std::size_t>::max() /
                                 bundleLocationRecordBytes,
                 "replication bundle index exceeds addressable memory");
-        const std::filesystem::path temporaryName =
-            std::filesystem::temp_directory_path() / "aowis-db-bundle-index-XXXXXX";
-        const std::string name = temporaryName.string();
-        std::vector<char> writableName(name.begin(), name.end());
-        writableName.push_back('\0');
-        this->fd_ = ::mkstemp(writableName.data());
-        systemCall(this->fd_ >= 0, "create temporary replication index");
-        if (::unlink(writableName.data()) != 0) {
-            const int saved = errno;
-            ::close(this->fd_);
-            this->fd_ = -1;
-            errno = saved;
-            systemCall(false, "unlink temporary replication index");
-        }
-        if (::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) < 0) {
-            const int saved = errno;
-            ::close(this->fd_);
-            this->fd_ = -1;
-            errno = saved;
-            systemCall(false, "mark temporary replication index close-on-exec");
-        }
+        this->fd_ = createScratchFile(scratch, "bundle-index");
     }
 
     ~BundleLocationIndex() {
@@ -396,19 +404,10 @@ private:
 // object. Cold pages can be reclaimed by the OS during very large imports.
 class BundleVisitMarks {
 public:
-    explicit BundleVisitMarks(std::size_t count) : count_(count) {
+    BundleVisitMarks(std::size_t count, const std::filesystem::path& scratch) : count_(count) {
         if (count == 0) return;
-        const std::filesystem::path temporaryName =
-            std::filesystem::temp_directory_path() / "aowis-db-bundle-marks-XXXXXX";
-        const std::string name = temporaryName.string();
-        std::vector<char> writableName(name.begin(), name.end());
-        writableName.push_back('\0');
-        this->fd_ = ::mkstemp(writableName.data());
-        systemCall(this->fd_ >= 0, "create temporary verification marks");
+        this->fd_ = createScratchFile(scratch, "bundle-marks");
         try {
-            systemCall(::unlink(writableName.data()) == 0, "unlink temporary verification marks");
-            systemCall(::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) == 0,
-                       "mark temporary verification marks close-on-exec");
             require(Err::LimitExceeded, count <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()),
                     "verification marks exceed file address limits");
             // ftruncate() can leave sparse pages whose first write would
@@ -477,24 +476,14 @@ public:
     static constexpr std::size_t kinds = 3;
     static constexpr std::size_t entryBytes = slotBytes * kinds;
 
-    explicit BundleTreeSummaries(std::size_t count) : count_(count) {
+    BundleTreeSummaries(std::size_t count, const std::filesystem::path& scratch) : count_(count) {
         if (count == 0) return;
         require(Err::LimitExceeded, count <= std::numeric_limits<std::size_t>::max() / entryBytes &&
                     count <= static_cast<std::uint64_t>(
                         std::numeric_limits<off_t>::max()) / entryBytes,
                 "replication trie summary table exceeds file address limits");
-        const std::filesystem::path temporaryName =
-            std::filesystem::temp_directory_path() / "aowis-db-tree-summaries-XXXXXX";
-        const std::string name = temporaryName.string();
-        std::vector<char> writableName(name.begin(), name.end());
-        writableName.push_back('\0');
-        this->fd_ = ::mkstemp(writableName.data());
-        systemCall(this->fd_ >= 0, "create temporary trie summary table");
+        this->fd_ = createScratchFile(scratch, "trie-summaries");
         try {
-            systemCall(::unlink(writableName.data()) == 0,
-                       "unlink temporary trie summary table");
-            systemCall(::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) == 0,
-                       "mark trie summary table close-on-exec");
             const std::size_t bytes = count * entryBytes;
             // A sparse mapped file can SIGBUS on first access under ENOSPC.
             // Reserve its blocks up front and fail the import cleanly instead.
@@ -570,7 +559,9 @@ public:
     static constexpr std::size_t chunkEdges = 8192;
     static_assert(sizeof(Edge) == 32);
 
-    SortedReferenceEdges() { this->buffer_.reserve(chunkEdges); }
+    explicit SortedReferenceEdges(const std::filesystem::path& scratch) : scratch_(scratch) {
+        this->buffer_.reserve(chunkEdges);
+    }
     ~SortedReferenceEdges() {
         if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->records_ * sizeof(Edge));
         if (this->fd_ >= 0) ::close(this->fd_);
@@ -648,23 +639,7 @@ private:
     void flush() {
         if (this->buffer_.empty()) return;
         std::sort(this->buffer_.begin(), this->buffer_.end());
-        if (this->fd_ < 0) {
-            const std::filesystem::path pattern =
-                std::filesystem::temp_directory_path() / "aowis-db-reference-edges-XXXXXX";
-            const std::string name = pattern.string();
-            std::vector<char> writableName(name.begin(), name.end());
-            writableName.push_back('\0');
-            const int descriptor = ::mkstemp(writableName.data());
-            systemCall(descriptor >= 0, "create temporary model reference sorter");
-            if (::unlink(writableName.data()) != 0 ||
-                ::fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0) {
-                const int saved = errno;
-                ::close(descriptor);
-                errno = saved;
-                systemCall(false, "unlink or secure temporary model reference sorter");
-            }
-            this->fd_ = descriptor;
-        }
+        if (this->fd_ < 0) this->fd_ = createScratchFile(this->scratch_, "reference-edges");
         require(Err::LimitExceeded, this->records_ <= static_cast<std::uint64_t>(
                     std::numeric_limits<off_t>::max() / sizeof(Edge)) -
                     this->buffer_.size(),
@@ -677,6 +652,7 @@ private:
         this->buffer_.clear();
     }
 
+    std::filesystem::path scratch_;
     int fd_ = -1;
     void* mapped_ = nullptr;
     bool finalized_ = false;
@@ -869,6 +845,7 @@ double elapsedImportMs(ImportClock::time_point start, ImportClock::time_point fi
 LogicalVerification verifyLogicalGraph(
         const std::vector<Hash>& tips,
         const std::function<Bytes(const Hash&)>& objectByHash,
+        const std::filesystem::path& scratch,
         const ExternalVerificationMarks& externalMarks = {},
         LogicalVerificationProfile* profile = nullptr) {
     enum class Kind {
@@ -1313,7 +1290,7 @@ LogicalVerification verifyLogicalGraph(
             } else {
                 // First indexed revision after a raw branch (or a history
                 // without an indexed parent): establish a complete baseline.
-                SortedReferenceEdges expected;
+                SortedReferenceEdges expected(scratch);
                 visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
                     require(Err::Corruption, source != Key{}, "bundled model tree contains zero UUID");
                     const Bytes stored = objectByHash(value);
@@ -1451,7 +1428,7 @@ Hash sha256(const Bytes& value) {
 }
 
 Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
-    : directory_(std::move(directory)) {
+    : directory_(std::move(directory)), scratch_(this->directory_ / "tmp") {
     require(Err::InvalidInput, storage == PhysicalStore::Pack, "unsupported storage backend");
     std::filesystem::create_directories(this->directory_ / "refs" / "heads");
     this->lifetimeFd_ = ::open((this->directory_ / "maintenance.lock").c_str(),
@@ -1463,6 +1440,7 @@ Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
                                   O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         systemCall(this->lockFd_ >= 0, "open repository lock");
         ScopedFileLock locked(this->lockFd_);
+        prepareScratchDirectory();
         // Prevent either constructor from silently opening the wrong physical
         // repository type (or creating a second, disconnected object pack).
         const std::filesystem::path format = this->directory_ / "storage.format";
@@ -1487,6 +1465,53 @@ Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
         ::close(this->lifetimeFd_);
         throw;
     }
+}
+
+// Called with repo.lock held. Named scratch files exist only between
+// mkostemp() and unlink() inside createScratchFile(); any such file found here
+// was left by a crashed process. A concurrent creator tolerates ENOENT.
+void Repository::prepareScratchDirectory() {
+    std::filesystem::create_directories(this->scratch_);
+    require(Err::Corruption, !std::filesystem::is_symlink(this->scratch_) &&
+                std::filesystem::is_directory(this->scratch_),
+            "repository scratch path is not a directory: " + this->scratch_.string());
+    std::filesystem::permissions(this->scratch_, std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace);
+    for (const std::filesystem::directory_entry& entry :
+            std::filesystem::directory_iterator(this->scratch_)) {
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with(scratchPrefix) || entry.is_symlink() || !entry.is_regular_file()) continue;
+        if (::unlink(entry.path().c_str()) != 0 && errno != ENOENT)
+            throwSystemError("remove leftover scratch file " + name);
+    }
+}
+
+ScratchFile Repository::createScratchFile() {
+    return ScratchFile(aowis::native::createScratchFile(this->scratch_, "client"));
+}
+
+const std::filesystem::path& Repository::scratchDirectory() const noexcept {
+    return this->scratch_;
+}
+
+ScratchFile::ScratchFile(int fd) noexcept : fd_(fd) {}
+ScratchFile::~ScratchFile() {
+    if (this->fd_ >= 0) ::close(this->fd_);
+}
+ScratchFile::ScratchFile(ScratchFile&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+ScratchFile& ScratchFile::operator=(ScratchFile&& other) noexcept {
+    if (this != &other) {
+        if (this->fd_ >= 0) ::close(this->fd_);
+        this->fd_ = other.fd_;
+        other.fd_ = -1;
+    }
+    return *this;
+}
+int ScratchFile::fd() const noexcept { return this->fd_; }
+int ScratchFile::release() noexcept {
+    const int fd = this->fd_;
+    this->fd_ = -1;
+    return fd;
 }
 
 Repository::~Repository() {
@@ -3093,7 +3118,7 @@ VerificationReport Repository::verifyRepository() {
         [this](const Hash& hash) { return load(hash); };
     LogicalVerification graph{};
     try {
-        graph = verifyLogicalGraph(tips, loadObject);
+        graph = verifyLogicalGraph(tips, loadObject, this->scratch_);
     } catch (...) {
         rethrowWithContext("logical repository verification failed: ");
     }
@@ -3128,7 +3153,22 @@ void Repository::exportBranchBundle(std::string_view branch,
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    exportBundleLocked(branch, bundlePath, std::nullopt, limits);
+    exportBundleLocked(branch, &bundlePath, -1, std::nullopt, limits);
+}
+
+void Repository::exportBranchBundle(std::string_view branch, int fd, BundleLimits limits) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    exportBundleLocked(branch, nullptr, fd, std::nullopt, limits);
+}
+
+void Repository::exportIncrementalBranchBundle(std::string_view branch, const Hash& recipientBase,
+                                               int fd, BundleLimits limits) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    exportBundleLocked(branch, nullptr, fd, recipientBase, limits);
 }
 
 void Repository::exportIncrementalBranchBundle(std::string_view branch,
@@ -3137,11 +3177,14 @@ void Repository::exportIncrementalBranchBundle(std::string_view branch,
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    exportBundleLocked(branch, bundlePath, recipientBase, limits);
+    exportBundleLocked(branch, &bundlePath, -1, recipientBase, limits);
 }
 
+// Writes to a new file at *bundlePath (O_EXCL, removed on failure) or, when
+// bundlePath is null, to the caller's empty descriptor targetFd (truncated
+// back to empty on failure; the caller keeps ownership).
 void Repository::exportBundleLocked(std::string_view branch,
-                                    const std::filesystem::path& bundlePath,
+                                    const std::filesystem::path* bundlePath, int targetFd,
                                     std::optional<Hash> recipientBase, BundleLimits limits) {
     const Hash tip = branchHead(branch);
     // Scan the base's *complete* reachable graph. Objects shared by new
@@ -3191,9 +3234,16 @@ void Repository::exportBundleLocked(std::string_view branch,
             "cannot export an empty revision graph");
     require(Err::LimitExceeded, limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
             "bundle transfer limit: object count exceeded");
-    int fd = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL |
-                    O_NOFOLLOW | O_CLOEXEC, 0600);
-    systemCall(fd >= 0, "create replication bundle (must not already exist)");
+    int fd = targetFd;
+    if (bundlePath != nullptr) {
+        fd = ::open(bundlePath->c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        systemCall(fd >= 0, "create replication bundle (must not already exist)");
+    } else {
+        struct stat target{};
+        systemCall(fd >= 0 && ::fstat(fd, &target) == 0, "stat replication bundle target");
+        require(Err::InvalidInput, S_ISREG(target.st_mode) && target.st_size == 0,
+                "replication bundle target must be an empty regular file");
+    }
     try {
         const std::uint64_t headerSize = recipientBase
             ? incrementalBundleHeaderBytes : bundleHeaderBytes;
@@ -3228,6 +3278,7 @@ void Repository::exportBundleLocked(std::string_view branch,
             offset += bytes.size();
         }
         systemCall(::fsync(fd) == 0, "sync replication bundle");
+        if (bundlePath == nullptr) return; // caller-owned descriptor stays open
         // Linux releases the descriptor even when close() reports an error.
         // Forget it first so the handler below can never close it twice (in a
         // multi-threaded server the number may already belong to another file).
@@ -3235,13 +3286,17 @@ void Repository::exportBundleLocked(std::string_view branch,
         fd = -1;
         systemCall(::close(closing) == 0, "close replication bundle");
         detail::faultCheckpoint("export.after.close");
-        const std::filesystem::path parent = bundlePath.parent_path().empty()
-            ? std::filesystem::path(".") : bundlePath.parent_path();
+        const std::filesystem::path parent = bundlePath->parent_path().empty()
+            ? std::filesystem::path(".") : bundlePath->parent_path();
         syncDirectory(parent);
     } catch (...) {
+        if (bundlePath == nullptr) {
+            (void)::ftruncate(targetFd, 0); // never leave a partial bundle behind
+            throw;
+        }
         if (fd >= 0) ::close(fd);
         std::error_code ignored;
-        std::filesystem::remove(bundlePath, ignored);
+        std::filesystem::remove(*bundlePath, ignored);
         throw;
     }
 }
@@ -3249,15 +3304,28 @@ void Repository::exportBundleLocked(std::string_view branch,
 BundleImportResult Repository::importBranchBundle(const std::filesystem::path& bundlePath,
                                                    std::string_view localBranch, BundleLimits limits,
                                                    BundleImportProfile* profile) {
+    const int fd = ::open(bundlePath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    systemCall(fd >= 0, "open replication bundle");
+    try {
+        const BundleImportResult result = importBranchBundle(fd, localBranch, limits, profile);
+        ::close(fd);
+        return result;
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+}
+
+BundleImportResult Repository::importBranchBundle(int fd, std::string_view localBranch,
+                                                   BundleLimits limits,
+                                                   BundleImportProfile* profile) {
     const ImportClock::time_point importStart = ImportClock::now();
     if (profile != nullptr) *profile = BundleImportProfile{};
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     checkBranch(localBranch);
-    const int fd = ::open(bundlePath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    systemCall(fd >= 0, "open replication bundle");
-    try {
+    {
         struct stat metadata{};
         systemCall(::fstat(fd, &metadata) == 0, "stat replication bundle");
         require(Err::InvalidInput, S_ISREG(metadata.st_mode) && metadata.st_size >= 0 &&
@@ -3292,7 +3360,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                 "invalid replication bundle object count");
         require(Err::LimitExceeded, limits.maxObjects == 0 || count <= limits.maxObjects,
                 "bundle transfer limit: object count exceeded");
-        BundleLocationIndex entries(count);
+        BundleLocationIndex entries(count, this->scratch_);
         std::uint64_t offset = headerBytes;
         Hash previous{};
         for (std::uint64_t index = 0; index < count; ++index) {
@@ -3367,8 +3435,8 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         // keys have the prefix preceding the root branch depth (or that it is
         // a single leaf). Parent checks can therefore use one representative
         // key without revisiting descendants in each ancestor context.
-        BundleVisitMarks visitMarks(entries.size());
-        BundleTreeSummaries treeSummaries(entries.size());
+        BundleVisitMarks visitMarks(entries.size(), this->scratch_);
+        BundleTreeSummaries treeSummaries(entries.size(), this->scratch_);
         const ExternalVerificationMarks externalMarks{
             [&](const Hash& hash) -> std::optional<std::uint8_t> {
                 const std::optional<std::size_t> ordinal = entries.ordinal(hash);
@@ -3405,7 +3473,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         LogicalVerificationProfile graphProfile{};
         LogicalVerification verification{};
         try {
-            verification = verifyLogicalGraph({incoming}, bundleObject, externalMarks,
+            verification = verifyLogicalGraph({incoming}, bundleObject, this->scratch_, externalMarks,
                                               profile != nullptr ? &graphProfile : nullptr);
         } catch (...) {
             rethrowBundleFailure();
@@ -3456,7 +3524,6 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             if (profile != nullptr) {
                 profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
             }
-            ::close(fd);
             return BundleImportResult{status, previousHead, 0};
         }
         const ImportClock::time_point writeStart = ImportClock::now();
@@ -3481,11 +3548,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             profile->publicationMs = elapsedImportMs(publishStart, ImportClock::now());
             profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
         }
-        ::close(fd);
         return BundleImportResult{status, incoming, imported};
-    } catch (...) {
-        ::close(fd);
-        throw;
     }
 }
 

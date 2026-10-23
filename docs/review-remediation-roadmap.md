@@ -21,13 +21,14 @@ Style findings about `auto` are out of scope by decision.
 | 1 | `aowis-db-custom-pack-tail-recovery` | F1 torn pack tail, F7 double close, F11 orphan generations | High | – | done |
 | 2 | `aowis-db-custom-typed-errors` | F2 error classification, F10b non-revision hash | Medium | – | done |
 | 3 | `aowis-db-custom-request-bounds` | F5 unbounded bodies, F9 late caps, F10a branch scoping | Medium | 2 | done |
-| 4 | `aowis-db-custom-scratch-storage` | F6 scratch files on tmpfs | Medium | – | open |
-| 5 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | open |
-| 6 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 2, 3 | open |
-| 7 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | open |
-| 8 | `aowis-db-custom-cleanup` | F12 tidy-ups | Low | – | open |
+| 4 | `aowis-db-custom-scratch-storage` | F6 scratch files on tmpfs | Medium | – | done |
+| 5 | `aowis-db-custom-httplib-server` | Replace QHttpServer (F5 on all Qt versions, streaming uploads) | Medium | 2, 3, 4 | open |
+| 6 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | open |
+| 7 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 5 | open |
+| 8 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | open |
+| 9 | `aowis-db-custom-cleanup` | F12 tidy-ups | Low | – | open |
 
-Phases 1, 2, 4, 7 and 8 are independent of each other. Phase 1 goes first
+Phases 1, 2, 4, 8 and 9 are independent of each other. Phase 1 goes first
 because it is the only finding that can make a repository unusable.
 
 ---
@@ -133,12 +134,12 @@ Implemented in `aowis-db-custom-typed-errors`:
 - Known limits, carried to later phases:
   - The hydraulic *load* APIs (`load…AtRevision`, `list…AtRevision`) still
     report failures as text, so the service treats them as 500 even when the
-    cause was I/O or ENOSPC (Phase 8).
+    cause was I/O or ENOSPC (Phase 9).
   - A structurally invalid **local** object reached by an incremental import
-    is reported as `InvalidInput`; this disappears with Phase 5, which stops
+    is reported as `InvalidInput`; this disappears with Phase 6, which stops
     re-verifying local objects.
   - The HTTP spool/export temp-file failures are `Io` because Qt hides errno
-    (Phase 4).
+    (Phase 4; done there).
 
 Original analysis:
 
@@ -270,7 +271,39 @@ revision behaves as documented.
 
 ---
 
-## Phase 4: Scratch storage location (Medium)
+## Phase 4: Scratch storage location (Medium) — done
+
+Implemented in `aowis-db-custom-scratch-storage`:
+- Every scratch table (bundle location index, visit marks, trie summaries,
+  external reference sort) lives in `<repository>/tmp/`:
+  - mode 0700;
+  - created with `O_TMPFILE` (no name), or with a `mkostemp` plus immediate
+    `unlink` fallback;
+  - leftovers of that fallback are removed on open, under `repo.lock`;
+  - a symlinked or non-directory `tmp` is refused as `Corruption`.
+- No code uses `TMPDIR` any more. A `[storage] scratch=` option was not added:
+  the pack's own filesystem is exactly the right place.
+- New C++ API: `ScratchFile`, `Repository::createScratchFile()`,
+  `scratchDirectory()`, and descriptor overloads of `importBranchBundle`,
+  `exportBranchBundle` and `exportIncrementalBranchBundle` (a failed export
+  leaves the descriptor empty).
+- HTTP: bundle upload spools and exports use project scratch files instead of
+  `QTemporaryDir`. A full disk while spooling is now 507, which removes the
+  `Io` limitation noted in Phase 2.
+- No statfs/tmpfs warning: scratch is on the pack's filesystem, so it is
+  pointless.
+- Tests:
+  - new `aowis-native-scratch-tests`: location, permissions, operation
+    without `TMPDIR` (O_TMPFILE and forced named fallback), leftover cleanup,
+    unsafe paths, `ScratchFile` semantics, descriptor import/export incl.
+    failure cleanup and pipes;
+  - the import integrity test now runs with a nonexistent `TMPDIR` and blocks
+    the repository's own `tmp` to prove fail-closed behaviour;
+  - the HTTP bundle API test runs without a usable `TMPDIR` and checks that
+    nothing is left in the project scratch directory.
+  - Seven mutations were each caught.
+
+Original analysis:
 
 **F6. "Disk-backed" scratch files live in `TMPDIR`.**
 The bundle location index, visit marks, trie summaries and reference-edge
@@ -298,7 +331,33 @@ success or after an injected failure.
 
 ---
 
-## Phase 5: Incremental synchronization cost (Medium, needs Phase 1)
+## Phase 5: Replace QHttpServer with cpp-httplib (Medium, needs Phases 2–4)
+
+Decision (2026-10-23): QHttpServer cannot limit requests before Qt 6.11
+(Debian 13 ships 6.8) and only exposes fully buffered bodies. Replace it with
+**cpp-httplib**, vendored as a pinned single header (MIT) in
+`external/cpp-httplib/`. The distro packages are not used because their
+versions differ too much (Debian 13: 0.18.7, Arch: 0.48+).
+
+Scope:
+- `src/db_http_routes.cpp` → httplib handlers with the same routes, JSON
+  shapes and error mapping (`StorageErrorKind` → status).
+- `set_payload_max_length` (= `max_transfer_mib`), header and URI limits, and
+  read/write timeouts on every Qt version. The Phase 3 proxy policy is kept
+  only as documentation for TLS termination.
+- Streaming bundle upload through a content receiver directly into a
+  `ScratchFile` (no full body in RAM); streaming download from the export
+  `ScratchFile` via a content provider.
+- The thread pool replaces the single event loop (prepares Phase 7).
+- Server dependencies: Qt Network and Qt HttpServer are dropped; Qt Core stays
+  only for the model codec. JSON uses Qt Core's `QJsonDocument`, as before.
+- HTTP tests use `httplib::Client`. All existing assertions are kept, and
+  additional tests cover oversized bodies (413 before buffering), slow and
+  aborted uploads, and concurrent requests.
+
+---
+
+## Phase 6: Incremental synchronization cost (Medium, needs Phase 1)
 
 **F3. Incremental import and export scale with total history.**
 Measured with a 4-object delta (ASan build):
@@ -349,7 +408,7 @@ Tests and benchmark:
 
 ---
 
-## Phase 6: Concurrent service (Medium, needs Phases 2 and 3)
+## Phase 7: Concurrent service (Medium, needs Phase 5)
 
 **F4. The service processes one request at a time.**
 Route handlers return synchronously on the main event-loop thread, and
@@ -362,19 +421,11 @@ Fix:
   - each `Entry` holds a `std::shared_ptr<Repository>` and its own operation
     mutex. `Repository` is already thread-safe internally, so read routes can
     skip the per-project mutex entirely.
-- HTTP:
-  - long-running routes (bundle GET/POST, network save, edits, merges, diff)
-    return `QFuture<QHttpServerResponse>` executed on a dedicated
-    `QThreadPool`;
+- HTTP (after Phase 5, cpp-httplib already runs handlers on a thread pool):
   - `[server] worker_threads=` with default 4;
   - per-project queue limit: return 503 with `Retry-After` when a project
     already has N pending writes;
-  - `/health` and `/ready` stay synchronous.
-- The responder-based bundle download must not touch the responder from a
-  worker thread. Prepare the file in the worker and send it from the server
-  thread (or use the Qt version's supported async responder pattern).
-- If the deployed Qt lacks `QFuture` route support, raise the minimum Qt
-  version in CMake (decide together with Phase 3).
+  - `/health` and `/ready` never wait for a project lock.
 
 Tests: `/health` answers within 200 ms while a large import runs; two
 projects import concurrently; concurrent edits on one project still give
@@ -383,7 +434,7 @@ runs with the thread pool enabled.
 
 ---
 
-## Phase 7: Model value validation (Low)
+## Phase 8: Model value validation (Low)
 
 **F8. Out-of-range enums and non-finite numbers are stored.**
 - `model_codec.cpp` decodes enums with an unchecked `static_cast`.
@@ -410,7 +461,7 @@ NaN → 400.
 
 ---
 
-## Phase 8: Cleanup (Low)
+## Phase 9: Cleanup (Low)
 
 - `Repository::Repository`: fix the leftover indentation (former `if` branch)
   and remove the unused `format` variable.
@@ -441,7 +492,7 @@ No functional tests are needed beyond the existing suites.
 ./compile_linux_tests.sh --both
 ```
 
-Phases that change the service (2, 3, 4, 6) additionally need a release
+Phases that change the service (2, 3, 4, 5, 7) additionally need a release
 build and a restart of `aowis-server-db`:
 
 ```

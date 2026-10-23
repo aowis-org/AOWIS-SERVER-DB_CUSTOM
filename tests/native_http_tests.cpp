@@ -662,7 +662,23 @@ void exercise(aowis::native::PhysicalStore backend) {
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
         exerciseHydraulicApi(client, service, firstId, second.json.value("id").toString(), firstRevision);
 #endif
-        exerciseBundleApi(client, service, firstId, backend);
+        {
+            // Review F6: bundle spools and exports use repository scratch files,
+            // so the whole transfer API works without a usable TMPDIR.
+            const char* previous = ::getenv("TMPDIR");
+            const std::string saved = previous == nullptr ? std::string() : std::string(previous);
+            check(::setenv("TMPDIR", (root.root() / "no-such-tmpdir").c_str(), 1) == 0, "setenv failed");
+            try {
+                exerciseBundleApi(client, service, firstId, backend);
+            } catch (...) {
+                if (previous == nullptr) ::unsetenv("TMPDIR"); else ::setenv("TMPDIR", saved.c_str(), 1);
+                throw;
+            }
+            if (previous == nullptr) ::unsetenv("TMPDIR"); else ::setenv("TMPDIR", saved.c_str(), 1);
+            check(std::filesystem::is_empty(root.root() / "projects" / firstId.toStdString() /
+                                            "repository" / "tmp"),
+                  "bundle transfers left files in the project scratch directory");
+        }
         exerciseErrorClassification(client, service, root.root());
         exerciseBoundsAndScoping(client, service);
     }

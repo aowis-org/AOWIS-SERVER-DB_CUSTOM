@@ -29,8 +29,12 @@ repository/
 ├── objects.<id>.idx        # its corresponding index
 ├── maintenance.lock        # repository lifetime/compaction locking
 ├── repo.lock               # repository operation locking
+├── recovered-pack-tails/   # copies of discarded torn pack tails (if any)
+├── tmp/                    # scratch space, mode 0700 (see below)
 └── refs/heads/             # branch -> immutable revision hash
 ```
+
+**Scratch space.** Import/verification tables (bundle location index, visit marks, trie summaries, external reference sort) and HTTP bundle spools/exports are nameless files in `tmp/`, created with `O_TMPFILE`; on filesystems without it, `aowis-scratch-*` files are created and unlinked immediately, and any such leftover from a crash is removed on open. Scratch space is therefore on the pack's own filesystem: never in `TMPDIR`, which is often a RAM-backed tmpfs (Fedora, Arch, Debian 13), so "file-backed, evictable" really means disk. A symlinked or non-directory `tmp` is refused. C++ callers can use `Repository::createScratchFile()` together with the descriptor overloads of `importBranchBundle` / `export…BranchBundle`.
 
 Object records use an `AOBJ` header and typed canonical bytes. Index entries contain object hash, physical offset/length and a CRC32 checksum. The index is derived: on damage or absence it can be rebuilt from the authoritative pack. A normal reopen checks index structure but does **not** hash every object; payload reads and explicit verification check SHA-256. Corrupted complete pack records are rejected. A torn pack tail is repaired on open: if the first invalid record (short, zero-filled, or a full-length body whose SHA-256 does not match) is followed by no valid record up to EOF, and every published branch head is still present before it, the region is unpublished by construction. It is copied to `recovered-pack-tails/` (fsynced), then truncated, and `Repository::recoveredPackTailBytes()` reports the amount. An invalid record followed by a valid one, or damage reaching a published head, is mid-pack corruption and fails closed without modifying the pack. A torn region whose payload happens to contain a complete, valid embedded pack record is also refused (fail-closed direction).
 

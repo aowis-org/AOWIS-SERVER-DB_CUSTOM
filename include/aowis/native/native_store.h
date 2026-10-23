@@ -192,6 +192,24 @@ struct MergeResult {
     std::vector<MergeConflict> conflicts;
 };
 
+// Anonymous file in a repository's scratch directory (<repository>/tmp: the
+// pack's filesystem, never TMPDIR). It has no name and disappears on close.
+class ScratchFile final {
+public:
+    ScratchFile() = default;
+    explicit ScratchFile(int fd) noexcept;
+    ~ScratchFile();
+    ScratchFile(ScratchFile&& other) noexcept;
+    ScratchFile& operator=(ScratchFile&& other) noexcept;
+    ScratchFile(const ScratchFile&) = delete;
+    ScratchFile& operator=(const ScratchFile&) = delete;
+    int fd() const noexcept;
+    // Hands the descriptor to a new owner (for example QFile/AutoCloseHandle).
+    int release() noexcept;
+private:
+    int fd_ = -1;
+};
+
 // Failures are reported as StorageError (a std::runtime_error) carrying a
 // StorageErrorKind; callers must classify by kind, never by message text.
 // Linux/POSIX prototype. All operations on one instance are thread-safe;
@@ -275,6 +293,18 @@ public:
     BundleImportResult importBranchBundle(const std::filesystem::path& bundlePath,
                                           std::string_view localBranch, BundleLimits limits = {},
                                           BundleImportProfile* profile = nullptr);
+    // Descriptor variants (e.g. for ScratchFile spools). The caller keeps
+    // ownership. Import reads the regular file fd positionally; export
+    // requires an empty regular file and leaves it empty on failure.
+    BundleImportResult importBranchBundle(int fd, std::string_view localBranch,
+                                          BundleLimits limits = {},
+                                          BundleImportProfile* profile = nullptr);
+    void exportBranchBundle(std::string_view branch, int fd, BundleLimits limits = {});
+    void exportIncrementalBranchBundle(std::string_view branch, const Hash& recipientBase, int fd,
+                                       BundleLimits limits = {});
+    // Scratch space on the repository's filesystem (see ScratchFile).
+    ScratchFile createScratchFile();
+    const std::filesystem::path& scratchDirectory() const noexcept;
 
     std::uint64_t packSize();
     std::uint64_t objectCount();
@@ -309,6 +339,7 @@ private:
     };
 
     std::filesystem::path directory_;
+    std::filesystem::path scratch_; // <directory_>/tmp
     int lockFd_ = -1;
     int lifetimeFd_ = -1;
     std::string packToken_;
@@ -331,8 +362,9 @@ private:
     std::uint64_t recoveredPackTailBytes_ = 0;
     Bytes pendingIndex_;
 
-    void exportBundleLocked(std::string_view branch, const std::filesystem::path& bundlePath,
-                            std::optional<Hash> recipientBase, BundleLimits limits);
+    void exportBundleLocked(std::string_view branch, const std::filesystem::path* bundlePath,
+                            int targetFd, std::optional<Hash> recipientBase, BundleLimits limits);
+    void prepareScratchDirectory();
     void scanPackTail();
     void discardTornPackTail(std::uint64_t position, std::uint64_t size);
     void preserveDiscardedPackBytes(std::uint64_t position, std::uint64_t size);

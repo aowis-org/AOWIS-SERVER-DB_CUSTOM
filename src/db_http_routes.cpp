@@ -19,7 +19,6 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QFile>
-#include <QTemporaryDir>
 #include <QUrlQuery>
 #include <QUuid>
 
@@ -34,6 +33,8 @@
 #include <utility>
 #include <stdexcept>
 #include <string>
+#include <cerrno>
+#include <unistd.h>
 
 namespace aowis::native::http {
 namespace {
@@ -127,17 +128,22 @@ void guardedResponder(QHttpServerResponder& responder, Function&& function) {
     catch (const std::exception& exception) { responder.sendResponse(internalFailure(exception)); }
 }
 
-// The responder assumes ownership of a supplied QIODevice and may continue
-// reading it after the route returns. Retain the private export directory for
-// exactly that lifetime; close the file before deleting the directory.
-class BundleExportDevice final : public QFile {
-public:
-    BundleExportDevice(const QString& filename, std::unique_ptr<QTemporaryDir> directory)
-        : QFile(filename), directory_(std::move(directory)) {}
-    ~BundleExportDevice() override { this->close(); }
-private:
-    std::unique_ptr<QTemporaryDir> directory_;
-};
+// Spools a request body into a repository scratch file. errno is kept, so a
+// full disk is reported as ResourceExhausted (507), not as a generic failure.
+void writeScratch(const ScratchFile& file, const QByteArray& bytes) {
+    qsizetype done = 0;
+    while (done < bytes.size()) {
+        const ssize_t written = ::pwrite(file.fd(), bytes.constData() + done,
+                                         static_cast<std::size_t>(bytes.size() - done),
+                                         static_cast<off_t>(done));
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            if (written == 0) errno = EIO;
+            throwSystemError("spool replication bundle");
+        }
+        done += static_cast<qsizetype>(written);
+    }
+}
 
 void requireInput(bool valid, const char* message) {
     if (!valid) throw ProjectError(ProjectErrorKind::InvalidInput, message);
@@ -390,16 +396,14 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 requireInput(item.first == QStringLiteral("base"), "unknown bundle query parameter");
             const std::optional<Hash> base = query.hasQueryItem("base") ?
                 std::optional<Hash>(parseHash(query.queryItemValue("base"))) : std::nullopt;
-            std::unique_ptr<QTemporaryDir> temporary = std::make_unique<QTemporaryDir>();
-            if (!temporary->isValid())
-                throw StorageError(StorageErrorKind::Io, "cannot create bundle export directory");
-            const QString filename = temporary->filePath(QStringLiteral("export.aowbundle"));
-            const std::filesystem::path path(filename.toStdString());
+            // Anonymous scratch file on the project's own filesystem (not TMPDIR).
+            ScratchFile exported;
             try {
                 service.withRepository(id.toStdString(), [&](Repository& repository) {
                     requireBranch(repository, target);
-                    if (base) repository.exportIncrementalBranchBundle(target, *base, path, transferLimits);
-                    else repository.exportBranchBundle(target, path, transferLimits);
+                    exported = repository.createScratchFile();
+                    if (base) repository.exportIncrementalBranchBundle(target, *base, exported.fd(), transferLimits);
+                    else repository.exportBranchBundle(target, exported.fd(), transferLimits);
                 });
             } catch (const StorageError& error) {
                 // Route-specific error codes; every other kind uses the common mapping.
@@ -415,18 +419,21 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 }
                 throw;
             }
-            std::unique_ptr<BundleExportDevice> file =
-                std::make_unique<BundleExportDevice>(filename, std::move(temporary));
-            if (!file->open(QIODevice::ReadOnly))
+            // The responder owns the device and may keep reading after the
+            // route returns; QFile closes the descriptor when it is destroyed,
+            // which also frees the nameless scratch file.
+            std::unique_ptr<QFile> file = std::make_unique<QFile>();
+            const int descriptor = exported.fd();
+            if (!file->open(descriptor, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle))
                 throw StorageError(StorageErrorKind::Io, "cannot read exported bundle");
+            (void)exported.release(); // now owned by QFile
             if (file->size() < 0 ||
                 static_cast<std::uint64_t>(file->size()) > transferLimits.maxBytes) {
                 responder.sendResponse(errorResponse(Status::PayloadTooLarge, "transfer_too_large",
                                                      QStringLiteral("export exceeds configured transfer limit")));
                 return;
             }
-            // Qt owns the device after write(). Its destructor cleans up the
-            // temporary file on success, disconnect and early response teardown.
+            // Qt owns the device after write(), also on disconnect and early teardown.
             responder.write(file.release(), QByteArray("application/vnd.aowis.bundle"));
         });
     });
@@ -442,19 +449,13 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             if (static_cast<std::uint64_t>(body.size()) > transferLimits.maxBytes)
                 return errorResponse(Status::PayloadTooLarge, "transfer_too_large",
                                      QStringLiteral("bundle exceeds configured transfer limit"));
-            QTemporaryDir temporary;
-            if (!temporary.isValid()) throw StorageError(StorageErrorKind::Io, "cannot create bundle import directory");
-            const QString filename = temporary.filePath(QStringLiteral("import.aowbundle"));
-            QFile file(filename);
-            if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly) ||
-                file.write(body) != body.size() || !file.flush())
-                throw StorageError(StorageErrorKind::Io, "cannot spool replication bundle");
-            file.close();
             BundleImportResult imported;
             try {
                 service.withRepository(id.toStdString(), [&](Repository& repository) {
-                    imported = repository.importBranchBundle(
-                        std::filesystem::path(filename.toStdString()), target, transferLimits);
+                    // Spool on the project's own filesystem (not TMPDIR).
+                    const ScratchFile spool = repository.createScratchFile();
+                    writeScratch(spool, body);
+                    imported = repository.importBranchBundle(spool.fd(), target, transferLimits);
                 });
             } catch (const StorageError& error) {
                 // Route-specific error codes; every other kind (including a full
