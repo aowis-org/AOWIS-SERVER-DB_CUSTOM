@@ -19,14 +19,17 @@
 #include <QProcess>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QStringList>
 #include <QTimer>
 #include <QUrl>
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 void check(bool ok, const char* message) {
@@ -196,6 +199,17 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
           "network appeared before initial save");
     check(client.call("GET", networkRoute + "?revision=" + createdHead).status == 200,
           "historical network read failed");
+    // Typed errors (review F2): a UUID owned by another model entity is not a
+    // network (404, formerly 500); editing a missing network is 404 (formerly 400).
+    check(client.call("GET", main + "/networks/" + junctionId).status == 404,
+          "non-network UUID was not reported as a missing network");
+    const Response missingEdit = client.call("POST", main + "/networks/" +
+        QUuid::createUuid().toString(QUuid::WithoutBraces) + "/edits",
+        QJsonObject{{"expectedHead", createdHead},
+                    {"changes", QJsonArray{QJsonObject{{"uuid", junctionId}, {"delete", true}}}}});
+    check(missingEdit.status == 404 &&
+          missingEdit.json.value("error").toObject().value("code").toString() == "not_found",
+          "edit of a missing network was not 404 not_found");
 
     junction.elevation_m = 456;
     const QString changed = QString::fromLatin1(native::ModelCodec<HydraulicNodeJunction>::encode(junction).toBase64());
@@ -411,6 +425,158 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
     });
 }
 
+// Review F2/F10b: classification by StorageErrorKind, never message text.
+void exerciseErrorClassification(Client& client, aowis::native::ProjectService& service,
+                                 const std::filesystem::path& root) {
+    namespace native = aowis::native;
+    const Response created = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Errors"}});
+    check(created.status == 201, "error-classification project creation failed");
+    const QString id = created.json.value("id").toString();
+    const QString prefix = "/api/v1/projects/" + id;
+    native::Revision committed;
+    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
+        native::Key key{};
+        key[15] = 7;
+        committed = repository.commit("main", {native::Change{key, native::Bytes{1, 2, 3}}});
+    });
+    // A tree hash is an existing object, but not a revision: 404, not 500.
+    const Response tree = client.call("GET", prefix + "/revisions/" +
+                                      QString::fromStdString(native::toHex(committed.root)));
+    check(tree.status == 404 &&
+          tree.json.value("error").toObject().value("code").toString() == "not_found",
+          "non-revision object hash was not reported as 404 not_found");
+    const QString to = QString::fromStdString(native::toHex(committed.id));
+    check(client.call("GET", prefix + "/diff?from=" +
+                      QString::fromStdString(native::toHex(committed.root)) + "&to=" + to).status == 404,
+          "diff accepted a non-revision object hash");
+
+    // Damaged local storage is a server failure: 500 with a generic message
+    // and no internal details (checksums, paths, errno text) in the response.
+    const std::filesystem::path pack = root / "projects" / id.toStdString() / "repository" / "objects.pack";
+    {
+        std::fstream stream(pack, std::ios::in | std::ios::out | std::ios::binary);
+        check(stream.good(), "cannot open project pack for corruption test");
+        stream.seekg(50);
+        char byte = 0;
+        stream.read(&byte, 1);
+        byte = static_cast<char>(static_cast<unsigned char>(byte) ^ 0xffU);
+        stream.seekp(50);
+        stream.write(&byte, 1);
+        check(stream.good(), "cannot corrupt project pack");
+    }
+    const QString initial = QString::fromStdString(native::toHex(committed.parents.front()));
+    const BinaryResponse damaged = client.callRaw("GET", prefix + "/revisions/" + initial);
+    const QJsonObject error = QJsonDocument::fromJson(damaged.body).object().value("error").toObject();
+    check(damaged.status == 500 && error.value("code").toString() == "internal_error" &&
+          error.value("message").toString() == "database operation failed",
+          "storage corruption was not reported as a generic 500");
+    check(!damaged.body.contains("checksum") && !damaged.body.contains("pack"),
+          "storage corruption details leaked to the HTTP client");
+}
+
+// Review F9/F10a: list-like responses are bounded before materialization, and
+// branch-scoped routes only serve revisions of that branch.
+void exerciseBoundsAndScoping(Client& client, aowis::native::ProjectService& service) {
+    namespace native = aowis::native;
+    const Response created = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Bounds"}});
+    check(created.status == 201, "bounds project creation failed");
+    const QString id = created.json.value("id").toString();
+    const QString prefix = "/api/v1/projects/" + id;
+    native::Hash empty{};
+    native::Hash exactly1000{};
+    native::Hash over1000{};
+    native::Hash mainOnly{};
+    native::Hash sideOnly{};
+    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
+        empty = repository.head("main").id;
+        std::vector<native::Change> changes;
+        for (unsigned i = 0; i < 1000; ++i) {
+            native::Key key{};
+            key[0] = static_cast<std::uint8_t>(i * 37U);
+            key[14] = static_cast<std::uint8_t>(i >> 8U);
+            key[15] = static_cast<std::uint8_t>(i);
+            changes.push_back(native::Change{key, native::Bytes{1}});
+        }
+        repository.createBranch("bulk", "main");
+        exactly1000 = repository.commit("bulk", changes).id;
+        native::Key extra{};
+        extra[0] = 0xfe;
+        extra[15] = 0xfe;
+        over1000 = repository.commit("bulk", {native::Change{extra, native::Bytes{2}}}).id;
+        native::Key a{};
+        a[15] = 1;
+        mainOnly = repository.commit("main", {native::Change{a, native::Bytes{3}}}).id;
+        repository.createBranch("side", "main");
+        native::Key b{};
+        b[15] = 2;
+        sideOnly = repository.commit("side", {native::Change{b, native::Bytes{4}}}).id;
+    });
+    const QString hex0 = QString::fromStdString(native::toHex(empty));
+    const Response fits = client.call("GET", prefix + "/diff?from=" + hex0 + "&to=" +
+                                      QString::fromStdString(native::toHex(exactly1000)));
+    check(fits.status == 200 && fits.json.value("changes").toArray().size() == 1000,
+          "diff with exactly 1000 records was not returned");
+    const Response tooLarge = client.call("GET", prefix + "/diff?from=" + hex0 + "&to=" +
+                                          QString::fromStdString(native::toHex(over1000)));
+    check(tooLarge.status == 413 &&
+          tooLarge.json.value("error").toObject().value("code").toString() == "limit_exceeded",
+          "diff with 1001 records was not rejected with 413 limit_exceeded");
+
+#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+    // Branch scoping is checked before any model access: a revision of another
+    // branch is 404; the branch's own ancestor passes scoping and then fails the
+    // (raw) model check with 400.
+    const QString anyNetwork = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString side = QString::fromStdString(native::toHex(sideOnly));
+    const QString main = QString::fromStdString(native::toHex(mainOnly));
+    const Response foreign = client.call("GET", prefix + "/branches/main/networks/" + anyNetwork +
+                                         "?revision=" + side);
+    check(foreign.status == 404 &&
+          foreign.json.value("error").toObject().value("code").toString() == "not_found",
+          "revision of another branch was served on a branch-scoped route");
+    check(client.call("GET", prefix + "/branches/main/networks/" + anyNetwork + "/entities?type=9&revision=" +
+                      side).status == 404, "entity listing served another branch's revision");
+    check(client.call("GET", prefix + "/branches/main/networks/" + anyNetwork + "/entities/" + anyNetwork +
+                      "?revision=" + side).status == 404, "entity read served another branch's revision");
+    check(client.call("GET", prefix + "/branches/side/networks/" + anyNetwork + "?revision=" + main)
+              .status == 400, "ancestor revision was not accepted by branch scoping");
+
+    // Entity listings: exactly 10000 UUIDs are returned, 10001 are 413.
+    const QUuid networkUuid = QUuid::createUuid();
+    QUuid removable;
+    native::Hash bigHead{};
+    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
+        repository.createBranch("large");
+        NetworkHydraulic network;
+        network.uuid = networkUuid;
+        network.id = QStringLiteral("large");
+        for (int i = 0; i < 10001; ++i) {
+            HydraulicNodeJunction junction;
+            junction.uuid = QUuid::createUuid();
+            junction.id = QStringLiteral("J%1").arg(i);
+            network.nodes_junctions.append(junction);
+        }
+        removable = network.nodes_junctions.last().uuid;
+        bigHead = native::hydraulic::saveHydraulicNetwork(repository, "large", network).id;
+    });
+    const QString listing = prefix + "/branches/large/networks/" +
+                            networkUuid.toString(QUuid::WithoutBraces) + "/entities?type=9";
+    const Response overList = client.call("GET", listing);
+    check(overList.status == 413 &&
+          overList.json.value("error").toObject().value("code").toString() == "limit_exceeded",
+          "10001-entity listing was not rejected with 413 limit_exceeded");
+    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
+        native::hydraulic::editHydraulicNetwork(repository, "large", networkUuid,
+            {native::hydraulic::HydraulicEntityChange{removable, std::nullopt}}, nullptr, bigHead);
+    });
+    const Response fullList = client.call("GET", listing);
+    check(fullList.status == 200 && fullList.json.value("uuids").toArray().size() == 10000,
+          "10000-entity listing was not returned completely");
+    check(client.call("GET", listing + "&revision=" + QString::fromStdString(native::toHex(bigHead)))
+              .status == 413, "historical 10001-entity listing was not bounded");
+#endif
+}
+
 void exercise(aowis::native::PhysicalStore backend) {
     TemporaryRoot root;
     QString firstId;
@@ -497,6 +663,8 @@ void exercise(aowis::native::PhysicalStore backend) {
         exerciseHydraulicApi(client, service, firstId, second.json.value("id").toString(), firstRevision);
 #endif
         exerciseBundleApi(client, service, firstId, backend);
+        exerciseErrorClassification(client, service, root.root());
+        exerciseBoundsAndScoping(client, service);
     }
     check(observedListener.isNull(), "HTTP server did not destroy its owned listener");
     {
@@ -561,6 +729,99 @@ void exerciseServerShutdown(const QString& executable) {
         throw;
     }
 }
+
+struct ServerRun {
+    bool listened = false;
+    int exitCode = -1;
+    QString diagnostics;
+};
+
+// Starts the real executable, probes it via 127.0.0.1, and stops it again.
+// A process that exits on its own is reported with its exit code.
+ServerRun runServer(const QString& executable, QStringList arguments) {
+    TemporaryRoot root;
+    QTcpServer reservation;
+    check(reservation.listen(QHostAddress::LocalHost, 0), "unable to reserve test port");
+    const quint16 port = reservation.serverPort();
+    reservation.close();
+    arguments << QStringLiteral("--port") << QString::number(port)
+              << QStringLiteral("--data-root") << QString::fromStdString(root.root().string());
+    QProcess process;
+    process.setProgram(executable);
+    process.setArguments(arguments);
+    process.start();
+    check(process.waitForStarted(5000), "database HTTP executable did not start");
+    ServerRun run;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while (elapsed.elapsed() < 5000 && process.state() != QProcess::NotRunning) {
+        QTcpSocket probe;
+        probe.connectToHost(QHostAddress::LocalHost, port);
+        if (probe.waitForConnected(100)) {
+            run.listened = true;
+            probe.disconnectFromHost();
+            break;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    if (run.listened) {
+        Client client(port);
+        check(client.call("GET", "/api/v1/health").status == 200, "policy run: health failed");
+        process.terminate();
+    }
+    if (!process.waitForFinished(5000)) {
+        process.kill();
+        process.waitForFinished(3000);
+    }
+    run.exitCode = process.exitCode();
+    run.diagnostics = QString::fromLocal8Bit(process.readAllStandardError());
+    return run;
+}
+
+// Review F5: Qt < 6.11 cannot bound request sizes; non-loopback listeners need
+// an explicitly declared limiting reverse proxy.
+void exerciseBodyLimitPolicy(const QString& executable) {
+    const bool qtLimits = QT_VERSION >= QT_VERSION_CHECK(6, 11, 0);
+    const ServerRun loopback = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("127.0.0.1")});
+    check(loopback.listened, "loopback listener did not start");
+    check(qtLimits != loopback.diagnostics.contains("listening on loopback address 127.0.0.1 only"),
+          "loopback warning does not match the Qt version");
+
+    const ServerRun exposed = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0")});
+    if (qtLimits) {
+        check(exposed.listened && exposed.diagnostics.isEmpty(),
+              "Qt >= 6.11 refused or warned about a non-loopback listener");
+    } else {
+        check(!exposed.listened && exposed.exitCode == 2 &&
+              exposed.diagnostics.contains("refusing to listen on non-loopback address 0.0.0.0"),
+              "Qt < 6.11 started a non-loopback listener without a declared proxy");
+    }
+
+    const ServerRun proxied = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0"),
+                                                     QStringLiteral("--proxy-enforces-body-limit")});
+    check(proxied.listened, "declared reverse proxy did not allow the listener");
+    check(qtLimits != proxied.diagnostics.contains("relying on the reverse proxy"),
+          "reverse proxy notice does not match the Qt version");
+
+    TemporaryRoot configuration;
+    const std::filesystem::path ini = configuration.root() / "server.ini";
+    {
+        std::ofstream output(ini);
+        output << "[server]\nproxy_enforces_body_limit=true\n";
+    }
+    const ServerRun fromIni = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0"),
+        QStringLiteral("--config"), QString::fromStdString(ini.string())});
+    check(fromIni.listened, "INI proxy_enforces_body_limit=true did not allow the listener");
+    {
+        std::ofstream output(ini, std::ios::trunc);
+        output << "[server]\nproxy_enforces_body_limit=maybe\n";
+    }
+    const ServerRun invalid = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
+        QStringLiteral("--config"), QString::fromStdString(ini.string())});
+    check(!invalid.listened && invalid.exitCode == 2 &&
+          invalid.diagnostics.contains("Invalid server/proxy_enforces_body_limit"),
+          "invalid proxy_enforces_body_limit value was accepted");
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -569,6 +830,7 @@ int main(int argc, char** argv) {
         check(argc == 2, "expected path to aowis-server-db executable");
         exercise(aowis::native::PhysicalStore::Pack);
         exerciseServerShutdown(QString::fromLocal8Bit(argv[1]));
+        exerciseBodyLimitPolicy(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
         return 0;
     } catch (const std::exception& error) {

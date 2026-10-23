@@ -1,4 +1,5 @@
 #include "aowis/native/db_http_routes.h"
+#include "aowis/native/storage_error.h"
 
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
 #include "aowis/native/hydraulic_network_persistence.h"
@@ -38,6 +39,11 @@ namespace aowis::native::http {
 namespace {
 using Status = QHttpServerResponse::StatusCode;
 
+// Response size bounds of list-like routes; larger results return 413 and
+// must use the native library. Enforced before the result is materialized.
+constexpr std::size_t maxHttpDiffRecords = 1000;
+constexpr std::size_t maxHttpEntityIds = 10000;
+
 QHttpServerResponse errorResponse(Status status, const QString& code, const QString& message) {
     return QHttpServerResponse(QJsonObject{{"error", QJsonObject{
         {"code", code}, {"message", message}}}}, status);
@@ -64,10 +70,50 @@ QHttpServerResponse internalFailure(const std::exception& exception) {
                          QStringLiteral("database operation failed"));
 }
 
+// Classification is by StorageErrorKind only. Client-caused failures return
+// their message; server-side failures are logged and answered generically so
+// paths, errno text and corruption details never reach remote clients.
+QHttpServerResponse storageFailure(const StorageError& error) {
+    const QString message = QString::fromUtf8(error.what());
+    switch (error.kind()) {
+    case StorageErrorKind::InvalidInput:
+        return errorResponse(Status::BadRequest, QStringLiteral("invalid_request"), message);
+    case StorageErrorKind::NotFound:
+        return errorResponse(Status::NotFound, QStringLiteral("not_found"), message);
+    case StorageErrorKind::Conflict:
+        return errorResponse(Status::Conflict, QStringLiteral("conflict"), message);
+    case StorageErrorKind::LimitExceeded:
+        return errorResponse(Status::PayloadTooLarge, QStringLiteral("limit_exceeded"), message);
+    case StorageErrorKind::Unavailable:
+        std::cerr << "AOWIS database unavailable: " << error.what() << '\n';
+        return errorResponse(Status::ServiceUnavailable, QStringLiteral("unavailable"),
+                             QStringLiteral("repository temporarily unavailable"));
+    case StorageErrorKind::ResourceExhausted:
+        std::cerr << "AOWIS database storage exhausted: " << error.what() << '\n';
+        return errorResponse(Status::InsufficientStorage, QStringLiteral("insufficient_storage"),
+                             QStringLiteral("database storage is exhausted"));
+    case StorageErrorKind::Corruption:
+    case StorageErrorKind::Io:
+    case StorageErrorKind::Internal:
+        break;
+    }
+    std::cerr << "AOWIS database request failed [" << StorageError::kindName(error.kind())
+              << "]: " << error.what() << '\n';
+    return errorResponse(Status::InternalServerError, QStringLiteral("internal_error"),
+                         QStringLiteral("database operation failed"));
+}
+
+// A failing hydraulic load reports damage as text only (an empty text means
+// "not found" and is handled by the caller).
+[[noreturn]] void throwLoadFailure(const QString& error) {
+    throw StorageError(StorageErrorKind::Corruption, error.toStdString());
+}
+
 template <typename Function>
 QHttpServerResponse guarded(Function&& function) {
     try { return function(); }
     catch (const ProjectError& error) { return projectFailure(error); }
+    catch (const StorageError& error) { return storageFailure(error); }
     catch (const std::exception& exception) { return internalFailure(exception); }
 }
 
@@ -77,6 +123,7 @@ template <typename Function>
 void guardedResponder(QHttpServerResponder& responder, Function&& function) {
     try { function(); }
     catch (const ProjectError& error) { responder.sendResponse(projectFailure(error)); }
+    catch (const StorageError& error) { responder.sendResponse(storageFailure(error)); }
     catch (const std::exception& exception) { responder.sendResponse(internalFailure(exception)); }
 }
 
@@ -161,15 +208,6 @@ void requireBranch(Repository& repository, const std::string& branch) {
         throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
 }
 
-Revision checkedRevision(Repository& repository, const Hash& id) {
-    try { return repository.revision(id); }
-    catch (const std::runtime_error& error) {
-        if (std::string_view(error.what()).find("referenced content") != std::string_view::npos)
-            throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
-        throw;
-    }
-}
-
 // A client-selected revision may be historical; it is always looked up within
 // the selected project and never through an untrusted filesystem path.
 Hash revisionForRead(Repository& repository, const std::string& branch,
@@ -178,7 +216,10 @@ Hash revisionForRead(Repository& repository, const std::string& branch,
     const QUrlQuery query = request.query();
     if (!query.hasQueryItem("revision")) return repository.head(branch).id;
     const Hash revisionId = parseHash(query.queryItemValue("revision"));
-    (void)checkedRevision(repository, revisionId);
+    // Branch-scoped routes only serve that branch's own history (head or any
+    // ancestor, including merged second parents). Unknown hashes: NotFound.
+    if (!repository.revisionOnBranch(branch, revisionId))
+        throw StorageError(StorageErrorKind::NotFound, "revision is not part of branch " + branch);
     return revisionId;
 }
 
@@ -248,36 +289,6 @@ void enforceHead(Repository& repository, const std::string& branch, const Hash& 
     requireBranch(repository, branch);
     if (repository.head(branch).id != expected)
         throw ProjectError(ProjectErrorKind::Conflict, "branch head does not match expectedHead");
-}
-
-// The underlying hydraulic adapter also checks expectedHead during atomic
-// publication. This precheck only improves the HTTP error response.
-template <typename Function>
-void hydraulicWrite(Function&& function) {
-    try { function(); }
-    catch (const ProjectError&) { throw; }
-    catch (const std::invalid_argument& error) {
-        throw ProjectError(ProjectErrorKind::InvalidInput, error.what());
-    }
-    catch (const std::runtime_error& error) {
-        const std::string message(error.what());
-        if (message.find("branch head changed") != std::string::npos ||
-            message.find("branch advanced") != std::string::npos ||
-            message.find("branch tip") != std::string::npos)
-            throw ProjectError(ProjectErrorKind::Conflict, message);
-        // Hydraulic validation and incompatible edit/merge choices are
-        // expected client errors; I/O and corruption failures remain 500.
-        if (message.starts_with("invalid ") || message.starts_with("cannot edit ") ||
-            message.starts_with("hydraulic ") || message.starts_with("duplicate ") ||
-            message.starts_with("null, network-owned") ||
-            message.starts_with("cannot delete referenced model UUID") ||
-            message.starts_with("model reference target") ||
-            message.starts_with("cannot commit model records") ||
-            message.find("merge contains unused") != std::string::npos ||
-            message.starts_with("cannot select both object and fields"))
-            throw ProjectError(ProjectErrorKind::InvalidInput, message);
-        throw;
-    }
 }
 
 QJsonObject diagnosticJson(const hydraulic::HydraulicEditDiagnostics& diagnostics) {
@@ -381,7 +392,7 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 std::optional<Hash>(parseHash(query.queryItemValue("base"))) : std::nullopt;
             std::unique_ptr<QTemporaryDir> temporary = std::make_unique<QTemporaryDir>();
             if (!temporary->isValid())
-                throw std::runtime_error("cannot create bundle export directory");
+                throw StorageError(StorageErrorKind::Io, "cannot create bundle export directory");
             const QString filename = temporary->filePath(QStringLiteral("export.aowbundle"));
             const std::filesystem::path path(filename.toStdString());
             try {
@@ -390,14 +401,14 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                     if (base) repository.exportIncrementalBranchBundle(target, *base, path, transferLimits);
                     else repository.exportBranchBundle(target, path, transferLimits);
                 });
-            } catch (const std::runtime_error& error) {
-                const std::string_view detail(error.what());
-                if (detail.find("bundle transfer limit:") != std::string_view::npos) {
+            } catch (const StorageError& error) {
+                // Route-specific error codes; every other kind uses the common mapping.
+                if (error.kind() == StorageErrorKind::LimitExceeded) {
                     responder.sendResponse(errorResponse(Status::PayloadTooLarge, "transfer_too_large",
                                                          QString::fromUtf8(error.what())));
                     return;
                 }
-                if (detail.find("incremental export base") != std::string_view::npos) {
+                if (error.kind() == StorageErrorKind::Conflict) {
                     responder.sendResponse(errorResponse(Status::Conflict, "invalid_base",
                                                          QString::fromUtf8(error.what())));
                     return;
@@ -407,7 +418,7 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             std::unique_ptr<BundleExportDevice> file =
                 std::make_unique<BundleExportDevice>(filename, std::move(temporary));
             if (!file->open(QIODevice::ReadOnly))
-                throw std::runtime_error("cannot read exported bundle");
+                throw StorageError(StorageErrorKind::Io, "cannot read exported bundle");
             if (file->size() < 0 ||
                 static_cast<std::uint64_t>(file->size()) > transferLimits.maxBytes) {
                 responder.sendResponse(errorResponse(Status::PayloadTooLarge, "transfer_too_large",
@@ -432,12 +443,12 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 return errorResponse(Status::PayloadTooLarge, "transfer_too_large",
                                      QStringLiteral("bundle exceeds configured transfer limit"));
             QTemporaryDir temporary;
-            if (!temporary.isValid()) throw std::runtime_error("cannot create bundle import directory");
+            if (!temporary.isValid()) throw StorageError(StorageErrorKind::Io, "cannot create bundle import directory");
             const QString filename = temporary.filePath(QStringLiteral("import.aowbundle"));
             QFile file(filename);
             if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly) ||
                 file.write(body) != body.size() || !file.flush())
-                throw std::runtime_error("cannot spool replication bundle");
+                throw StorageError(StorageErrorKind::Io, "cannot spool replication bundle");
             file.close();
             BundleImportResult imported;
             try {
@@ -445,21 +456,22 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                     imported = repository.importBranchBundle(
                         std::filesystem::path(filename.toStdString()), target, transferLimits);
                 });
-            } catch (const std::runtime_error& error) {
-                const std::string_view detail(error.what());
-                if (detail.find("bundle transfer limit:") != std::string_view::npos)
+            } catch (const StorageError& error) {
+                // Route-specific error codes; every other kind (including a full
+                // disk while preparing the import) uses the common mapping.
+                switch (error.kind()) {
+                case StorageErrorKind::LimitExceeded:
                     return errorResponse(Status::PayloadTooLarge, "transfer_too_large",
                                          QString::fromUtf8(error.what()));
-                if (detail.find("divergent") != std::string_view::npos ||
-                    detail.find("base revision is missing") != std::string_view::npos)
+                case StorageErrorKind::Conflict:
                     return errorResponse(Status::Conflict, "divergent_history",
                                          QString::fromUtf8(error.what()));
-                if (detail.find("bundle") != std::string_view::npos ||
-                    detail.find("bundled") != std::string_view::npos ||
-                    detail.find("replication") != std::string_view::npos)
+                case StorageErrorKind::InvalidInput:
                     return errorResponse(Status::BadRequest, "invalid_bundle",
                                          QString::fromUtf8(error.what()));
-                throw;
+                default:
+                    throw;
+                }
             }
             const QString status = imported.status == BundleImportStatus::Created ?
                 QStringLiteral("created") :
@@ -539,11 +551,9 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             const Hash to = parseHash(query.queryItemValue("to"));
             QJsonArray differences;
             service.withRepository(id.toStdString(), [&](Repository& repository) {
-                (void)checkedRevision(repository, from);
-                (void)checkedRevision(repository, to);
-                const std::vector<Difference> changes = repository.diffRevisions(from, to);
-                requireInput(changes.size() <= 1000,
-                             "diff exceeds 1000 records; use native library for large diffs");
+                // Bounded before materialization: more than 1000 records is 413.
+                const std::vector<Difference> changes =
+                    repository.diffRevisions(from, to, maxHttpDiffRecords);
                 for (const Difference& item : changes) {
                     const QByteArray bytes(reinterpret_cast<const char*>(item.key.data()),
                                            static_cast<qsizetype>(item.key.size()));
@@ -580,7 +590,7 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 const std::optional<NetworkHydraulic> loaded =
                     hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkUuid, &error);
                 if (!loaded) {
-                    if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
+                    if (!error.isEmpty()) throwLoadFailure(error);
                     throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
                 }
                 result = QJsonObject{{"revision", hashString(revisionId)},
@@ -604,10 +614,8 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             Revision committed;
             service.withRepository(id.toStdString(), [&](Repository& repository) {
                 enforceHead(repository, branch.toStdString(), expected);
-                hydraulicWrite([&]() {
-                    committed = hydraulic::saveHydraulicNetwork(
-                        repository, branch.toStdString(), *network, expected);
-                });
+                committed = hydraulic::saveHydraulicNetwork(
+                    repository, branch.toStdString(), *network, expected);
             });
             return QHttpServerResponse(revisionJson(committed), Status::Created);
         });
@@ -631,16 +639,11 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                         throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
                     throw ProjectError(ProjectErrorKind::InvalidInput, "revision is not model-indexed");
                 }
-                QString error;
-                const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevision(
+                // Bounded before materialization: more than 10000 UUIDs is 413.
+                const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevisionLimited(
                     repository, revisionId, networkUuid,
-                    static_cast<hydraulic::HydraulicEntityType>(type), &error);
-                if (!ids) {
-                    if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
-                    throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
-                }
-                requireInput(ids->size() <= 10000,
-                             "entity list exceeds 10000 UUIDs; use native library for large collections");
+                    static_cast<hydraulic::HydraulicEntityType>(type), maxHttpEntityIds);
+                if (!ids) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
                 QJsonArray entries;
                 for (const QUuid& uuid : *ids) entries.append(uuidString(uuid));
                 result = QJsonObject{{"revision", hashString(revisionId)},
@@ -669,7 +672,7 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 const std::optional<HydraulicEntity> item = hydraulic::loadHydraulicEntityAtRevision(
                     repository, revisionId, networkUuid, entityUuid, &error);
                 if (!item) {
-                    if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
+                    if (!error.isEmpty()) throwLoadFailure(error);
                     throw ProjectError(ProjectErrorKind::NotFound, "hydraulic entity not found");
                 }
                 result = QJsonObject{{"revision", hashString(revisionId)},
@@ -721,10 +724,8 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
             hydraulic::HydraulicEditDiagnostics diagnostics;
             service.withRepository(id.toStdString(), [&](Repository& repository) {
                 enforceHead(repository, branch.toStdString(), expected);
-                hydraulicWrite([&]() {
-                    committed = hydraulic::editHydraulicNetwork(repository, branch.toStdString(),
-                                                                networkUuid, changes, &diagnostics, expected);
-                });
+                committed = hydraulic::editHydraulicNetwork(repository, branch.toStdString(),
+                                                            networkUuid, changes, &diagnostics, expected);
             });
             return QHttpServerResponse(QJsonObject{{"revision", revisionJson(committed)},
                                                    {"diagnostics", diagnosticJson(diagnostics)}});
@@ -775,9 +776,7 @@ void registerRoutes(QHttpServer& server, ProjectService& service,
                 requireBranch(repository, source);
                 if (repository.head(target).id != targetHead || repository.head(source).id != sourceHead)
                     throw ProjectError(ProjectErrorKind::Conflict, "merge branch head has advanced");
-                hydraulicWrite([&]() {
-                    result = hydraulic::mergeHydraulicBranches(repository, target, source, selections);
-                });
+                result = hydraulic::mergeHydraulicBranches(repository, target, source, selections);
             });
             const QJsonObject output = mergeJson(result);
             return QHttpServerResponse(output, result.status == MergeStatus::Conflicts ?

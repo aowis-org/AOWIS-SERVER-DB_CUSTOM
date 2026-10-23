@@ -19,8 +19,8 @@ Style findings about `auto` are out of scope by decision.
 | Phase | Patch | Findings | Severity | Depends on | Status |
 |---|---|---|---|---|---|
 | 1 | `aowis-db-custom-pack-tail-recovery` | F1 torn pack tail, F7 double close, F11 orphan generations | High | – | done |
-| 2 | `aowis-db-custom-typed-errors` | F2 error classification, F10b non-revision hash | Medium | – | open |
-| 3 | `aowis-db-custom-request-bounds` | F5 unbounded bodies, F9 late caps, F10a branch scoping | Medium | 2 | open |
+| 2 | `aowis-db-custom-typed-errors` | F2 error classification, F10b non-revision hash | Medium | – | done |
+| 3 | `aowis-db-custom-request-bounds` | F5 unbounded bodies, F9 late caps, F10a branch scoping | Medium | 2 | done |
 | 4 | `aowis-db-custom-scratch-storage` | F6 scratch files on tmpfs | Medium | – | open |
 | 5 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | open |
 | 6 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 2, 3 | open |
@@ -105,7 +105,42 @@ review opens all three cases.
 
 ---
 
-## Phase 2: Typed storage errors (Medium)
+## Phase 2: Typed storage errors (Medium) — done
+
+Implemented in `aowis-db-custom-typed-errors`:
+- New header `include/aowis/native/storage_error.h`: `StorageError` and
+  `StorageErrorKind`. Besides the planned kinds it has `Unavailable` (503) and
+  `Internal`.
+- `native_store.cpp`: all 198 `require` sites carry an explicit kind (the
+  classification is listed in the patch); `systemCall` maps errno; context
+  wrappers keep the kind.
+- `clientRevision()` reports unknown and non-revision hashes as `NotFound`.
+- Bundle import reclassifies verifier `Corruption` as `InvalidInput`, but
+  failures while reading local objects keep their kind.
+- The hydraulic layer, model records and the codec adapter throw typed errors.
+- The HTTP routes contain no message matching any more. `ProjectService`
+  translates client kinds to `ProjectError`.
+- Behaviour changes:
+  - non-network UUID on `/networks/{id}` → 404 (was 500);
+  - editing a missing network → 404 (was 400);
+  - "merge selection is not a conflicting field" → 400 (was 500);
+  - ENOSPC → 507;
+  - corruption → generic 500.
+- Tests: new `aowis-native-error-kind-tests`; every forged bundle in the import
+  integrity suite must now be `InvalidInput`; HTTP tests for tree-hash 404,
+  generic corruption 500, non-network 404 and missing-network edit 404. Five
+  mutations (removing each safeguard) were each caught.
+- Known limits, carried to later phases:
+  - The hydraulic *load* APIs (`load…AtRevision`, `list…AtRevision`) still
+    report failures as text, so the service treats them as 500 even when the
+    cause was I/O or ENOSPC (Phase 8).
+  - A structurally invalid **local** object reached by an incremental import
+    is reported as `InvalidInput`; this disappears with Phase 5, which stops
+    re-verifying local objects.
+  - The HTTP spool/export temp-file failures are `Io` because Qt hides errno
+    (Phase 4).
+
+Original analysis:
 
 **F2. HTTP status codes come from substring matching of exception text.**
 `db_http_routes.cpp` (`hydraulicWrite`, bundle import/export) and
@@ -157,7 +192,42 @@ Tests:
 
 ---
 
-## Phase 3: Request and response bounds (Medium, needs Phase 2)
+## Phase 3: Request and response bounds (Medium, needs Phase 2) — done
+
+Implemented in `aowis-db-custom-request-bounds`:
+- **F5:**
+  - Qt >= 6.11 (Arch) limits bodies to `max_transfer_mib` and headers to 64 KiB.
+  - Qt < 6.11 (Debian 13 ships 6.8) gets a startup policy from
+    `include/aowis/native/http_limit_policy.h`: loopback starts with a
+    warning; non-loopback is refused (exit 2) unless
+    `server/proxy_enforces_body_limit=true` or `--proxy-enforces-body-limit`.
+  - `deploy/nginx-aowis-server-db.conf` is the matching proxy example.
+  - No changes to or around QHttpServer itself.
+- **F9:**
+  - `diffHashes` is now a structural trie diff whose work is proportional to
+    the changed paths, also across prefix splits. It no longer lists unaligned
+    subtrees; this also speeds up merges.
+  - `diffRevisions(from, to, max)` raises `LimitExceeded` before
+    materializing more results.
+  - `listHydraulicEntityIdsAtRevisionLimited` stops after one membership
+    chunk past the cap.
+  - HTTP returns 413 `limit_exceeded` for > 1000 diff records or > 10000 UUIDs.
+- **F10a:** went with option 1, but with **404** instead of 409 (the revision
+  does not exist *on that branch*). `Repository::revisionOnBranch` covers
+  ancestors and merged second parents.
+- **Tests:**
+  - new `aowis-native-diff-scope-tests`: randomized diff against an
+    independent reference over 120 commits, a damaged-leaf probe proving the
+    diff never reads unchanged subtrees, limit boundaries 1000/1001, and branch
+    scoping incl. merges;
+  - new `aowis-http-limit-policy-tests`;
+  - HTTP tests run the real binary for every policy case (CLI and INI), plus
+    diff 1000/1001, entity list 10000/10001 (current and historical), and
+    branch scoping on all three read routes.
+  - Nine mutations, including the previous listing-based diff, were each
+    caught.
+
+Original analysis:
 
 **F5. Request bodies are unbounded on Qt < 6.11.**
 `setMaximumBodySize` is compiled in only for Qt ≥ 6.11 (Ubuntu 24.04 ships
@@ -345,6 +415,11 @@ NaN → 400.
 - `Repository::Repository`: fix the leftover indentation (former `if` branch)
   and remove the unused `format` variable.
 - Remove the duplicated comment text in `syncPack()` and `compact()`.
+- Remove the unused `loadMembers()` in `hydraulic_network_persistence.cpp`
+  and the unused `backend` parameters in `tests/native_repository_verify_tests.cpp`
+  and `tests/native_http_tests.cpp` (the only `-Wall -Wextra` warnings).
+- Give the hydraulic load APIs a typed failure channel (e.g. rethrow
+  non-Corruption `StorageError`s) so I/O and ENOSPC map to 500/507 correctly.
 - Remove no-op `try { … } catch (...) { throw; }` wrappers in
   `mergeBranches`, `commit` and `commitModel`.
 - `ProjectService::createProject`: the `remove_all(staging)` in the catch

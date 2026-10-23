@@ -1,4 +1,5 @@
 #include "aowis/native/model_record.h"
+#include "aowis/native/storage_error.h"
 
 #include <algorithm>
 #include <limits>
@@ -20,7 +21,7 @@ void append32(Bytes& output, std::uint32_t value) {
 
 std::uint16_t read16(const Bytes& bytes, std::size_t& cursor) {
     if (cursor > bytes.size() || bytes.size() - cursor < 2) {
-        throw std::runtime_error("truncated native model record");
+        throw StorageError(StorageErrorKind::Corruption, "truncated native model record");
     }
     const std::uint16_t value = static_cast<std::uint16_t>(
         (static_cast<unsigned>(bytes[cursor]) << 8U) | bytes[cursor + 1]);
@@ -30,7 +31,7 @@ std::uint16_t read16(const Bytes& bytes, std::size_t& cursor) {
 
 std::uint32_t read32(const Bytes& bytes, std::size_t& cursor) {
     if (cursor > bytes.size() || bytes.size() - cursor < 4) {
-        throw std::runtime_error("truncated native model record");
+        throw StorageError(StorageErrorKind::Corruption, "truncated native model record");
     }
     std::uint32_t value = 0;
     for (unsigned i = 0; i < 4; ++i) value = (value << 8U) | bytes[cursor++];
@@ -40,10 +41,11 @@ std::uint32_t read32(const Bytes& bytes, std::size_t& cursor) {
 } // namespace
 
 Bytes encodeModelRecord(const ModelRecord& record) {
-    if (record.kind == 0) throw std::runtime_error("model record kind must be nonzero");
+    if (record.kind == 0)
+        throw StorageError(StorageErrorKind::InvalidInput, "model record kind must be nonzero");
     if (record.references.size() > std::numeric_limits<std::uint32_t>::max() ||
         record.payload.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error("model record exceeds encoding limit");
+        throw StorageError(StorageErrorKind::LimitExceeded, "model record exceeds encoding limit");
     }
     // References are a dependency *set*, not an ordered list of model fields.
     // The roles/order of pipe endpoints remain in the opaque canonical payload.
@@ -64,15 +66,15 @@ Bytes encodeModelRecord(const ModelRecord& record) {
 ModelRecord decodeModelRecord(const Bytes& bytes) {
     if (bytes.size() < 15 || !std::equal(bytes.begin(), bytes.begin() + 5,
                                          "AOMD\x01")) {
-        throw std::runtime_error("invalid native model record envelope");
+        throw StorageError(StorageErrorKind::Corruption, "invalid native model record envelope");
     }
     std::size_t cursor = 5;
     ModelRecord result{};
     result.kind = read16(bytes, cursor);
-    if (result.kind == 0) throw std::runtime_error("model record kind must be nonzero");
+    if (result.kind == 0) throw StorageError(StorageErrorKind::Corruption, "model record kind must be nonzero");
     const std::uint32_t references = read32(bytes, cursor);
     if (references > (bytes.size() - cursor) / 16) {
-        throw std::runtime_error("truncated native model references");
+        throw StorageError(StorageErrorKind::Corruption, "truncated native model references");
     }
     result.references.reserve(references);
     for (std::uint32_t i = 0; i < references; ++i) {
@@ -83,7 +85,7 @@ ModelRecord decodeModelRecord(const Bytes& bytes) {
     }
     const std::uint32_t payloadSize = read32(bytes, cursor);
     if (payloadSize != bytes.size() - cursor) {
-        throw std::runtime_error("invalid native model payload length");
+        throw StorageError(StorageErrorKind::Corruption, "invalid native model payload length");
     }
     result.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), bytes.end());
     return result;

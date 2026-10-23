@@ -1,4 +1,5 @@
 #include "aowis/native/native_store.h"
+#include "aowis/native/storage_error.h"
 #include "native_test_faults.h"
 
 #include <openssl/evp.h>
@@ -47,15 +48,50 @@ constexpr std::array<std::uint8_t, indexHeaderSize> indexMagic{
 constexpr std::uint64_t maxObjectBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::size_t stagedFlushThreshold = 8U * 1024U * 1024U;
 
-void require(bool condition, const std::string& message) {
-    if (!condition) {
-        throw std::runtime_error(message);
+using Err = StorageErrorKind;
+
+void require(Err kind, bool condition, const std::string& message) {
+    if (!condition) throw StorageError(kind, message);
+}
+
+// ENOSPC/EDQUOT become ResourceExhausted, every other errno Io.
+void systemCall(bool ok, const std::string& operation) {
+    if (!ok) throwSystemError(operation);
+}
+
+// Failure while reading an object of the LOCAL repository during a bundle
+// import. Keeps local corruption from being reported as an invalid bundle.
+class LocalStorageFailure final : public StorageError {
+public:
+    using StorageError::StorageError;
+};
+
+// Adds context to the in-flight exception without losing its classification.
+[[noreturn]] void rethrowWithContext(const std::string& prefix) {
+    try {
+        throw;
+    } catch (const LocalStorageFailure& error) {
+        throw LocalStorageFailure(error.kind(), prefix + error.what());
+    } catch (const StorageError& error) {
+        throw StorageError(error.kind(), prefix + error.what());
+    } catch (const std::exception& error) {
+        throw StorageError(Err::Internal, prefix + error.what());
     }
 }
 
-void systemCall(bool ok, const std::string& operation) {
-    if (!ok) {
-        throw std::runtime_error(operation + ": " + std::strerror(errno));
+// The structural verifier is shared with verifyRepository(), where a failed
+// check means local Corruption. Applied to untrusted bundle data, the same
+// failure is invalid client input. Failures while reading LOCAL objects keep
+// their kind (an incremental import also visits local ancestors).
+[[noreturn]] void rethrowBundleFailure() {
+    try {
+        throw;
+    } catch (const LocalStorageFailure& error) {
+        throw StorageError(error.kind(), error.what());
+    } catch (const StorageError& error) {
+        if (error.kind() != Err::Corruption) throw;
+        throw StorageError(Err::InvalidInput,
+                           std::string("invalid replication bundle: ") + error.what());
     }
 }
 
@@ -74,7 +110,7 @@ public:
         if (::flock(this->fd_, LOCK_EX | LOCK_NB) != 0) {
             systemCall(::flock(this->fd_, LOCK_SH) == 0,
                        "restore maintenance shared lock after refused compaction");
-            throw std::runtime_error(
+            throw StorageError(Err::Conflict,
                 "compaction requires all other repository handles to be closed");
         }
     }
@@ -114,7 +150,7 @@ void appendHash(Bytes& bytes, const Hash& hash) {
 // Revisions index the reverse edges in a second content-addressed tree.
 // These entries are intentionally independent of the SQL model payload codec.
 Bytes encodeReferrers(const std::set<Key>& referrers) {
-    require(referrers.size() <= std::numeric_limits<std::uint32_t>::max(),
+    require(Err::LimitExceeded, referrers.size() <= std::numeric_limits<std::uint32_t>::max(),
             "too many incoming model references");
     Bytes bytes{'I', 'N', 'R', '1'};
     const std::uint32_t count = static_cast<std::uint32_t>(referrers.size());
@@ -129,13 +165,13 @@ Bytes encodeReferrers(const std::set<Key>& referrers) {
 }
 
 std::vector<Key> decodeReferrers(const Bytes& bytes) {
-    require(bytes.size() >= 8 && bytes[0] == 'I' && bytes[1] == 'N' &&
+    require(Err::Corruption, bytes.size() >= 8 && bytes[0] == 'I' && bytes[1] == 'N' &&
             bytes[2] == 'R' && bytes[3] == '1', "invalid incoming-reference index object");
     std::uint32_t count = 0;
     for (std::size_t i = 4; i < 8; ++i) {
         count = (count << 8U) | bytes[i];
     }
-    require(count != 0 && static_cast<std::uint64_t>(count) * 16ULL == bytes.size() - 8,
+    require(Err::Corruption, count != 0 && static_cast<std::uint64_t>(count) * 16ULL == bytes.size() - 8,
             "invalid incoming-reference index size");
     std::vector<Key> referrers;
     referrers.reserve(count);
@@ -143,7 +179,7 @@ std::vector<Key> decodeReferrers(const Bytes& bytes) {
     for (std::uint32_t i = 0; i < count; ++i) {
         Key source{};
         std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset), 16, source.begin());
-        require(source != Key{} && (referrers.empty() || referrers.back() < source),
+        require(Err::Corruption, source != Key{} && (referrers.empty() || referrers.back() < source),
                 "incoming-reference index is not canonical");
         referrers.push_back(source);
         offset += 16;
@@ -152,7 +188,7 @@ std::vector<Key> decodeReferrers(const Bytes& bytes) {
 }
 
 Hash readHash(const Bytes& bytes, std::size_t offset) {
-    require(offset <= bytes.size() && bytes.size() - offset >= 32, "truncated hash");
+    require(Err::Corruption, offset <= bytes.size() && bytes.size() - offset >= 32, "truncated hash");
     Hash result{};
     std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset), 32, result.begin());
     return result;
@@ -225,7 +261,7 @@ void readExact(int fd, std::uint8_t* out, std::size_t size, std::uint64_t offset
             continue;
         }
         systemCall(count >= 0, "pread");
-        require(count != 0, "unexpected EOF reading content pack");
+        require(Err::Corruption, count != 0, "unexpected EOF reading content pack");
         done += static_cast<std::size_t>(count);
     }
 }
@@ -239,7 +275,7 @@ void writeExact(int fd, const std::uint8_t* bytes, std::size_t size, std::uint64
             continue;
         }
         systemCall(count >= 0, "pwrite");
-        require(count != 0, "pwrite made no progress");
+        require(Err::Internal, count != 0, "pwrite made no progress");
         done += static_cast<std::size_t>(count);
     }
 }
@@ -258,7 +294,7 @@ struct BundleLocation {
 class BundleLocationIndex {
 public:
     explicit BundleLocationIndex(std::uint64_t capacity) {
-        require(capacity <= std::numeric_limits<std::size_t>::max() /
+        require(Err::LimitExceeded, capacity <= std::numeric_limits<std::size_t>::max() /
                                 bundleLocationRecordBytes,
                 "replication bundle index exceeds addressable memory");
         const std::filesystem::path temporaryName =
@@ -294,7 +330,7 @@ public:
     BundleLocationIndex& operator=(const BundleLocationIndex&) = delete;
 
     void append(const Hash& hash, BundleLocation location) {
-        require(this->mapped_ == nullptr, "cannot append to finalized replication index");
+        require(Err::Internal, this->mapped_ == nullptr, "cannot append to finalized replication index");
         std::array<std::uint8_t, bundleLocationRecordBytes> record{};
         std::copy(hash.begin(), hash.end(), record.begin());
         storeU64(record.data() + 32, location.offset);
@@ -315,7 +351,7 @@ public:
     std::size_t size() const { return this->count_; }
 
     std::pair<Hash, BundleLocation> at(std::size_t index) const {
-        require(index < this->count_ && this->mapped_ != nullptr,
+        require(Err::Internal, index < this->count_ && this->mapped_ != nullptr,
                 "replication index lookup out of range");
         const std::uint8_t* record = static_cast<const std::uint8_t*>(this->mapped_) +
                                      index * bundleLocationRecordBytes;
@@ -373,7 +409,7 @@ public:
             systemCall(::unlink(writableName.data()) == 0, "unlink temporary verification marks");
             systemCall(::fcntl(this->fd_, F_SETFD, FD_CLOEXEC) == 0,
                        "mark temporary verification marks close-on-exec");
-            require(count <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()),
+            require(Err::LimitExceeded, count <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()),
                     "verification marks exceed file address limits");
             // ftruncate() can leave sparse pages whose first write would
             // SIGBUS under ENOSPC. Reserve the temporary storage now so a
@@ -403,13 +439,13 @@ public:
     BundleVisitMarks& operator=(const BundleVisitMarks&) = delete;
 
     std::uint8_t at(std::size_t index) const {
-        require(index < this->count_, "verification mark index out of bounds");
+        require(Err::Internal, index < this->count_, "verification mark index out of bounds");
         return this->mapped_[index];
     }
 
     void mark(std::size_t index, std::uint8_t bits) {
-        require(index < this->count_, "verification mark index out of bounds");
-        require(bits != 0, "empty verification mark");
+        require(Err::Internal, index < this->count_, "verification mark index out of bounds");
+        require(Err::Internal, bits != 0, "empty verification mark");
         if (this->mapped_[index] == 0) ++this->marked_;
         this->mapped_[index] = bits;
     }
@@ -443,7 +479,7 @@ public:
 
     explicit BundleTreeSummaries(std::size_t count) : count_(count) {
         if (count == 0) return;
-        require(count <= std::numeric_limits<std::size_t>::max() / entryBytes &&
+        require(Err::LimitExceeded, count <= std::numeric_limits<std::size_t>::max() / entryBytes &&
                     count <= static_cast<std::uint64_t>(
                         std::numeric_limits<off_t>::max()) / entryBytes,
                 "replication trie summary table exceeds file address limits");
@@ -497,8 +533,8 @@ public:
 
     void write(std::size_t ordinal, unsigned kind, const TreeSummary& summary) {
         std::uint8_t* slot = slotAt(ordinal, kind);
-        require(slot[0] == 0, "duplicate replication trie summary");
-        require(summary.depth < 32, "invalid replication trie summary depth");
+        require(Err::Internal, slot[0] == 0, "duplicate replication trie summary");
+        require(Err::Internal, summary.depth < 32, "invalid replication trie summary depth");
         // Set the validity byte last: a failed verification never caches a
         // partially written summary, even if an import throws during parsing.
         slot[1] = summary.leaf ? 1 : 0;
@@ -512,7 +548,7 @@ public:
 
 private:
     std::uint8_t* slotAt(std::size_t ordinal, unsigned kind) const {
-        require(ordinal < this->count_ && kind < kinds && this->mapped_ != nullptr,
+        require(Err::Internal, ordinal < this->count_ && kind < kinds && this->mapped_ != nullptr,
                 "replication trie summary lookup out of range");
         return this->mapped_ + ordinal * entryBytes + kind * slotBytes;
     }
@@ -543,7 +579,7 @@ public:
     SortedReferenceEdges& operator=(const SortedReferenceEdges&) = delete;
 
     void append(const Key& target, const Key& source) {
-        require(!this->finalized_, "cannot append to finalized reference sorter");
+        require(Err::Internal, !this->finalized_, "cannot append to finalized reference sorter");
         Edge edge{};
         std::copy(target.begin(), target.end(), edge.begin());
         std::copy(source.begin(), source.end(), edge.begin() + 16);
@@ -552,14 +588,14 @@ public:
     }
 
     void finalize() {
-        require(!this->finalized_, "reference sorter finalized twice");
+        require(Err::Internal, !this->finalized_, "reference sorter finalized twice");
         this->finalized_ = true;
         if (this->runs_.empty()) {
             std::sort(this->buffer_.begin(), this->buffer_.end());
             return;
         }
         flush();
-        require(this->records_ <= std::numeric_limits<std::size_t>::max() / sizeof(Edge),
+        require(Err::LimitExceeded, this->records_ <= std::numeric_limits<std::size_t>::max() / sizeof(Edge),
                 "sorted references exceed addressable memory");
         void* const mapped = ::mmap(nullptr, this->records_ * sizeof(Edge),
                                     PROT_READ, MAP_SHARED, this->fd_, 0);
@@ -572,7 +608,7 @@ public:
     }
 
     std::optional<Edge> next() {
-        require(this->finalized_, "reference sorter must be finalized");
+        require(Err::Internal, this->finalized_, "reference sorter must be finalized");
         if (this->runs_.empty()) {
             if (this->cursor_ == this->buffer_.size()) return std::nullopt;
             return this->buffer_[this->cursor_++];
@@ -629,7 +665,7 @@ private:
             }
             this->fd_ = descriptor;
         }
-        require(this->records_ <= static_cast<std::uint64_t>(
+        require(Err::LimitExceeded, this->records_ <= static_cast<std::uint64_t>(
                     std::numeric_limits<off_t>::max() / sizeof(Edge)) -
                     this->buffer_.size(),
                 "temporary model reference sorter exceeds file size limit");
@@ -657,21 +693,21 @@ private:
 Hash sha256FileRegion(int fd, std::uint64_t offset, std::uint64_t length) {
     using DigestContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
     DigestContext context(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
-    require(context != nullptr && EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) == 1,
+    require(Err::Internal, context != nullptr && EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) == 1,
             "initialize bundle SHA-256 failed");
     std::array<std::uint8_t, 64 * 1024> buffer{};
     while (length != 0) {
         const std::size_t chunk = static_cast<std::size_t>(
             std::min<std::uint64_t>(length, buffer.size()));
         readExact(fd, buffer.data(), chunk, offset);
-        require(EVP_DigestUpdate(context.get(), buffer.data(), chunk) == 1,
+        require(Err::Internal, EVP_DigestUpdate(context.get(), buffer.data(), chunk) == 1,
                 "update bundle SHA-256 failed");
         offset += chunk;
         length -= chunk;
     }
     Hash result{};
     unsigned int digestSize = 0;
-    require(EVP_DigestFinal_ex(context.get(), result.data(), &digestSize) == 1 &&
+    require(Err::Internal, EVP_DigestFinal_ex(context.get(), result.data(), &digestSize) == 1 &&
             digestSize == result.size(), "finalize bundle SHA-256 failed");
     return result;
 }
@@ -750,13 +786,13 @@ std::string activePackToken(const std::filesystem::path& directory) {
     const std::filesystem::path pointer = directory / "objects.current";
     if (!std::filesystem::exists(pointer)) return {};
     std::ifstream stream(pointer, std::ios::binary);
-    require(stream.good(), "cannot read active pack pointer");
+    require(Err::Corruption, stream.good(), "cannot read active pack pointer");
     const std::string contents((std::istreambuf_iterator<char>(stream)),
                                std::istreambuf_iterator<char>());
-    require(contents.size() == 39 && contents.substr(0, 6) == "PACK1 " &&
+    require(Err::Corruption, contents.size() == 39 && contents.substr(0, 6) == "PACK1 " &&
             contents.back() == '\n', "invalid active pack pointer");
     for (std::size_t i = 6; i < 38; ++i) {
-        require((contents[i] >= '0' && contents[i] <= '9') ||
+        require(Err::Corruption, (contents[i] >= '0' && contents[i] <= '9') ||
                 (contents[i] >= 'a' && contents[i] <= 'f'),
                 "invalid active pack generation");
     }
@@ -770,9 +806,9 @@ std::filesystem::path packPath(const std::filesystem::path& directory,
 }
 
 void checkBranch(std::string_view name) {
-    require(!name.empty() && name.size() <= 96, "branch name must contain 1..96 characters");
+    require(Err::InvalidInput, !name.empty() && name.size() <= 96, "branch name must contain 1..96 characters");
     for (char character : name) {
-        require((character >= 'a' && character <= 'z') ||
+        require(Err::InvalidInput, (character >= 'a' && character <= 'z') ||
                 (character >= 'A' && character <= 'Z') ||
                 (character >= '0' && character <= '9') ||
                 character == '-' || character == '_', "invalid branch name");
@@ -782,7 +818,7 @@ void checkBranch(std::string_view name) {
 int nibbleHex(char character) {
     if (character >= '0' && character <= '9') return character - '0';
     if (character >= 'a' && character <= 'f') return character - 'a' + 10;
-    throw std::runtime_error("invalid SHA-256 hex digit");
+    throw StorageError(Err::InvalidInput, "invalid SHA-256 hex digit");
 }
 
 // Shared immutable logical verifier for untrusted bundle objects AND objects
@@ -841,7 +877,7 @@ LogicalVerification verifyLogicalGraph(
     };
     std::vector<std::pair<Hash, Kind>> pending;
     for (const Hash& tip : tips) {
-        require(!isZero(tip), "zero revision tip is invalid");
+        require(Err::Corruption, !isZero(tip), "zero revision tip is invalid");
         pending.emplace_back(tip, Kind::Revision);
     }
     std::map<Hash, std::uint8_t> checkedKinds;
@@ -870,7 +906,7 @@ LogicalVerification verifyLogicalGraph(
     std::function<TreeSummary(const Hash&, Kind, unsigned)> verifyTree;
     verifyTree = [&](const Hash& hash, Kind kind, unsigned minimumDepth) -> TreeSummary {
         try {
-            require(!isZero(hash), "zero bundled tree node");
+            require(Err::Corruption, !isZero(hash), "zero bundled tree node");
             const std::pair<Hash, Kind> identity{hash, kind};
             const unsigned treeKind = static_cast<unsigned>(kind) -
                 static_cast<unsigned>(Kind::RawTree);
@@ -879,35 +915,35 @@ LogicalVerification verifyLogicalGraph(
             const std::optional<TreeSummary> cached = externalMarks.readTree
                 ? externalMarks.readTree(hash, treeKind) : std::nullopt;
             if (cached) {
-                require(cached->leaf || cached->depth >= minimumDepth,
+                require(Err::Corruption, cached->leaf || cached->depth >= minimumDepth,
                         "invalid bundled compressed trie depth ordering");
                 return *cached;
             }
             const std::map<std::pair<Hash, Kind>, TreeSummary>::const_iterator previous =
                 verifiedTrees.find(identity);
             if (previous != verifiedTrees.end()) {
-                require(previous->second.leaf || previous->second.depth >= minimumDepth,
+                require(Err::Corruption, previous->second.leaf || previous->second.depth >= minimumDepth,
                         "invalid bundled compressed trie depth ordering");
                 return previous->second;
             }
-            require(visitingTrees.insert(identity).second, "cyclic bundled trie");
+            require(Err::Corruption, visitingTrees.insert(identity).second, "cyclic bundled trie");
             const Bytes object = objectByHash(hash);
-            require(!object.empty(), "invalid bundled tree node");
+            require(Err::Corruption, !object.empty(), "invalid bundled tree node");
             TreeSummary result{};
             if (object[0] == 'L') {
-                require(object.size() == 49, "invalid bundled leaf");
+                require(Err::Corruption, object.size() == 49, "invalid bundled leaf");
                 result.leaf = true;
                 std::copy_n(object.begin() + 1, 16, result.representative.begin());
                 const Hash value = readHash(object, 17);
-                require(!isZero(value), "bundled leaf contains zero value hash");
+                require(Err::Corruption, !isZero(value), "bundled leaf contains zero value hash");
                 const Kind valueKind = kind == Kind::RawTree ? Kind::RawValue :
                     kind == Kind::ModelTree ? Kind::ModelValue : Kind::ReferenceValue;
                 pending.emplace_back(value, valueKind);
             } else if (object[0] == 'B') {
-                require(object.size() == 530 && object[1] < 32,
+                require(Err::Corruption, object.size() == 530 && object[1] < 32,
                         "invalid bundled tree branch");
                 result.depth = object[1];
-                require(result.depth >= minimumDepth,
+                require(Err::Corruption, result.depth >= minimumDepth,
                         "invalid bundled compressed trie depth ordering");
                 Key prefix{};
                 std::copy_n(object.begin() + 2, 16, prefix.begin());
@@ -915,7 +951,7 @@ LogicalVerification verifyLogicalGraph(
                 // Requiring that representation also excludes equivalent but
                 // differently hashed encodings of one logical trie.
                 for (unsigned position = result.depth; position < 32; ++position) {
-                    require(nibble(prefix, position) == 0,
+                    require(Err::Corruption, nibble(prefix, position) == 0,
                             "noncanonical bundled trie prefix");
                 }
                 unsigned children = 0;
@@ -924,20 +960,20 @@ LogicalVerification verifyLogicalGraph(
                     if (isZero(child)) continue;
                     ++children;
                     const TreeSummary descendant = verifyTree(child, kind, result.depth + 1U);
-                    require(descendant.leaf || descendant.depth > result.depth,
+                    require(Err::Corruption, descendant.leaf || descendant.depth > result.depth,
                             "invalid bundled compressed trie depth ordering");
                     for (unsigned position = 0; position < result.depth; ++position) {
-                        require(nibble(descendant.representative, position) ==
+                        require(Err::Corruption, nibble(descendant.representative, position) ==
                                     nibble(prefix, position),
                                 "bundled trie child violates compressed prefix");
                     }
-                    require(nibble(descendant.representative, result.depth) == slot,
+                    require(Err::Corruption, nibble(descendant.representative, result.depth) == slot,
                             "bundled trie child occupies wrong slot");
                     if (children == 1) result.representative = descendant.representative;
                 }
-                require(children >= 2, "invalid bundled branch child count");
+                require(Err::Corruption, children >= 2, "invalid bundled branch child count");
             } else {
-                throw std::runtime_error("invalid bundled tree tag");
+                throw StorageError(Err::Corruption, "invalid bundled tree tag");
             }
             visitingTrees.erase(identity);
             if (externalMarks.writeTree && externalMarks.read &&
@@ -948,8 +984,8 @@ LogicalVerification verifyLogicalGraph(
             }
             markKind(hash, kind);
             return result;
-        } catch (const std::exception& error) {
-            throw std::runtime_error("tree " + toHex(hash) + ": " + error.what());
+        } catch (...) {
+            rethrowWithContext("tree " + toHex(hash) + ": ");
         }
     };
     const ImportClock::time_point graphStart = ImportClock::now();
@@ -967,15 +1003,15 @@ LogicalVerification verifyLogicalGraph(
         markKind(next.first, next.second);
         const Bytes object = objectByHash(next.first);
         if (next.second == Kind::Revision) {
-            require(object.size() >= 67 && object[0] == 'S',
+            require(Err::Corruption, object.size() >= 67 && object[0] == 'S',
                     "invalid bundled revision " + toHex(next.first));
             const unsigned parents = object[66];
-            require(object[65] <= 1 && parents <= 2 &&
+            require(Err::Corruption, object[65] <= 1 && parents <= 2 &&
                     object.size() == 67 + 32U * parents,
                     "invalid bundled revision metadata");
             const Hash root = readHash(object, 1);
             const Hash referenceRoot = readHash(object, 33);
-            require(object[65] == 1 || isZero(referenceRoot),
+            require(Err::Corruption, object[65] == 1 || isZero(referenceRoot),
                     "raw bundled revision has reference index");
             ++verifiedRevisionCount;
             // The bundle's visitation bitmap is already keyed by content
@@ -988,13 +1024,13 @@ LogicalVerification verifyLogicalGraph(
             pending.emplace_back(referenceRoot, Kind::ReferenceTree);
             for (unsigned index = 0; index < parents; ++index) {
                 const Hash parent = readHash(object, 67 + index * 32);
-                require(!isZero(parent), "zero parent in bundled revision");
+                require(Err::Corruption, !isZero(parent), "zero parent in bundled revision");
                 pending.emplace_back(parent, Kind::Revision);
             }
         } else if (next.second == Kind::ReferenceValue) {
             (void)decodeReferrers(object);
         } else {
-            require(!object.empty() && object[0] == 'V',
+            require(Err::Corruption, !object.empty() && object[0] == 'V',
                     "invalid bundled model/raw value");
             if (next.second == Kind::ModelValue) {
                 (void)decodeModelRecord(Bytes(object.begin() + 1, object.end()));
@@ -1032,7 +1068,7 @@ LogicalVerification verifyLogicalGraph(
                 if (node[0] == 'L') {
                     Key key{};
                     std::copy_n(node.begin() + 1, 16, key.begin());
-                    require(!previous || *previous < key,
+                    require(Err::Corruption, !previous || *previous < key,
                             "bundled trie contains duplicate or unordered UUID");
                     previous = key;
                     visitor(key, readHash(node, 17));
@@ -1202,12 +1238,12 @@ LogicalVerification verifyLogicalGraph(
                     [&](const Hash& value, bool canonical) {
                         if (isZero(value)) return std::vector<Key>{};
                         const Bytes stored = objectByHash(value);
-                        require(!stored.empty() && stored.front() == 'V',
+                        require(Err::Corruption, !stored.empty() && stored.front() == 'V',
                                 "invalid bundled model value");
                         const Bytes envelope(stored.begin() + 1, stored.end());
                         const ModelRecord record = decodeModelRecord(envelope);
                         if (canonical) {
-                            require(encodeModelRecord(record) == envelope,
+                            require(Err::Corruption, encodeModelRecord(record) == envelope,
                                     "noncanonical bundled model references");
                         }
                         return record.references;
@@ -1215,7 +1251,7 @@ LogicalVerification verifyLogicalGraph(
                 diffLeaves(parentSnapshot->first, modelRoot,
                            [&](const Key& source, const OptionalValueHash& oldValue,
                                const OptionalValueHash& newValue) {
-                    require(source != Key{}, "bundled model tree contains zero UUID");
+                    require(Err::Corruption, source != Key{}, "bundled model tree contains zero UUID");
                     if (oldValue && !newValue) deletedModels.push_back(source);
                     if (oldValue) {
                         for (const Key& target : references(*oldValue, false)) {
@@ -1224,7 +1260,7 @@ LogicalVerification verifyLogicalGraph(
                     }
                     if (newValue) {
                         for (const Key& target : references(*newValue, true)) {
-                            require(target != Key{} && target != source,
+                            require(Err::Corruption, target != Key{} && target != source,
                                     "invalid bundled model UUID reference");
                             changeEdge(modelChanges, target, source, 1);
                         }
@@ -1233,7 +1269,7 @@ LogicalVerification verifyLogicalGraph(
                 diffLeaves(parentSnapshot->second, referenceRoot,
                            [&](const Key& target, const OptionalValueHash& oldValue,
                                const OptionalValueHash& newValue) {
-                    require(target != Key{},
+                    require(Err::Corruption, target != Key{},
                             "bundled incoming-reference target is zero");
                     if (oldValue) {
                         for (const Key& source : decodeReferrers(objectByHash(*oldValue))) {
@@ -1253,7 +1289,7 @@ LogicalVerification verifyLogicalGraph(
                             [](const std::pair<const ReferenceEdge, int>& edge) {
                                 return edge.second < 0;
                             });
-                    throw std::runtime_error(onlyMissingFromUnchangedModel
+                    throw StorageError(Err::Corruption, onlyMissingFromUnchangedModel
                         ? "bundled reverse-reference index is missing model references"
                         : "bundled reverse-reference index does not match model records");
                 }
@@ -1266,12 +1302,12 @@ LogicalVerification verifyLogicalGraph(
                     Key target{};
                     std::copy_n(edge.first.begin(), 16, target.begin());
                     if (previousTarget && *previousTarget == target) continue;
-                    require(containsModel(modelRoot, target),
+                    require(Err::Corruption, containsModel(modelRoot, target),
                             "bundled model reference target does not exist");
                     previousTarget = target;
                 }
                 for (const Key& deleted : deletedModels) {
-                    require(!containsModel(referenceRoot, deleted),
+                    require(Err::Corruption, !containsModel(referenceRoot, deleted),
                             "bundled model reference target does not exist");
                 }
             } else {
@@ -1279,16 +1315,16 @@ LogicalVerification verifyLogicalGraph(
                 // without an indexed parent): establish a complete baseline.
                 SortedReferenceEdges expected;
                 visitLeaves(modelRoot, [&](const Key& source, const Hash& value) {
-                    require(source != Key{}, "bundled model tree contains zero UUID");
+                    require(Err::Corruption, source != Key{}, "bundled model tree contains zero UUID");
                     const Bytes stored = objectByHash(value);
-                    require(!stored.empty() && stored.front() == 'V',
+                    require(Err::Corruption, !stored.empty() && stored.front() == 'V',
                             "invalid bundled model value");
                     const Bytes envelope(stored.begin() + 1, stored.end());
                     const ModelRecord record = decodeModelRecord(envelope);
-                    require(encodeModelRecord(record) == envelope,
+                    require(Err::Corruption, encodeModelRecord(record) == envelope,
                             "noncanonical bundled model references");
                     for (const Key& target : record.references) {
-                        require(target != Key{} && target != source,
+                        require(Err::Corruption, target != Key{} && target != source,
                                 "invalid bundled model UUID reference");
                         expected.append(target, source);
                     }
@@ -1301,37 +1337,36 @@ LogicalVerification verifyLogicalGraph(
                     Key target{};
                     std::copy_n(nextExpected->begin(), 16, target.begin());
                     if (checkedTarget && *checkedTarget == target) return;
-                    require(containsModel(modelRoot, target),
+                    require(Err::Corruption, containsModel(modelRoot, target),
                             "bundled model reference target does not exist");
                     checkedTarget = target;
                 };
                 visitLeaves(referenceRoot, [&](const Key& target, const Hash& value) {
-                    require(target != Key{}, "bundled incoming-reference target is zero");
+                    require(Err::Corruption, target != Key{}, "bundled incoming-reference target is zero");
                     const std::vector<Key> actual = decodeReferrers(objectByHash(value));
                     for (const Key& source : actual) {
                         checkTarget();
                         SortedReferenceEdges::Edge matching{};
                         std::copy(target.begin(), target.end(), matching.begin());
                         std::copy(source.begin(), source.end(), matching.begin() + 16);
-                        require(nextExpected && *nextExpected == matching,
+                        require(Err::Corruption, nextExpected && *nextExpected == matching,
                                 "bundled reverse-reference index does not match model records");
                         nextExpected = expected.next();
                     }
                     if (nextExpected && std::equal(target.begin(), target.end(),
                                                    nextExpected->begin())) {
-                        throw std::runtime_error(
+                        throw StorageError(Err::Corruption,
                             "bundled reverse-reference index does not match model records");
                     }
                 });
                 checkTarget();
-                require(!nextExpected,
+                require(Err::Corruption, !nextExpected,
                         "bundled reverse-reference index is missing model references");
             }
             verifiedModelSnapshots.insert(snapshot);
             markModelRevisionDone(revisionId);
-        } catch (const std::exception& error) {
-            throw std::runtime_error("model revision " + toHex(revisionId) +
-                                     ": " + error.what());
+        } catch (...) {
+            rethrowWithContext("model revision " + toHex(revisionId) + ": ");
         }
     };
     // Use an explicit postorder stack: histories can contain hundreds of
@@ -1348,7 +1383,7 @@ LogicalVerification verifyLogicalGraph(
                 active.erase(frame.first);
                 continue;
             }
-            require(active.insert(frame.first).second,
+            require(Err::Corruption, active.insert(frame.first).second,
                     "cyclic bundled revision ancestry");
             work.emplace_back(frame.first, true);
             const Bytes revision = objectByHash(frame.first);
@@ -1397,7 +1432,7 @@ std::string toHex(const Hash& value) {
 }
 
 Hash fromHex(std::string_view value) {
-    require(value.size() == 64, "SHA-256 hex must be 64 characters");
+    require(Err::InvalidInput, value.size() == 64, "SHA-256 hex must be 64 characters");
     Hash hash{};
     for (std::size_t i = 0; i < hash.size(); ++i) {
         hash[i] = static_cast<std::uint8_t>((nibbleHex(value[2*i]) << 4U) |
@@ -1409,7 +1444,7 @@ Hash fromHex(std::string_view value) {
 Hash sha256(const Bytes& value) {
     Hash output{};
     unsigned length = 0;
-    require(EVP_Digest(value.data(), value.size(), output.data(), &length,
+    require(Err::Internal, EVP_Digest(value.data(), value.size(), output.data(), &length,
                        EVP_sha256(), nullptr) == 1 && length == output.size(),
             "OpenSSL SHA-256 failed");
     return output;
@@ -1417,7 +1452,7 @@ Hash sha256(const Bytes& value) {
 
 Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
     : directory_(std::move(directory)) {
-    require(storage == PhysicalStore::Pack, "unsupported storage backend");
+    require(Err::InvalidInput, storage == PhysicalStore::Pack, "unsupported storage backend");
     std::filesystem::create_directories(this->directory_ / "refs" / "heads");
     this->lifetimeFd_ = ::open((this->directory_ / "maintenance.lock").c_str(),
                                O_CREAT | O_RDWR | O_CLOEXEC, 0644);
@@ -1431,7 +1466,7 @@ Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
         // Prevent either constructor from silently opening the wrong physical
         // repository type (or creating a second, disconnected object pack).
         const std::filesystem::path format = this->directory_ / "storage.format";
-        require(!std::filesystem::exists(this->directory_ / "storage.format") &&
+        require(Err::Internal, !std::filesystem::exists(this->directory_ / "storage.format") &&
                 !std::filesystem::exists(this->directory_ / "blocks"),
                 "repository uses obsolete block storage; export its history with an older build");
             this->packToken_ = activePackToken(this->directory_);
@@ -1464,9 +1499,9 @@ Repository::~Repository() {
 void Repository::scanPackTail() {
     struct stat data{};
     systemCall(::fstat(this->packFd_, &data) == 0, "stat content pack");
-    require(data.st_size >= 0, "invalid negative pack size");
+    require(Err::Corruption, data.st_size >= 0, "invalid negative pack size");
     const std::uint64_t size = static_cast<std::uint64_t>(data.st_size);
-    require(size >= this->scanOffset_, "content pack shrank while repository was open");
+    require(Err::Corruption, size >= this->scanOffset_, "content pack shrank while repository was open");
     std::uint64_t position = this->scanOffset_;
     while (position < size) {
         const std::optional<PackRecord> record = validPackRecord(this->packFd_, position, size);
@@ -1491,7 +1526,7 @@ void Repository::scanPackTail() {
 void Repository::discardTornPackTail(std::uint64_t position, std::uint64_t size) {
     if (const std::optional<std::uint64_t> later =
             findValidPackRecord(this->packFd_, position + 1U, size)) {
-        throw std::runtime_error(
+        throw StorageError(Err::Corruption,
             "corrupt content pack record at offset " + std::to_string(position) +
             " is followed by a valid record at offset " + std::to_string(*later) +
             "; refusing automatic repair (restore from backup)");
@@ -1507,7 +1542,7 @@ void Repository::discardTornPackTail(std::uint64_t position, std::uint64_t size)
         Hash head{};
         try { head = branchHead(name); }
         catch (const std::exception&) { continue; } // temporary or malformed refs
-        require(this->index_.contains(head),
+        require(Err::Corruption, this->index_.contains(head),
                 "branch '" + name + "' references content inside the damaged pack tail at offset " +
                 std::to_string(position) + "; refusing automatic repair (restore from backup)");
     }
@@ -1528,7 +1563,7 @@ void Repository::preserveDiscardedPackBytes(std::uint64_t position, std::uint64_
     int fd = -1;
     std::filesystem::path target;
     for (unsigned attempt = 0; fd < 0; ++attempt) {
-        require(attempt < 1000, "too many preserved copies of one torn pack tail");
+        require(Err::Internal, attempt < 1000, "too many preserved copies of one torn pack tail");
         target = directory / (stem + (attempt == 0 ? std::string() :
                                       "-" + std::to_string(attempt)) + ".bin");
         fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -1612,7 +1647,7 @@ void Repository::rebuildIndex() {
 }
 
 void Repository::refreshIndex() {
-    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
+    require(Err::Unavailable, !this->needsReopen_, "repository must be reopened after interrupted compaction");
     // A preceding operation could have written objects before throwing;
     // make its orphan records discoverable by other processes too.
     if (!this->pendingIndex_.empty()) syncPack();
@@ -1620,7 +1655,7 @@ void Repository::refreshIndex() {
     struct stat indexData{};
     systemCall(::fstat(this->packFd_, &packData) == 0, "stat content pack");
     systemCall(::fstat(this->indexFd_, &indexData) == 0, "stat content index");
-    require(packData.st_size >= 0 && indexData.st_size >= 0, "invalid storage size");
+    require(Err::Corruption, packData.st_size >= 0 && indexData.st_size >= 0, "invalid storage size");
     const std::uint64_t packBytes = static_cast<std::uint64_t>(packData.st_size);
     const std::uint64_t indexBytes = static_cast<std::uint64_t>(indexData.st_size);
     if (indexBytes < indexHeaderSize) {
@@ -1681,17 +1716,17 @@ void Repository::refreshIndex() {
 }
 
 Bytes Repository::load(const Hash& hash) {
-    require(!isZero(hash), "attempted to load empty tree hash");
+    require(Err::Corruption, !isZero(hash), "attempted to load empty tree hash");
     std::unordered_map<Hash, Location, HashHasher>::const_iterator it = this->index_.find(hash);
-    require(it != this->index_.end(), "referenced content is missing from pack");
+    require(Err::Corruption, it != this->index_.end(), "referenced content is missing from pack");
     Bytes payload(static_cast<std::size_t>(it->second.size));
     if (!payload.empty()) readExact(this->packFd_, payload.data(), payload.size(), it->second.offset);
-    require(sha256(payload) == hash, "content checksum mismatch during read");
+    require(Err::Corruption, sha256(payload) == hash, "content checksum mismatch during read");
     return payload;
 }
 
 Hash Repository::store(const Bytes& bytes) {
-    require(bytes.size() <= maxObjectBytes, "content object exceeds size limit");
+    require(Err::LimitExceeded, bytes.size() <= maxObjectBytes, "content object exceeds size limit");
     Hash hash = sha256(bytes);
     if (this->index_.contains(hash)) return hash;
     std::array<std::uint8_t, headerSize> header{};
@@ -1740,28 +1775,28 @@ void Repository::syncPack() {
 
 Repository::TreeNode Repository::readNode(const Hash& hash) {
     const Bytes bytes = load(hash);
-    require(!bytes.empty(), "empty tree node");
+    require(Err::Corruption, !bytes.empty(), "empty tree node");
     TreeNode result{};
     if (bytes[0] == 'L') {
-        require(bytes.size() == 1 + 16 + 32, "invalid leaf node size");
+        require(Err::Corruption, bytes.size() == 1 + 16 + 32, "invalid leaf node size");
         result.leaf = true;
         std::copy_n(bytes.begin() + 1, 16, result.key.begin());
         result.value = readHash(bytes, 17);
-        require(!isZero(result.value), "leaf references zero content hash");
+        require(Err::Corruption, !isZero(result.value), "leaf references zero content hash");
     } else if (bytes[0] == 'B') {
-        require(bytes.size() == 2 + 16 + 16 * 32, "invalid branch node size");
+        require(Err::Corruption, bytes.size() == 2 + 16 + 16 * 32, "invalid branch node size");
         result.leaf = false;
         result.depth = bytes[1];
         std::copy_n(bytes.begin() + 2, 16, result.prefix.begin());
-        require(result.depth < 32, "invalid trie branch depth");
+        require(Err::Corruption, result.depth < 32, "invalid trie branch depth");
         unsigned count = 0;
         for (std::size_t i = 0; i < 16; ++i) {
             result.children[i] = readHash(bytes, 18 + i * 32);
             if (!isZero(result.children[i])) ++count;
         }
-        require(count >= 2, "trie branch must have at least two children");
+        require(Err::Corruption, count >= 2, "trie branch must have at least two children");
     } else {
-        throw std::runtime_error("invalid tree node tag");
+        throw StorageError(Err::Corruption, "invalid tree node tag");
     }
     return result;
 }
@@ -1798,7 +1833,7 @@ Hash Repository::buildTree(const std::vector<TreeUpdate>& updates, std::size_t b
                            std::size_t end, unsigned minDepth) {
     if (begin == end) return Hash{};
     if (end - begin == 1) {
-        require(updates[begin].second.has_value(), "buildTree expects present values");
+        require(Err::Internal, updates[begin].second.has_value(), "buildTree expects present values");
         TreeNode leaf{};
         leaf.key = updates[begin].first;
         leaf.value = *updates[begin].second;
@@ -1809,7 +1844,7 @@ Hash Repository::buildTree(const std::vector<TreeUpdate>& updates, std::size_t b
            nibble(updates[begin].first, divergence) == nibble(updates[end - 1].first, divergence)) {
         ++divergence;
     }
-    require(divergence < 32, "duplicate UUID in sorted batch");
+    require(Err::Internal, divergence < 32, "duplicate UUID in sorted batch");
     TreeNode branch{};
     branch.leaf = false;
     branch.depth = static_cast<std::uint8_t>(divergence);
@@ -1862,7 +1897,7 @@ Hash Repository::applyTree(const Hash& root, const std::vector<TreeUpdate>& upda
             combined.front().second && *combined.front().second == node.value) return root;
         return buildTree(combined, 0, combined.size(), minDepth);
     }
-    require(node.depth >= minDepth, "invalid compressed tree ordering");
+    require(Err::Corruption, node.depth >= minDepth, "invalid compressed tree ordering");
 
     // If an inserted UUID diverges before this branch's compressed prefix,
     // split ABOVE the existing subtree instead of traversing a wrong child.
@@ -1967,59 +2002,87 @@ void Repository::listHashes(const Hash& root, std::vector<std::pair<Key, Hash>>&
     for (const Hash& child : node.children) listHashes(child, output);
 }
 
+// Emits every leaf of `root` as an addition (added == true) or a removal.
+void Repository::diffWholeSubtree(const Hash& root, bool added, std::vector<Difference>& output,
+                                  std::size_t limit) {
+    if (isZero(root)) return;
+    const TreeNode node = readNode(root);
+    if (node.leaf) {
+        output.push_back(added ? Difference{node.key, std::nullopt, node.value}
+                               : Difference{node.key, node.value, std::nullopt});
+        require(Err::LimitExceeded, output.size() <= limit, "difference exceeds the requested limit");
+        return;
+    }
+    for (const Hash& child : node.children) diffWholeSubtree(child, added, output, limit);
+}
+
+// Structural three-case diff of two canonical compressed tries. Work is
+// proportional to the changed paths: a key inserted above an existing
+// compressed prefix descends into that subtree instead of listing it. At most
+// `limit` differences are produced; more raise LimitExceeded immediately.
 void Repository::diffHashes(const Hash& from, const Hash& to,
-                            std::vector<Difference>& output) {
+                            std::vector<Difference>& output, std::size_t limit) {
     if (from == to) return;
-    // Align matching branch nodes structurally. When insertion/removal changes
-    // a compressed prefix, fall back to comparing just those subtrees.
-    if (!isZero(from) && !isZero(to)) {
-        const TreeNode left = readNode(from);
-        const TreeNode right = readNode(to);
-        bool aligned = !left.leaf && !right.leaf && left.depth == right.depth;
-        if (aligned) {
-            for (unsigned position = 0; position < left.depth; ++position) {
-                if (nibble(left.prefix, position) != nibble(right.prefix, position)) {
-                    aligned = false;
-                    break;
-                }
-            }
+    if (isZero(from)) { diffWholeSubtree(to, true, output, limit); return; }
+    if (isZero(to)) { diffWholeSubtree(from, false, output, limit); return; }
+    const TreeNode left = readNode(from);
+    const TreeNode right = readNode(to);
+    if (left.leaf && right.leaf) {
+        if (left.key == right.key) {
+            output.push_back(Difference{left.key, left.value, right.value});
+        } else {
+            output.push_back(Difference{left.key, left.value, std::nullopt});
+            require(Err::LimitExceeded, output.size() <= limit, "difference exceeds the requested limit");
+            output.push_back(Difference{right.key, std::nullopt, right.value});
         }
-        if (aligned) {
-            for (std::size_t i = 0; i < 16; ++i) {
-                diffHashes(left.children[i], right.children[i], output);
-            }
+        require(Err::LimitExceeded, output.size() <= limit, "difference exceeds the requested limit");
+        return;
+    }
+    // A leaf behaves like a node whose whole key is its prefix (depth 32).
+    const unsigned leftDepth = left.leaf ? 32U : left.depth;
+    const unsigned rightDepth = right.leaf ? 32U : right.depth;
+    const Key& leftPrefix = left.leaf ? left.key : left.prefix;
+    const Key& rightPrefix = right.leaf ? right.key : right.prefix;
+    const unsigned shared = std::min(leftDepth, rightDepth);
+    for (unsigned position = 0; position < shared; ++position) {
+        if (nibble(leftPrefix, position) != nibble(rightPrefix, position)) {
+            // Disjoint key ranges: everything left was removed, everything right added.
+            diffWholeSubtree(from, false, output, limit);
+            diffWholeSubtree(to, true, output, limit);
             return;
         }
     }
-    std::vector<std::pair<Key, Hash>> leftValues;
-    std::vector<std::pair<Key, Hash>> rightValues;
-    listHashes(from, leftValues);
-    listHashes(to, rightValues);
-    std::map<Key, std::pair<std::optional<Hash>, std::optional<Hash>>> combined;
-    for (const std::pair<Key, Hash>& entry : leftValues) combined[entry.first].first = entry.second;
-    for (const std::pair<Key, Hash>& entry : rightValues) combined[entry.first].second = entry.second;
-    for (const std::pair<const Key, std::pair<std::optional<Hash>, std::optional<Hash>>>& entry : combined) {
-        if (entry.second.first != entry.second.second) {
-            output.push_back(Difference{entry.first, entry.second.first, entry.second.second});
-        }
+    if (leftDepth == rightDepth) { // two branches with the same split
+        for (std::size_t slot = 0; slot < 16; ++slot)
+            diffHashes(left.children[slot], right.children[slot], output, limit);
+        return;
     }
+    if (leftDepth < rightDepth) { // `to` lies entirely in one child slot of `from`
+        const unsigned slot = nibble(rightPrefix, leftDepth);
+        for (unsigned child = 0; child < 16; ++child)
+            diffHashes(left.children[child], child == slot ? to : Hash{}, output, limit);
+        return;
+    }
+    const unsigned slot = nibble(leftPrefix, rightDepth); // `from` lies in one slot of `to`
+    for (unsigned child = 0; child < 16; ++child)
+        diffHashes(child == slot ? from : Hash{}, right.children[child], output, limit);
 }
 
 Revision Repository::readRevision(const Hash& hash) {
     const Bytes payload = load(hash);
     // Native prototype format 2. No pre-release migration is supported.
     // S | content root | reverse-reference root | indexed flag | parent count | parents
-    require(payload.size() >= 67 && payload[0] == 'S', "invalid native revision object");
+    require(Err::Corruption, payload.size() >= 67 && payload[0] == 'S', "invalid native revision object");
     const std::uint8_t flags = payload[65];
     const std::size_t parentCount = payload[66];
-    require(flags <= 1 && parentCount <= 2 && payload.size() == 67 + 32 * parentCount,
+    require(Err::Corruption, flags <= 1 && parentCount <= 2 && payload.size() == 67 + 32 * parentCount,
             "invalid native revision metadata");
     Revision revision{};
     revision.id = hash;
     revision.root = readHash(payload, 1);
     revision.referencesRoot = readHash(payload, 33);
     revision.modelIndexed = (flags == 1);
-    require(revision.modelIndexed || isZero(revision.referencesRoot),
+    require(Err::Corruption, revision.modelIndexed || isZero(revision.referencesRoot),
             "raw revision contains a model reference index");
     for (std::size_t i = 0; i < parentCount; ++i) {
         revision.parents.push_back(readHash(payload, 67 + i * 32));
@@ -2028,13 +2091,13 @@ Revision Repository::readRevision(const Hash& hash) {
 }
 
 bool Repository::revisionReachableFrom(const Hash& tip, const Hash& candidate) {
-    require(!isZero(candidate), "zero revision hash is invalid");
+    require(Err::InvalidInput, !isZero(candidate), "zero revision hash is invalid");
     std::vector<Hash> pending{tip};
     std::unordered_set<Hash, HashHasher> seen;
     while (!pending.empty()) {
         const Hash current = pending.back();
         pending.pop_back();
-        require(!isZero(current), "invalid zero revision parent");
+        require(Err::Corruption, !isZero(current), "invalid zero revision parent");
         if (!seen.insert(current).second) continue;
         // Verify the record even for the requested candidate: a supplied
         // hash of an arbitrary content object is not a valid revision.
@@ -2049,11 +2112,11 @@ Hash Repository::branchHead(std::string_view name) {
     checkBranch(name);
     const std::filesystem::path path = this->directory_ / "refs" / "heads" / std::string(name);
     std::ifstream stream(path, std::ios::binary);
-    require(stream.good(), "branch does not exist: " + std::string(name));
+    require(Err::NotFound, stream.good(), "branch does not exist: " + std::string(name));
     std::string content((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
-    require(content.size() == 65 && content.back() == '\n', "invalid branch ref format");
+    require(Err::Corruption, content.size() == 65 && content.back() == '\n', "invalid branch ref format");
     Hash hash = fromHex(std::string_view(content.data(), 64));
-    require(!isZero(hash), "branch ref points to zero hash");
+    require(Err::Corruption, !isZero(hash), "branch ref points to zero hash");
     return hash;
 }
 
@@ -2061,7 +2124,7 @@ void Repository::publishRef(std::string_view branch, const Hash& commitHash, boo
     checkBranch(branch);
     const std::filesystem::path heads = this->directory_ / "refs" / "heads";
     const std::filesystem::path final = heads / std::string(branch);
-    if (mustBeAbsent) require(!std::filesystem::exists(final), "branch already exists");
+    if (mustBeAbsent) require(Err::Conflict, !std::filesystem::exists(final), "branch already exists");
     const std::filesystem::path temporary = heads / ("." + std::string(branch) + ".tmp");
     int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     systemCall(fd >= 0, "open temporary branch ref");
@@ -2092,7 +2155,7 @@ void Repository::createBranch(std::string_view name, std::optional<std::string_v
     refreshIndex();
     checkBranch(name);
     const std::filesystem::path ref = this->directory_ / "refs" / "heads" / std::string(name);
-    require(!std::filesystem::exists(ref), "branch already exists");
+    require(Err::Conflict, !std::filesystem::exists(ref), "branch already exists");
     Hash initial{};
     if (from) {
         initial = branchHead(*from);
@@ -2135,7 +2198,19 @@ Revision Repository::revision(const Hash& revisionId) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(!isZero(revisionId), "zero revision hash is invalid");
+    return clientRevision(revisionId);
+}
+
+// Revision identities supplied by callers (HTTP clients, CLI arguments) may be
+// unknown or may name a tree/value object. Both are NotFound, never storage
+// corruption; a checksum failure of an existing object remains Corruption.
+Revision Repository::clientRevision(const Hash& revisionId) {
+    require(Err::InvalidInput, !isZero(revisionId), "zero revision hash is invalid");
+    require(Err::NotFound, this->index_.contains(revisionId), "revision not found");
+    const Bytes payload = load(revisionId);
+    require(Err::NotFound, payload.size() >= 67 && payload[0] == 'S' && payload[65] <= 1 &&
+                payload[66] <= 2 && payload.size() == 67U + 32U * payload[66],
+            "object is not a revision");
     return readRevision(revisionId);
 }
 
@@ -2144,10 +2219,10 @@ std::vector<Revision> Repository::history(std::string_view branch, std::size_t m
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(maxCount <= 1000, "history page exceeds 1000 revisions");
+    require(Err::InvalidInput, maxCount <= 1000, "history page exceeds 1000 revisions");
     Hash current = branchHead(branch);
     if (after) {
-        require(!isZero(*after), "zero history cursor is invalid");
+        require(Err::InvalidInput, !isZero(*after), "zero history cursor is invalid");
         // A cursor from another branch (or a side parent of a merge) must
         // not silently switch the history being paged.
         for (;;) {
@@ -2156,7 +2231,7 @@ std::vector<Revision> Repository::history(std::string_view branch, std::size_t m
                 current = item.parents.empty() ? Hash{} : item.parents.front();
                 break;
             }
-            require(!item.parents.empty(), "history cursor not on branch first-parent chain");
+            require(Err::InvalidInput, !item.parents.empty(), "history cursor not on branch first-parent chain");
             current = item.parents.front();
         }
     }
@@ -2170,6 +2245,14 @@ std::vector<Revision> Repository::history(std::string_view branch, std::size_t m
     return result;
 }
 
+bool Repository::revisionOnBranch(std::string_view branch, const Hash& revisionId) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    (void)clientRevision(revisionId); // NotFound before walking any history
+    return revisionReachableFrom(branchHead(branch), revisionId);
+}
+
 void Repository::createBranchAtRevision(std::string_view name, std::string_view sourceBranch,
                                         const Hash& revisionId) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
@@ -2177,8 +2260,8 @@ void Repository::createBranchAtRevision(std::string_view name, std::string_view 
     refreshIndex();
     checkBranch(name);
     const std::filesystem::path ref = this->directory_ / "refs" / "heads" / std::string(name);
-    require(!std::filesystem::exists(ref), "branch already exists");
-    require(revisionReachableFrom(branchHead(sourceBranch), revisionId),
+    require(Err::Conflict, !std::filesystem::exists(ref), "branch already exists");
+    require(Err::InvalidInput, revisionReachableFrom(branchHead(sourceBranch), revisionId),
             "revision is not reachable from source branch");
     publishRef(name, revisionId, true);
 }
@@ -2191,14 +2274,14 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
     try {
         const Revision targetHead = readRevision(branchHead(target));
         const Revision sourceHead = readRevision(branchHead(source));
-        require(!options.expectedTargetHead || *options.expectedTargetHead == targetHead.id,
+        require(Err::Conflict, !options.expectedTargetHead || *options.expectedTargetHead == targetHead.id,
                 "target branch advanced since merge resolution was prepared");
-        require(!options.expectedSourceHead || *options.expectedSourceHead == sourceHead.id,
+        require(Err::Conflict, !options.expectedSourceHead || *options.expectedSourceHead == sourceHead.id,
                 "source branch advanced since merge resolution was prepared");
         const std::function<void()> checkSelections = [&options]() {
             if (!options.checkSelections) return;
             const std::optional<std::string> problem = options.checkSelections();
-            require(!problem, problem.value_or("unconsumed merge resolution choices"));
+            require(Err::InvalidInput, !problem, problem.value_or("unconsumed merge resolution choices"));
         };
         MergeResult result{};
         result.targetBefore = targetHead.id;
@@ -2218,7 +2301,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
         while (!pending.empty()) {
             const Hash current = pending.back();
             pending.pop_back();
-            require(!isZero(current), "zero revision parent in merge ancestry");
+            require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
             if (!targetAncestors.insert(current).second) continue;
             if (current == sourceHead.id) {
                 checkSelections();
@@ -2240,7 +2323,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
         while (!pending.empty()) {
             const Hash current = pending.back();
             pending.pop_back();
-            require(!isZero(current), "zero revision parent in merge ancestry");
+            require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
             if (!sourceVisited.insert(current).second) continue;
             if (current == targetHead.id) {
                 // The target is an ancestor of the source: preserve the
@@ -2259,7 +2342,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
             const Revision record = readRevision(current);
             for (const Hash& parent : record.parents) pending.push_back(parent);
         }
-        require(!commonFrontier.empty(), "branches have no common revision ancestor");
+        require(Err::Conflict, !commonFrontier.empty(), "branches have no common revision ancestor");
 
         // Different merge paths can expose common-frontier nodes which are
         // themselves ancestors of other frontier nodes (criss-cross DAGs).
@@ -2286,10 +2369,10 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
         for (const Hash& candidate : commonFrontier) {
             if (!dominated.contains(candidate)) lowest.push_back(candidate);
         }
-        require(lowest.size() == 1, "multiple independent merge bases require recursive merging");
+        require(Err::Conflict, lowest.size() == 1, "multiple independent merge bases require recursive merging");
         result.base = lowest.front();
         const Revision base = readRevision(result.base);
-        require(targetHead.modelIndexed == sourceHead.modelIndexed &&
+        require(Err::InvalidInput, targetHead.modelIndexed == sourceHead.modelIndexed &&
                 (base.modelIndexed == targetHead.modelIndexed ||
                  (!base.modelIndexed && isZero(base.root) && targetHead.modelIndexed)),
                 "cannot merge incompatible raw and model-indexed histories");
@@ -2342,7 +2425,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                     values.base && values.target && values.source) {
                     const auto decodeAt = [this](const Hash& hash) {
                         const Bytes envelope = load(hash);
-                        require(!envelope.empty() && envelope.front() == 'V',
+                        require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
                                 "invalid model envelope in merge conflict");
                         return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
                     };
@@ -2372,7 +2455,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                     !values.base && values.target && values.source) {
                     const auto decodeAt = [this](const Hash& hash) {
                         const Bytes envelope = load(hash);
-                        require(!envelope.empty() && envelope.front() == 'V',
+                        require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
                                 "invalid model envelope in concurrent addition");
                         return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
                     };
@@ -2413,7 +2496,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                 continue;
             }
             const Bytes value = load(*item.second);
-            require(!value.empty() && value.front() == 'V', "invalid merged value envelope");
+            require(Err::Corruption, !value.empty() && value.front() == 'V', "invalid merged value envelope");
             const Bytes payload(value.begin() + 1, value.end());
             if (targetHead.modelIndexed) {
                 ModelRecord record = decodeModelRecord(payload);
@@ -2432,7 +2515,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                 const std::optional<Hash> hash = lookup(root, key);
                 if (!hash) return std::nullopt;
                 const Bytes value = load(*hash);
-                require(!value.empty() && value.front() == 'V',
+                require(Err::Corruption, !value.empty() && value.front() == 'V',
                         "invalid model envelope in merge reconciliation");
                 return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
             };
@@ -2468,7 +2551,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                             ++pending;
                         } else {
                             const std::optional<ModelRecord> record = readMerged(entry.first);
-                            require(record.has_value(), "missing record in merge reconciliation");
+                            require(Err::Corruption, record.has_value(), "missing record in merge reconciliation");
                             visitor(entry.first, *record);
                         }
                     }
@@ -2544,7 +2627,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                     const std::optional<Hash> hash = lookup(targetHead.root, key);
                     if (!hash) return std::nullopt;
                     const Bytes value = load(*hash);
-                    require(!value.empty() && value.front() == 'V',
+                    require(Err::Corruption, !value.empty() && value.front() == 'V',
                             "invalid model envelope in merge validation");
                     return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
                 };
@@ -2565,7 +2648,7 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                                 ++pending;
                             } else {
                                 const std::optional<ModelRecord> record = lookupRecord(entry.first);
-                                require(record.has_value(), "missing model in merge preview");
+                                require(Err::Corruption, record.has_value(), "missing model in merge preview");
                                 visitor(entry.first, *record);
                             }
                         }
@@ -2616,9 +2699,9 @@ Revision Repository::commitLocked(std::string_view branch, const std::vector<Cha
                                   std::optional<Hash> mergeParent) {
     const Hash parent = branchHead(branch);
     const Revision previous = readRevision(parent);
-    require(!previous.modelIndexed || referencesRoot.has_value(),
+    require(Err::InvalidInput, !previous.modelIndexed || referencesRoot.has_value(),
             "raw commits cannot modify a model-indexed branch");
-    require(!referencesRoot.has_value() || previous.modelIndexed || isZero(previous.root),
+    require(Err::InvalidInput, !referencesRoot.has_value() || previous.modelIndexed || isZero(previous.root),
             "cannot enable model indexing on a populated raw branch");
     // Sort pointers into the input rather than copying every encoded payload
     // into a second map. Stable ordering preserves raw commit's last-write-
@@ -2651,7 +2734,7 @@ Revision Repository::commitLocked(std::string_view branch, const std::vector<Cha
     encoded.push_back(mergeParent ? 2 : 1);
     appendHash(encoded, parent);
     if (mergeParent) {
-        require(!isZero(*mergeParent) && *mergeParent != parent, "invalid merge parent");
+        require(Err::Internal, !isZero(*mergeParent) && *mergeParent != parent, "invalid merge parent");
         appendHash(encoded, *mergeParent);
     }
     const Hash newRevision = store(std::move(encoded));
@@ -2685,9 +2768,9 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
                                        std::optional<Hash> expectedHead,
                                        std::optional<Hash> mergeParent) {
     const Revision previous = readRevision(branchHead(branch));
-    require(!expectedHead || previous.id == *expectedHead,
+    require(Err::Conflict, !expectedHead || previous.id == *expectedHead,
             "branch head changed since the model update was prepared");
-    require(previous.modelIndexed || isZero(previous.root),
+    require(Err::InvalidInput, previous.modelIndexed || isZero(previous.root),
             "cannot commit model records to a populated raw branch");
 
     // Canonicalize the owned change list in place. Large initial imports no
@@ -2696,12 +2779,12 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
         [](const ModelChange& left, const ModelChange& right) { return left.key < right.key; });
     for (std::size_t i = 0; i < changes.size(); ++i) {
         ModelChange& change = changes[i];
-        require(change.key != Key{}, "null model UUID is not allowed");
-        require(i == 0 || changes[i - 1].key != change.key,
+        require(Err::InvalidInput, change.key != Key{}, "null model UUID is not allowed");
+        require(Err::InvalidInput, i == 0 || changes[i - 1].key != change.key,
                 "duplicate model UUID in commit");
         if (change.record) {
             ModelRecord& canonical = *change.record;
-            require(canonical.kind != 0, "model kind must be nonzero");
+            require(Err::InvalidInput, canonical.kind != 0, "model kind must be nonzero");
             std::sort(canonical.references.begin(), canonical.references.end());
             canonical.references.erase(std::unique(canonical.references.begin(),
                         canonical.references.end()), canonical.references.end());
@@ -2717,7 +2800,7 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
         std::vector<Key> oldReferences;
         if (existing) {
             const Bytes stored = load(*existing);
-            require(!stored.empty() && stored.front() == 'V', "invalid model value object");
+            require(Err::Corruption, !stored.empty() && stored.front() == 'V', "invalid model value object");
             const ModelRecord old = decodeModelRecord(Bytes(stored.begin() + 1, stored.end()));
             oldReferences = old.references;
         }
@@ -2728,7 +2811,7 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
             }
         }
         for (const Key& referenced : newReferences) {
-            require(referenced != Key{} && referenced != item.key,
+            require(Err::InvalidInput, referenced != Key{} && referenced != item.key,
                     "invalid model UUID reference");
             if (!std::binary_search(oldReferences.begin(), oldReferences.end(), referenced)) {
                 addedEdges[referenced].insert(item.key);
@@ -2739,11 +2822,11 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
                         return candidate.key < key;
                     });
             if (pending != changes.end() && pending->key == referenced) {
-                require(pending->record.has_value(),
+                require(Err::InvalidInput, pending->record.has_value(),
                         "model reference target deleted by same commit");
             } else {
                 const std::optional<Hash> destination = lookup(previous.root, referenced);
-                require(destination.has_value(), "model reference target does not exist");
+                require(Err::InvalidInput, destination.has_value(), "model reference target does not exist");
             }
         }
     }
@@ -2775,9 +2858,9 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
                     return candidate.first < key;
                 });
         if (changed != nextIncoming.end() && changed->first == item.key) {
-            require(changed->second.empty(), "cannot delete referenced model UUID");
+            require(Err::InvalidInput, changed->second.empty(), "cannot delete referenced model UUID");
         } else {
-            require(readReferrers(previous.referencesRoot, item.key).empty(),
+            require(Err::InvalidInput, readReferrers(previous.referencesRoot, item.key).empty(),
                     "cannot delete referenced model UUID");
         }
     }
@@ -2789,7 +2872,7 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
     for (ModelChange& item : changes) {
         if (item.record) {
             Bytes value = encodeModelRecord(*item.record);
-            require(value.size() < maxObjectBytes, "encoded model value exceeds pack limit");
+            require(Err::LimitExceeded, value.size() < maxObjectBytes, "encoded model value exceeds pack limit");
             encoded.push_back(Change{item.key, std::move(value)});
             // All validation has finished. Release each canonical source
             // payload as soon as its encoded representation is available.
@@ -2805,7 +2888,7 @@ Revision Repository::commitModelLocked(std::string_view branch, std::vector<Mode
             pendingIndex.emplace_back(item.first, std::nullopt);
         } else {
             Bytes value = encodeReferrers(item.second);
-            require(value.size() <= maxObjectBytes, "incoming model index exceeds pack limit");
+            require(Err::LimitExceeded, value.size() <= maxObjectBytes, "incoming model index exceeds pack limit");
             pendingIndex.emplace_back(item.first, std::move(value));
         }
     }
@@ -2828,7 +2911,7 @@ std::vector<Key> Repository::referencingModel(std::string_view branch, const Key
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     const Revision revision = readRevision(branchHead(branch));
-    require(revision.modelIndexed, "reverse references are unavailable on raw branch");
+    require(Err::InvalidInput, revision.modelIndexed, "reverse references are unavailable on raw branch");
     return readReferrers(revision.referencesRoot, key);
 }
 
@@ -2836,12 +2919,11 @@ std::optional<Bytes> Repository::getAtRevision(const Hash& revisionId, const Key
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(!isZero(revisionId), "zero revision hash is invalid");
-    const Revision snapshot = readRevision(revisionId);
+    const Revision snapshot = clientRevision(revisionId);
     const std::optional<Hash> object = lookup(snapshot.root, key);
     if (!object) return std::nullopt;
     const Bytes encoded = load(*object);
-    require(!encoded.empty() && encoded.front() == 'V', "invalid value object");
+    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
     return Bytes(encoded.begin() + 1, encoded.end());
 }
 
@@ -2849,13 +2931,12 @@ std::optional<ModelRecord> Repository::getModelAtRevision(const Hash& revisionId
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(!isZero(revisionId), "zero revision hash is invalid");
-    const Revision snapshot = readRevision(revisionId);
-    require(snapshot.modelIndexed, "model records require a model-indexed revision");
+    const Revision snapshot = clientRevision(revisionId);
+    require(Err::InvalidInput, snapshot.modelIndexed, "model records require a model-indexed revision");
     const std::optional<Hash> object = lookup(snapshot.root, key);
     if (!object) return std::nullopt;
     const Bytes encoded = load(*object);
-    require(!encoded.empty() && encoded.front() == 'V', "invalid value object");
+    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
     return decodeModelRecord(Bytes(encoded.begin() + 1, encoded.end()));
 }
 
@@ -2863,9 +2944,8 @@ std::vector<Key> Repository::referencingModelAtRevision(const Hash& revisionId, 
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(!isZero(revisionId), "zero revision hash is invalid");
-    const Revision snapshot = readRevision(revisionId);
-    require(snapshot.modelIndexed, "reverse references are unavailable on raw revision");
+    const Revision snapshot = clientRevision(revisionId);
+    require(Err::InvalidInput, snapshot.modelIndexed, "reverse references are unavailable on raw revision");
     return readReferrers(snapshot.referencesRoot, key);
 }
 
@@ -2883,7 +2963,7 @@ std::optional<Bytes> Repository::get(std::string_view branch, const Key& key) {
     const std::optional<Hash> payloadHash = lookup(revision.root, key);
     if (!payloadHash) return std::nullopt;
     const Bytes encoded = load(*payloadHash);
-    require(!encoded.empty() && encoded.front() == 'V', "invalid value object");
+    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
     return Bytes(encoded.begin() + 1, encoded.end());
 }
 
@@ -2902,7 +2982,7 @@ std::vector<std::pair<Key, Bytes>> Repository::scan(std::string_view branch) {
     result.reserve(entries.size());
     for (const std::pair<Key, Hash>& entry : entries) {
         const Bytes encoded = load(entry.second);
-        require(!encoded.empty() && encoded.front() == 'V', "invalid value object");
+        require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
         result.emplace_back(entry.first, Bytes(encoded.begin() + 1, encoded.end()));
     }
     return result;
@@ -2924,15 +3004,18 @@ std::vector<Difference> Repository::diff(std::string_view from, std::string_view
 
 std::vector<Difference> Repository::diffRevisions(const Hash& fromRevision,
                                                   const Hash& toRevision) {
+    return diffRevisions(fromRevision, toRevision, std::numeric_limits<std::size_t>::max());
+}
+
+std::vector<Difference> Repository::diffRevisions(const Hash& fromRevision, const Hash& toRevision,
+                                                  std::size_t maxDifferences) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(!isZero(fromRevision) && !isZero(toRevision),
-            "zero revision hash is invalid");
-    const Revision before = readRevision(fromRevision);
-    const Revision after = readRevision(toRevision);
+    const Revision before = clientRevision(fromRevision);
+    const Revision after = clientRevision(toRevision);
     std::vector<Difference> result;
-    diffHashes(before.root, after.root, result);
+    diffHashes(before.root, after.root, result, maxDifferences);
     std::sort(result.begin(), result.end(), [](const Difference& first, const Difference& second) {
         return first.key < second.key;
     });
@@ -2946,35 +3029,35 @@ void Repository::verifyPack() {
 }
 
 void Repository::verifyPackLocked() {
-    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
+    require(Err::Unavailable, !this->needsReopen_, "repository must be reopened after interrupted compaction");
     refreshIndex();
     std::uint64_t position = 0;
     std::uint64_t checked = 0;
     while (position < this->scanOffset_) {
-        require(this->scanOffset_ - position >= headerSize, "truncated pack header");
+        require(Err::Corruption, this->scanOffset_ - position >= headerSize, "truncated pack header");
         std::array<std::uint8_t, headerSize> header{};
         readExact(this->packFd_, header.data(), header.size(), position);
-        require(header[0] == 'A' && header[1] == 'O' && header[2] == 'B' &&
+        require(Err::Corruption, header[0] == 'A' && header[1] == 'O' && header[2] == 'B' &&
                 header[3] == 'J' && header[4] == 1, "corrupt pack record header");
         Hash expected{};
         std::copy_n(header.begin() + 5, 32, expected.begin());
         const std::uint64_t length = readU64(header.data() + 37);
-        require(this->scanOffset_ - position >= headerSize &&
+        require(Err::Corruption, this->scanOffset_ - position >= headerSize &&
                 length <= maxObjectBytes && length <= this->scanOffset_ - position - headerSize,
                 "invalid content pack object boundary");
         Bytes payload(static_cast<std::size_t>(length));
         if (!payload.empty()) {
             readExact(this->packFd_, payload.data(), payload.size(), position + headerSize);
         }
-        require(sha256(payload) == expected, "content pack checksum mismatch");
+        require(Err::Corruption, sha256(payload) == expected, "content pack checksum mismatch");
         const std::unordered_map<Hash, Location, HashHasher>::const_iterator entry =
             this->index_.find(expected);
-        require(entry != this->index_.end() && entry->second.offset == position + headerSize &&
+        require(Err::Corruption, entry != this->index_.end() && entry->second.offset == position + headerSize &&
                 entry->second.size == length, "index differs from content pack");
         ++checked;
         position += headerSize + length;
     }
-    require(position == this->scanOffset_ && checked == this->index_.size(),
+    require(Err::Corruption, position == this->scanOffset_ && checked == this->index_.size(),
             "pack verification found inconsistent object count");
 }
 
@@ -2984,7 +3067,7 @@ VerificationReport Repository::verifyRepository() {
     // Verify all physical objects, including unreachable ones, first.
     // Neither stage mutates branch heads or rewrites invalid object graphs.
     verifyPackLocked();
-    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
+    require(Err::Unavailable, !this->needsReopen_, "repository must be reopened after interrupted compaction");
     refreshIndex();
 
     const std::filesystem::path heads = this->directory_ / "refs" / "heads";
@@ -3002,8 +3085,8 @@ VerificationReport Repository::verifyRepository() {
     for (const std::string& name : names) {
         try {
             tips.push_back(branchHead(name));
-        } catch (const std::exception& error) {
-            throw std::runtime_error("invalid branch '" + name + "': " + error.what());
+        } catch (...) {
+            rethrowWithContext("invalid branch '" + name + "': ");
         }
     }
     const std::function<Bytes(const Hash&)> loadObject =
@@ -3011,9 +3094,8 @@ VerificationReport Repository::verifyRepository() {
     LogicalVerification graph{};
     try {
         graph = verifyLogicalGraph(tips, loadObject);
-    } catch (const std::exception& error) {
-        throw std::runtime_error(std::string("logical repository verification failed: ") +
-                                 error.what());
+    } catch (...) {
+        rethrowWithContext("logical repository verification failed: ");
     }
     VerificationReport result{};
     result.branches = static_cast<std::uint64_t>(tips.size());
@@ -3097,7 +3179,7 @@ void Repository::exportBundleLocked(std::string_view branch,
     // Validate the request before creating an output file. A parent revision
     // can be shared even if it is not on the first-parent history.
     if (recipientBase) {
-        require(!isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
+        require(Err::Conflict, !isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
                 "incremental export base is not an ancestor of the source branch");
     }
     std::set<Hash> objects = collectObjects(tip);
@@ -3105,9 +3187,9 @@ void Repository::exportBundleLocked(std::string_view branch,
         const std::set<Hash> knownObjects = collectObjects(*recipientBase);
         for (const Hash& known : knownObjects) objects.erase(known);
     }
-    require(recipientBase.has_value() || !objects.empty(),
+    require(Err::InvalidInput, recipientBase.has_value() || !objects.empty(),
             "cannot export an empty revision graph");
-    require(limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
+    require(Err::LimitExceeded, limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
             "bundle transfer limit: object count exceeded");
     int fd = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL |
                     O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -3126,13 +3208,13 @@ void Repository::exportBundleLocked(std::string_view branch,
         }
         writeExact(fd, header.data(), header.size(), 0);
         std::uint64_t offset = headerSize;
-        require(limits.maxBytes == 0 || offset <= limits.maxBytes,
+        require(Err::LimitExceeded, limits.maxBytes == 0 || offset <= limits.maxBytes,
                 "bundle transfer limit: byte count exceeded");
         for (const Hash& hash : objects) {
             const Bytes bytes = load(hash);
-            require(limits.maxObjectBytes == 0 || bytes.size() <= limits.maxObjectBytes,
+            require(Err::LimitExceeded, limits.maxObjectBytes == 0 || bytes.size() <= limits.maxObjectBytes,
                     "bundle transfer limit: individual object exceeded");
-            require(limits.maxBytes == 0 ||
+            require(Err::LimitExceeded, limits.maxBytes == 0 ||
                     (offset <= limits.maxBytes &&
                      bytes.size() <= limits.maxBytes - offset &&
                      bundleEntryBytes <= limits.maxBytes - offset - bytes.size()),
@@ -3178,43 +3260,43 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
     try {
         struct stat metadata{};
         systemCall(::fstat(fd, &metadata) == 0, "stat replication bundle");
-        require(S_ISREG(metadata.st_mode) && metadata.st_size >= 0 &&
+        require(Err::InvalidInput, S_ISREG(metadata.st_mode) && metadata.st_size >= 0 &&
                 static_cast<std::uint64_t>(metadata.st_size) >= bundleHeaderBytes,
                 "invalid replication bundle file");
         const std::uint64_t fileSize = static_cast<std::uint64_t>(metadata.st_size);
-        require(limits.maxBytes == 0 || fileSize <= limits.maxBytes,
+        require(Err::LimitExceeded, limits.maxBytes == 0 || fileSize <= limits.maxBytes,
                 "bundle transfer limit: byte count exceeded");
         std::array<std::uint8_t, bundleHeaderBytes> header{};
         readExact(fd, header.data(), header.size(), 0);
         const bool incremental = std::equal(incrementalBundleMagic.begin(),
                                             incrementalBundleMagic.end(), header.begin());
-        require(incremental || std::equal(bundleMagic.begin(), bundleMagic.end(), header.begin()),
+        require(Err::InvalidInput, incremental || std::equal(bundleMagic.begin(), bundleMagic.end(), header.begin()),
                 "invalid replication bundle magic");
         const std::uint64_t headerBytes = incremental
             ? incrementalBundleHeaderBytes : bundleHeaderBytes;
-        require(fileSize >= headerBytes, "truncated replication bundle header");
+        require(Err::InvalidInput, fileSize >= headerBytes, "truncated replication bundle header");
         Hash recipientBase{};
         if (incremental) {
             readExact(fd, recipientBase.data(), recipientBase.size(), bundleHeaderBytes);
-            require(!isZero(recipientBase), "incremental bundle has zero base revision");
+            require(Err::InvalidInput, !isZero(recipientBase), "incremental bundle has zero base revision");
             const bool known = this->index_.contains(recipientBase);
-            require(known, "incremental bundle base revision is missing locally");
+            require(Err::Conflict, known, "incremental bundle base revision is missing locally");
             (void)readRevision(recipientBase); // Must be a real revision, not another object.
         }
         Hash incoming{};
         std::copy_n(header.begin() + 8, 32, incoming.begin());
-        require(!isZero(incoming), "replication bundle has zero revision head");
+        require(Err::InvalidInput, !isZero(incoming), "replication bundle has zero revision head");
         const std::uint64_t count = readU64(header.data() + 40);
-        require((incremental || count != 0) &&
+        require(Err::InvalidInput, (incremental || count != 0) &&
                 count <= (fileSize - headerBytes) / bundleEntryBytes,
                 "invalid replication bundle object count");
-        require(limits.maxObjects == 0 || count <= limits.maxObjects,
+        require(Err::LimitExceeded, limits.maxObjects == 0 || count <= limits.maxObjects,
                 "bundle transfer limit: object count exceeded");
         BundleLocationIndex entries(count);
         std::uint64_t offset = headerBytes;
         Hash previous{};
         for (std::uint64_t index = 0; index < count; ++index) {
-            require(fileSize - offset >= bundleEntryBytes,
+            require(Err::InvalidInput, fileSize - offset >= bundleEntryBytes,
                     "truncated replication bundle entry");
             std::array<std::uint8_t, bundleEntryBytes> entry{};
             readExact(fd, entry.data(), entry.size(), offset);
@@ -3222,19 +3304,19 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             Hash hash{};
             std::copy_n(entry.begin(), 32, hash.begin());
             const std::uint64_t size = readU64(entry.data() + 32);
-            require(!isZero(hash) && (index == 0 || previous < hash),
+            require(Err::InvalidInput, !isZero(hash) && (index == 0 || previous < hash),
                     "replication bundle object hashes must be unique and sorted");
-            require(size <= maxObjectBytes && size <= fileSize - offset,
+            require(Err::InvalidInput, size <= maxObjectBytes && size <= fileSize - offset,
                     "replication bundle object exceeds bounds");
-            require(limits.maxObjectBytes == 0 || size <= limits.maxObjectBytes,
+            require(Err::LimitExceeded, limits.maxObjectBytes == 0 || size <= limits.maxObjectBytes,
                     "bundle transfer limit: individual object exceeded");
-            require(sha256FileRegion(fd, offset, size) == hash,
+            require(Err::InvalidInput, sha256FileRegion(fd, offset, size) == hash,
                     "replication bundle SHA-256 mismatch");
             entries.append(hash, BundleLocation{offset, size});
             offset += size;
             previous = hash;
         }
-        require(offset == fileSize, "replication bundle contains trailing bytes");
+        require(Err::InvalidInput, offset == fileSize, "replication bundle contains trailing bytes");
         entries.finalize();
         if (profile != nullptr) {
             profile->scanMs = elapsedImportMs(importStart, ImportClock::now());
@@ -3243,16 +3325,27 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         const auto containsLocally = [&](const Hash& hash) {
             return this->index_.contains(hash);
         };
-        require(entries.find(incoming).has_value() ||
+        require(Err::InvalidInput, entries.find(incoming).has_value() ||
                     (incremental && containsLocally(incoming)),
                 "replication bundle lacks tip revision");
         const auto bundleObject = [&](const Hash& hash) -> Bytes {
             const std::optional<BundleLocation> location = entries.find(hash);
             if (!location) {
-                require(incremental && containsLocally(hash),
+                require(Err::InvalidInput, incremental && containsLocally(hash),
                         "incremental replication bundle is missing a referenced object");
-                const Bytes local = load(hash);
-                require(sha256(local) == hash, "local replication object SHA-256 mismatch");
+                Bytes local;
+                try {
+                    local = load(hash);
+                    require(Err::Corruption, sha256(local) == hash,
+                            "local replication object SHA-256 mismatch");
+                } catch (...) {
+                    // Damage in THIS repository is not a defect of the bundle.
+                    try { throw; }
+                    catch (const StorageError& error) {
+                        throw LocalStorageFailure(error.kind(), "local object " + toHex(hash) +
+                                                  ": " + error.what());
+                    }
+                }
                 if (profile != nullptr) {
                     ++profile->localObjectReads;
                     profile->localObjectBytes += local.size();
@@ -3261,7 +3354,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             }
             Bytes object(static_cast<std::size_t>(location->size));
             if (!object.empty()) readExact(fd, object.data(), object.size(), location->offset);
-            require(sha256(object) == hash, "replication bundle changed during import");
+            require(Err::InvalidInput, sha256(object) == hash, "replication bundle changed during import");
             if (profile != nullptr) {
                 ++profile->bundleObjectReads;
                 profile->bundleObjectBytes += object.size();
@@ -3284,7 +3377,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             },
             [&](const Hash& hash, std::uint8_t bits) {
                 const std::optional<std::size_t> ordinal = entries.ordinal(hash);
-                require(ordinal.has_value(), "missing hash in bundle visitation index");
+                require(Err::Internal, ordinal.has_value(), "missing hash in bundle visitation index");
                 visitMarks.mark(*ordinal, bits);
             },
             [&]() { return visitMarks.markedCount(); },
@@ -3295,7 +3388,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             },
             [&](const Hash& hash, unsigned kind, const TreeSummary& summary) {
                 const std::optional<std::size_t> ordinal = entries.ordinal(hash);
-                require(ordinal.has_value(), "missing hash in bundle trie summary index");
+                require(Err::Internal, ordinal.has_value(), "missing hash in bundle trie summary index");
                 treeSummaries.write(*ordinal, kind, summary);
             },
             [&]() { return treeSummaries.size(); },
@@ -3310,9 +3403,13 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             }
         };
         LogicalVerificationProfile graphProfile{};
-        const LogicalVerification verification =
-            verifyLogicalGraph({incoming}, bundleObject, externalMarks,
-                               profile != nullptr ? &graphProfile : nullptr);
+        LogicalVerification verification{};
+        try {
+            verification = verifyLogicalGraph({incoming}, bundleObject, externalMarks,
+                                              profile != nullptr ? &graphProfile : nullptr);
+        } catch (...) {
+            rethrowBundleFailure();
+        }
         if (profile != nullptr) {
             // Includes setup of visit-mark and trie-summary scratch tables.
             // The separately reported graph/model stages cover the verifier
@@ -3323,11 +3420,11 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
         }
         const ImportClock::time_point reachStart = ImportClock::now();
         for (std::size_t index = 0; index < entries.size(); ++index) {
-            require(visitMarks.at(index) != 0,
+            require(Err::InvalidInput, visitMarks.at(index) != 0,
                     "replication bundle contains unreachable objects");
         }
         if (incremental) {
-            require(verification.containsRevision(recipientBase),
+            require(Err::InvalidInput, verification.containsRevision(recipientBase),
                     "incremental bundle base is not an ancestor of incoming revision");
         }
         if (profile != nullptr) {
@@ -3347,7 +3444,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
                  revisionReachableFrom(previousHead, incoming))) {
                 status = BundleImportStatus::UpToDate;
             } else {
-                require(verification.containsRevision(previousHead),
+                require(Err::Conflict, verification.containsRevision(previousHead),
                         "replication would overwrite divergent branch history");
                 status = BundleImportStatus::FastForward;
             }
@@ -3369,7 +3466,7 @@ BundleImportResult Repository::importBranchBundle(const std::filesystem::path& b
             const bool present = this->index_.contains(entry.first);
             if (present) continue;
             Bytes payload = bundleObject(entry.first);
-            require(store(std::move(payload)) == entry.first,
+            require(Err::Internal, store(std::move(payload)) == entry.first,
                     "replication content hash changed before publication");
             ++imported;
         }
@@ -3396,7 +3493,7 @@ CompactionStats Repository::compact() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     ScopedMaintenanceExclusive alone(this->lifetimeFd_);
-    require(!this->needsReopen_, "repository must be reopened after interrupted compaction");
+    require(Err::Unavailable, !this->needsReopen_, "repository must be reopened after interrupted compaction");
     refreshIndex();
 
     CompactionStats stats{};
@@ -3405,7 +3502,7 @@ CompactionStats Repository::compact() {
     stats.packBytesBefore = this->scanOffset_;
     struct stat oldIndex{};
     systemCall(::fstat(this->indexFd_, &oldIndex) == 0, "stat content index");
-    require(oldIndex.st_size >= 0, "invalid index size");
+    require(Err::Corruption, oldIndex.st_size >= 0, "invalid index size");
     stats.indexBytesBefore = static_cast<std::uint64_t>(oldIndex.st_size);
 
     // The retention policy is intentionally conservative:    // The retention policy is intentionally conservative: preserve EVERY
@@ -3418,7 +3515,7 @@ CompactionStats Repository::compact() {
          std::filesystem::directory_iterator(heads)) {
         const std::string name = entry.path().filename().string();
         if (!name.empty() && name.front() == '.') continue; // abandoned temporary ref
-        require(entry.is_regular_file() && !entry.is_symlink(),
+        require(Err::Corruption, entry.is_regular_file() && !entry.is_symlink(),
                 "unexpected non-file in branch refs");
         checkBranch(name);
         pending.emplace_back(branchHead(name), ReachableKind::Revision);
@@ -3449,9 +3546,9 @@ CompactionStats Repository::compact() {
             (void)load(next.first); // validate all retained content
         }
     }
-    require(reachable.size() <= stats.objectsBefore, "invalid reachable object count");
+    require(Err::Corruption, reachable.size() <= stats.objectsBefore, "invalid reachable object count");
     std::array<std::uint8_t, 16> random{};
-    require(RAND_bytes(random.data(), static_cast<int>(random.size())) == 1,
+    require(Err::Internal, RAND_bytes(random.data(), static_cast<int>(random.size())) == 1,
             "failed to generate pack generation identifier");
     constexpr char digits[] = "0123456789abcdef";
     std::string nextToken;
@@ -3480,10 +3577,10 @@ CompactionStats Repository::compact() {
         while (oldPosition < this->scanOffset_) {
             std::array<std::uint8_t, headerSize> header{};
             readExact(this->packFd_, header.data(), header.size(), oldPosition);
-            require(header[0] == 'A' && header[1] == 'O' && header[2] == 'B' &&
+            require(Err::Corruption, header[0] == 'A' && header[1] == 'O' && header[2] == 'B' &&
                     header[3] == 'J' && header[4] == 1, "invalid existing pack header");
             const std::uint64_t size = readU64(header.data() + 37);
-            require(size <= maxObjectBytes &&
+            require(Err::Corruption, size <= maxObjectBytes &&
                     this->scanOffset_ - oldPosition >= headerSize &&
                     size <= this->scanOffset_ - oldPosition - headerSize,
                     "invalid existing pack record boundary");
@@ -3492,7 +3589,7 @@ CompactionStats Repository::compact() {
             if (reachable.contains(hash)) {
                 const std::unordered_map<Hash, Location, HashHasher>::const_iterator entry =
                     this->index_.find(hash);
-                require(entry != this->index_.end() &&
+                require(Err::Corruption, entry != this->index_.end() &&
                         entry->second.offset == oldPosition + headerSize &&
                         entry->second.size == size, "pack and index mismatch during compaction");
                 const Bytes payload = load(hash); // verify SHA-256 before copying
@@ -3510,7 +3607,7 @@ CompactionStats Repository::compact() {
             }
             oldPosition += headerSize + size;
         }
-        require(stats.objectsAfter == reachable.size(),
+        require(Err::Corruption, stats.objectsAfter == reachable.size(),
                 "not all reachable objects were found in the pack");
         stats.packBytesAfter = newPosition;
         stats.indexBytesAfter = indexPosition;

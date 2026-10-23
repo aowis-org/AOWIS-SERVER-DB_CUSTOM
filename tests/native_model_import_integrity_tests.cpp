@@ -287,10 +287,14 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
     bool rejected = false;
     try {
         (void)target.importBranchBundle(bundle, branch);
-    } catch (const std::runtime_error& error) {
+    } catch (const aowis::native::StorageError& error) {
         rejected = true;
         expect(std::string(error.what()).find(reason) != std::string::npos,
                "wrong rejection reason for " + label + ": " + error.what());
+        // A malformed bundle is client input, never local corruption (review F2).
+        expect(error.kind() == aowis::native::StorageErrorKind::InvalidInput,
+               "malformed bundle not classified as InvalidInput: " + label + " (" +
+               aowis::native::StorageError::kindName(error.kind()) + ")");
     }
     expect(rejected, "forged model history accepted: " + label);
     expect(target.head("stable").id == headBefore &&

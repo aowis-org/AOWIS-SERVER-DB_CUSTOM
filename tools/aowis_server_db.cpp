@@ -1,4 +1,5 @@
 #include "aowis/native/db_http_routes.h"
+#include "aowis/native/http_limit_policy.h"
 
 #include <QCommandLineOption>
 #include <QCommandLineParser>
@@ -55,11 +56,14 @@ int main(int argc, char** argv) {
     const QCommandLineOption port({"p", "port"}, "TCP port (1..65535)", "port");
     const QCommandLineOption dataRoot({"d", "data-root"}, "Project data directory", "directory");
     const QCommandLineOption logFile("log-file", "Append server errors to a log file", "file");
+    const QCommandLineOption proxyLimits("proxy-enforces-body-limit",
+        "Qt < 6.11 only: a reverse proxy in front of this server enforces request size limits");
     parser.addOption(config);
     parser.addOption(bind);
     parser.addOption(port);
     parser.addOption(dataRoot);
     parser.addOption(logFile);
+    parser.addOption(proxyLimits);
     const QCommandLineOption bundleMib("sync-max-mib", "Maximum transfer size in MiB (1..256)", "MiB");
     const QCommandLineOption bundleObjects("sync-max-objects", "Maximum objects in a bundle (1..1000000)", "count");
     const QCommandLineOption objectMib("sync-max-object-mib", "Maximum object size in MiB (1..64)", "MiB");
@@ -80,6 +84,12 @@ int main(int argc, char** argv) {
         const QString storageValue = settings.value("storage/default_backend", "pack").toString();
         const QString logPath = parser.isSet(logFile) ? parser.value(logFile) :
             settings.value("logging/file", "").toString();
+        const QString proxyValue = settings.value("server/proxy_enforces_body_limit", "false").toString();
+        if (proxyValue != "true" && proxyValue != "false") {
+            std::cerr << "Invalid server/proxy_enforces_body_limit (expected true or false)\n";
+            return 2;
+        }
+        const bool proxyEnforcesLimits = parser.isSet(proxyLimits) || proxyValue == "true";
 
         const QString transferMibValue = parser.isSet(bundleMib) ? parser.value(bundleMib) :
             settings.value("sync/max_transfer_mib", 32).toString();
@@ -115,12 +125,23 @@ int main(int argc, char** argv) {
         // Default: errors go to stderr/journald. Optional file logging
         // redirects the C++ service diagnostics, restoring stderr on exit.
         ScopedErrorLog errorLog(logPath);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+        constexpr bool qtEnforcesLimits = true;
+#else
+        constexpr bool qtEnforcesLimits = false;
+#endif
+        const aowis::native::http::BodyLimitPolicyDecision policy =
+            aowis::native::http::evaluateBodyLimitPolicy(qtEnforcesLimits, address.isLoopback(),
+                                                         proxyEnforcesLimits, bindValue.toStdString());
+        if (!policy.message.empty()) std::cerr << "AOWIS database: " << policy.message << '\n';
+        if (!policy.start) return 2;
         aowis::native::ProjectService service(rootValue.toStdString());
         QHttpServer httpServer;
         aowis::native::http::registerRoutes(httpServer, service, storage, limits);
 #if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
         QHttpServerConfiguration configuration = httpServer.configuration();
         configuration.setMaximumBodySize(static_cast<qint64>(limits.maxBytes));
+        configuration.setMaximumTotalHeaderSize(64 * 1024);
         httpServer.setConfiguration(configuration);
 #endif
         // QHttpServer::bind() takes QObject ownership of the listener.

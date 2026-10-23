@@ -76,6 +76,8 @@ repository.createBranch("main");
 // with the canonical AOWIS NetworkHydraulic model.
 ```
 
+Engine failures are `aowis::native::StorageError` exceptions (see `include/aowis/native/storage_error.h`); classify them by `StorageErrorKind`, never by message text.
+
 The project catalogue is also available as `AOWIS::NativeProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-db` (binds to 127.0.0.1:8755, project storage `./aowis-db-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/db-http-api.yaml) documents implemented routes.
 
 For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).

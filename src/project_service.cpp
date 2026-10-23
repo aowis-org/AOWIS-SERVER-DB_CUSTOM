@@ -16,18 +16,20 @@
 namespace aowis::native {
 namespace {
 
-void check(bool ok, const std::string& message) {
-    if (!ok) throw std::runtime_error(message);
+// Catalogue metadata on disk violating its format is storage corruption.
+void check(bool ok, const std::string& message,
+           StorageErrorKind kind = StorageErrorKind::Corruption) {
+    if (!ok) throw StorageError(kind, message);
 }
 
 void syscallChecked(bool ok, const char* action) {
-    if (!ok) throw std::runtime_error(std::string(action) + ": " + std::strerror(errno));
+    if (!ok) throwSystemError(action);
 }
 
 std::string randomId() {
     std::array<unsigned char, 16> bytes{};
     check(RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) == 1,
-          "failed to generate secure project ID");
+          "failed to generate secure project ID", StorageErrorKind::Internal);
     bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0fU) | 0x40U);
     bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3fU) | 0x80U);
     constexpr char digits[] = "0123456789abcdef";
@@ -155,6 +157,29 @@ ProjectInfo readManifest(const std::filesystem::path& projectDirectory) {
     info.storage = PhysicalStore::Pack;
     info.name = decodeName(body.substr(third + 1, body.size() - third - 2));
     return info;
+}
+
+// ProjectService methods report client mistakes as ProjectError (their
+// documented contract). Server-side StorageError kinds (corruption, I/O,
+// exhausted storage, internal) propagate unchanged.
+template <typename Result, typename Function>
+Result translated(Function&& function) {
+    try {
+        return function();
+    } catch (const StorageError& error) {
+        switch (error.kind()) {
+        case StorageErrorKind::InvalidInput:
+            throw ProjectError(ProjectErrorKind::InvalidInput, error.what());
+        case StorageErrorKind::NotFound:
+            throw ProjectError(ProjectErrorKind::NotFound, error.what());
+        case StorageErrorKind::Conflict:
+            throw ProjectError(ProjectErrorKind::Conflict, error.what());
+        case StorageErrorKind::Unavailable:
+            throw ProjectError(ProjectErrorKind::Unavailable, error.what());
+        default:
+            throw;
+        }
+    }
 }
 
 } // namespace
@@ -317,7 +342,9 @@ ProjectInfo ProjectService::project(std::string_view id) const {
 
 std::vector<std::string> ProjectService::listBranches(std::string_view projectId) {
     std::lock_guard<std::mutex> guard(this->mutex_);
-    return repositoryEntry(projectId).repository->listBranches();
+    return translated<std::vector<std::string>>([&]() {
+        return repositoryEntry(projectId).repository->listBranches();
+    });
 }
 
 Revision ProjectService::createBranch(std::string_view projectId, std::string_view name,
@@ -335,15 +362,11 @@ Revision ProjectService::createBranch(std::string_view projectId, std::string_vi
     }
     if (fromBranch && std::find(branches.begin(), branches.end(), *fromBranch) == branches.end())
         throw ProjectError(ProjectErrorKind::NotFound, "source branch not found");
-    if (fromRevision) {
-        try { repository.createBranchAtRevision(name, *fromBranch, *fromRevision); }
-        catch (const std::runtime_error& error) {
-            if (std::string_view(error.what()).find("revision is not reachable") != std::string_view::npos)
-                throw ProjectError(ProjectErrorKind::InvalidInput, "revision is not reachable from source branch");
-            throw;
-        }
-    } else repository.createBranch(name, fromBranch);
-    return repository.head(name);
+    return translated<Revision>([&]() {
+        if (fromRevision) repository.createBranchAtRevision(name, *fromBranch, *fromRevision);
+        else repository.createBranch(name, fromBranch);
+        return repository.head(name);
+    });
 }
 
 Revision ProjectService::head(std::string_view projectId, std::string_view branch) {
@@ -354,7 +377,7 @@ Revision ProjectService::head(std::string_view projectId, std::string_view branc
     const std::vector<std::string> branches = repository.listBranches();
     if (std::find(branches.begin(), branches.end(), branch) == branches.end())
         throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
-    return repository.head(branch);
+    return translated<Revision>([&]() { return repository.head(branch); });
 }
 
 std::vector<Revision> ProjectService::history(std::string_view projectId,
@@ -366,25 +389,16 @@ std::vector<Revision> ProjectService::history(std::string_view projectId,
     const std::vector<std::string> branches = repository.listBranches();
     if (std::find(branches.begin(), branches.end(), branch) == branches.end())
         throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
-    try { return repository.history(branch, maxCount, after); }
-    catch (const std::runtime_error& error) {
-        const std::string_view message(error.what());
-        if (message.find("history cursor not on") != std::string_view::npos ||
-            message.find("zero history cursor") != std::string_view::npos)
-            throw ProjectError(ProjectErrorKind::InvalidInput, "invalid history cursor");
-        throw;
-    }
+    return translated<std::vector<Revision>>([&]() {
+        return repository.history(branch, maxCount, after);
+    });
 }
 
 Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
     std::lock_guard<std::mutex> guard(this->mutex_);
-    try { return repositoryEntry(projectId).repository->revision(id); }
-    catch (const std::runtime_error& error) {
-        const std::string_view message(error.what());
-        if (message.find("referenced content is missing from pack") != std::string_view::npos)
-            throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
-        throw;
-    }
+    return translated<Revision>([&]() {
+        return repositoryEntry(projectId).repository->revision(id);
+    });
 }
 
 

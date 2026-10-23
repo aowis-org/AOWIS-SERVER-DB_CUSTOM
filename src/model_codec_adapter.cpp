@@ -1,4 +1,5 @@
 #include "aowis/native/model_codec_adapter.h"
+#include "aowis/native/storage_error.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -10,7 +11,7 @@ namespace aowis::native::hydraulic {
 Key keyFromUuid(const QUuid& uuid) {
     const QByteArray raw = uuid.toRfc4122();
     if (raw.size() != 16 || uuid.isNull()) {
-        throw std::invalid_argument("AOWIS model record requires a non-null UUID");
+        throw StorageError(StorageErrorKind::InvalidInput, "AOWIS model record requires a non-null UUID");
     }
     Key key{};
     for (std::size_t i = 0; i < key.size(); ++i) {
@@ -36,7 +37,7 @@ Bytes bytesFromQByteArray(const QByteArray& data) {
 
 QByteArray qByteArrayFromBytes(const Bytes& data) {
     if (data.size() > static_cast<std::size_t>(std::numeric_limits<qsizetype>::max())) {
-        throw std::length_error("canonical model payload too large");
+        throw StorageError(StorageErrorKind::LimitExceeded, "canonical model payload too large");
     }
     return QByteArray(reinterpret_cast<const char*>(data.data()),
                       static_cast<qsizetype>(data.size()));

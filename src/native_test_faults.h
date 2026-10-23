@@ -4,6 +4,8 @@
 // with AOWIS_NATIVE_FAULT_TEST_BUILD; shipping binaries never examine an
 // environment variable or expose crash injection.
 #ifdef AOWIS_NATIVE_FAULT_TEST_BUILD
+#include "aowis/native/storage_error.h"
+
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -21,8 +23,10 @@ inline void faultCheckpoint(const char* name) {
     if (selected == nullptr || std::strcmp(selected, name) != 0) return;
     const char* action = ::getenv("AOWIS_NATIVE_TEST_ACTION");
     if (action != nullptr && std::strcmp(action, "crash") == 0) ::_exit(93);
+    // Same classification as a real ENOSPC reported through systemCall().
     errno = ENOSPC;
-    throw std::runtime_error(std::string("injected storage failure at ") + name);
+    throw StorageError(StorageErrorKind::ResourceExhausted,
+                       std::string("injected storage failure at ") + name);
 #else
     (void)name;
 #endif

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 // Optional Qt/hydraulic persistence adapter for a complete NetworkHydraulic aggregate. The
 // authoritative entity bytes are encoded by the native-owned canonical ModelCodec;
 // ordered network membership is stored as bounded, individually versioned chunks.
@@ -87,6 +89,13 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevision(
 std::optional<QList<QUuid>> listHydraulicEntityIds(
     Repository& repository, std::string_view branch, const QUuid& networkUuid,
     HydraulicEntityType type, QString* error = nullptr);
+
+// Bounded listing for untrusted callers. Missing network -> nullopt. Failures
+// throw StorageError; a collection with more than maxCount members throws
+// LimitExceeded after decoding at most one membership chunk beyond the limit.
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
+    Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
+    HydraulicEntityType type, std::size_t maxCount);
 
 // Targeted, index-backed entity read. Membership is tested via the persistent
 // reverse-reference index; the complete network is NOT reconstructed. This

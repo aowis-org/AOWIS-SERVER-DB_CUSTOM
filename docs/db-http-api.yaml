@@ -221,7 +221,7 @@ paths:
       - {name: to, in: query, required: true, schema: {$ref: '#/components/schemas/RevisionHash'}}
     get:
       operationId: diffImmutableRevisions
-      description: Compare two immutable revision roots. Currently restricted to at most 1000 changed records; no pagination.
+      description: Compare two immutable revision roots. At most 1000 changed records; larger differences return 413 limit_exceeded, detected without materializing the full difference. No pagination.
       responses:
         '200':
           description: Changed UUIDs and before/after value hashes
@@ -293,7 +293,7 @@ paths:
       - {name: type, in: query, required: true, schema: {type: integer, minimum: 0, maximum: 17}}
     get:
       operationId: listHydraulicEntities
-      description: Ordered UUIDs for one network collection; currently restricted to at most 10000 UUIDs.
+      description: Ordered UUIDs for one network collection; at most 10000 UUIDs, larger collections return 413 limit_exceeded.
       responses:
         '200':
           description: Entity UUIDs and pinned revision
@@ -427,6 +427,16 @@ components:
           items: {$ref: '#/components/schemas/RevisionHash'}
     Error:
       type: object
+      description: >-
+        Every error is classified by the engine's StorageErrorKind, never by
+        message text. Global mapping: invalid_request 400, not_found 404,
+        conflict 409, limit_exceeded 413, unavailable 503,
+        insufficient_storage 507, internal_error 500. 5xx responses carry a
+        generic message only; details (corruption, I/O, paths) are written to
+        the service log. Bundle routes use transfer-specific codes
+        (invalid_bundle 400, divergent_history / invalid_base 409,
+        transfer_too_large 413). Hashes of existing objects that are not
+        revisions are reported as not_found.
       required: [error]
       properties:
         error:
@@ -445,7 +455,7 @@ components:
       name: revision
       in: query
       required: false
-      description: Explicit immutable revision snapshot; defaults to the branch head captured once
+      description: Explicit immutable revision snapshot; must be the branch head or one of its ancestors (otherwise 404). Defaults to the branch head captured once
       schema: {$ref: '#/components/schemas/RevisionHash'}
     ProjectId:
       name: projectId
@@ -470,6 +480,21 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
     Conflict:
       description: A resource already exists or revision conflict
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    ServerError:
+      description: Storage corruption, I/O or internal failure (generic message; details in the service log)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: Repository handle must be reopened (for example after an interrupted compaction)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    InsufficientStorage:
+      description: The server's storage is exhausted (ENOSPC/EDQUOT)
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

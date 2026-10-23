@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -13,6 +14,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "aowis/native/storage_error.h"
 
 namespace aowis::native {
 
@@ -189,6 +192,8 @@ struct MergeResult {
     std::vector<MergeConflict> conflicts;
 };
 
+// Failures are reported as StorageError (a std::runtime_error) carrying a
+// StorageErrorKind; callers must classify by kind, never by message text.
 // Linux/POSIX prototype. All operations on one instance are thread-safe;
 // processes using the same repository serialize operations with flock(2).
 // A successful commit syncs its append-only pack before publishing its ref.
@@ -245,6 +250,14 @@ public:
     std::vector<std::pair<Key, Bytes>> scan(std::string_view branch);
     std::vector<Difference> diff(std::string_view from, std::string_view to);
     std::vector<Difference> diffRevisions(const Hash& fromRevision, const Hash& toRevision);
+    // Bounded variant for untrusted callers: work is proportional to the
+    // changed trie paths, and more than maxDifferences results raise
+    // StorageError(LimitExceeded) before the full difference is materialized.
+    std::vector<Difference> diffRevisions(const Hash& fromRevision, const Hash& toRevision,
+                                          std::size_t maxDifferences);
+    // True when revisionId is the head of `branch` or any ancestor of it
+    // (through either merge parent). Unknown or non-revision ids: NotFound.
+    bool revisionOnBranch(std::string_view branch, const Hash& revisionId);
     // A self-contained branch snapshot for offline transfer between independent
     // native repositories, including different physical storage backends.
     // Export refuses to replace an existing bundle file.
@@ -332,6 +345,7 @@ private:
     Hash store(const Bytes& bytes);
     Hash store(Bytes&& bytes);
     Revision readRevision(const Hash& hash);
+    Revision clientRevision(const Hash& revisionId);
     bool revisionReachableFrom(const Hash& tip, const Hash& candidate);
     Hash branchHead(std::string_view name);
     void publishRef(std::string_view branch, const Hash& commitHash, bool mustBeAbsent);
@@ -344,7 +358,10 @@ private:
                    std::size_t begin, std::size_t end, unsigned minDepth);
     std::optional<Hash> lookup(const Hash& root, const Key& key);
     void listHashes(const Hash& root, std::vector<std::pair<Key, Hash>>& output);
-    void diffHashes(const Hash& from, const Hash& to, std::vector<Difference>& output);
+    void diffHashes(const Hash& from, const Hash& to, std::vector<Difference>& output,
+                    std::size_t limit = std::numeric_limits<std::size_t>::max());
+    void diffWholeSubtree(const Hash& root, bool added, std::vector<Difference>& output,
+                          std::size_t limit);
     Revision commitLocked(std::string_view branch, const std::vector<Change>& changes,
                           std::optional<Hash> referencesRoot = std::nullopt,
                           std::optional<Hash> mergeParent = std::nullopt);
