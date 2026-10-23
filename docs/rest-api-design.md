@@ -5,7 +5,7 @@
 ## Goals and deployment
 
 - One `aowis-server-db` process serves **multiple independent AOWIS projects**. A project has a stable UUID, descriptive metadata and one native repository with its own branch/revision history.
-- Expose **RESTful HTTP over TCP**, with a configurable listen address and port. Use **Qt QHttpServer** and the existing Qt/C++ model types internally. Do not develop another HTTP parser.
+- Expose **RESTful HTTP over TCP**, with a configurable listen address and port. Use the vendored, pinned **cpp-httplib** (decision 2026-10-23: QHttpServer cannot bound requests before Qt 6.11 and buffers whole bodies) and the existing Qt/C++ model types internally. Do not develop another HTTP parser.
 - **HTTP only, no TLS/HTTPS in this implementation.** Authentication, authorization, sessions, keys and identities are intentionally **not implemented or enforced** in the initial REST service. These will be defined by a future AOWIS-wide security system, not separately for database storage.
 - The native database and hydraulic APIs remain usable directly as libraries by AOWIS standalone and in-process services. REST is an adapter, not a second storage implementation.
 - Keep a clear service boundary between request parsing, project lookup, native storage operations, domain validation and response encoding.

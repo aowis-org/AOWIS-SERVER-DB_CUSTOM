@@ -402,6 +402,13 @@ Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
 }
 
 
+ScratchFile ProjectService::createScratchFile(std::string_view projectId) {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    return translated<ScratchFile>([&]() {
+        return repositoryEntry(projectId).repository->createScratchFile();
+    });
+}
+
 void ProjectService::withRepository(std::string_view projectId,
                                     const std::function<void(Repository&)>& action) {
     std::lock_guard<std::mutex> guard(this->mutex_);

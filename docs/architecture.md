@@ -8,7 +8,7 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 2. **Domain persistence:** the hydraulic adapter validates `NetworkHydraulic`, persists network metadata, up to 256 ordered UUIDs per membership chunk, and one independently addressed record per top-level entity.
 3. **Logical object store:** content-addressed immutable values, compressed 16-way UUID Merkle trie, persistent reverse-reference index, revision DAG and named branch refs.
 4. **Physical store:** append-only content-addressed object pack with a derived/rebuildable index.
-5. **Service boundary:** `aowis-server-db` uses Qt QHttpServer over HTTP/TCP with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Only catalogue/branch/history operations are HTTP-accessible so far.
+5. **Service boundary:** `aowis-server-db` uses the vendored cpp-httplib over HTTP/TCP (worker thread pool) with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Only catalogue/branch/history operations are HTTP-accessible so far.
 
 ## Logical identities and history
 

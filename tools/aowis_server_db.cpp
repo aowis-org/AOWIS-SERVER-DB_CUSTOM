@@ -1,30 +1,28 @@
 #include "aowis/native/db_http_routes.h"
-#include "aowis/native/http_limit_policy.h"
+
+#include <httplib.h>
 
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QCoreApplication>
-#include <QHostAddress>
-#include <QHttpServer>
-#include <QtGlobal>
-#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
-#include <QHttpServerConfiguration>
-#endif
 #include <QSettings>
-#include <QTcpServer>
-#include <QTimer>
 
-#include <fstream>
+#include <arpa/inet.h>
+#include <atomic>
+#include <cerrno>
 #include <csignal>
-#include <streambuf>
-#include <stdexcept>
+#include <cstring>
+#include <ctime>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <pthread.h>
+#include <stdexcept>
+#include <streambuf>
+#include <string>
+#include <thread>
 
 namespace {
-volatile std::sig_atomic_t shutdownRequested = 0;
-void requestShutdown(int) { shutdownRequested = 1; }
-
 class ScopedErrorLog {
 public:
     explicit ScopedErrorLog(const QString& path) {
@@ -42,9 +40,58 @@ private:
     std::ofstream stream_;
     std::streambuf* previous_ = nullptr;
 };
+
+// Numeric IPv4 or IPv6 literal only: host names would make the listen
+// address depend on name resolution at startup.
+bool numericAddress(const std::string& address) {
+    unsigned char buffer[sizeof(in6_addr)]{};
+    return ::inet_pton(AF_INET, address.c_str(), buffer) == 1 ||
+           ::inet_pton(AF_INET6, address.c_str(), buffer) == 1;
+}
+
+// SIGINT/SIGTERM are blocked in every thread and received synchronously here;
+// the watcher stops the server, whose listen loop then returns in main().
+class ShutdownWatcher {
+public:
+    explicit ShutdownWatcher(httplib::Server& server) : server_(server) {
+        this->thread_ = std::thread([this]() { this->run(); });
+    }
+    ~ShutdownWatcher() {
+        this->finished_.store(true);
+        if (this->thread_.joinable()) this->thread_.join();
+    }
+    ShutdownWatcher(const ShutdownWatcher&) = delete;
+    ShutdownWatcher& operator=(const ShutdownWatcher&) = delete;
+private:
+    void run() {
+        sigset_t shutdownSet;
+        sigemptyset(&shutdownSet);
+        sigaddset(&shutdownSet, SIGINT);
+        sigaddset(&shutdownSet, SIGTERM);
+        const timespec interval{0, 200 * 1000 * 1000};
+        while (!this->finished_.load()) {
+            if (::sigtimedwait(&shutdownSet, nullptr, &interval) > 0) {
+                this->server_.stop();
+                return;
+            }
+        }
+    }
+    httplib::Server& server_;
+    std::atomic<bool> finished_{false};
+    std::thread thread_;
+};
 } // namespace
 
 int main(int argc, char** argv) {
+    // Block shutdown signals before any thread exists, so every worker
+    // inherits the mask and only the watcher receives them.
+    sigset_t shutdownSignals;
+    sigemptyset(&shutdownSignals);
+    sigaddset(&shutdownSignals, SIGINT);
+    sigaddset(&shutdownSignals, SIGTERM);
+    ::pthread_sigmask(SIG_BLOCK, &shutdownSignals, nullptr);
+    std::signal(SIGPIPE, SIG_IGN); // a closed client socket must not kill the server
+
     QCoreApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("aowis-server-db"));
 
@@ -52,18 +99,17 @@ int main(int argc, char** argv) {
     parser.setApplicationDescription(QStringLiteral("AOWIS multi-project native database HTTP service"));
     parser.addHelpOption();
     const QCommandLineOption config({"c", "config"}, "INI configuration file", "file");
-    const QCommandLineOption bind({"b", "bind"}, "TCP bind address", "address");
+    const QCommandLineOption bind({"b", "bind"}, "TCP bind address (numeric IPv4/IPv6)", "address");
     const QCommandLineOption port({"p", "port"}, "TCP port (1..65535)", "port");
     const QCommandLineOption dataRoot({"d", "data-root"}, "Project data directory", "directory");
     const QCommandLineOption logFile("log-file", "Append server errors to a log file", "file");
-    const QCommandLineOption proxyLimits("proxy-enforces-body-limit",
-        "Qt < 6.11 only: a reverse proxy in front of this server enforces request size limits");
+    const QCommandLineOption workers("worker-threads", "HTTP worker threads (1..256)", "count");
     parser.addOption(config);
     parser.addOption(bind);
     parser.addOption(port);
     parser.addOption(dataRoot);
     parser.addOption(logFile);
-    parser.addOption(proxyLimits);
+    parser.addOption(workers);
     const QCommandLineOption bundleMib("sync-max-mib", "Maximum transfer size in MiB (1..256)", "MiB");
     const QCommandLineOption bundleObjects("sync-max-objects", "Maximum objects in a bundle (1..1000000)", "count");
     const QCommandLineOption objectMib("sync-max-object-mib", "Maximum object size in MiB (1..64)", "MiB");
@@ -79,17 +125,13 @@ int main(int argc, char** argv) {
             settings.value("server/bind", "127.0.0.1").toString();
         const QString portValue = parser.isSet(port) ? parser.value(port) :
             settings.value("server/port", 8755).toString();
+        const QString workerValue = parser.isSet(workers) ? parser.value(workers) :
+            settings.value("server/worker_threads", 8).toString();
         const QString rootValue = parser.isSet(dataRoot) ? parser.value(dataRoot) :
             settings.value("storage/root", "./aowis-db-data").toString();
         const QString storageValue = settings.value("storage/default_backend", "pack").toString();
         const QString logPath = parser.isSet(logFile) ? parser.value(logFile) :
             settings.value("logging/file", "").toString();
-        const QString proxyValue = settings.value("server/proxy_enforces_body_limit", "false").toString();
-        if (proxyValue != "true" && proxyValue != "false") {
-            std::cerr << "Invalid server/proxy_enforces_body_limit (expected true or false)\n";
-            return 2;
-        }
-        const bool proxyEnforcesLimits = parser.isSet(proxyLimits) || proxyValue == "true";
 
         const QString transferMibValue = parser.isSet(bundleMib) ? parser.value(bundleMib) :
             settings.value("sync/max_transfer_mib", 32).toString();
@@ -113,55 +155,39 @@ int main(int argc, char** argv) {
             static_cast<std::uint64_t>(transferMib) * 1024ULL * 1024ULL,
             static_cast<std::uint64_t>(count),
             static_cast<std::uint64_t>(individualMib) * 1024ULL * 1024ULL};
-        QHostAddress address;
         bool validPort = false;
+        bool validWorkers = false;
         const unsigned requestedPort = portValue.toUInt(&validPort);
-        if (!address.setAddress(bindValue) || !validPort || requestedPort == 0 || requestedPort > 65535 ||
+        const unsigned workerCount = workerValue.toUInt(&validWorkers);
+        const std::string address = bindValue.toStdString();
+        if (!numericAddress(address) || !validPort || requestedPort == 0 || requestedPort > 65535 ||
+            !validWorkers || workerCount == 0 || workerCount > 256 ||
             (storageValue != "pack") || rootValue.trimmed().isEmpty()) {
-            std::cerr << "Invalid bind address, port, data root or storage backend configuration\n";
+            std::cerr << "Invalid bind address, port, worker threads, data root or storage backend "
+                         "configuration\n";
             return 2;
         }
-        const aowis::native::PhysicalStore storage = aowis::native::PhysicalStore::Pack;
         // Default: errors go to stderr/journald. Optional file logging
         // redirects the C++ service diagnostics, restoring stderr on exit.
         ScopedErrorLog errorLog(logPath);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
-        constexpr bool qtEnforcesLimits = true;
-#else
-        constexpr bool qtEnforcesLimits = false;
-#endif
-        const aowis::native::http::BodyLimitPolicyDecision policy =
-            aowis::native::http::evaluateBodyLimitPolicy(qtEnforcesLimits, address.isLoopback(),
-                                                         proxyEnforcesLimits, bindValue.toStdString());
-        if (!policy.message.empty()) std::cerr << "AOWIS database: " << policy.message << '\n';
-        if (!policy.start) return 2;
         aowis::native::ProjectService service(rootValue.toStdString());
-        QHttpServer httpServer;
-        aowis::native::http::registerRoutes(httpServer, service, storage, limits);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
-        QHttpServerConfiguration configuration = httpServer.configuration();
-        configuration.setMaximumBodySize(static_cast<qint64>(limits.maxBytes));
-        configuration.setMaximumTotalHeaderSize(64 * 1024);
-        httpServer.setConfiguration(configuration);
-#endif
-        // QHttpServer::bind() takes QObject ownership of the listener.
-        // Never bind a stack-allocated QTcpServer: the HTTP server destroys its children.
-        QTcpServer* tcpServer = new QTcpServer(&httpServer);
-        if (!tcpServer->listen(address, static_cast<quint16>(requestedPort)) ||
-            !httpServer.bind(tcpServer)) {
-            std::cerr << "Unable to bind HTTP listener: " << tcpServer->errorString().toStdString() << '\n';
+        httplib::Server server;
+        // Fixed pool; at most 16 waiting connections per worker are queued,
+        // further connections are closed instead of piling up.
+        server.new_task_queue = [workerCount]() {
+            const std::size_t threads = static_cast<std::size_t>(workerCount);
+            return new httplib::ThreadPool(threads, threads, threads * 16U);
+        };
+        aowis::native::http::registerRoutes(server, service, aowis::native::PhysicalStore::Pack, limits);
+        if (!server.bind_to_port(address, static_cast<int>(requestedPort))) {
+            std::cerr << "Unable to bind HTTP listener on " << address << ':' << requestedPort
+                      << ": " << std::strerror(errno) << '\n';
             return 1;
         }
-        std::signal(SIGINT, requestShutdown);
-        std::signal(SIGTERM, requestShutdown);
-        QTimer shutdownCheck;
-        QObject::connect(&shutdownCheck, &QTimer::timeout, &app, [&app]() {
-            if (shutdownRequested != 0) app.quit();
-        });
-        shutdownCheck.start(150);
-        std::cout << "AOWIS database listening on " << tcpServer->serverAddress().toString().toStdString()
-                  << ':' << tcpServer->serverPort() << std::endl;
-        return app.exec();
+        std::cout << "AOWIS database listening on " << address << ':' << requestedPort << std::endl;
+        ShutdownWatcher watcher(server);
+        const bool listened = server.listen_after_bind();
+        return listened ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "AOWIS database server startup failed: " << error.what() << '\n';
         return 1;

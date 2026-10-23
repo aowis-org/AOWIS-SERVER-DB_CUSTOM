@@ -40,14 +40,14 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
 | Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
 | Replication | Portable full/incremental `.aowbundle` exchange, SHA-256, object graph, canonical Merkle trie and model-reference index verification, fast-forward-only import, divergence protection |
-| Service | Qt QHttpServer TCP service with durable multi-project catalogue, project create/list/read, branches, heads, history and revision metadata |
+| Service | HTTP/TCP service (vendored cpp-httplib, worker thread pool) with durable multi-project catalogue, project create/list/read, branches, heads, history and revision metadata |
 | Administrative access policy | Provisional UUID-based users/groups/roles/grants library and local CLI, **not currently enforced by any service** |
 
 These are engineering capabilities, **not a production-readiness claim**. See [limitations and roadmap](docs/roadmap.md).
 
 ## Build and tests
 
-Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries and a POSIX filesystem with `flock`, `fsync`, `rename`, `pread` and `pwrite`. Qt6 Core and the pinned `AOWIS-SERVER-MODEL` submodule are required for typed model serialization and hydraulic persistence; Qt6 Network and HttpServer are additionally required for the HTTP executable; the generic byte store can build without Qt.
+Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries and a POSIX filesystem with `flock`, `fsync`, `rename`, `pread` and `pwrite`. Qt6 Core and the pinned `AOWIS-SERVER-MODEL` submodule are required for typed model serialization and hydraulic persistence; the HTTP executable uses the vendored cpp-httplib header (`external/cpp-httplib`) and Qt6 Core only; the generic byte store can build without Qt.
 
 ```bash
 ./git_submodule_init.sh          # on initial checkout, if the Model submodule is not initialized
@@ -107,7 +107,7 @@ Portable bundles exchange immutable branches between independent repositories, w
   /path/to/destination pack /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Locally resident incremental ancestors and distinct snapshot-root bookkeeping still use memory proportional to their sizes; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads are served from a file-backed QIODevice without a second full-size response buffer. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Locally resident incremental ancestors and distinct snapshot-root bookkeeping still use memory proportional to their sizes; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads and uploads are streamed through project scratch files, without a full-size buffer in memory. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 
@@ -131,7 +131,7 @@ These tests exercise deterministic software failure paths; they cannot by themse
 
 The chosen server design is:
 
-- **`aowis-server-db`**, built on **Qt QHttpServer**, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
+- **`aowis-server-db`**, built on the vendored **cpp-httplib** with a worker thread pool, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
 - **Multiple projects**, each identified by UUID and owning an independent native versioned repository, managed by one process. Clients never supply server filesystem paths as project identifiers.
 - Implemented versioned REST resources for projects, branches and revision metadata, with JSON responses. Hydraulic networks/entities, merges/conflicts and bounded binary full/incremental synchronization are available.
 - Revision-pinned hydraulic network/entity/membership reads (including historical APIs) and optimistic revision-head checks for mutations, preventing mixed snapshots and silent concurrent overwrites.

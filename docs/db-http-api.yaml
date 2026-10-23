@@ -62,7 +62,7 @@ paths:
         Export the full portable immutable revision graph or an incremental
         delta relative to a base ancestor. The binary result is capped by
         configured transfer size, object-count and individual-object limits.
-        The response is sent from an exported temporary file through a QIODevice; Qt reads the file in chunks and cleans up when the responder releases the device.
+        The response is streamed in chunks from a nameless scratch file in the project repository, which is released when the response ends.
       parameters:
         - name: base
           in: query
@@ -83,8 +83,9 @@ paths:
       description: |
         Validate a complete binary bundle and create or fast-forward the
         destination branch atomically. Repeated imports return up_to_date.
-        Divergent history is never overwritten. The request is buffered
-        with an upper body size limit on Qt 6.11 and newer.
+        Divergent history is never overwritten. The body is streamed into a
+        project scratch file; a declared or received size above the transfer
+        limit returns 413 before (or while) reading it.
       requestBody:
         required: true
         content:
@@ -435,7 +436,7 @@ components:
         generic message only; details (corruption, I/O, paths) are written to
         the service log. Bundle routes use transfer-specific codes
         (invalid_bundle 400, divergent_history / invalid_base 409,
-        transfer_too_large 413). Hashes of existing objects that are not
+        transfer_too_large 413). JSON requests without Content-Length return 411 length_required; oversized URIs 414 uri_too_long. Hashes of existing objects that are not
         revisions are reported as not_found.
       required: [error]
       properties:

@@ -162,11 +162,6 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-merge-ancestry-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-merge-ancestry-tests COMMAND aowis-native-merge-ancestry-tests)
     set_tests_properties(aowis-native-merge-ancestry-tests PROPERTIES LABELS "aowis")
-    add_executable(aowis-http-limit-policy-tests tests/http_limit_policy_tests.cpp)
-    target_compile_features(aowis-http-limit-policy-tests PRIVATE cxx_std_20)
-    target_include_directories(aowis-http-limit-policy-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    add_test(NAME aowis-http-limit-policy-tests COMMAND aowis-http-limit-policy-tests)
-    set_tests_properties(aowis-http-limit-policy-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-diff-scope-tests tests/native_diff_scope_tests.cpp)
     target_link_libraries(aowis-native-diff-scope-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-diff-scope-tests COMMAND aowis-native-diff-scope-tests)
@@ -175,7 +170,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-http-limit-policy-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
@@ -259,16 +254,26 @@ else()
     message(STATUS "Native model serialization disabled by configuration")
 endif()
 
-# The HTTP transport optionally links the Qt-based hydraulic model adapter.
-# A native-only build uses
-# -DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF (HTTP defaults to OFF as well).
-option(AOWIS_NATIVE_WITH_HTTP_SERVER "Build the Qt HTTP/TCP multi-project server" ${AOWIS_NATIVE_WITH_MODEL_CODEC})
+# HTTP transport: vendored cpp-httplib (external/cpp-httplib, pinned single
+# header) on a worker thread pool. Qt Core is used for JSON/CLI/INI and, when
+# enabled, the hydraulic model adapter. Qt Network/HttpServer are not used.
+# A native-only build uses -DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF (HTTP defaults
+# to OFF as well).
+option(AOWIS_NATIVE_WITH_HTTP_SERVER "Build the HTTP/TCP multi-project server" ${AOWIS_NATIVE_WITH_MODEL_CODEC})
 if(AOWIS_NATIVE_WITH_HTTP_SERVER)
-    find_package(Qt6 REQUIRED COMPONENTS Core Network HttpServer)
+    find_package(Qt6 REQUIRED COMPONENTS Core)
+    find_package(Threads REQUIRED)
+    add_library(aowis-cpp-httplib INTERFACE)
+    target_include_directories(aowis-cpp-httplib SYSTEM INTERFACE
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/cpp-httplib")
+    target_link_libraries(aowis-cpp-httplib INTERFACE Threads::Threads)
     add_library(aowis-native-http STATIC src/db_http_routes.cpp)
     target_compile_features(aowis-native-http PUBLIC cxx_std_20)
     target_include_directories(aowis-native-http PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    target_link_libraries(aowis-native-http PUBLIC aowis-native-project-service Qt6::HttpServer Qt6::Network)
+    target_link_libraries(aowis-native-http PUBLIC aowis-native-project-service aowis-cpp-httplib Qt6::Core)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(aowis-native-http PRIVATE -Wall -Wextra)
+    endif()
     if(TARGET aowis-native-hydraulic)
         target_link_libraries(aowis-native-http PUBLIC aowis-native-hydraulic)
         target_compile_definitions(aowis-native-http PUBLIC AOWIS_HTTP_WITH_HYDRAULIC=1)
@@ -285,7 +290,7 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
         set_tests_properties(aowis-native-http-tests PROPERTIES LABELS "aowis")
         add_dependencies(aowis-db-tests aowis-native-http-tests)
     endif()
-    message(STATUS "Native multi-project HTTP server enabled")
+    message(STATUS "Native multi-project HTTP server enabled (cpp-httplib)")
 else()
     message(STATUS "Native multi-project HTTP server disabled by configuration")
 endif()

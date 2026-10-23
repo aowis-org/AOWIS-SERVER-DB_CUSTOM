@@ -22,7 +22,7 @@ Style findings about `auto` are out of scope by decision.
 | 2 | `aowis-db-custom-typed-errors` | F2 error classification, F10b non-revision hash | Medium | – | done |
 | 3 | `aowis-db-custom-request-bounds` | F5 unbounded bodies, F9 late caps, F10a branch scoping | Medium | 2 | done |
 | 4 | `aowis-db-custom-scratch-storage` | F6 scratch files on tmpfs | Medium | – | done |
-| 5 | `aowis-db-custom-httplib-server` | Replace QHttpServer (F5 on all Qt versions, streaming uploads) | Medium | 2, 3, 4 | open |
+| 5 | `aowis-db-custom-httplib-server` | Replace QHttpServer (F5 on all Qt versions, streaming uploads) | Medium | 2, 3, 4 | done |
 | 6 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | open |
 | 7 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 5 | open |
 | 8 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | open |
@@ -195,7 +195,9 @@ Tests:
 
 ## Phase 3: Request and response bounds (Medium, needs Phase 2) — done
 
-Implemented in `aowis-db-custom-request-bounds`:
+Implemented in `aowis-db-custom-request-bounds`. (The F5 startup policy was
+superseded by Phase 5: the new server limits requests itself on every
+platform, so the policy, its INI key and its test were removed again.)
 - **F5:**
   - Qt >= 6.11 (Arch) limits bodies to `max_transfer_mib` and headers to 64 KiB.
   - Qt < 6.11 (Debian 13 ships 6.8) gets a startup policy from
@@ -331,7 +333,57 @@ success or after an injected failure.
 
 ---
 
-## Phase 5: Replace QHttpServer with cpp-httplib (Medium, needs Phases 2–4)
+## Phase 5: Replace QHttpServer with cpp-httplib (Medium, needs Phases 2–4) — done
+
+Implemented in `aowis-db-custom-httplib-server`:
+- **Dependency:** `external/cpp-httplib/` vendors v0.60.1 (commit `00afaae`,
+  MIT). CMake no longer needs Qt Network/HttpServer, only Qt Core and Threads.
+- **Routes:** same paths, JSON shapes and error codes. `registerRoutes()` now
+  takes an `httplib::Server&`.
+- **Limits (before a body byte is read):**
+  - global payload limit;
+  - bundle uploads checked by declared length;
+  - per-route JSON limits from `Content-Length` in the pre-request handler;
+  - JSON without `Content-Length` returns 411;
+  - URI over 8 KiB returns 414; header line over 8 KiB or more than 100
+    headers returns 400;
+  - all rejections close the connection. httplib 0.60.1 also does this itself
+    for every error, so our explicit `Connection: close` is defence in depth.
+- **Streaming:**
+  - uploads go into a `ScratchFile` through a content receiver; no catalogue
+    or project lock is held while the body arrives;
+  - downloads use a content provider reading 64 KiB chunks from the export
+    `ScratchFile`.
+- **Server:**
+  - `[server] worker_threads` / `--worker-threads` (default 8);
+  - at most 16 queued connections per worker;
+  - read/write/keep-alive timeouts of 30/60/10 s;
+  - JSON error bodies also for httplib's own rejections;
+  - SIGINT/SIGTERM handled by a `sigtimedwait` watcher thread (clean exit 0);
+  - `SIGPIPE` ignored;
+  - bind address must be a numeric IP.
+- **Removed:** the Qt < 6.11 policy (`http_limit_policy.h`, its test, the INI
+  key and the CLI flag). `deploy/nginx-aowis-server-db.conf` is now an optional
+  TLS front end.
+- **Tests:**
+  - the HTTP suite now uses `httplib::Client`, an in-process
+    `httplib::Server` and raw sockets; all previous assertions are kept;
+  - limits are proven before the body: oversized declared upload, every JSON
+    route limit, chunked JSON, chunked upload over the limit, URI/header
+    limits;
+  - streaming: a slow upload does not block health/catalogue/project
+    requests; an abandoned upload leaves no branch and no file;
+  - concurrency: 8 × 20 parallel requests;
+  - the executable: clean SIGTERM shutdown, non-loopback bind, invalid
+    CLI/INI configuration.
+  - Seven of eight mutations were caught; the eighth, removing the explicit
+    connection close, is behaviour-neutral with httplib 0.60.1.
+  - Whole suite incl. the threaded HTTP server is clean under ASan/UBSan.
+  - The model submodule's `unit_conversion_test` does not compile with GCC's
+    UBSan (`static_assert` not constant). That is in AOWIS-SERVER-MODEL, not
+    this repository.
+
+Original plan:
 
 Decision (2026-10-23): QHttpServer cannot limit requests before Qt 6.11
 (Debian 13 ships 6.8) and only exposes fully buffered bodies. Replace it with
@@ -421,8 +473,8 @@ Fix:
   - each `Entry` holds a `std::shared_ptr<Repository>` and its own operation
     mutex. `Repository` is already thread-safe internally, so read routes can
     skip the per-project mutex entirely.
-- HTTP (after Phase 5, cpp-httplib already runs handlers on a thread pool):
-  - `[server] worker_threads=` with default 4;
+- HTTP (cpp-httplib already runs handlers on a thread pool, and
+  `[server] worker_threads` exists since Phase 5):
   - per-project queue limit: return 503 with `Retry-After` when a project
     already has N pending writes;
   - `/health` and `/ready` never wait for a project lock.

@@ -56,6 +56,9 @@ public:
     // This is the transport-independent adapter boundary for model operations.
     void withRepository(std::string_view projectId,
                         const std::function<void(Repository&)>& action);
+    // Nameless scratch file in the project's repository (for streaming
+    // uploads). The catalogue lock is held only while creating it.
+    ScratchFile createScratchFile(std::string_view projectId);
 
     static bool validProjectId(std::string_view id);
     static bool validBranchName(std::string_view name);

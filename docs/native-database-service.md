@@ -1,17 +1,17 @@
 # Native database HTTP/TCP service
 
-`aowis-server-db` hosts independent AOWIS versioned project repositories in one process. The REST transport uses Qt QHttpServer; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::NativeProjectService` and `AOWIS::NativeHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
+`aowis-server-db` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::NativeProjectService` and `AOWIS::NativeHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
 
 ## Build
 
-With Qt6 Core, Network and HttpServer installed, run:
+With Qt6 Core installed (Qt Network/HttpServer are not needed), run:
 
 ```bash
 ./compile_linux.sh
 ./compile_linux_tests.sh --both
 ```
 
-`AOWIS_NATIVE_WITH_HTTP_SERVER=ON` builds the executable and HTTP integration tests (the default when the model codec is enabled). A missing Qt HttpServer module causes an explicit CMake error. A native-only build uses `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF -DAOWIS_NATIVE_WITH_HTTP_SERVER=OFF`.
+`AOWIS_NATIVE_WITH_HTTP_SERVER=ON` builds the executable and HTTP integration tests (the default when the model codec is enabled). A native-only build uses `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF -DAOWIS_NATIVE_WITH_HTTP_SERVER=OFF`.
 
 ## Run
 
@@ -66,7 +66,7 @@ curl -sS -H 'Content-Type: application/json' -d '{"name":"Water Distribution"}' 
   http://127.0.0.1:8755/api/v1/projects
 ```
 
-Project creation accepts `{"name":"..."}`; the optional `"storage":"pack"` field is accepted, but no alternate backend is available. Creating a branch accepts `{"name":"scenario"}` (new independent raw history), `{"name":"scenario","fromBranch":"main"}` (fork current head) or `{"name":"scenario","fromBranch":"main","revision":"<64-character-hash>"}` (fork a particular reachable revision). A historical fork never changes the source branch. Branch names are `[A-Za-z0-9_-]`, maximum 96 characters; project IDs are lowercase UUIDs. JSON mutation bodies are currently limited to 16 KiB after QHttpServer has received them. Responses use JSON and include machine-readable error codes.
+Project creation accepts `{"name":"..."}`; the optional `"storage":"pack"` field is accepted, but no alternate backend is available. Creating a branch accepts `{"name":"scenario"}` (new independent raw history), `{"name":"scenario","fromBranch":"main"}` (fork current head) or `{"name":"scenario","fromBranch":"main","revision":"<64-character-hash>"}` (fork a particular reachable revision). A historical fork never changes the source branch. Branch names are `[A-Za-z0-9_-]`, maximum 96 characters; project IDs are lowercase UUIDs. JSON mutation bodies are limited per route (see request limits below) before they are read. Responses use JSON and include machine-readable error codes.
 
 **Error model.** The engine raises `aowis::native::StorageError` (a `std::runtime_error`) carrying a `StorageErrorKind`; the service maps the kind, never message text: `InvalidInput` 400 `invalid_request`, `NotFound` 404 `not_found`, `Conflict` 409 `conflict`, `LimitExceeded` 413 `limit_exceeded`, `Unavailable` 503 `unavailable`, `ResourceExhausted` (ENOSPC/EDQUOT) 507 `insufficient_storage`, and `Corruption`/`Io`/`Internal` 500 `internal_error`. Client errors return the engine message; 5xx responses return a generic message and the details are logged with the kind (`AOWIS database request failed [corruption]: ...`). A structural defect in an uploaded bundle is `InvalidInput`; the same defect found in the local repository is `Corruption`. `ProjectService` methods keep their contract of reporting client mistakes as `ProjectError`.
 
@@ -82,20 +82,28 @@ Semantic merges use `POST .../projects/{projectId}/merges` with `target`, `sourc
 
 JSON payloads are limited to 8 MiB for network saves and entity edits (256 KiB for merges). Entity batches are limited to 128 changes. UUID lists (10000 entries) and diffs (1000 changed UUIDs) are bounded **while** they are computed: a larger result returns 413 `limit_exceeded` after reading at most one extra membership chunk or changed trie path, never after building the full list. The diff walks only changed trie paths, also when an insertion splits a compressed prefix above a large unchanged subtree.
 
-**Request size limits.** With Qt HttpServer >= 6.11 (e.g. Arch Linux) the server limits request bodies to `[sync] max_transfer_mib` and the request line plus headers to 64 KiB while receiving. Older Qt (e.g. Debian 13: 6.8) buffers complete requests of any size, so the server then applies a startup policy: a loopback bind address starts with a warning; a non-loopback address is **refused** (exit code 2) unless `[server] proxy_enforces_body_limit=true` (or `--proxy-enforces-body-limit`) declares that a reverse proxy enforces the limits. `deploy/nginx-aowis-server-db.conf` is a matching nginx example. Endpoint-specific JSON limits are always checked as well.
+**Request limits (all platforms).** Enforced by the server before a body byte is read:
+
+- **Bodies:** a bundle upload may be at most `[sync] max_transfer_mib`. JSON bodies must declare `Content-Length` (411 otherwise) and are limited per route: 16 KiB for projects/branches, 256 KiB for merges, 8 MiB for network saves and edits. Oversized requests return 413, and the connection is closed without reading the body.
+- **Request line and headers:** at most 8 KiB per header line (400 above that), 8 KiB per URI (414) and 100 header fields (400).
+- **Timeouts:** read 30 s, write 60 s, keep-alive 10 s.
+- **Workers:** requests run on `[server] worker_threads` worker threads (default 8, range 1–256, CLI `--worker-threads`). At most 16 further connections per worker are queued; more are closed.
+- **Error bodies:** all rejections, including protocol-level ones, carry the usual JSON error body.
+
+TLS and access control are not built in; terminate TLS in a reverse proxy, see `deploy/nginx-aowis-server-db.conf`.
 
 **Branch-scoped revisions.** `?revision=` on `/branches/{branch}/...` routes must name the branch head or one of its ancestors (including merged second parents); any other revision of the project returns 404 `not_found`. Use project-level `/revisions/{id}` and `/diff` for revisions independent of a branch. Large network retrievals currently encode the full result in memory; paginated/streaming alternatives are part of the subsequent resource-hardening stage.
 
-The service does not yet provide network enumeration, a dry-run merge preview, project deletion or runtime compaction. These follow in subsequent milestones. Bundle bodies have configurable byte/object ceilings, including Qt 6.11+ parser-level maximum body size. Download responses now use file-backed QIODevice transfer; upload requests remain fully buffered by QHttpServer. Further disk-backed verification and end-to-end streaming uploads remain future work.
+The service does not yet provide network enumeration, a dry-run merge preview, project deletion or runtime compaction. These follow in subsequent milestones. Bundle bodies have configurable byte/object ceilings enforced before reading; downloads and uploads are streamed through project scratch files. Cheaper incremental verification remains future work.
 
 ## Verification and integration tests
 
-`aowis-native-project-service-tests` covers the pack format, catalogue restart, project isolation, staged creation debris, malformed manifests, invalid path/ID inputs, multiple project/branch operations, concurrent creation and cross-process locking. When Qt HttpServer is installed, `aowis-native-http-tests` exercises the routes over real localhost TCP with Qt Network, including error codes, CRUD, pagination and restart. Both are part of `./compile_linux_tests.sh --both`.
+`aowis-native-project-service-tests` covers the pack format, catalogue restart, project isolation, staged creation debris, malformed manifests, invalid path/ID inputs, multiple project/branch operations, concurrent creation and cross-process locking. When the HTTP server is enabled, `aowis-native-http-tests` exercises the routes over real localhost TCP with Qt Network, including error codes, CRUD, pagination and restart. Both are part of `./compile_linux_tests.sh --both`.
 
 ### Portable bundle replication over HTTP
 
 `GET /api/v1/projects/{id}/branches/{branch}/bundle` exports the same validated `.aowbundle` format used by `aowis-native-sync`. Add `?base=<64-character-revision-hash>` to omit immutable objects already reachable from that ancestor. `POST` the binary bundle to the corresponding endpoint on a destination project, choosing a tracking branch if you wish to preserve independent work; import never overwrites divergent history. The response is `{"status":"created|fast_forward|up_to_date","head":"...","objectsImported":N}`. Errors are JSON with 400 for malformed transfer, 409 for divergent history or invalid incremental base, and 413 for transfer ceilings.
 
-The `[sync]` INI section sets `max_transfer_mib` (default 32, range 1–256), `max_objects` (default 100000, range 1–1000000), and `max_object_mib` (default 8, range 1–64). The same values can be supplied as `--sync-max-mib`, `--sync-max-objects` and `--sync-max-object-mib`; an individual object may not exceed the transfer ceiling. For Qt >=6.11 the HTTP request parser also enforces `max_transfer_mib`, returning 413 before unbounded body buffering. The native importer/exporter independently enforces all ceilings even when called from C++.
+The `[sync]` INI section sets `max_transfer_mib` (default 32, range 1–256), `max_objects` (default 100000, range 1–1000000), and `max_object_mib` (default 8, range 1–64). The same values can be supplied as `--sync-max-mib`, `--sync-max-objects` and `--sync-max-object-mib`; an individual object may not exceed the transfer ceiling. The HTTP server also rejects larger uploads with 413 before reading them. The native importer/exporter independently enforces all ceilings even when called from C++.
 
-Bundle **downloads are file-backed**: Qt reads a QIODevice incrementally after native export completes, and the temporary export directory remains alive until the HTTP responder releases the device (including client disconnects). Uploads still buffer the entire request in Qt before being spooled and validated. Both directions retain the same transfer limits. Export preparation and import verification remain synchronous, and the service is not yet an end-to-end streaming transfer implementation. Graph verification is still O(reachable history) in CPU/metadata and transfers are performed synchronously; use the offline synchronization CLI for larger data until the streaming follow-up is implemented. No authentication or TLS has been added.
+Bundle **transfers are streamed**: a download is exported into a nameless scratch file in the project repository and sent in 64 KiB chunks; the file disappears when the response ends, also on client disconnect. An upload is written into such a scratch file while it arrives, without holding any catalogue or project lock, so slow clients do not block other requests; the import (verification and publication) starts only after the complete body has arrived. A full disk while spooling returns 507. Both directions retain the same transfer limits. Export preparation and import verification remain synchronous, and the service is not yet an end-to-end streaming transfer implementation. Graph verification is still O(reachable history) in CPU/metadata and transfers are performed synchronously; use the offline synchronization CLI for larger data until the streaming follow-up is implemented. No authentication or TLS has been added.

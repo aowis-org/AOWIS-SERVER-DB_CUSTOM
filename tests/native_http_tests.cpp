@@ -3,31 +3,34 @@
 #include "aowis/native/hydraulic_network_persistence.h"
 #endif
 
+#include <httplib.h>
+
 #include <QCoreApplication>
-#include <QUuid>
 #include <QElapsedTimer>
-#include <QEventLoop>
-#include <QHostAddress>
-#include <QHttpServer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QNetworkAccessManager>
-#include <QNetworkReply>
-#include <QNetworkRequest>
-#include <QPointer>
 #include <QProcess>
-#include <QTcpServer>
-#include <QTcpSocket>
 #include <QStringList>
-#include <QTimer>
-#include <QUrl>
+#include <QUuid>
 
+#include <arpa/inet.h>
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <netinet/in.h>
+#include <optional>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -60,10 +63,91 @@ struct BinaryResponse {
     QByteArray contentType;
 };
 
+// Raw TCP connection to 127.0.0.1 for protocol-level tests (partial bodies,
+// declared lengths without bodies, slow clients). Closes on destruction.
+class RawConnection {
+public:
+    explicit RawConnection(quint16 port) {
+        this->fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        check(this->fd_ >= 0, "socket failed");
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        this->connected_ = ::connect(this->fd_, reinterpret_cast<sockaddr*>(&address),
+                                     sizeof(address)) == 0;
+    }
+    ~RawConnection() { if (this->fd_ >= 0) ::close(this->fd_); }
+    RawConnection(const RawConnection&) = delete;
+    RawConnection& operator=(const RawConnection&) = delete;
+    bool connected() const { return this->connected_; }
+    void send(const QByteArray& bytes) {
+        qsizetype done = 0;
+        while (done < bytes.size()) {
+            const ssize_t sent = ::send(this->fd_, bytes.constData() + done,
+                                        static_cast<std::size_t>(bytes.size() - done), MSG_NOSIGNAL);
+            check(sent > 0, "raw send failed");
+            done += sent;
+        }
+    }
+    // Everything the server sends until it closes the connection or the
+    // timeout expires (whichever comes first).
+    QByteArray receive(int timeoutMs) {
+        QByteArray received;
+        const std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            const long remaining = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count());
+            if (remaining <= 0) break;
+            pollfd descriptor{this->fd_, POLLIN, 0};
+            if (::poll(&descriptor, 1, static_cast<int>(remaining)) <= 0) break;
+            char buffer[4096];
+            const ssize_t count = ::recv(this->fd_, buffer, sizeof(buffer), 0);
+            if (count <= 0) { this->closedByPeer_ = true; break; }
+            received.append(buffer, count);
+        }
+        return received;
+    }
+    bool closedByPeer() const { return this->closedByPeer_; }
+    void close() {
+        if (this->fd_ >= 0) ::close(this->fd_);
+        this->fd_ = -1;
+    }
+private:
+    int fd_ = -1;
+    bool connected_ = false;
+    bool closedByPeer_ = false;
+};
+
+int statusOf(const QByteArray& response) {
+    // "HTTP/1.1 413 Payload Too Large"
+    if (!response.startsWith("HTTP/1.")) return 0;
+    return response.mid(9, 3).toInt();
+}
+
+// An ephemeral loopback port that is free right now.
+quint16 reservePort() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    check(fd >= 0, "socket failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(address);
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+                    ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0;
+    ::close(fd);
+    check(ok, "unable to reserve test port");
+    return ntohs(address.sin_port);
+}
+
 class Client {
 public:
-    explicit Client(quint16 port)
-        : base_(QStringLiteral("http://127.0.0.1:%1").arg(port)), port_(port) {}
+    explicit Client(quint16 port) : client_("127.0.0.1", port), port_(port) {
+        this->client_.set_connection_timeout(std::chrono::seconds(5));
+        this->client_.set_read_timeout(std::chrono::seconds(30));
+        this->client_.set_write_timeout(std::chrono::seconds(30));
+    }
     quint16 port() const { return this->port_; }
     Response call(const QByteArray& verb, const QString& path, const QJsonObject& body = {}) {
         const BinaryResponse reply = callRaw(verb, path,
@@ -75,52 +159,60 @@ public:
     BinaryResponse callRaw(const QByteArray& verb, const QString& path,
                            const QByteArray& bytes = QByteArray(),
                            const QByteArray& mime = "application/vnd.aowis.bundle") {
-        QNetworkRequest request(QUrl(this->base_ + path));
-        request.setHeader(QNetworkRequest::ContentTypeHeader, mime);
-        QNetworkReply* reply = nullptr;
-        if (verb == "GET") reply = this->manager_.get(request);
-        else reply = this->manager_.post(request, bytes);
-        QEventLoop loop;
-        QTimer timer;
-        timer.setSingleShot(true);
-        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-        QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-        timer.start(5000);
-        loop.exec();
-        check(timer.isActive() && reply->isFinished(), "HTTP request timed out");
-        const QByteArray payload = reply->readAll();
-        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const QByteArray contentType = reply->header(QNetworkRequest::ContentTypeHeader).toByteArray();
-        reply->deleteLater();
-        return BinaryResponse{status, payload, contentType};
+        const std::string target = path.toStdString();
+        httplib::Result result = verb == "GET"
+            ? this->client_.Get(target)
+            : this->client_.Post(target, std::string(bytes.constData(), static_cast<std::size_t>(bytes.size())),
+                                 mime.toStdString());
+        if (!result) {
+            throw std::runtime_error("HTTP request failed: " + httplib::to_string(result.error()) +
+                                     " (" + verb.toStdString() + ' ' + target + ')');
+        }
+        return BinaryResponse{result->status,
+                              QByteArray(result->body.data(), static_cast<qsizetype>(result->body.size())),
+                              QByteArray::fromStdString(result->get_header_value("Content-Type"))};
     }
-    // Abort a bundle response after its first readable bytes. The server must
-    // release the device-owned temporary directory even on disconnect.
+    // Abort a bundle response after its first bytes. The server must release
+    // the response's scratch file even on disconnect.
     void abortDownload(const QString& path) {
-        QNetworkRequest request(QUrl(this->base_ + path));
-        QNetworkReply* reply = this->manager_.get(request);
-        QEventLoop loop;
-        QTimer timer;
-        timer.setSingleShot(true);
         bool receivedBody = false;
-        QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&]() {
-            if (reply->bytesAvailable() > 0) {
-                receivedBody = true;
-                reply->abort();
-                loop.quit();
-            }
-        });
-        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-        QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-        timer.start(5000);
-        loop.exec();
-        check(timer.isActive() && receivedBody, "streamed download did not produce bytes");
-        reply->deleteLater();
+        const httplib::Result result = this->client_.Get(path.toStdString(),
+            [&](const char*, std::size_t length) {
+                receivedBody = length > 0;
+                return false; // abort
+            });
+        check(!result && receivedBody, "streamed download did not produce bytes before abort");
     }
 private:
-    QString base_;
+    httplib::Client client_;
     quint16 port_;
-    QNetworkAccessManager manager_;
+};
+
+// In-process server on a loopback port, serving from worker threads.
+class TestServer {
+public:
+    TestServer(aowis::native::ProjectService& service, aowis::native::BundleLimits limits) {
+        this->server_.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 128); };
+        aowis::native::http::registerRoutes(this->server_, service,
+                                            aowis::native::PhysicalStore::Pack, limits);
+        const int bound = this->server_.bind_to_any_port("127.0.0.1");
+        check(bound > 0, "unable to listen");
+        this->port_ = static_cast<quint16>(bound);
+        this->thread_ = std::thread([this] { this->server_.listen_after_bind(); });
+        this->server_.wait_until_ready();
+    }
+    ~TestServer() { this->stop(); }
+    TestServer(const TestServer&) = delete;
+    TestServer& operator=(const TestServer&) = delete;
+    quint16 port() const { return this->port_; }
+    void stop() {
+        this->server_.stop();
+        if (this->thread_.joinable()) this->thread_.join();
+    }
+private:
+    httplib::Server server_;
+    std::thread thread_;
+    quint16 port_ = 0;
 };
 
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
@@ -359,16 +451,14 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
           "oversized bundle upload accepted");
     // Partial request body followed by disconnect must never invoke bundle publication.
     {
-        QTcpSocket interrupted;
-        interrupted.connectToHost(QHostAddress::LocalHost, client.port());
-        check(interrupted.waitForConnected(2000), "unable to connect interrupted upload");
+        RawConnection interrupted(client.port());
+        check(interrupted.connected(), "unable to connect interrupted upload");
         const QByteArray head = "POST " + to.toUtf8() +
             "/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/vnd.aowis.bundle\r\n" +
             "Content-Length: " + QByteArray::number(bundle.body.size()) + "\r\n\r\n";
-        interrupted.write(head + bundle.body.left(bundle.body.size() / 2));
-        check(interrupted.waitForBytesWritten(2000), "partial upload was not sent");
-        interrupted.abort();
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        interrupted.send(head + bundle.body.left(bundle.body.size() / 2));
+        interrupted.close();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     check(client.call("GET", to + "/head").status == 404,
           "disconnected partial request published a branch");
@@ -577,23 +667,170 @@ void exerciseBoundsAndScoping(Client& client, aowis::native::ProjectService& ser
 #endif
 }
 
+// Phase 5 (cpp-httplib): limits are enforced before bodies are read, uploads
+// stream without holding project locks, and requests run concurrently.
+void exerciseTransport(Client& client, aowis::native::ProjectService& service,
+                       const std::filesystem::path& root, std::uint64_t transferLimit) {
+    namespace native = aowis::native;
+    const quint16 port = client.port();
+    const Response sourceProject = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Transport source"}});
+    const Response targetProject = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Transport target"}});
+    check(sourceProject.status == 201 && targetProject.status == 201, "transport projects not created");
+    const QString sourceId = sourceProject.json.value("id").toString();
+    const QString targetId = targetProject.json.value("id").toString();
+    service.withRepository(sourceId.toStdString(), [](native::Repository& repository) {
+        std::vector<native::Change> changes;
+        for (unsigned i = 0; i < 200; ++i) {
+            native::Key key{};
+            key[0] = static_cast<std::uint8_t>(i);
+            key[15] = 1;
+            changes.push_back(native::Change{key, native::Bytes(1024, static_cast<std::uint8_t>(i))});
+        }
+        repository.commit("main", changes);
+    });
+    const BinaryResponse bundle = client.callRaw("GET", "/api/v1/projects/" + sourceId + "/branches/main/bundle");
+    check(bundle.status == 200 && bundle.body.size() > 100 * 1024 &&
+          bundle.contentType == "application/vnd.aowis.bundle", "transport bundle export failed");
+    const QByteArray uploadPath = "/api/v1/projects/" + targetId.toUtf8() + "/branches/incoming/bundle";
+
+    // 1. A declared length above the transfer limit is refused before any body
+    //    byte is sent; the server answers and closes the connection.
+    {
+        RawConnection raw(port);
+        check(raw.connected(), "raw connect failed");
+        raw.send("POST " + uploadPath + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " +
+                 QByteArray::number(static_cast<qulonglong>(transferLimit + 1)) + "\r\n\r\n");
+        const QByteArray reply = raw.receive(3000);
+        check(statusOf(reply) == 413 && reply.contains("transfer_too_large"),
+              "oversized declared upload not rejected with 413 before its body");
+        check(raw.closedByPeer(), "connection not closed after rejecting an unread body");
+    }
+    // 2. Per-route JSON limits, also decided before the body is read.
+    const std::vector<std::pair<QByteArray, std::size_t>> jsonRoutes{
+        {"/api/v1/projects", aowis::native::http::maxJsonSmallBytes},
+        {"/api/v1/projects/" + targetId.toUtf8() + "/branches", aowis::native::http::maxJsonSmallBytes},
+        {"/api/v1/projects/" + targetId.toUtf8() + "/merges", aowis::native::http::maxJsonMergeBytes},
+        {"/api/v1/projects/" + targetId.toUtf8() + "/branches/main/networks",
+         aowis::native::http::maxJsonModelBytes}};
+    for (const std::pair<QByteArray, std::size_t>& route : jsonRoutes) {
+        RawConnection raw(port);
+        raw.send("POST " + route.first + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                 "Content-Length: " + QByteArray::number(static_cast<qulonglong>(route.second + 1)) + "\r\n\r\n");
+        const QByteArray reply = raw.receive(3000);
+        check(statusOf(reply) == 413 && reply.contains("limit_exceeded") && raw.closedByPeer(),
+              "JSON body over its route limit not rejected before reading");
+    }
+    {
+        RawConnection raw(port);
+        raw.send("POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                 "Transfer-Encoding: chunked\r\n\r\n10\r\n{\"name\":\"chunk\"}\r\n0\r\n\r\n");
+        const QByteArray reply = raw.receive(3000);
+        check(statusOf(reply) == 411 && reply.contains("length_required"),
+              "chunked JSON request without Content-Length accepted");
+    }
+    // 3. A chunked upload that grows past the limit is cut off with 413 and
+    //    publishes nothing.
+    {
+        RawConnection raw(port);
+        raw.send("POST " + uploadPath + " HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        const QByteArray chunk(64 * 1024, 'x');
+        const QByteArray framed = QByteArray::number(chunk.size(), 16) + "\r\n" + chunk + "\r\n";
+        for (std::uint64_t sent = 0; sent <= transferLimit + chunk.size(); sent += chunk.size()) {
+            try { raw.send(framed); } catch (const std::exception&) { break; } // server may close early
+        }
+        const QByteArray reply = raw.receive(3000);
+        check(statusOf(reply) == 413, "chunked upload beyond the limit not rejected with 413");
+    }
+    check(client.call("GET", "/api/v1/projects/" + targetId + "/branches/incoming/head").status == 404,
+          "rejected upload published a branch");
+    // 4. A slow upload neither blocks other requests nor holds the catalogue
+    //    or project lock while its body is still arriving.
+    {
+        RawConnection slow(port);
+        slow.send("POST " + uploadPath + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " +
+                  QByteArray::number(bundle.body.size()) + "\r\n\r\n" + bundle.body.left(bundle.body.size() / 2));
+        QElapsedTimer elapsed;
+        elapsed.start();
+        check(client.call("GET", "/api/v1/health").status == 200, "health blocked by a slow upload");
+        check(client.call("GET", "/api/v1/projects").status == 200, "catalogue blocked by a slow upload");
+        check(client.call("GET", "/api/v1/projects/" + targetId + "/branches").status == 200,
+              "target project blocked by a slow upload");
+        check(elapsed.elapsed() < 2000, "requests during a slow upload were delayed");
+        slow.send(bundle.body.mid(bundle.body.size() / 2));
+        const QByteArray reply = slow.receive(10000);
+        check(statusOf(reply) == 201 && reply.contains("\"created\""),
+              "slow upload was not imported after completion");
+    }
+    // 5. An upload abandoned halfway publishes nothing and leaves no file.
+    {
+        RawConnection abandoned(port);
+        abandoned.send("POST /api/v1/projects/" + targetId.toUtf8() + "/branches/abandoned/bundle HTTP/1.1\r\n"
+                       "Host: 127.0.0.1\r\nContent-Length: " + QByteArray::number(bundle.body.size()) +
+                       "\r\n\r\n" + bundle.body.left(bundle.body.size() / 3));
+        abandoned.close();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        check(client.call("GET", "/api/v1/projects/" + targetId + "/branches/abandoned/head").status == 404,
+              "abandoned upload published a branch");
+        check(std::filesystem::is_empty(root / "projects" / targetId.toStdString() / "repository" / "tmp"),
+              "abandoned upload left a scratch file");
+    }
+    // 6. Requests are served concurrently by the worker pool.
+    {
+        std::atomic<int> failures{0};
+        std::vector<std::thread> workers;
+        for (int worker = 0; worker < 8; ++worker) {
+            workers.emplace_back([&, worker]() {
+                try {
+                    Client parallel(port);
+                    for (int request = 0; request < 20; ++request) {
+                        const QString path = request % 2 == 0
+                            ? "/api/v1/projects/" + targetId + "/branches/incoming/head"
+                            : "/api/v1/projects/" + sourceId + "/branches/main/history?limit=1";
+                        if (parallel.call("GET", path).status != 200) failures.fetch_add(1);
+                    }
+                } catch (...) {
+                    failures.fetch_add(1);
+                }
+                (void)worker;
+            });
+        }
+        for (std::thread& thread : workers) thread.join();
+        check(failures.load() == 0, "concurrent requests failed");
+    }
+    // 7. Protocol-level rejections by httplib also carry JSON error bodies.
+    const Response unknownRoute = client.call("GET", "/api/v1/no-such-route");
+    check(unknownRoute.status == 404 &&
+          unknownRoute.json.value("error").toObject().value("code").toString() == "not_found",
+          "unknown route did not return a JSON 404");
+    // Header and URI sizes are bounded by httplib (8 KiB per header line and
+    // URI, at most 100 header fields); rejections close the connection.
+    QByteArray manyHeaders;
+    for (int i = 0; i < 200; ++i) manyHeaders += "X-" + QByteArray::number(i) + ": a\r\n";
+    const std::vector<std::tuple<QByteArray, int, QByteArray>> protocolCases{
+        {"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Large: " + QByteArray(16 * 1024, 'a') +
+             "\r\n\r\n", 400, "invalid_request"},
+        {"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n" + manyHeaders + "\r\n", 400, "invalid_request"},
+        {"GET /api/v1/" + QByteArray(9000, 'a') + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 414, "uri_too_long"}};
+    for (const std::tuple<QByteArray, int, QByteArray>& protocolCase : protocolCases) {
+        RawConnection raw(port);
+        raw.send(std::get<0>(protocolCase));
+        const QByteArray reply = raw.receive(3000);
+        check(statusOf(reply) == std::get<1>(protocolCase) && reply.contains(std::get<2>(protocolCase)) &&
+              raw.closedByPeer(), "oversized header/URI not rejected with a JSON error");
+    }
+}
+
 void exercise(aowis::native::PhysicalStore backend) {
     TemporaryRoot root;
     QString firstId;
     QString firstRevision;
-    QPointer<QTcpServer> observedListener;
+    quint16 listenerPort = 0;
     {
         aowis::native::ProjectService service(root.root());
-        QHttpServer server;
-        // bind() reparents the listener to the HTTP server, which owns its lifetime.
-        QTcpServer* tcp = new QTcpServer(&server);
-        observedListener = tcp;
-        aowis::native::http::registerRoutes(
-            server, service, backend, aowis::native::BundleLimits{1024ULL * 1024ULL, 10000ULL,
-                                                                    1024ULL * 1024ULL});
-        check(tcp->listen(QHostAddress::LocalHost, 0) && server.bind(tcp), "unable to listen");
-        check(tcp->parent() == &server, "HTTP listener must belong to the HTTP server");
-        Client client(tcp->serverPort());
+        const aowis::native::BundleLimits limits{1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL};
+        TestServer server(service, limits);
+        listenerPort = server.port();
+        Client client(server.port());
         check(client.call("GET", "/api/v1/health").status == 200, "health failed");
         check(client.call("GET", "/api/v1/ready").status == 200, "readiness failed");
         check(client.call("GET", "/api/v1/projects").json.value("projects").toArray().isEmpty(),
@@ -681,8 +918,10 @@ void exercise(aowis::native::PhysicalStore backend) {
         }
         exerciseErrorClassification(client, service, root.root());
         exerciseBoundsAndScoping(client, service);
+        exerciseTransport(client, service, root.root(), limits.maxBytes);
+        server.stop();
+        check(!RawConnection(listenerPort).connected(), "stopped HTTP server still accepts connections");
     }
-    check(observedListener.isNull(), "HTTP server did not destroy its owned listener");
     {
         aowis::native::ProjectService reopened(root.root());
         check(reopened.project(firstId.toStdString()).name == "Hydraulik Ü", "restart lost project name");
@@ -691,75 +930,20 @@ void exercise(aowis::native::PhysicalStore backend) {
     }
 }
 
-// Exercise the real executable's startup/shutdown path, not just its route handlers.
-// A listener incorrectly allocated on the stack crashes during a clean shutdown.
-void exerciseServerShutdown(const QString& executable) {
-    TemporaryRoot root;
-    QTcpServer reservation;
-    check(reservation.listen(QHostAddress::LocalHost, 0), "unable to reserve test port");
-    const quint16 port = reservation.serverPort();
-    reservation.close();
-
-    QProcess process;
-    process.setProgram(executable);
-    process.setArguments({QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
-                          QStringLiteral("--port"), QString::number(port),
-                          QStringLiteral("--data-root"), QString::fromStdString(root.root().string())});
-    process.start();
-    try {
-        check(process.waitForStarted(5000), "database HTTP executable did not start");
-        QElapsedTimer elapsed;
-        elapsed.start();
-        bool listening = false;
-        while (elapsed.elapsed() < 5000 && process.state() != QProcess::NotRunning) {
-            QTcpSocket probe;
-            probe.connectToHost(QHostAddress::LocalHost, port);
-            if (probe.waitForConnected(100)) {
-                listening = true;
-                probe.disconnectFromHost();
-                break;
-            }
-            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
-        }
-        if (!listening) {
-            const std::string diagnostics = process.readAllStandardError().toStdString();
-            throw std::runtime_error("database HTTP executable did not accept connections" +
-                                     (diagnostics.empty() ? std::string() : ": " + diagnostics));
-        }
-        Client client(port);
-        check(client.call("GET", "/api/v1/health").status == 200,
-              "database HTTP executable health endpoint failed");
-        const Response created = client.call("POST", "/api/v1/projects",
-                                              QJsonObject{{"name", "Shutdown test"}});
-        check(created.status == 201 && created.json.value("storage").toString() == "pack",
-              "database HTTP executable did not create a project on the selected backend");
-        process.terminate();
-        check(process.waitForFinished(5000), "database HTTP executable did not shut down");
-        check(process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0,
-              "database HTTP executable crashed during shutdown");
-    } catch (...) {
-        if (process.state() != QProcess::NotRunning) {
-            process.kill();
-            process.waitForFinished(3000);
-        }
-        throw;
-    }
-}
-
 struct ServerRun {
     bool listened = false;
     int exitCode = -1;
+    QString output;
     QString diagnostics;
 };
 
-// Starts the real executable, probes it via 127.0.0.1, and stops it again.
-// A process that exits on its own is reported with its exit code.
-ServerRun runServer(const QString& executable, QStringList arguments) {
+// Starts the real executable, probes /api/v1/health on 127.0.0.1, optionally
+// runs `whileRunning`, then stops it with SIGTERM. A process that exits on
+// its own is reported with its exit code.
+ServerRun runServer(const QString& executable, QStringList arguments,
+                    const std::function<void(quint16)>& whileRunning = {}) {
     TemporaryRoot root;
-    QTcpServer reservation;
-    check(reservation.listen(QHostAddress::LocalHost, 0), "unable to reserve test port");
-    const quint16 port = reservation.serverPort();
-    reservation.close();
+    const quint16 port = reservePort();
     arguments << QStringLiteral("--port") << QString::number(port)
               << QStringLiteral("--data-root") << QString::fromStdString(root.root().string());
     QProcess process;
@@ -768,75 +952,80 @@ ServerRun runServer(const QString& executable, QStringList arguments) {
     process.start();
     check(process.waitForStarted(5000), "database HTTP executable did not start");
     ServerRun run;
-    QElapsedTimer elapsed;
-    elapsed.start();
-    while (elapsed.elapsed() < 5000 && process.state() != QProcess::NotRunning) {
-        QTcpSocket probe;
-        probe.connectToHost(QHostAddress::LocalHost, port);
-        if (probe.waitForConnected(100)) {
-            run.listened = true;
-            probe.disconnectFromHost();
-            break;
+    try {
+        QElapsedTimer elapsed;
+        elapsed.start();
+        while (elapsed.elapsed() < 5000 && process.state() != QProcess::NotRunning) {
+            RawConnection probe(port);
+            if (probe.connected()) {
+                run.listened = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        if (run.listened) {
+            Client client(port);
+            check(client.call("GET", "/api/v1/health").status == 200, "executable health failed");
+            if (whileRunning) whileRunning(port);
+            process.terminate(); // SIGTERM
+        }
+        if (!process.waitForFinished(5000)) {
+            process.kill();
+            process.waitForFinished(3000);
+            throw std::runtime_error("database HTTP executable did not stop on SIGTERM");
+        }
+    } catch (...) {
+        if (process.state() != QProcess::NotRunning) {
+            process.kill();
+            process.waitForFinished(3000);
+        }
+        throw;
     }
-    if (run.listened) {
-        Client client(port);
-        check(client.call("GET", "/api/v1/health").status == 200, "policy run: health failed");
-        process.terminate();
-    }
-    if (!process.waitForFinished(5000)) {
-        process.kill();
-        process.waitForFinished(3000);
-    }
-    run.exitCode = process.exitCode();
+    run.exitCode = process.exitStatus() == QProcess::NormalExit ? process.exitCode() : -1;
+    run.output = QString::fromLocal8Bit(process.readAllStandardOutput());
     run.diagnostics = QString::fromLocal8Bit(process.readAllStandardError());
     return run;
 }
 
-// Review F5: Qt < 6.11 cannot bound request sizes; non-loopback listeners need
-// an explicitly declared limiting reverse proxy.
-void exerciseBodyLimitPolicy(const QString& executable) {
-    const bool qtLimits = QT_VERSION >= QT_VERSION_CHECK(6, 11, 0);
-    const ServerRun loopback = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("127.0.0.1")});
-    check(loopback.listened, "loopback listener did not start");
-    check(qtLimits != loopback.diagnostics.contains("listening on loopback address 127.0.0.1 only"),
-          "loopback warning does not match the Qt version");
+// The real executable: startup, request handling and a clean SIGTERM
+// shutdown (exit code 0), plus configuration validation.
+void exerciseExecutable(const QString& executable) {
+    const ServerRun normal = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("127.0.0.1")},
+        [](quint16 port) {
+            Client client(port);
+            const Response created = client.call("POST", "/api/v1/projects",
+                                                 QJsonObject{{"name", "Shutdown test"}});
+            check(created.status == 201 && created.json.value("storage").toString() == "pack",
+                  "executable did not create a project");
+        });
+    check(normal.listened && normal.exitCode == 0, "executable did not shut down cleanly on SIGTERM");
+    check(normal.output.contains("AOWIS database listening on 127.0.0.1:"), "startup message missing");
 
-    const ServerRun exposed = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0")});
-    if (qtLimits) {
-        check(exposed.listened && exposed.diagnostics.isEmpty(),
-              "Qt >= 6.11 refused or warned about a non-loopback listener");
-    } else {
-        check(!exposed.listened && exposed.exitCode == 2 &&
-              exposed.diagnostics.contains("refusing to listen on non-loopback address 0.0.0.0"),
-              "Qt < 6.11 started a non-loopback listener without a declared proxy");
+    // All addresses are served without a proxy policy: limits are enforced
+    // by the server itself on every platform.
+    const ServerRun anyAddress = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0"),
+                                                        QStringLiteral("--worker-threads"), QStringLiteral("2")});
+    check(anyAddress.listened && anyAddress.exitCode == 0 && !anyAddress.diagnostics.contains("AOWIS database"),
+          "non-loopback listener with 2 workers failed");
+
+    const std::vector<QStringList> invalid{
+        {QStringLiteral("--bind"), QStringLiteral("localhost")},
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("0")},
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("257")},
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--sync-max-mib"), QStringLiteral("0")}};
+    for (const QStringList& arguments : invalid) {
+        const ServerRun refused = runServer(executable, arguments);
+        check(!refused.listened && refused.exitCode == 2, "invalid configuration was accepted");
     }
-
-    const ServerRun proxied = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0"),
-                                                     QStringLiteral("--proxy-enforces-body-limit")});
-    check(proxied.listened, "declared reverse proxy did not allow the listener");
-    check(qtLimits != proxied.diagnostics.contains("relying on the reverse proxy"),
-          "reverse proxy notice does not match the Qt version");
-
     TemporaryRoot configuration;
     const std::filesystem::path ini = configuration.root() / "server.ini";
     {
         std::ofstream output(ini);
-        output << "[server]\nproxy_enforces_body_limit=true\n";
+        output << "[server]\nbind=127.0.0.1\nworker_threads=0\n";
     }
-    const ServerRun fromIni = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0"),
-        QStringLiteral("--config"), QString::fromStdString(ini.string())});
-    check(fromIni.listened, "INI proxy_enforces_body_limit=true did not allow the listener");
-    {
-        std::ofstream output(ini, std::ios::trunc);
-        output << "[server]\nproxy_enforces_body_limit=maybe\n";
-    }
-    const ServerRun invalid = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
-        QStringLiteral("--config"), QString::fromStdString(ini.string())});
-    check(!invalid.listened && invalid.exitCode == 2 &&
-          invalid.diagnostics.contains("Invalid server/proxy_enforces_body_limit"),
-          "invalid proxy_enforces_body_limit value was accepted");
+    const ServerRun fromIni = runServer(executable, {QStringLiteral("--config"),
+                                                     QString::fromStdString(ini.string())});
+    check(!fromIni.listened && fromIni.exitCode == 2, "invalid INI worker_threads accepted");
 }
 } // namespace
 
@@ -845,8 +1034,7 @@ int main(int argc, char** argv) {
     try {
         check(argc == 2, "expected path to aowis-server-db executable");
         exercise(aowis::native::PhysicalStore::Pack);
-        exerciseServerShutdown(QString::fromLocal8Bit(argv[1]));
-        exerciseBodyLimitPolicy(QString::fromLocal8Bit(argv[1]));
+        exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
         return 0;
     } catch (const std::exception& error) {
