@@ -59,10 +59,13 @@ const char* const routeEdits = "/api/v1/projects/:id/branches/:branch/networks/:
 struct Reply {
     int status = 200;
     QJsonObject body;
+    int retryAfterSeconds = 0; // > 0: send a Retry-After header
 };
 
 void send(httplib::Response& response, const Reply& reply) {
     response.status = reply.status;
+    if (reply.retryAfterSeconds > 0)
+        response.set_header("Retry-After", std::to_string(reply.retryAfterSeconds));
     response.set_content(QJsonDocument(reply.body).toJson(QJsonDocument::Compact).toStdString(),
                          "application/json");
 }
@@ -86,6 +89,12 @@ Reply projectFailure(const ProjectError& error) {
     case ProjectErrorKind::NotFound: status = 404; code = QStringLiteral("not_found"); break;
     case ProjectErrorKind::Conflict: status = 409; code = QStringLiteral("conflict"); break;
     case ProjectErrorKind::Unavailable: status = 503; code = QStringLiteral("unavailable"); break;
+    case ProjectErrorKind::Busy: {
+        // The project's operation queue is full; other projects are unaffected.
+        Reply reply = errorReply(503, QStringLiteral("busy"), QString::fromUtf8(error.what()));
+        reply.retryAfterSeconds = 1;
+        return reply;
+    }
     }
     return errorReply(status, code, QString::fromUtf8(error.what()));
 }
@@ -461,7 +470,10 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
                                                   QStringLiteral("bundle exceeds configured transfer limit")));
                 return;
             }
-            ScratchFile spool = service.createScratchFile(id); // 404/400 before any body byte
+            // 400/404, and 503 when the project's queue is full, before any
+            // body byte is read. The reservation is held through the import.
+            ProjectService::Operation operation = service.reserveOperation(id);
+            ScratchFile spool = service.createScratchFile(id);
             std::uint64_t received = 0;
             bool tooLarge = false;
             std::optional<int> writeError;
@@ -505,7 +517,7 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
             requireInput(received != 0, "empty replication bundle");
             BundleImportResult imported;
             try {
-                service.withRepository(id, [&](Repository& repository) {
+                service.withRepository(operation, [&](Repository& repository) {
                     imported = repository.importBranchBundle(spool.fd(), target, limits);
                 });
             } catch (const StorageError& error) {

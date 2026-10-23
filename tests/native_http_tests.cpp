@@ -14,14 +14,18 @@
 #include <QStringList>
 #include <QUuid>
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <netinet/in.h>
 #include <optional>
@@ -56,11 +60,13 @@ private:
 struct Response {
     int status = 0;
     QJsonObject json;
+    QByteArray retryAfter;
 };
 struct BinaryResponse {
     int status = 0;
     QByteArray body;
     QByteArray contentType;
+    QByteArray retryAfter;
 };
 
 // Raw TCP connection to 127.0.0.1 for protocol-level tests (partial bodies,
@@ -154,7 +160,7 @@ public:
             QJsonDocument(body).toJson(QJsonDocument::Compact), "application/json");
         const QJsonDocument json = QJsonDocument::fromJson(reply.body);
         check(json.isObject(), "HTTP response is not JSON");
-        return Response{reply.status, json.object()};
+        return Response{reply.status, json.object(), reply.retryAfter};
     }
     BinaryResponse callRaw(const QByteArray& verb, const QString& path,
                            const QByteArray& bytes = QByteArray(),
@@ -170,7 +176,8 @@ public:
         }
         return BinaryResponse{result->status,
                               QByteArray(result->body.data(), static_cast<qsizetype>(result->body.size())),
-                              QByteArray::fromStdString(result->get_header_value("Content-Type"))};
+                              QByteArray::fromStdString(result->get_header_value("Content-Type")),
+                              QByteArray::fromStdString(result->get_header_value("Retry-After"))};
     }
     // Abort a bundle response after its first bytes. The server must release
     // the response's scratch file even on disconnect.
@@ -820,6 +827,264 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
     }
 }
 
+// Holds one scoped operation of a project (as a long import would) until
+// release(), so tests can observe what still runs meanwhile.
+class ProjectHold {
+public:
+    ProjectHold(aowis::native::ProjectService& service, const std::string& projectId) {
+        this->thread_ = std::thread([this, &service, projectId] {
+            service.withRepository(projectId, [this](aowis::native::Repository&) {
+                std::unique_lock<std::mutex> lock(this->mutex_);
+                this->entered_ = true;
+                this->changed_.notify_all();
+                this->changed_.wait(lock, [this] { return this->released_; });
+            });
+        });
+        std::unique_lock<std::mutex> lock(this->mutex_);
+        check(this->changed_.wait_for(lock, std::chrono::seconds(10), [this] { return this->entered_; }),
+              "project hold did not start");
+    }
+    ~ProjectHold() { this->release(); }
+    ProjectHold(const ProjectHold&) = delete;
+    ProjectHold& operator=(const ProjectHold&) = delete;
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->released_ = true;
+        }
+        this->changed_.notify_all();
+        if (this->thread_.joinable()) this->thread_.join();
+    }
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false;
+    bool released_ = false;
+    std::thread thread_;
+};
+
+// Joins a helper thread on scope exit, so a failed check reports its
+// message instead of terminating with a joinable thread.
+struct Joiner {
+    explicit Joiner(std::thread& target) : thread(target) {}
+    ~Joiner() {
+        if (this->thread.joinable()) this->thread.join();
+    }
+    Joiner(const Joiner&) = delete;
+    Joiner& operator=(const Joiner&) = delete;
+    std::thread& thread;
+};
+
+void waitForPending(aowis::native::ProjectService& service, const QString& id, std::size_t count) {
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (service.pendingOperations(id.toStdString()) != count) {
+        check(std::chrono::steady_clock::now() < deadline, "pending request count not reached");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+std::chrono::milliseconds timed(const std::function<void()>& action) {
+    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    action();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+}
+
+// Review F4: a long operation of one project blocks neither /health nor
+// other projects; a full project queue answers 503 with Retry-After before
+// reading an upload; racing writes of one project serialize correctly.
+void exerciseConcurrency() {
+    namespace native = aowis::native;
+    TemporaryRoot root;
+    native::ProjectService service(root.root(), 3);
+    TestServer server(service, native::BundleLimits{64ULL * 1024ULL * 1024ULL, 100000ULL,
+                                                    8ULL * 1024ULL * 1024ULL});
+    Client client(server.port());
+    const QString a = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "A"}}).json.value("id").toString();
+    const QString b = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "B"}}).json.value("id").toString();
+    const QString aPrefix = "/api/v1/projects/" + a;
+    const QString bPrefix = "/api/v1/projects/" + b;
+
+    // A bundle of ~4 MiB for project B, built in an independent repository.
+    QByteArray bundle;
+    {
+        native::Repository source(root.root() / "source");
+        source.createBranch("main");
+        std::vector<native::Change> changes;
+        for (unsigned i = 0; i < 2000; ++i) {
+            native::Key item{};
+            item[0] = static_cast<std::uint8_t>(i >> 8U);
+            item[1] = static_cast<std::uint8_t>(i);
+            item[15] = 7;
+            changes.push_back(native::Change{item, native::Bytes(2048, static_cast<std::uint8_t>(i))});
+        }
+        source.commit("main", changes);
+        source.exportBranchBundle("main", root.root() / "source.bundle");
+        std::ifstream input(root.root() / "source.bundle", std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        bundle = QByteArray(bytes.data(), static_cast<qsizetype>(bytes.size()));
+    }
+
+    std::thread importer;
+    std::thread first;
+    std::thread second;
+    const Joiner joinImporter(importer);
+    const Joiner joinFirst(first);
+    const Joiner joinSecond(second);
+    int firstStatus = 0;
+    int secondStatus = 0;
+    {
+        ProjectHold hold(service, a.toStdString());
+        // Everything else answers promptly while A's operation runs.
+        check(timed([&] { check(client.call("GET", "/api/v1/health").status == 200, "health failed"); }) <
+              std::chrono::milliseconds(200), "/health waited for a project operation");
+        check(timed([&] { check(client.call("GET", "/api/v1/ready").status == 200, "ready failed"); }) <
+              std::chrono::milliseconds(200), "/ready waited for a project operation");
+        check(client.call("GET", aPrefix + "/branches/main/head").status == 200, "read of held project failed");
+        check(client.call("POST", bPrefix + "/branches", QJsonObject{{"name", "side"}}).status == 201,
+              "other project's write waited");
+        // A real import into B, with /health probed throughout.
+        std::atomic<bool> importing{true};
+        int importStatus = 0;
+        importer = std::thread([&] {
+            Client own(server.port());
+            importStatus = own.callRaw("POST", bPrefix + "/branches/imported/bundle", bundle).status;
+            importing = false;
+        });
+        std::chrono::milliseconds slowest{0};
+        unsigned probes = 0;
+        while (importing.load() || probes == 0) {
+            slowest = std::max(slowest, timed([&] {
+                check(client.call("GET", "/api/v1/health").status == 200, "health failed during import");
+            }));
+            ++probes;
+        }
+        importer.join();
+        check(importStatus == 201, "import into another project failed while A was busy");
+        check(slowest < std::chrono::milliseconds(200), "/health was slow during an import");
+
+        // Two racing creations of one branch on A queue behind the hold.
+        first = std::thread([&] {
+            Client own(server.port());
+            firstStatus = own.call("POST", aPrefix + "/branches", QJsonObject{{"name", "race"}}).status;
+        });
+        second = std::thread([&] {
+            Client own(server.port());
+            secondStatus = own.call("POST", aPrefix + "/branches", QJsonObject{{"name", "race"}}).status;
+        });
+        waitForPending(service, a, 3);
+        // The queue of A is full: 503 + Retry-After, also before an upload body.
+        const Response busy = client.call("POST", aPrefix + "/branches", QJsonObject{{"name", "late"}});
+        check(busy.status == 503 && busy.retryAfter == "1" &&
+              busy.json.value("error").toObject().value("code").toString() == "busy",
+              "full project queue not answered with 503 busy and Retry-After");
+        const BinaryResponse busyUpload = client.callRaw("POST", aPrefix + "/branches/up/bundle", bundle);
+        check(busyUpload.status == 503 && busyUpload.retryAfter == "1", "upload to a full project queue accepted");
+        {
+            // Headers only: the 503 must come without waiting for the body.
+            RawConnection raw(server.port());
+            raw.send("POST " + aPrefix.toUtf8() + "/branches/up/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 1000000\r\n\r\n");
+            const QByteArray reply = raw.receive(2000);
+            check(statusOf(reply) == 503 && reply.contains("Retry-After: 1") && raw.closedByPeer(),
+                  "full project queue did not refuse the upload before its body");
+        }
+        check(client.call("POST", bPrefix + "/branches", QJsonObject{{"name", "still"}}).status == 201,
+              "other project affected by A's full queue");
+        hold.release();
+        first.join();
+        second.join();
+        check((firstStatus == 201 && secondStatus == 409) || (firstStatus == 409 && secondStatus == 201),
+              "racing branch creations not exactly one 201 and one 409");
+    }
+    check(service.pendingOperations(a.toStdString()) == 0, "project queue not drained");
+    check(client.call("POST", aPrefix + "/branches", QJsonObject{{"name", "late"}}).status == 201,
+          "project still busy after its queue drained");
+
+#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+    // Racing hydraulic saves with one expectedHead: one 201, one 409.
+    {
+        const QString head = client.call("GET", aPrefix + "/branches/main/head").json.value("id").toString();
+        const std::function<QString()> payload = [] {
+            NetworkHydraulic network;
+            network.uuid = QUuid::createUuid();
+            network.id = QStringLiteral("race");
+            return QString::fromLatin1(aowis::native::ModelCodec<NetworkHydraulic>::encode(network).toBase64());
+        };
+        const QString one = payload();
+        const QString two = payload();
+        int firstStatus = 0;
+        int secondStatus = 0;
+        std::thread first;
+        std::thread second;
+        const Joiner joinFirst(first);
+        const Joiner joinSecond(second);
+        {
+            ProjectHold hold(service, a.toStdString());
+            first = std::thread([&] {
+                Client own(server.port());
+                firstStatus = own.call("POST", aPrefix + "/branches/main/networks",
+                    QJsonObject{{"expectedHead", head}, {"payloadBase64", one}}).status;
+            });
+            second = std::thread([&] {
+                Client own(server.port());
+                secondStatus = own.call("POST", aPrefix + "/branches/main/networks",
+                    QJsonObject{{"expectedHead", head}, {"payloadBase64", two}}).status;
+            });
+            waitForPending(service, a, 3);
+        }
+        first.join();
+        second.join();
+        check((firstStatus == 201 && secondStatus == 409) || (firstStatus == 409 && secondStatus == 201),
+              "racing hydraulic saves not exactly one 201 and one 409");
+    }
+#endif
+
+    // Stress: 8 clients, mixed reads and writes over three projects. Every
+    // answer is a success or a 503 for a full queue; nothing else.
+    const QString c = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "C"}}).json.value("id").toString();
+    const std::vector<QString> projects{a, b, c};
+    std::atomic<unsigned> created{0};
+    std::atomic<unsigned> busyAnswers{0};
+    std::atomic<unsigned> unexpected{0};
+    std::vector<std::thread> clients;
+    for (unsigned worker = 0; worker < 8; ++worker) {
+        clients.emplace_back([&, worker] {
+            Client own(server.port());
+            for (unsigned step = 0; step < 30; ++step) {
+                const QString prefix = "/api/v1/projects/" + projects[(worker + step) % projects.size()];
+                int status = 0;
+                switch (step % 4) {
+                case 0:
+                    status = own.call("POST", prefix + "/branches", QJsonObject{
+                        {"name", QStringLiteral("s%1_%2").arg(worker).arg(step)}}).status;
+                    if (status == 201) ++created;
+                    break;
+                case 1: status = own.call("GET", prefix + "/branches/main/head").status; break;
+                case 2: status = own.callRaw("GET", prefix + "/branches/main/bundle").status; break;
+                default: status = own.call("GET", "/api/v1/health").status; break;
+                }
+                if (status == 503) ++busyAnswers;
+                else if (status != 200 && status != 201) ++unexpected;
+            }
+        });
+    }
+    for (std::thread& thread : clients) thread.join();
+    check(unexpected == 0, "unexpected status under concurrent load");
+    std::size_t branches = 0;
+    for (const QString& project : projects) {
+        branches += static_cast<std::size_t>(client.call("GET", "/api/v1/projects/" + project + "/branches")
+                                                 .json.value("branches").toArray().size());
+        service.withRepository(project.toStdString(), [](native::Repository& repository) {
+            (void)repository.verifyRepository();
+        });
+    }
+    // Before the stress: A main/race/late, B main/side/imported/still, C main.
+    check(branches == 8U + created.load(), "branch count does not match successful creations");
+    std::cout << "  concurrent load: " << created.load() << " branches created, "
+              << busyAnswers.load() << " busy answers\n";
+}
+
 void exercise(aowis::native::PhysicalStore backend) {
     TemporaryRoot root;
     QString firstId;
@@ -1004,7 +1269,8 @@ void exerciseExecutable(const QString& executable) {
     // All addresses are served without a proxy policy: limits are enforced
     // by the server itself on every platform.
     const ServerRun anyAddress = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("0.0.0.0"),
-                                                        QStringLiteral("--worker-threads"), QStringLiteral("2")});
+                                                        QStringLiteral("--worker-threads"), QStringLiteral("2"),
+                                                        QStringLiteral("--max-pending-per-project"), QStringLiteral("2")});
     check(anyAddress.listened && anyAddress.exitCode == 0 && !anyAddress.diagnostics.contains("AOWIS database"),
           "non-loopback listener with 2 workers failed");
 
@@ -1012,7 +1278,11 @@ void exerciseExecutable(const QString& executable) {
         {QStringLiteral("--bind"), QStringLiteral("localhost")},
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("0")},
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("257")},
-        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--sync-max-mib"), QStringLiteral("0")}};
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--sync-max-mib"), QStringLiteral("0")},
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--max-pending-per-project"), QStringLiteral("0")},
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("4"),
+         QStringLiteral("--max-pending-per-project"), QStringLiteral("5")},
+        {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--max-pending-per-project"), QStringLiteral("x")}};
     for (const QStringList& arguments : invalid) {
         const ServerRun refused = runServer(executable, arguments);
         check(!refused.listened && refused.exitCode == 2, "invalid configuration was accepted");
@@ -1026,6 +1296,20 @@ void exerciseExecutable(const QString& executable) {
     const ServerRun fromIni = runServer(executable, {QStringLiteral("--config"),
                                                      QString::fromStdString(ini.string())});
     check(!fromIni.listened && fromIni.exitCode == 2, "invalid INI worker_threads accepted");
+    {
+        std::ofstream output(ini, std::ios::trunc);
+        output << "[server]\nbind=127.0.0.1\nworker_threads=2\nmax_pending_per_project=3\n";
+    }
+    const ServerRun pendingIni = runServer(executable, {QStringLiteral("--config"),
+                                                        QString::fromStdString(ini.string())});
+    check(!pendingIni.listened && pendingIni.exitCode == 2, "INI max_pending_per_project above workers accepted");
+    {
+        std::ofstream output(ini, std::ios::trunc);
+        output << "[server]\nbind=127.0.0.1\nworker_threads=4\nmax_pending_per_project=4\n";
+    }
+    const ServerRun validIni = runServer(executable, {QStringLiteral("--config"),
+                                                      QString::fromStdString(ini.string())});
+    check(validIni.listened && validIni.exitCode == 0, "valid INI max_pending_per_project refused");
 }
 } // namespace
 
@@ -1034,6 +1318,7 @@ int main(int argc, char** argv) {
     try {
         check(argc == 2, "expected path to aowis-server-db executable");
         exercise(aowis::native::PhysicalStore::Pack);
+        exerciseConcurrency();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
         return 0;

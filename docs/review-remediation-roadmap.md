@@ -24,7 +24,7 @@ Style findings about `auto` are out of scope by decision.
 | 4 | `aowis-db-custom-scratch-storage` | F6 scratch files on tmpfs | Medium | – | done |
 | 5 | `aowis-db-custom-httplib-server` | Replace QHttpServer (F5 on all Qt versions, streaming uploads) | Medium | 2, 3, 4 | done |
 | 6 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | done |
-| 7 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 5 | open |
+| 7 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 5 | done |
 | 8 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | open |
 | 9 | `aowis-db-custom-cleanup` | F12 tidy-ups | Low | – | open |
 
@@ -507,7 +507,49 @@ Tests and benchmark:
 
 ---
 
-## Phase 7: Concurrent service (Medium, needs Phase 5)
+## Phase 7: Concurrent service (Medium, needs Phase 5) — done
+
+Implemented in `aowis-db-custom-concurrent-service`:
+- `ProjectService`:
+  - the catalogue mutex guards only the project map and the "uncertain"
+    flag; it is never held while a repository opens or works;
+  - each project (`shared_ptr<Project>`) has its own open mutex (lazy open,
+    torn-tail log), its own operation mutex and a pending counter;
+  - `withRepository` and `createBranch` run under the project's operation
+    mutex; `head`, `history`, `revision`, `listBranches` and
+    `createScratchFile` take no operation lock (Repository serializes its own
+    calls);
+  - per-project queue: `ProjectService(root, maxPendingOperations = 4)`;
+    `reserveOperation()` returns a movable `Operation` place, a full queue is
+    `ProjectErrorKind::Busy`; `pendingOperations(id)` for tests/monitoring.
+- HTTP: `Busy` is 503 `busy` with `Retry-After: 1`. A bundle upload reserves
+  its place before reading the body, so a full project refuses the upload
+  without receiving it, and keeps the place through the import.
+- Server: `[server] max_pending_per_project` / `--max-pending-per-project`,
+  default half the workers (min 1), range 1..worker_threads (exit code 2
+  otherwise). One busy project can therefore never occupy every worker.
+- `/health` never touched the service; `/ready` and the catalogue routes now
+  only take the short catalogue lock.
+- Tests:
+  - new `aowis-native-project-concurrency-tests`: catalogue and other project
+    usable while a project operation is held (with a deadline instead of a
+    hang), single reads of the held project, per-project serialization, queue
+    limit and reservation semantics, 8-thread expected-head race (exactly one
+    commit), 8-thread same-name branch race, parallel imports into two
+    unopened projects plus full verify;
+  - `aowis-native-http-tests`: `/health` and `/ready` under 200 ms while a
+    project operation is held and during a real 4 MiB import into another
+    project; other project's writes succeed; full queue gives 503 + Retry-After,
+    also for an upload sent as headers only; racing branch creations and
+    racing hydraulic saves on one expected head give exactly one 201 and one
+    409; 8 clients x 30 mixed requests over three projects answer only
+    200/201/503 and branch counts match; executable rejects invalid
+    `max_pending_per_project` (CLI and INI).
+  - Six mutations (catalogue lock held during an operation, queue limit off,
+    operation mutex off, slot not released, Retry-After missing, upload
+    reserving only after its body) were each caught. ThreadSanitizer run of the service tests is clean.
+
+Original analysis:
 
 **F4. The service processes one request at a time.**
 Route handlers return synchronously on the main event-loop thread, and

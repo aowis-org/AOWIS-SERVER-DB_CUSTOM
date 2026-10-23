@@ -431,7 +431,8 @@ components:
       description: >-
         Every error is classified by the engine's StorageErrorKind, never by
         message text. Global mapping: invalid_request 400, not_found 404,
-        conflict 409, limit_exceeded 413, unavailable 503,
+        conflict 409, limit_exceeded 413, unavailable 503, busy 503 (project
+        queue full, with Retry-After),
         insufficient_storage 507, internal_error 500. 5xx responses carry a
         generic message only; details (corruption, I/O, paths) are written to
         the service log. Bundle routes use transfer-specific codes

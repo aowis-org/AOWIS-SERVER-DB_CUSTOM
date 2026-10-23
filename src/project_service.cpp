@@ -9,9 +9,11 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <sys/file.h>
 #include <unistd.h>
+#include <utility>
 
 namespace aowis::native {
 namespace {
@@ -208,9 +210,23 @@ bool ProjectService::validBranchName(std::string_view name) {
     return true;
 }
 
-ProjectService::ProjectService(std::filesystem::path root)
+ProjectService::Project::Project(ProjectInfo value) : info(std::move(value)) {}
+
+ProjectService::Operation::Operation(std::shared_ptr<Project> project) noexcept
+    : project_(std::move(project)) {}
+
+ProjectService::Operation::Operation(Operation&& other) noexcept
+    : project_(std::move(other.project_)) {}
+
+ProjectService::Operation::~Operation() {
+    if (this->project_) this->project_->pending.fetch_sub(1);
+}
+
+ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendingOperations)
     : root_(std::filesystem::absolute(std::move(root)).lexically_normal()),
-      projects_(this->root_ / "projects") {
+      projects_(this->root_ / "projects"), maxPending_(maxPendingOperations) {
+    if (this->maxPending_ == 0) throw ProjectError(ProjectErrorKind::InvalidInput,
+                                                    "at least one pending operation per project is required");
     std::filesystem::create_directories(this->projects_);
     // Persist the newly created projects/ entry before project publication.
     syncDirectory(this->root_);
@@ -232,8 +248,7 @@ ProjectService::ProjectService(std::filesystem::path root)
             if (id.starts_with(".creating-")) continue;
             check(validProjectId(id) && !entry.is_symlink() && entry.is_directory(),
                   "unexpected entry in project catalogue: " + entry.path().string());
-            ProjectInfo info = readManifest(entry.path());
-            this->entries_.emplace(id, Entry{std::move(info), nullptr});
+            this->entries_.emplace(id, std::make_shared<Project>(readManifest(entry.path())));
         }
     } catch (...) {
         ::flock(this->lockFd_, LOCK_UN);
@@ -251,9 +266,14 @@ ProjectService::~ProjectService() {
     }
 }
 
+// Called with the catalogue mutex held.
 void ProjectService::ensureHealthy() const {
     if (this->uncertain_) throw ProjectError(ProjectErrorKind::Unavailable,
         "catalogue publication status is uncertain; restart the database server");
+}
+
+std::size_t ProjectService::maxPendingOperations() const noexcept {
+    return this->maxPending_;
 }
 
 ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore storage) {
@@ -287,7 +307,7 @@ ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore s
                        "publish project directory");
         renamed = true;
         syncDirectory(this->projects_);
-        this->entries_.emplace(info.id, Entry{info, nullptr});
+        this->entries_.emplace(info.id, std::make_shared<Project>(info));
     } catch (...) {
         if (renamed) this->uncertain_ = true;
         else std::filesystem::remove_all(staging);
@@ -296,32 +316,34 @@ ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore s
     return info;
 }
 
-const ProjectService::Entry& ProjectService::findEntry(std::string_view id) const {
+std::shared_ptr<ProjectService::Project> ProjectService::findProject(std::string_view id) const {
     if (!validProjectId(id)) throw ProjectError(ProjectErrorKind::InvalidInput,
                                                 "invalid project UUID");
-    const std::map<std::string, Entry>::const_iterator it = this->entries_.find(std::string(id));
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    const std::map<std::string, std::shared_ptr<Project>>::const_iterator it =
+        this->entries_.find(std::string(id));
     if (it == this->entries_.end())
         throw ProjectError(ProjectErrorKind::NotFound, "project not found");
     return it->second;
 }
 
-ProjectService::Entry& ProjectService::repositoryEntry(std::string_view id) {
-    ensureHealthy();
-    findEntry(id);
-    Entry& entry = this->entries_.at(std::string(id));
-    if (!entry.repository) {
-        const std::filesystem::path directory = this->projects_ / entry.info.id / "repository";
+// Opening scans the pack tail and loads the index; only this project waits.
+std::shared_ptr<Repository> ProjectService::openRepository(Project& project) const {
+    std::lock_guard<std::mutex> guard(project.openMutex);
+    if (!project.repository) {
+        const std::filesystem::path directory = this->projects_ / project.info.id / "repository";
         check(!std::filesystem::is_symlink(directory) &&
               std::filesystem::is_directory(directory), "project repository directory is unavailable");
-        entry.repository = std::make_unique<Repository>(directory, entry.info.storage);
-        const std::uint64_t recovered = entry.repository->recoveredPackTailBytes();
+        project.repository = std::make_shared<Repository>(directory, project.info.storage);
+        const std::uint64_t recovered = project.repository->recoveredPackTailBytes();
         if (recovered != 0) {
-            std::cerr << "AOWIS database: project " << entry.info.id << " discarded "
+            std::cerr << "AOWIS database: project " << project.info.id << " discarded "
                       << recovered << " bytes of an unpublished torn pack tail; a copy is in "
                       << (directory / "recovered-pack-tails").string() << '\n';
         }
     }
-    return entry;
+    return project.repository;
 }
 
 std::vector<ProjectInfo> ProjectService::listProjects() const {
@@ -329,91 +351,113 @@ std::vector<ProjectInfo> ProjectService::listProjects() const {
     ensureHealthy();
     std::vector<ProjectInfo> result;
     result.reserve(this->entries_.size());
-    for (const std::pair<const std::string, Entry>& entry : this->entries_)
-        result.push_back(entry.second.info);
+    for (const std::pair<const std::string, std::shared_ptr<Project>>& entry : this->entries_)
+        result.push_back(entry.second->info);
     return result;
 }
 
 ProjectInfo ProjectService::project(std::string_view id) const {
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
-    return findEntry(id).info;
+    return findProject(id)->info;
 }
 
 std::vector<std::string> ProjectService::listBranches(std::string_view projectId) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
+    const std::shared_ptr<Project> found = findProject(projectId);
     return translated<std::vector<std::string>>([&]() {
-        return repositoryEntry(projectId).repository->listBranches();
+        return openRepository(*found)->listBranches();
     });
 }
 
 Revision ProjectService::createBranch(std::string_view projectId, std::string_view name,
                                       std::optional<std::string_view> fromBranch,
                                       std::optional<Hash> fromRevision) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
     if (!validBranchName(name) || (fromBranch && !validBranchName(*fromBranch)) ||
         (fromRevision && !fromBranch))
         throw ProjectError(ProjectErrorKind::InvalidInput,
                            "invalid branch name or revision source");
-    Repository& repository = *repositoryEntry(projectId).repository;
-    const std::vector<std::string> branches = repository.listBranches();
-    if (std::find(branches.begin(), branches.end(), std::string(name)) != branches.end()) {
-        throw ProjectError(ProjectErrorKind::Conflict, "branch already exists");
-    }
-    if (fromBranch && std::find(branches.begin(), branches.end(), *fromBranch) == branches.end())
-        throw ProjectError(ProjectErrorKind::NotFound, "source branch not found");
-    return translated<Revision>([&]() {
-        if (fromRevision) repository.createBranchAtRevision(name, *fromBranch, *fromRevision);
-        else repository.createBranch(name, fromBranch);
-        return repository.head(name);
+    Revision created;
+    // Check and creation form one operation of this project.
+    withRepository(projectId, [&](Repository& repository) {
+        const std::vector<std::string> branches = repository.listBranches();
+        if (std::find(branches.begin(), branches.end(), std::string(name)) != branches.end()) {
+            throw ProjectError(ProjectErrorKind::Conflict, "branch already exists");
+        }
+        if (fromBranch && std::find(branches.begin(), branches.end(), *fromBranch) == branches.end())
+            throw ProjectError(ProjectErrorKind::NotFound, "source branch not found");
+        created = translated<Revision>([&]() {
+            if (fromRevision) repository.createBranchAtRevision(name, *fromBranch, *fromRevision);
+            else repository.createBranch(name, fromBranch);
+            return repository.head(name);
+        });
     });
+    return created;
 }
 
 Revision ProjectService::head(std::string_view projectId, std::string_view branch) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
     if (!validBranchName(branch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
-    Repository& repository = *repositoryEntry(projectId).repository;
-    const std::vector<std::string> branches = repository.listBranches();
-    if (std::find(branches.begin(), branches.end(), branch) == branches.end())
-        throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
-    return translated<Revision>([&]() { return repository.head(branch); });
+    const std::shared_ptr<Project> found = findProject(projectId);
+    return translated<Revision>([&]() {
+        const std::shared_ptr<Repository> repository = openRepository(*found);
+        const std::vector<std::string> branches = repository->listBranches();
+        if (std::find(branches.begin(), branches.end(), branch) == branches.end())
+            throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
+        return repository->head(branch);
+    });
 }
 
 std::vector<Revision> ProjectService::history(std::string_view projectId,
                     std::string_view branch, std::size_t maxCount, std::optional<Hash> after) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
     if (!validBranchName(branch) || maxCount == 0 || maxCount > 1000)
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch or history limit");
-    Repository& repository = *repositoryEntry(projectId).repository;
-    const std::vector<std::string> branches = repository.listBranches();
-    if (std::find(branches.begin(), branches.end(), branch) == branches.end())
-        throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
+    const std::shared_ptr<Project> found = findProject(projectId);
     return translated<std::vector<Revision>>([&]() {
-        return repository.history(branch, maxCount, after);
+        const std::shared_ptr<Repository> repository = openRepository(*found);
+        const std::vector<std::string> branches = repository->listBranches();
+        if (std::find(branches.begin(), branches.end(), branch) == branches.end())
+            throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
+        return repository->history(branch, maxCount, after);
     });
 }
 
 Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    return translated<Revision>([&]() {
-        return repositoryEntry(projectId).repository->revision(id);
-    });
+    const std::shared_ptr<Project> found = findProject(projectId);
+    return translated<Revision>([&]() { return openRepository(*found)->revision(id); });
 }
 
-
 ScratchFile ProjectService::createScratchFile(std::string_view projectId) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    return translated<ScratchFile>([&]() {
-        return repositoryEntry(projectId).repository->createScratchFile();
-    });
+    const std::shared_ptr<Project> found = findProject(projectId);
+    return translated<ScratchFile>([&]() { return openRepository(*found)->createScratchFile(); });
+}
+
+ProjectService::Operation ProjectService::reserveOperation(std::string_view projectId) {
+    std::shared_ptr<Project> found = findProject(projectId);
+    if (found->pending.fetch_add(1) >= this->maxPending_) {
+        found->pending.fetch_sub(1);
+        throw ProjectError(ProjectErrorKind::Busy,
+                           "project has too many pending operations; retry later");
+    }
+    return Operation(std::move(found));
+}
+
+void ProjectService::withRepository(Operation& operation,
+                                    const std::function<void(Repository&)>& action) {
+    if (!operation.project_) throw ProjectError(ProjectErrorKind::InvalidInput,
+                                                "operation reservation was moved from");
+    const std::shared_ptr<Project> project = operation.project_;
+    std::lock_guard<std::mutex> guard(project->operationMutex);
+    const std::shared_ptr<Repository> repository =
+        translated<std::shared_ptr<Repository>>([&]() { return openRepository(*project); });
+    action(*repository);
 }
 
 void ProjectService::withRepository(std::string_view projectId,
                                     const std::function<void(Repository&)>& action) {
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    Repository& repository = *repositoryEntry(projectId).repository;
-    action(repository);
+    Operation operation = reserveOperation(projectId);
+    withRepository(operation, action);
+}
+
+std::size_t ProjectService::pendingOperations(std::string_view projectId) const {
+    return findProject(projectId)->pending.load();
 }
 
 } // namespace aowis::native

@@ -104,12 +104,15 @@ int main(int argc, char** argv) {
     const QCommandLineOption dataRoot({"d", "data-root"}, "Project data directory", "directory");
     const QCommandLineOption logFile("log-file", "Append server errors to a log file", "file");
     const QCommandLineOption workers("worker-threads", "HTTP worker threads (1..256)", "count");
+    const QCommandLineOption pending("max-pending-per-project",
+        "Operations per project that may wait or run (1..worker threads, default half of them)", "count");
     parser.addOption(config);
     parser.addOption(bind);
     parser.addOption(port);
     parser.addOption(dataRoot);
     parser.addOption(logFile);
     parser.addOption(workers);
+    parser.addOption(pending);
     const QCommandLineOption bundleMib("sync-max-mib", "Maximum transfer size in MiB (1..256)", "MiB");
     const QCommandLineOption bundleObjects("sync-max-objects", "Maximum objects in a bundle (1..1000000)", "count");
     const QCommandLineOption objectMib("sync-max-object-mib", "Maximum object size in MiB (1..64)", "MiB");
@@ -127,6 +130,8 @@ int main(int argc, char** argv) {
             settings.value("server/port", 8755).toString();
         const QString workerValue = parser.isSet(workers) ? parser.value(workers) :
             settings.value("server/worker_threads", 8).toString();
+        const QString pendingValue = parser.isSet(pending) ? parser.value(pending) :
+            settings.value("server/max_pending_per_project", "").toString();
         const QString rootValue = parser.isSet(dataRoot) ? parser.value(dataRoot) :
             settings.value("storage/root", "./aowis-db-data").toString();
         const QString storageValue = settings.value("storage/default_backend", "pack").toString();
@@ -167,10 +172,21 @@ int main(int argc, char** argv) {
                          "configuration\n";
             return 2;
         }
+        // One busy project may hold at most this many workers (waiting for its
+        // operation lock); the rest keep serving other projects and /health.
+        unsigned pendingLimit = workerCount > 1 ? workerCount / 2 : 1;
+        if (!pendingValue.isEmpty()) {
+            bool validPending = false;
+            pendingLimit = pendingValue.toUInt(&validPending);
+            if (!validPending || pendingLimit == 0 || pendingLimit > workerCount) {
+                std::cerr << "Invalid max_pending_per_project (1..worker_threads)\n";
+                return 2;
+            }
+        }
         // Default: errors go to stderr/journald. Optional file logging
         // redirects the C++ service diagnostics, restoring stderr on exit.
         ScopedErrorLog errorLog(logPath);
-        aowis::native::ProjectService service(rootValue.toStdString());
+        aowis::native::ProjectService service(rootValue.toStdString(), pendingLimit);
         httplib::Server server;
         // Fixed pool; at most 16 waiting connections per worker are queued,
         // further connections are closed instead of piling up.

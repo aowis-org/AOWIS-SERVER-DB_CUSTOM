@@ -63,7 +63,7 @@ portable bundle before upgrading, then import into a new pack repository.
 
 ## Concurrency and physical limits
 
-Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. Pack repositories permit coordinated concurrent handles; compaction requires exclusive repository lifetime ownership. The HTTP service manages repository handles centrally. The database and server are Linux/POSIX-oriented and not yet production hardened.
+Hydraulic read operations capture one immutable revision and resolve their entire network, membership or targeted entity query against it; multi-call clients can pass the same revision ID explicitly. Full-save/edit preparation also uses revision-pinned reads, with atomic expected-head publication protecting against concurrent writers. The code currently relies on repository-level locking rather than general multi-writer, fine-grained transactional concurrency. Pack repositories permit coordinated concurrent handles; compaction requires exclusive repository lifetime ownership. The HTTP service manages repository handles centrally, with one operation lock and a bounded operation queue per project; projects do not block each other. The database and server are Linux/POSIX-oriented and not yet production hardened.
 
 ## Replication independence
 
