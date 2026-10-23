@@ -54,6 +54,18 @@ void require(Err kind, bool condition, const std::string& message) {
     if (!condition) throw StorageError(kind, message);
 }
 
+// Bound export graph discovery, not merely the finished bundle. A duplicate
+// content hash does not consume a second slot (shared Merkle subtrees and
+// histories routinely point at the same immutable object).
+bool insertBundleObject(std::set<Hash>& objects, const Hash& hash, std::uint64_t maxObjects) {
+    const bool inserted = objects.insert(hash).second;
+    if (inserted) {
+        require(Err::LimitExceeded, maxObjects == 0 || objects.size() <= maxObjects,
+                "bundle transfer limit: object count exceeded");
+    }
+    return inserted;
+}
+
 // ENOSPC/EDQUOT become ResourceExhausted, every other errno Io.
 void systemCall(bool ok, const std::string& operation) {
     if (!ok) throwSystemError(operation);
@@ -3281,7 +3293,8 @@ void Repository::exportIncrementalBranchBundle(std::string_view branch,
 // where an insertion or deletion changed the trie shape, `before` is aligned
 // to the level of `after`. Skipping happens only for hashes proven present
 // in `before`, so a misaligned comparison costs bytes, never correctness.
-void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::set<Hash>& output) {
+void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::set<Hash>& output,
+                                  std::uint64_t maxObjects) {
     // No pruning at nodes already emitted for another revision: that walk
     // relied on ITS parent's tree, which may in turn rely on this one.
     if (isZero(after) || before == after) return;
@@ -3297,9 +3310,10 @@ void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::se
         old.reset();
     }
     if (aligned == after) return;
-    output.insert(after);
+    insertBundleObject(output, after, maxObjects);
     if (node.leaf) {
-        if (!old || !old->leaf || old->value != node.value) output.insert(node.value);
+        if (!old || !old->leaf || old->value != node.value)
+            insertBundleObject(output, node.value, maxObjects);
         return;
     }
     for (unsigned slot = 0; slot < 16; ++slot) {
@@ -3310,7 +3324,7 @@ void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::se
             const Key& oldPrefix = old->leaf ? old->key : old->prefix;
             if (nibble(oldPrefix, node.depth) == slot) oldChild = aligned;
         }
-        collectTreeDelta(oldChild, node.children[slot], output);
+        collectTreeDelta(oldChild, node.children[slot], output, maxObjects);
     }
 }
 
@@ -3321,7 +3335,8 @@ void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::se
 // The recipient holds the base's complete graph. Each new revision's walk is
 // complete relative to its chosen parent, so by induction over the ancestry
 // every object of a new revision is emitted or held by the recipient.
-std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base) {
+std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base,
+                                        std::uint64_t maxObjects) {
     std::unordered_set<Hash, HashHasher> known;
     std::vector<Hash> pending{base};
     while (!pending.empty()) {
@@ -3338,7 +3353,7 @@ std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base) {
         pending.pop_back();
         if (known.contains(current) || !visited.insert(current).second) continue;
         const Revision revision = readRevision(current);
-        output.insert(current);
+        insertBundleObject(output, current, maxObjects);
         // Prefer a parent the recipient already holds: its trees need no
         // transfer and the new revision's diff against it is the smallest.
         Revision parent{};
@@ -3346,8 +3361,8 @@ std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base) {
             if (known.contains(candidate)) { parent = readRevision(candidate); break; }
         }
         if (isZero(parent.id) && !revision.parents.empty()) parent = readRevision(revision.parents.front());
-        collectTreeDelta(parent.root, revision.root, output);
-        collectTreeDelta(parent.referencesRoot, revision.referencesRoot, output);
+        collectTreeDelta(parent.root, revision.root, output, maxObjects);
+        collectTreeDelta(parent.referencesRoot, revision.referencesRoot, output, maxObjects);
         for (const Hash& candidate : revision.parents) pending.push_back(candidate);
     }
     return output;
@@ -3368,7 +3383,7 @@ void Repository::exportBundleLocked(std::string_view branch,
         while (!pending.empty()) {
             const std::pair<Hash, Kind> entry = pending.back();
             pending.pop_back();
-            if (isZero(entry.first) || !objects.insert(entry.first).second) continue;
+            if (isZero(entry.first) || !insertBundleObject(objects, entry.first, limits.maxObjects)) continue;
             if (entry.second == Kind::Revision) {
                 const Revision revision = readRevision(entry.first);
                 pending.emplace_back(revision.root, Kind::Tree);
@@ -3397,12 +3412,12 @@ void Repository::exportBundleLocked(std::string_view branch,
         require(Err::Conflict, !isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
                 "incremental export base is not an ancestor of the source branch");
     }
-    const std::set<Hash> objects = recipientBase ? collectDelta(tip, *recipientBase)
+    const std::set<Hash> objects = recipientBase ? collectDelta(tip, *recipientBase, limits.maxObjects)
                                                  : collectObjects(tip);
     require(Err::InvalidInput, recipientBase.has_value() || !objects.empty(),
             "cannot export an empty revision graph");
-    require(Err::LimitExceeded, limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
-            "bundle transfer limit: object count exceeded");
+    // The count limit was enforced at each unique discovery, before opening
+    // any output file. No partial bundle can be published on rejection.
     int fd = targetFd;
     if (bundlePath != nullptr) {
         fd = ::open(bundlePath->c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);

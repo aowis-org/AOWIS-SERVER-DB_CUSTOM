@@ -405,8 +405,9 @@ private:
                           std::size_t limit);
     // Incremental export: objects reachable from `tip` but not held by a
     // recipient of `base`, collected per new revision by a trie delta.
-    std::set<Hash> collectDelta(const Hash& tip, const Hash& base);
-    void collectTreeDelta(const Hash& before, const Hash& after, std::set<Hash>& output);
+    std::set<Hash> collectDelta(const Hash& tip, const Hash& base, std::uint64_t maxObjects);
+    void collectTreeDelta(const Hash& before, const Hash& after, std::set<Hash>& output,
+                          std::uint64_t maxObjects);
     Revision commitLocked(std::string_view branch, const std::vector<Change>& changes,
                           std::optional<Hash> referencesRoot = std::nullopt,
                           std::optional<Hash> mergeParent = std::nullopt);

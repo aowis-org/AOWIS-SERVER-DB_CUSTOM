@@ -24,22 +24,22 @@ validator. `UpToDate` is explicitly a no-op, not a revalidation operation.
 Native, hydraulic and HTTP regression cases cover valid and invalid sources,
 stale head pins and equal-head merges. Keep this invariant in future changes.
 
-### 2. Make export limits effective during traversal
+### 2. Make export limits effective during traversal — implemented
 
-`Repository::exportBundleLocked` collects the reachable object set before it
-checks `BundleLimits::maxObjects`. Incremental export also maintains a growing
-set of visited or emitted hashes.
+`Repository::exportBundleLocked` now enforces `BundleLimits::maxObjects` as
+unique object hashes enter the full or incremental export set, **before**
+opening an output path or writing to a caller-owned descriptor. Shared Merkle
+objects and revisions count once. Exceeding the limit reports `LimitExceeded`
+without creating a partial output file or disturbing an existing destination.
 
-- Enforce the object limit as hashes are accepted into traversal, with a
-  distinct `LimitExceeded` result and no published partial bundle.
-- Test limits for full and incremental export, highly shared Merkle subtrees,
-  and repeated parent paths; verify that a failed export preserves its previous
-  destination and temporary files are cleaned up.
-- Measure peak RSS and elapsed time for a limit that rejects a very large
-  history early, not merely whether the error is returned eventually.
+`aowis-native-bundle-limit-tests` covers exact and over-limit exports,
+repeated payload objects, two-parent revision histories, both export variants,
+descriptor output safety, and successful imports of bounded bundles.
 
-**Exit criterion:** over-limit requests stop near the configured bound without
-first building the full reachable history.
+The limit caps objects **emitted**, not the pre-existing ancestry inspected to
+establish a valid incremental base. Full or incremental exports that succeed
+with an unlimited or very large object budget still construct the resulting
+sorted hash set in memory. Bounded-memory successful export remains Phase 4.
 
 ## P1 — Complete distributed version control
 

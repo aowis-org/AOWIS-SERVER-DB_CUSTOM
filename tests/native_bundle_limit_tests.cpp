@@ -1,10 +1,15 @@
 #include "aowis/native/native_store.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -14,6 +19,10 @@ using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::Repository;
+using aowis::native::StorageError;
+using aowis::native::StorageErrorKind;
+using aowis::native::MergeStatus;
+using aowis::native::Change;
 
 void check(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -23,7 +32,9 @@ template <class Callable>
 void rejectsLimit(Callable operation) {
     try {
         operation();
-    } catch (const std::runtime_error& error) {
+    } catch (const StorageError& error) {
+        check(error.kind() == StorageErrorKind::LimitExceeded,
+              "wrong error classification for transfer limit");
         check(std::string_view(error.what()).find("bundle transfer limit:") != std::string_view::npos,
               "wrong rejection reason for transfer limit");
         return;
@@ -47,6 +58,137 @@ public:
 private:
     std::filesystem::path root_;
 };
+
+// The object limit counts distinct SHA-256 object identities, not graph
+// edges. A tree shared between many revisions is counted only once.
+std::uint64_t bundleObjectCount(const std::filesystem::path& bundle) {
+    std::ifstream input(bundle, std::ios::binary);
+    check(input.good(), "cannot read bundle object count");
+    input.seekg(40);
+    std::uint64_t count = 0;
+    for (unsigned index = 0; index < 8; ++index) {
+        const int value = input.get();
+        check(value >= 0, "truncated bundle count header");
+        count = (count << 8U) | static_cast<std::uint8_t>(value);
+    }
+    return count;
+}
+
+std::vector<char> contents(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    check(input.good(), "cannot open bundle file");
+    return std::vector<char>(std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>());
+}
+
+Key testKey(unsigned sequence) {
+    Key result{};
+    result[12] = static_cast<std::uint8_t>(sequence >> 24U);
+    result[13] = static_cast<std::uint8_t>(sequence >> 16U);
+    result[14] = static_cast<std::uint8_t>(sequence >> 8U);
+    result[15] = static_cast<std::uint8_t>(sequence);
+    return result;
+}
+
+void testTraversalBounds() {
+    TemporaryRoot temporary;
+    Repository source(temporary.path() / "source");
+    Repository destination(temporary.path() / "destination");
+    source.createBranch("main");
+    // Repeat a value across keys and revisions to exercise hash sharing.
+    const Bytes repeated(180, 0x57);
+    (void)source.commit("main", {{testKey(1), repeated}});
+    const Hash base = source.head("main").id;
+    const std::filesystem::path basePath = temporary.path() / "base.bundle";
+    source.exportBranchBundle("main", basePath);
+    check(destination.importBranchBundle(basePath, "main").head == base,
+          "failed to seed incremental recipient");
+
+    source.createBranch("side", "main");
+    for (unsigned index = 2; index < 16; ++index) {
+        (void)source.commit("main", {{testKey(index), repeated}});
+    }
+    for (unsigned index = 40; index < 46; ++index) {
+        (void)source.commit("side", {{testKey(index), repeated}});
+    }
+    check(source.mergeBranches("main", "side").status == MergeStatus::Merged,
+          "fixture did not create a two-parent merge history");
+    const Hash tip = source.head("main").id;
+    const std::filesystem::path full = temporary.path() / "full.bundle";
+    const std::filesystem::path delta = temporary.path() / "delta.bundle";
+    source.exportBranchBundle("main", full);
+    source.exportIncrementalBranchBundle("main", base, delta);
+    const std::uint64_t fullCount = bundleObjectCount(full);
+    const std::uint64_t deltaCount = bundleObjectCount(delta);
+    check(fullCount > deltaCount && deltaCount > 1, "invalid shared-history fixture");
+
+    // Exactly the number of unique objects must succeed. A one-object-smaller
+    // limit must reject BEFORE a path or an empty descriptor is opened.
+    const std::filesystem::path boundedFull = temporary.path() / "bounded-full.bundle";
+    source.exportBranchBundle("main", boundedFull, BundleLimits{0, fullCount, 0});
+    check(contents(boundedFull) == contents(full), "exact-bound full export differs");
+    const std::filesystem::path boundedDelta = temporary.path() / "bounded-delta.bundle";
+    source.exportIncrementalBranchBundle("main", base, boundedDelta,
+                                         BundleLimits{0, deltaCount, 0});
+    check(contents(boundedDelta) == contents(delta), "exact-bound incremental export differs");
+
+    const std::filesystem::path overFull = temporary.path() / "over-full.bundle";
+    rejectsLimit([&] {
+        source.exportBranchBundle("main", overFull, BundleLimits{0, fullCount - 1, 0});
+    });
+    check(!std::filesystem::exists(overFull), "rejected full export left output");
+    const std::filesystem::path overDelta = temporary.path() / "over-delta.bundle";
+    rejectsLimit([&] {
+        source.exportIncrementalBranchBundle("main", base, overDelta,
+                                             BundleLimits{0, deltaCount - 1, 0});
+    });
+    check(!std::filesystem::exists(overDelta), "rejected incremental export left output");
+
+    // Do not replace a caller's existing file when the object count is too big.
+    const std::filesystem::path existing = temporary.path() / "existing.bundle";
+    {
+        std::ofstream output(existing, std::ios::binary);
+        output << "keep original contents";
+    }
+    const std::vector<char> previous = contents(existing);
+    rejectsLimit([&] {
+        source.exportBranchBundle("main", existing, BundleLimits{0, 1, 0});
+    });
+    check(contents(existing) == previous, "failed export replaced existing file");
+
+    // Both descriptor variants leave caller-owned regular files empty on
+    // an object-count rejection. The descriptors remain open and reusable.
+    for (unsigned incremental = 0; incremental < 2; ++incremental) {
+        const std::filesystem::path target = temporary.path() /
+            (incremental ? "incremental-fd.bundle" : "full-fd.bundle");
+        const int fd = ::open(target.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        check(fd >= 0, "cannot create descriptor export fixture");
+        try {
+            rejectsLimit([&] {
+                if (incremental) {
+                    source.exportIncrementalBranchBundle("main", base, fd, BundleLimits{0, 1, 0});
+                } else {
+                    source.exportBranchBundle("main", fd, BundleLimits{0, 1, 0});
+                }
+            });
+            struct stat metadata{};
+            check(::fstat(fd, &metadata) == 0 && metadata.st_size == 0,
+                  "object-limited descriptor export wrote data");
+        } catch (...) {
+            ::close(fd);
+            throw;
+        }
+        check(::close(fd) == 0, "close descriptor export fixture");
+    }
+
+    check(destination.importBranchBundle(boundedDelta, "main").head == tip,
+          "exact-bound incremental export failed to import");
+    (void)destination.verifyRepository();
+    Repository independent(temporary.path() / "independent");
+    check(independent.importBranchBundle(boundedFull, "main").head == tip,
+          "exact-bound full export failed to import");
+    (void)independent.verifyRepository();
+}
 
 void exercise() {
     TemporaryRoot temporary;
@@ -107,6 +249,7 @@ void exercise() {
 int main() {
     try {
         exercise();
+        testTraversalBounds();
         std::cout << "AOWIS native bundle limit tests: passed\n";
         return 0;
     } catch (const std::exception& error) {
