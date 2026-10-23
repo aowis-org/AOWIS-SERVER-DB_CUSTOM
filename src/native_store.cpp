@@ -1805,10 +1805,12 @@ void Repository::scanPackTail() {
     while (position < size) {
         const std::optional<PackRecord> record = validPackRecord(this->packFd_, position, size);
         if (!record) break;
-        this->index_[record->hash] = Location{position + headerSize, record->payloadSize};
+        
         const std::array<std::uint8_t, indexEntrySize> entry =
             encodeIndexEntry(record->hash, position + headerSize, record->payloadSize);
+        const std::uint64_t entryPosition = this->indexReadOffset_ + this->pendingIndex_.size();
         this->pendingIndex_.insert(this->pendingIndex_.end(), entry.begin(), entry.end());
+        indexEntry(record->hash, entryPosition);
         position += headerSize + record->payloadSize;
     }
     const bool truncated = position != size;
@@ -1841,7 +1843,7 @@ void Repository::discardTornPackTail(std::uint64_t position, std::uint64_t size)
         Hash head{};
         try { head = branchHead(name); }
         catch (const std::exception&) { continue; } // temporary or malformed refs
-        require(Err::Corruption, this->index_.contains(head),
+        require(Err::Corruption, containsIndex(head),
                 "branch '" + name + "' references content inside the damaged pack tail at offset " +
                 std::to_string(position) + "; refusing automatic repair (restore from backup)");
     }
@@ -1930,11 +1932,133 @@ std::uint64_t Repository::removeStalePackGenerations() {
     return static_cast<std::uint64_t>(stale.size());
 }
 
+// The physical lookup accelerator only stores 8 bytes per occupied slot.
+// Values in the checksummed sidecar remain authoritative: a fingerprint match
+// always reads and compares the entire SHA-256 hash. A zero ordinal marks an
+// empty slot; no tombstones are needed because removal rebuilds the index.
+std::uint32_t Repository::indexFingerprint(const Hash& hash) const noexcept {
+    std::uint64_t value = 14695981039346656037ULL;
+    for (std::uint8_t byte : hash) value = (value ^ byte) * 1099511628211ULL;
+    return static_cast<std::uint32_t>(value ^ (value >> 32U));
+}
+
+void Repository::reserveIndexEntries(std::uint64_t entries) {
+    require(Err::LimitExceeded, entries <= std::numeric_limits<std::uint32_t>::max(),
+            "physical index exceeds 32-bit sidecar ordinal capacity");
+    // Keep load <= 70%, including before inserting the next entry.
+    const std::uint64_t required = (entries * 10U) / 7U + 2U;
+    std::size_t capacity = this->indexSlots_.empty() ? 16U : this->indexSlots_.size();
+    while (static_cast<std::uint64_t>(capacity) < required) {
+        require(Err::LimitExceeded, capacity <= std::numeric_limits<std::size_t>::max() / 2U,
+                "physical index capacity overflow");
+        capacity *= 2U;
+    }
+    if (capacity == this->indexSlots_.size()) return;
+    std::vector<std::uint64_t> slots(capacity, 0);
+    for (std::uint64_t value : this->indexSlots_) {
+        if (value == 0) continue;
+        std::size_t bucket = static_cast<std::size_t>(value >> 32U) & (capacity - 1U);
+        while (slots[bucket] != 0) bucket = (bucket + 1U) & (capacity - 1U);
+        slots[bucket] = value;
+    }
+    this->indexSlots_.swap(slots);
+}
+
+void Repository::clearIndex() noexcept {
+    this->indexSlots_.clear();
+    this->indexCache_.clear();
+    this->indexCount_ = 0;
+}
+
+void Repository::readIndexedEntry(std::uint32_t ordinal, std::uint8_t* destination) const {
+    require(Err::Corruption, ordinal != 0, "invalid empty sidecar ordinal");
+    const std::uint64_t position = indexHeaderSize +
+        (static_cast<std::uint64_t>(ordinal) - 1U) * indexEntrySize;
+    if (position < this->indexReadOffset_) {
+        readExact(this->indexFd_, destination, indexEntrySize, position);
+    } else {
+        const std::uint64_t offset = position - this->indexReadOffset_;
+        require(Err::Corruption, offset <= this->pendingIndex_.size() &&
+                indexEntrySize <= this->pendingIndex_.size() - offset,
+                "physical index points outside pending sidecar entries");
+        std::copy_n(this->pendingIndex_.data() + static_cast<std::size_t>(offset),
+                    indexEntrySize, destination);
+    }
+    require(Err::Corruption, indexChecksum(destination) == readU32(destination + 48),
+            "physical index sidecar entry checksum mismatch");
+}
+
+Hash Repository::indexedHash(std::uint32_t ordinal) const {
+    std::array<std::uint8_t, indexEntrySize> entry{};
+    readIndexedEntry(ordinal, entry.data());
+    Hash hash{};
+    std::copy_n(entry.begin(), hash.size(), hash.begin());
+    return hash;
+}
+
+std::optional<Repository::Location> Repository::indexLocation(const Hash& hash) const {
+    if (this->indexSlots_.empty()) return std::nullopt;
+    const std::uint32_t fingerprint = indexFingerprint(hash);
+    if (!this->indexCache_.empty()) {
+        const CachedIndexEntry& cached = this->indexCache_[fingerprint & 4095U];
+        if (cached.location.offset != 0 && cached.hash == hash) return cached.location;
+    }
+    std::size_t bucket = static_cast<std::size_t>(fingerprint) & (this->indexSlots_.size() - 1U);
+    while (this->indexSlots_[bucket] != 0) {
+        const std::uint64_t value = this->indexSlots_[bucket];
+        if (static_cast<std::uint32_t>(value >> 32U) == fingerprint) {
+            std::array<std::uint8_t, indexEntrySize> entry{};
+            readIndexedEntry(static_cast<std::uint32_t>(value), entry.data());
+            if (std::equal(hash.begin(), hash.end(), entry.begin())) {
+                const Location location{readU64(entry.data() + 32), readU64(entry.data() + 40)};
+                if (this->indexCache_.empty()) this->indexCache_.resize(4096);
+                CachedIndexEntry& cached = this->indexCache_[fingerprint & 4095U];
+                cached.hash = hash;
+                cached.location = location;
+                return location;
+            }
+        }
+        bucket = (bucket + 1U) & (this->indexSlots_.size() - 1U);
+    }
+    return std::nullopt;
+}
+
+bool Repository::containsIndex(const Hash& hash) const {
+    return indexLocation(hash).has_value();
+}
+
+void Repository::indexEntry(const Hash& hash, std::uint64_t position) {
+    require(Err::Corruption, position >= indexHeaderSize &&
+            (position - indexHeaderSize) % indexEntrySize == 0,
+            "misaligned sidecar entry location");
+    const std::uint64_t ordinal = (position - indexHeaderSize) / indexEntrySize + 1U;
+    require(Err::LimitExceeded, ordinal <= std::numeric_limits<std::uint32_t>::max(),
+            "physical index exceeds 32-bit sidecar ordinal capacity");
+    reserveIndexEntries(this->indexCount_ + 1U);
+    const std::uint32_t fingerprint = indexFingerprint(hash);
+    std::size_t bucket = static_cast<std::size_t>(fingerprint) & (this->indexSlots_.size() - 1U);
+    while (this->indexSlots_[bucket] != 0) {
+        const std::uint64_t value = this->indexSlots_[bucket];
+        if (static_cast<std::uint32_t>(value >> 32U) == fingerprint &&
+            indexedHash(static_cast<std::uint32_t>(value)) == hash) {
+            this->indexSlots_[bucket] = (static_cast<std::uint64_t>(fingerprint) << 32U) | ordinal;
+            if (!this->indexCache_.empty()) {
+                CachedIndexEntry& cached = this->indexCache_[fingerprint & 4095U];
+                if (cached.hash == hash) cached.location.offset = 0;
+            }
+            return;
+        }
+        bucket = (bucket + 1U) & (this->indexSlots_.size() - 1U);
+    }
+    this->indexSlots_[bucket] = (static_cast<std::uint64_t>(fingerprint) << 32U) | ordinal;
+    ++this->indexCount_;
+}
+
 // The sidecar is derived data. If missing, torn, or internally inconsistent,
 // rebuild it from cryptographically verified pack records without changing
 // any model, tree, or revision hash.
 void Repository::rebuildIndex() {
-    this->index_.clear();
+    clearIndex();
     this->pendingIndex_.clear();
     this->scanOffset_ = 0;
     this->indexReadOffset_ = indexHeaderSize;
@@ -1974,6 +2098,7 @@ void Repository::refreshIndex() {
     std::array<std::uint8_t, entriesPerRead * indexEntrySize> buffer{};
     std::uint64_t position = this->indexReadOffset_;
     std::uint64_t coveredPack = this->scanOffset_;
+    reserveIndexEntries(this->indexCount_ + (indexBytes - position) / indexEntrySize);
     bool damagedIndex = false;
     while (indexBytes - position >= indexEntrySize) {
         const std::size_t count = static_cast<std::size_t>(
@@ -1992,7 +2117,8 @@ void Repository::refreshIndex() {
             Hash hash{};
             std::copy_n(entry, hash.size(), hash.begin());
             if (isZero(hash)) { damagedIndex = true; break; }
-            this->index_[hash] = Location{offset, length};
+            this->indexReadOffset_ = position + (i + 1U) * indexEntrySize;
+            indexEntry(hash, position + i * indexEntrySize);
             coveredPack = offset + length;
         }
         if (damagedIndex) break;
@@ -2016,10 +2142,10 @@ void Repository::refreshIndex() {
 
 Bytes Repository::load(const Hash& hash) {
     require(Err::Corruption, !isZero(hash), "attempted to load empty tree hash");
-    std::unordered_map<Hash, Location, HashHasher>::const_iterator it = this->index_.find(hash);
-    require(Err::Corruption, it != this->index_.end(), "referenced content is missing from pack");
-    Bytes payload(static_cast<std::size_t>(it->second.size));
-    if (!payload.empty()) readExact(this->packFd_, payload.data(), payload.size(), it->second.offset);
+    const std::optional<Location> location = indexLocation(hash);
+    require(Err::Corruption, location.has_value(), "referenced content is missing from pack");
+    Bytes payload(static_cast<std::size_t>(location->size));
+    if (!payload.empty()) readExact(this->packFd_, payload.data(), payload.size(), location->offset);
     require(Err::Corruption, sha256(payload) == hash, "content checksum mismatch during read");
     return payload;
 }
@@ -2027,7 +2153,7 @@ Bytes Repository::load(const Hash& hash) {
 Hash Repository::store(const Bytes& bytes) {
     require(Err::LimitExceeded, bytes.size() <= maxObjectBytes, "content object exceeds size limit");
     Hash hash = sha256(bytes);
-    if (this->index_.contains(hash)) return hash;
+    if (containsIndex(hash)) return hash;
     std::array<std::uint8_t, headerSize> header{};
     header[0] = 'A'; header[1] = 'O'; header[2] = 'B'; header[3] = 'J'; header[4] = 1;
     std::copy(hash.begin(), hash.end(), header.begin() + 5);
@@ -2042,10 +2168,11 @@ Hash Repository::store(const Bytes& bytes) {
         writeExact(this->packFd_, bytes.data(), bytes.size(), offset + headerSize);
     }
     detail::faultCheckpoint("pack.after.body");
-    this->index_.emplace(hash, Location{offset + headerSize, bytes.size()});
     const std::array<std::uint8_t, indexEntrySize> entry =
         encodeIndexEntry(hash, offset + headerSize, bytes.size());
+    const std::uint64_t entryPosition = this->indexReadOffset_ + this->pendingIndex_.size();
     this->pendingIndex_.insert(this->pendingIndex_.end(), entry.begin(), entry.end());
+    indexEntry(hash, entryPosition);
     this->scanOffset_ += headerSize + bytes.size();
     return hash;
 }
@@ -2505,7 +2632,7 @@ Revision Repository::revision(const Hash& revisionId) {
 // corruption; a checksum failure of an existing object remains Corruption.
 Revision Repository::clientRevision(const Hash& revisionId) {
     require(Err::InvalidInput, !isZero(revisionId), "zero revision hash is invalid");
-    require(Err::NotFound, this->index_.contains(revisionId), "revision not found");
+    require(Err::NotFound, containsIndex(revisionId), "revision not found");
     const Bytes payload = load(revisionId);
     require(Err::NotFound, payload.size() >= 67 && payload[0] == 'S' && payload[65] <= 1 &&
                 payload[66] <= 2 && payload.size() == 67U + 32U * payload[66],
@@ -3380,14 +3507,13 @@ void Repository::verifyPackLocked() {
             readExact(this->packFd_, payload.data(), payload.size(), position + headerSize);
         }
         require(Err::Corruption, sha256(payload) == expected, "content pack checksum mismatch");
-        const std::unordered_map<Hash, Location, HashHasher>::const_iterator entry =
-            this->index_.find(expected);
-        require(Err::Corruption, entry != this->index_.end() && entry->second.offset == position + headerSize &&
-                entry->second.size == length, "index differs from content pack");
+        const std::optional<Location> entry = indexLocation(expected);
+        require(Err::Corruption, entry.has_value() && entry->offset == position + headerSize &&
+                entry->size == length, "index differs from content pack");
         ++checked;
         position += headerSize + length;
     }
-    require(Err::Corruption, position == this->scanOffset_ && checked == this->index_.size(),
+    require(Err::Corruption, position == this->scanOffset_ && checked == this->indexCount_,
             "pack verification found inconsistent object count");
 }
 
@@ -3433,7 +3559,7 @@ VerificationReport Repository::verifyRepository() {
     result.reachableObjects = graph.reachableObjects;
     result.treeNodes = graph.treeNodes;
     result.modelSnapshots = graph.modelSnapshots;
-    result.physicalObjects = static_cast<std::uint64_t>(this->index_.size());
+    result.physicalObjects = static_cast<std::uint64_t>(this->indexCount_);
     return result;
 }
 
@@ -3441,7 +3567,7 @@ std::uint64_t Repository::objectCount() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    return static_cast<std::uint64_t>(this->index_.size());
+    return static_cast<std::uint64_t>(this->indexCount_);
 }
 
 std::uint64_t Repository::packSize() {
@@ -3744,7 +3870,7 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
         if (incremental) {
             readExact(fd, recipientBase.data(), recipientBase.size(), bundleHeaderBytes);
             require(Err::InvalidInput, !isZero(recipientBase), "incremental bundle has zero base revision");
-            const bool known = this->index_.contains(recipientBase);
+            const bool known = containsIndex(recipientBase);
             require(Err::Conflict, known, "incremental bundle base revision is missing locally");
             (void)readRevision(recipientBase); // Must be a real revision, not another object.
         }
@@ -3788,7 +3914,7 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
         }
         const ImportClock::time_point graphStart = ImportClock::now();
         const auto containsLocally = [&](const Hash& hash) {
-            return this->index_.contains(hash);
+            return containsIndex(hash);
         };
         require(Err::InvalidInput, entries.find(incoming).has_value() ||
                     (incremental && containsLocally(incoming)),
@@ -3932,7 +4058,7 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
             previousHead = branchHead(localBranch);
             if (previousHead == incoming ||
                 // A previous import may already have advanced past this tip.
-                (this->index_.contains(incoming) &&
+                (containsIndex(incoming) &&
                  revisionReachableFrom(previousHead, incoming))) {
                 status = BundleImportStatus::UpToDate;
             } else {
@@ -3954,7 +4080,7 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
         std::uint64_t imported = 0;
         for (std::size_t index = 0; index < entries.size(); ++index) {
             const std::pair<Hash, BundleLocation> entry = entries.at(index);
-            const bool present = this->index_.contains(entry.first);
+            const bool present = containsIndex(entry.first);
             if (present) continue;
             Bytes payload = bundleObject(entry.first);
             require(Err::Internal, store(std::move(payload)) == entry.first,
@@ -3985,7 +4111,7 @@ CompactionStats Repository::compact() {
 
     CompactionStats stats{};
     stats.staleFilesRemoved = removeStalePackGenerations();
-    stats.objectsBefore = static_cast<std::uint64_t>(this->index_.size());
+    stats.objectsBefore = static_cast<std::uint64_t>(this->indexCount_);
     stats.packBytesBefore = this->scanOffset_;
     struct stat oldIndex{};
     systemCall(::fstat(this->indexFd_, &oldIndex) == 0, "stat content index");
@@ -4074,11 +4200,10 @@ CompactionStats Repository::compact() {
             Hash hash{};
             std::copy_n(header.begin() + 5, 32, hash.begin());
             if (reachable.contains(hash)) {
-                const std::unordered_map<Hash, Location, HashHasher>::const_iterator entry =
-                    this->index_.find(hash);
-                require(Err::Corruption, entry != this->index_.end() &&
-                        entry->second.offset == oldPosition + headerSize &&
-                        entry->second.size == size, "pack and index mismatch during compaction");
+                const std::optional<Location> entry = indexLocation(hash);
+                require(Err::Corruption, entry.has_value() &&
+                        entry->offset == oldPosition + headerSize &&
+                        entry->size == size, "pack and index mismatch during compaction");
                 const Bytes payload = load(hash); // verify SHA-256 before copying
                 writeExact(newPackFd, header.data(), header.size(), newPosition);
                 if (!payload.empty()) {
@@ -4129,7 +4254,7 @@ CompactionStats Repository::compact() {
         newPackFd = -1;
         newIndexFd = -1;
         this->packToken_ = nextToken;
-        this->index_.clear();
+        clearIndex();
         this->pendingIndex_.clear();
         this->scanOffset_ = 0;
         this->indexReadOffset_ = 0;

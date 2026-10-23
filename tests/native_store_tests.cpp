@@ -11,6 +11,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace {
@@ -1431,12 +1432,62 @@ void testFastForwardSemanticPreflight() {
            "untyped fast-forward silently bypassed model validation");
 }
 
+// Fingerprints are only probes: distinct complete SHA-256 hashes must never
+// alias even when their compact in-RAM index signatures collide.
+void testPhysicalIndexFingerprintCollision() {
+    TemporaryRepo test("compact-index-collision");
+    std::unordered_map<std::uint32_t, std::string> observed;
+    std::string first;
+    std::string second;
+    for (std::uint64_t attempt = 0; attempt < 1000000; ++attempt) {
+        const std::string payload = "fingerprint-collision-" + std::to_string(attempt);
+        const Hash hash = aowis::native::sha256(value(payload));
+        std::uint64_t fingerprint64 = 14695981039346656037ULL;
+        for (std::uint8_t byte : hash) {
+            fingerprint64 = (fingerprint64 ^ byte) * 1099511628211ULL;
+        }
+        const std::uint32_t fingerprint =
+            static_cast<std::uint32_t>(fingerprint64 ^ (fingerprint64 >> 32U));
+        const std::pair<std::unordered_map<std::uint32_t, std::string>::iterator, bool> result =
+            observed.emplace(fingerprint, payload);
+        if (!result.second) {
+            first = result.first->second;
+            second = payload;
+            break;
+        }
+    }
+    expect(!first.empty() && !second.empty() && first != second,
+           "deterministic fingerprint collision not found");
+    {
+        Repository repository(test.directory);
+        repository.createBranch("main");
+        repository.commit("main", {{key(1), value(first)}, {key(2), value(second)}});
+        expect(repository.get("main", key(1)) == value(first), "first colliding hash unavailable");
+        expect(repository.get("main", key(2)) == value(second), "second colliding hash unavailable");
+        repository.verifyPack();
+    }
+    {
+        Repository repository(test.directory);
+        expect(repository.get("main", key(1)) == value(first), "reopen lost first colliding hash");
+        expect(repository.get("main", key(2)) == value(second), "reopen lost second colliding hash");
+        repository.verifyPack();
+    }
+    std::filesystem::remove(test.directory / "objects.idx");
+    {
+        Repository repository(test.directory);
+        expect(repository.get("main", key(1)) == value(first), "rebuild lost first colliding hash");
+        expect(repository.get("main", key(2)) == value(second), "rebuild lost second colliding hash");
+        repository.verifyPack();
+    }
+}
+
 int main() {
     try {
         testEmptyAndBranches();
         testCompressedTreeAndNoOp();
         testRecoveryAndCorruption();
         testPersistentPackIndex();
+        testPhysicalIndexFingerprintCollision();
         testCompactionAndRetainedHistory();
         testCompactionRequiresExclusiveLifetime();
         testMixedEditsAgainstReference();

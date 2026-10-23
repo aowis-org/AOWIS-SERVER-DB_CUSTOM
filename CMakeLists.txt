@@ -39,6 +39,9 @@ target_link_libraries(aowis-native-verify PRIVATE aowis-native-store)
 add_executable(aowis-native-compact tools/native_compact.cpp)
 target_link_libraries(aowis-native-compact PRIVATE aowis-native-store)
 
+add_executable(aowis-native-index-scaling-benchmark benchmarks/native_index_scaling_benchmark.cpp)
+target_link_libraries(aowis-native-index-scaling-benchmark PRIVATE aowis-native-store)
+
 add_executable(aowis-native-benchmark benchmarks/native_benchmark.cpp)
 target_link_libraries(aowis-native-benchmark PRIVATE aowis-native-store)
 
@@ -54,6 +57,11 @@ target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME aowis-native-index-scaling-smoke
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_native_index.py"
+            --binary "$<TARGET_FILE:aowis-native-index-scaling-benchmark>" --smoke)
+    set_tests_properties(aowis-native-index-scaling-smoke PROPERTIES LABELS "aowis")
     # Packaging must include the working-tree files of every Git submodule,
     # including recursive submodules. The test creates disposable Git repos.
     find_program(AOWIS_TEST_GIT_EXECUTABLE git)
@@ -190,7 +198,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

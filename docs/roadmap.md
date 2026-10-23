@@ -74,23 +74,40 @@ quota enforcement, and failure recovery on the supported production filesystems.
 
 ## P2 — Capacity and service operations
 
-### 5. Measure, then optimize physical object lookup
+### 5. Compact physical object lookup — implemented, scale verification pending
 
-The physical SHA-256-to-pack-location `unordered_map` remains RAM-resident,
-including entries for unreachable objects until offline compaction.
+The Release baseline measured on the developer machine (October 23, 2026)
+showed 101,387 / 1,001,959 / 10,001,723 physical objects using approximately
+8.4 / 72.8 / 703.5 MiB extra RSS on open and 49.5 / 690 / 8,612 ms to
+reconstruct the old in-memory `unordered_map`. Two 10m-object repositories
+reached approximately 1.38 GiB RSS (1.48 GB). See [benchmark-plan.md](benchmark-plan.md)
+for the repeatable benchmarking procedure.
 
-- Benchmark 100k, 1m and 10m physical objects: fresh open/index-rebuild time,
-  peak RSS, read latency, commit throughput, compaction time, and multiple
-  concurrently open project repositories.
-- If results miss agreed budgets, introduce a disk-backed searchable index plus
-  bounded cache or a similarly measured alternative; retain the append-only
-  pack as the **only** physical storage format.
-- Exercise index rebuild after deletion/corruption, sparse and dense object
-  distribution, cold cache and long-lived handles.
+The physical lookup accelerator now stores 8-byte open-addressed slots
+(32-bit FNV-derived hash fingerprint plus a 32-bit ordinal referencing the
+existing checksummed `objects.idx`). A fingerprint match **must** compare the
+full SHA-256 hash in the sidecar before using its pack offset. A small 4096-slot
+direct-mapped hot-object cache reduces repeated sidecar reads. The append-only
+pack, sidecar encoding, revision IDs, and replication format are unchanged.
+`pread` is used for random sidecar reads, so the index does not mmap the full
+sidecar into process RSS. Rebuilding a lost/corrupt derived sidecar still
+verifies the pack. This accelerator currently supports at most 2^32-1
+physical sidecar entries per generation; that bound must be revisited before
+exceeding it.
 
-**Exit criterion:** recorded performance budgets and a reproducible benchmark;
-any new lookup design must improve meaningful workloads without compromising
-recovery or format compatibility.
+- Repeat the identical 100k/1m/10m **Release** matrix with the compact index
+  and publish before/after RSS, reopen, lookup, commit, compaction, sidecar
+  rebuild, and simultaneous-project figures.
+- Test cold-cache/random lookups, hash fingerprint collisions, corrupt and
+  truncated sidecars, crashes during partial publication, and long-lived
+  cross-process repository handles.
+- Profile the optional bounded cache; increase it only with evidence, not
+  by making the physical index memory proportional to pack size again.
+
+**Remaining exit criterion:** establish and meet a documented large-scale
+memory/latency budget on the deployed storage hardware, with operational and
+corruption recovery verified. This remains open until the Release rerun and
+fault matrix have completed.
 
 ### 6. Operational resource bounds and maintenance
 

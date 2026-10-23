@@ -358,13 +358,30 @@ private:
     struct HashHasher {
         std::size_t operator()(const Hash& hash) const noexcept {
             std::uint64_t value = 14695981039346656037ULL;
-            for (std::uint8_t byte : hash) {
-                value = (value ^ byte) * 1099511628211ULL;
-            }
+            for (std::uint8_t byte : hash) value = (value ^ byte) * 1099511628211ULL;
             return static_cast<std::size_t>(value);
         }
     };
-    std::unordered_map<Hash, Location, HashHasher> index_;
+    // Compact volatile accelerator over the checksummed append-only sidecar.
+    // Each slot is [32-bit hash fingerprint | 32-bit 1-based entry ordinal].
+    // Full SHA-256 equality and pack locations are read from objects.idx on
+    // fingerprint matches. No alternative physical storage format is created.
+    std::vector<std::uint64_t> indexSlots_;
+    std::uint64_t indexCount_ = 0;
+    struct CachedIndexEntry {
+        Hash hash{};
+        Location location{};
+    };
+    // Bounded direct-mapped hot-object cache; lookups remain correct without it.
+    mutable std::vector<CachedIndexEntry> indexCache_;
+    std::uint32_t indexFingerprint(const Hash& hash) const noexcept;
+    void reserveIndexEntries(std::uint64_t entries);
+    void indexEntry(const Hash& hash, std::uint64_t position);
+    std::optional<Location> indexLocation(const Hash& hash) const;
+    Hash indexedHash(std::uint32_t ordinal) const;
+    void readIndexedEntry(std::uint32_t ordinal, std::uint8_t* destination) const;
+    void clearIndex() noexcept;
+    bool containsIndex(const Hash& hash) const;
     std::uint64_t scanOffset_ = 0;
     std::uint64_t indexReadOffset_ = 0;
     bool needsReopen_ = false; // fatal failure after publishing a compaction pointer
