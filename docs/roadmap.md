@@ -37,43 +37,40 @@ repeated payload objects, two-parent revision histories, both export variants,
 descriptor output safety, and successful imports of bounded bundles.
 
 The limit caps objects **emitted**, not the pre-existing ancestry inspected to
-establish a valid incremental base. Full or incremental exports that succeed
-with an unlimited or very large object budget still construct the resulting
-sorted hash set in memory. Bounded-memory successful export remains Phase 4.
+establish a valid incremental base. The successful full-export hash set has
+since moved to disk-backed scratch storage (Phase 4); large incremental
+deltas continue to use an in-memory sorted set.
 
 ## P1 — Complete distributed version control
 
-### 3. Merge criss-cross revision histories
+### 3. Merge criss-cross revision histories — implemented
 
-The ancestor algorithm deliberately rejects histories with multiple independent
-lowest common ancestors. Implement recursive merge-base synthesis rather than
-arbitrarily choosing one base.
+Multiple independent lowest common ancestors are combined into deterministic
+virtual merge bases without writing temporary revisions or pack objects. The
+ancestry tests exercise two and three bases, nested criss-cross histories,
+reversed merges, and genuinely conflicting virtual bases. Keep the recursive
+merge result deterministic and benchmark very large/shared DAGs as part of
+release qualification.
 
-- Design deterministic virtual-base consolidation, preserving UUID/model-field
-  merge semantics and deterministic conflict reporting.
-- Cover two and more incomparable bases, nested criss-cross histories, reversed
-  branch selection, and repeated merges across independent replicas.
-- Benchmark large shared histories and ensure ancestry traversal does not
-  multiply work exponentially.
+### 4. Bound full-history replication memory — disk-backed core implemented
 
-**Exit criterion:** valid multi-base DAGs merge or report actual semantic
-conflicts without the current blanket rejection.
+Full-history export now discovers reachable hashes in an open-addressed table
+held in private, repository-local scratch files. The table grows on disk and
+uses `pread`/`pwrite` rather than writable file mappings, so scratch ENOSPC
+raises an error rather than SIGBUS. A bounded-chunk external merge sort emits
+objects in unchanged SHA-256 order. Neither an in-memory `std::set` of all
+reachable hashes nor a complete in-memory sorted output is required. Both
+path and descriptor exports retain the existing wire format and error behavior.
 
-### 4. Bound full-history replication memory
+- Measure peak RSS, scratch bytes and throughput at 100k, 1m and 10m objects.
+- Define and enforce operational scratch-disk and transfer-time budgets;
+  exercise ENOSPC, cancellations and interrupted exports on deployed filesystems.
+- Incremental export still collects a sorted in-memory set of emitted delta
+  hashes to preserve efficient changed-trie traversal. Consider externalizing
+  large deltas only if profiling demonstrates a need.
 
-Full export currently holds all reachable hashes in RAM; successful large
-exports are not bounded by a fixed memory budget. Imported bundle verification
-already has disk-backed techniques that can inform the export design.
-
-- Prototype external-memory traversal/deduplication or a sorted disk-backed
-  object index. Preserve deterministic bundle encoding and object verification.
-- Use project-local, quota-aware scratch files, with correct cleanup on
-  cancellation, simulated ENOSPC and process interruption.
-- Keep incremental-transfer efficiency: do not regress to full-history walking
-  for small deltas.
-
-**Exit criterion:** export peak RSS grows slowly with history size and is
-bounded under the configured operational budget; imported heads remain exact.
+**Remaining exit criterion:** verify large-export RSS under a documented budget,
+quota enforcement, and failure recovery on the supported production filesystems.
 
 ## P2 — Capacity and service operations
 

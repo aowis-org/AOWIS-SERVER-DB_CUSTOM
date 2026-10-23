@@ -190,6 +190,68 @@ void testTraversalBounds() {
     (void)independent.verifyRepository();
 }
 
+// Larger than an external-sort chunk and several times the initial visited
+// table capacity. Exercises table growth, multi-run sorting, hash sharing,
+// canonical output order, repeated exports, import and rejection cleanup.
+void testDiskBackedFullExport() {
+    TemporaryRoot temporary;
+    Repository source(temporary.path() / "source");
+    source.createBranch("main");
+    std::vector<Change> changes;
+    changes.reserve(1300);
+    for (unsigned index = 0; index < 1300; ++index) {
+        Bytes value(40);
+        value[0] = static_cast<std::uint8_t>(index >> 8U);
+        value[1] = static_cast<std::uint8_t>(index);
+        value[2] = static_cast<std::uint8_t>(index ^ 0x55U);
+        changes.push_back(Change{testKey(index + 1), value});
+    }
+    const Hash head = source.commit("main", changes).id;
+    const std::filesystem::path first = temporary.path() / "sorted-first.bundle";
+    const std::filesystem::path second = temporary.path() / "sorted-second.bundle";
+    source.exportBranchBundle("main", first);
+    source.exportBranchBundle("main", second);
+    check(contents(first) == contents(second), "disk-backed exports were nondeterministic");
+    const std::uint64_t count = bundleObjectCount(first);
+    check(count > 2048, "fixture did not cross the external sorter run boundary");
+
+    // A bundle must retain the original sorted-by-hash ABI, not the order of
+    // hash-table slots or the order in which graph traversal discovered them.
+    std::ifstream input(first, std::ios::binary);
+    check(input.good(), "cannot inspect disk-backed export");
+    input.seekg(48);
+    Hash previous{};
+    for (std::uint64_t ordinal = 0; ordinal < count; ++ordinal) {
+        Hash hash{};
+        input.read(reinterpret_cast<char*>(hash.data()), static_cast<std::streamsize>(hash.size()));
+        check(input.good() && previous < hash, "full export contains unordered or duplicate hashes");
+        std::uint64_t size = 0;
+        for (unsigned index = 0; index < 8; ++index) {
+            const int byte = input.get();
+            check(byte >= 0, "export has truncated object size");
+            size = (size << 8U) | static_cast<std::uint8_t>(byte);
+        }
+        input.seekg(static_cast<std::streamoff>(size), std::ios::cur);
+        check(input.good(), "export has a truncated object payload");
+        previous = hash;
+    }
+    check(input.peek() == std::char_traits<char>::eof(), "export has trailing data");
+
+    Repository recipient(temporary.path() / "recipient");
+    check(recipient.importBranchBundle(first, "main").head == head,
+          "disk-backed full export could not be imported");
+    (void)recipient.verifyRepository();
+
+    const std::filesystem::path exact = temporary.path() / "exact.bundle";
+    source.exportBranchBundle("main", exact, BundleLimits{0, count, 0});
+    check(contents(first) == contents(exact), "exact limit changed external sort output");
+    const std::filesystem::path failed = temporary.path() / "rejected.bundle";
+    rejectsLimit([&] { source.exportBranchBundle("main", failed, BundleLimits{0, count - 1, 0}); });
+    check(!std::filesystem::exists(failed), "over-limit external sort created output");
+    check(std::filesystem::is_empty(source.scratchDirectory()),
+          "external export left visible repository scratch files");
+}
+
 void exercise() {
     TemporaryRoot temporary;
     Repository source(temporary.path() / "sender");
@@ -250,6 +312,7 @@ int main() {
     try {
         exercise();
         testTraversalBounds();
+        testDiskBackedFullExport();
         std::cout << "AOWIS native bundle limit tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

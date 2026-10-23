@@ -320,6 +320,203 @@ void writeExact(int fd, const std::uint8_t* bytes, std::size_t size, std::uint64
     }
 }
 
+// Full-history exports may contain millions of reachable immutable objects.
+// Keep the visited hash set on repository-local scratch storage, not in a
+// process-size std::set. A sparse open-addressed table uses pread/pwrite
+// rather than writable mmap: ENOSPC is a recoverable StorageError, never a
+// SIGBUS from a failed page fault. A zero hash denotes an unoccupied slot.
+class DiskBundleHashes {
+public:
+    explicit DiskBundleHashes(const std::filesystem::path& scratch)
+        : scratch_(scratch), fd_(createScratchFile(scratch, "export-visited")) {
+        try {
+            resize(1024);
+        } catch (...) {
+            ::close(this->fd_);
+            this->fd_ = -1;
+            throw;
+        }
+    }
+
+    ~DiskBundleHashes() { if (this->fd_ >= 0) ::close(this->fd_); }
+    DiskBundleHashes(const DiskBundleHashes&) = delete;
+    DiskBundleHashes& operator=(const DiskBundleHashes&) = delete;
+
+    bool insert(const Hash& hash, std::uint64_t maxObjects) {
+        require(Err::Internal, !isZero(hash), "zero object in export graph");
+        const std::pair<std::uint64_t, bool> found = slot(hash, this->fd_, this->capacity_);
+        if (found.second) return false;
+        require(Err::LimitExceeded, maxObjects == 0 || this->count_ < maxObjects,
+                "bundle transfer limit: object count exceeded");
+        std::uint64_t destination = found.first;
+        if (this->count_ >= this->capacity_ / 2) {
+            require(Err::LimitExceeded, this->capacity_ <= maximumSlots / 2,
+                    "temporary export hash table exceeds file size limit");
+            resize(this->capacity_ * 2);
+            destination = slot(hash, this->fd_, this->capacity_).first;
+        }
+        writeExact(this->fd_, hash.data(), hash.size(), destination * hash.size());
+        ++this->count_;
+        return true;
+    }
+
+    std::uint64_t size() const { return this->count_; }
+
+    template<class Consumer>
+    void forEach(Consumer&& consume) const {
+        constexpr std::size_t batchHashes = 256;
+        std::array<Hash, batchHashes> batch{};
+        for (std::uint64_t index = 0; index < this->capacity_;) {
+            const std::size_t count = static_cast<std::size_t>(
+                std::min<std::uint64_t>(batchHashes, this->capacity_ - index));
+            readExact(this->fd_, reinterpret_cast<std::uint8_t*>(batch.data()),
+                      count * sizeof(Hash), index * sizeof(Hash));
+            for (std::size_t offset = 0; offset < count; ++offset)
+                if (!isZero(batch[offset])) consume(batch[offset]);
+            index += count;
+        }
+    }
+
+private:
+    static constexpr std::uint64_t maximumSlots =
+        static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) / sizeof(Hash);
+
+    static std::pair<std::uint64_t, bool> slot(const Hash& hash, int fd,
+                                              std::uint64_t capacity) {
+        // SHA-256 already distributes the first eight bytes uniformly.
+        std::uint64_t first = 0;
+        for (unsigned index = 0; index < 8; ++index)
+            first = (first << 8U) | hash[index];
+        std::uint64_t position = first & (capacity - 1);
+        Hash candidate{};
+        for (std::uint64_t probe = 0; probe < capacity; ++probe) {
+            readExact(fd, candidate.data(), candidate.size(), position * candidate.size());
+            if (isZero(candidate)) return {position, false};
+            if (candidate == hash) return {position, true};
+            position = (position + 1) & (capacity - 1);
+        }
+        throw StorageError(Err::Internal, "full export hash table exhausted");
+    }
+
+    void resize(std::uint64_t newCapacity) {
+        require(Err::LimitExceeded, newCapacity <= maximumSlots,
+                "temporary export hash table exceeds file size limit");
+        const int replacement = createScratchFile(this->scratch_, "export-visited-grow");
+        try {
+            systemCall(::ftruncate(replacement, static_cast<off_t>(newCapacity * sizeof(Hash))) == 0,
+                       "size export visited table");
+            if (this->capacity_ != 0) {
+                this->forEach([&](const Hash& value) {
+                    const std::uint64_t position = slot(value, replacement, newCapacity).first;
+                    writeExact(replacement, value.data(), value.size(), position * value.size());
+                });
+            }
+        } catch (...) {
+            ::close(replacement);
+            throw;
+        }
+        const int previous = this->fd_;
+        this->fd_ = replacement;
+        this->capacity_ = newCapacity;
+        if (previous >= 0) ::close(previous);
+    }
+
+    std::filesystem::path scratch_;
+    int fd_ = -1;
+    std::uint64_t capacity_ = 0;
+    std::uint64_t count_ = 0;
+};
+
+// A bounded in-memory chunk sorter with an unlinked scratch run file. Sorting
+// the visited table by SHA-256 preserves byte-for-byte bundle compatibility.
+// Only a hash and run number per sorted run are resident during the merge.
+class SortedBundleHashes {
+public:
+    static constexpr std::size_t chunkHashes = 2048;
+
+    explicit SortedBundleHashes(const std::filesystem::path& scratch) : scratch_(scratch) {
+        this->buffer_.reserve(chunkHashes);
+    }
+
+    ~SortedBundleHashes() { if (this->fd_ >= 0) ::close(this->fd_); }
+    SortedBundleHashes(const SortedBundleHashes&) = delete;
+    SortedBundleHashes& operator=(const SortedBundleHashes&) = delete;
+
+    void append(const Hash& hash) {
+        require(Err::Internal, !this->finalized_, "cannot append to finalized export sorter");
+        this->buffer_.push_back(hash);
+        if (this->buffer_.size() == chunkHashes) flush();
+    }
+
+    void finalize() {
+        require(Err::Internal, !this->finalized_, "export sorter finalized twice");
+        this->finalized_ = true;
+        if (this->runs_.empty()) {
+            std::sort(this->buffer_.begin(), this->buffer_.end());
+            return;
+        }
+        flush();
+        for (std::size_t index = 0; index < this->runs_.size(); ++index) {
+            this->next_.push(Head{readRunHash(this->runs_[index].start), index});
+        }
+    }
+
+    std::optional<Hash> next() {
+        require(Err::Internal, this->finalized_, "export sorter must be finalized");
+        if (this->runs_.empty()) {
+            if (this->cursor_ == this->buffer_.size()) return std::nullopt;
+            return this->buffer_[this->cursor_++];
+        }
+        if (this->next_.empty()) return std::nullopt;
+        const Head first = this->next_.top();
+        this->next_.pop();
+        Run& run = this->runs_[first.run];
+        ++run.used;
+        if (run.used < run.count)
+            this->next_.push(Head{readRunHash(run.start + run.used), first.run});
+        return first.hash;
+    }
+
+private:
+    struct Run { std::uint64_t start = 0; std::uint64_t count = 0; std::uint64_t used = 0; };
+    struct Head { Hash hash{}; std::size_t run = 0; };
+    struct GreaterHead {
+        bool operator()(const Head& left, const Head& right) const {
+            return left.hash > right.hash;
+        }
+    };
+
+    Hash readRunHash(std::uint64_t ordinal) const {
+        Hash hash{};
+        readExact(this->fd_, hash.data(), hash.size(), ordinal * hash.size());
+        return hash;
+    }
+
+    void flush() {
+        if (this->buffer_.empty()) return;
+        std::sort(this->buffer_.begin(), this->buffer_.end());
+        if (this->fd_ < 0) this->fd_ = createScratchFile(this->scratch_, "export-sort");
+        require(Err::LimitExceeded,
+                this->records_ <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max() /
+                                     sizeof(Hash)) - this->buffer_.size(),
+                "temporary export sorter exceeds file size limit");
+        writeExact(this->fd_, reinterpret_cast<const std::uint8_t*>(this->buffer_.data()),
+                   this->buffer_.size() * sizeof(Hash), this->records_ * sizeof(Hash));
+        this->runs_.push_back(Run{this->records_, this->buffer_.size(), 0});
+        this->records_ += this->buffer_.size();
+        this->buffer_.clear();
+    }
+
+    std::filesystem::path scratch_;
+    int fd_ = -1;
+    std::uint64_t records_ = 0;
+    std::size_t cursor_ = 0;
+    bool finalized_ = false;
+    std::vector<Hash> buffer_;
+    std::vector<Run> runs_;
+    std::priority_queue<Head, std::vector<Head>, GreaterHead> next_;
+};
+
 // The on-disk bundle is sorted by SHA-256 but has variable-sized payloads.
 // Record fixed-size file offsets in an unlinked temporary index rather than
 // retaining one std::map node per transferred object on the C++ heap. Mapping
@@ -3375,36 +3572,34 @@ void Repository::exportBundleLocked(std::string_view branch,
                                     const std::filesystem::path* bundlePath, int targetFd,
                                     std::optional<Hash> recipientBase, BundleLimits limits) {
     const Hash tip = branchHead(branch);
-    // A full bundle carries the complete reachable graph of the tip.
-    const auto collectObjects = [&](const Hash& revisionTip) {
+    // Full-history visited state lives in a private, disk-backed hash table.
+    // Keep incremental trie-delta enumeration unchanged: its small-delta
+    // performance must not pay the full-history scratch/index overhead.
+    const auto collectObjects = [&](const Hash& revisionTip, DiskBundleHashes& objects) {
         enum class Kind { Revision, Tree, Value };
         std::vector<std::pair<Hash, Kind>> pending{{revisionTip, Kind::Revision}};
-        std::set<Hash> objects;
         while (!pending.empty()) {
             const std::pair<Hash, Kind> entry = pending.back();
             pending.pop_back();
-            if (isZero(entry.first) || !insertBundleObject(objects, entry.first, limits.maxObjects)) continue;
+            if (isZero(entry.first) || !objects.insert(entry.first, limits.maxObjects)) continue;
             if (entry.second == Kind::Revision) {
                 const Revision revision = readRevision(entry.first);
                 pending.emplace_back(revision.root, Kind::Tree);
                 pending.emplace_back(revision.referencesRoot, Kind::Tree);
-                for (const Hash& parent : revision.parents) {
+                for (const Hash& parent : revision.parents)
                     pending.emplace_back(parent, Kind::Revision);
-                }
             } else if (entry.second == Kind::Tree) {
                 const TreeNode node = readNode(entry.first);
                 if (node.leaf) {
                     pending.emplace_back(node.value, Kind::Value);
                 } else {
-                    for (const Hash& child : node.children) {
+                    for (const Hash& child : node.children)
                         pending.emplace_back(child, Kind::Tree);
-                    }
                 }
             } else {
                 (void)load(entry.first); // Verify every immutable object on export.
             }
         }
-        return objects;
     };
     // Validate the request before creating an output file. A parent revision
     // can be shared even if it is not on the first-parent history.
@@ -3412,10 +3607,21 @@ void Repository::exportBundleLocked(std::string_view branch,
         require(Err::Conflict, !isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
                 "incremental export base is not an ancestor of the source branch");
     }
-    const std::set<Hash> objects = recipientBase ? collectDelta(tip, *recipientBase, limits.maxObjects)
-                                                 : collectObjects(tip);
-    require(Err::InvalidInput, recipientBase.has_value() || !objects.empty(),
-            "cannot export an empty revision graph");
+    std::optional<std::set<Hash>> delta;
+    std::unique_ptr<SortedBundleHashes> sortedFull;
+    std::uint64_t objectCount = 0;
+    if (recipientBase) {
+        delta = collectDelta(tip, *recipientBase, limits.maxObjects);
+        objectCount = delta->size();
+    } else {
+        DiskBundleHashes objects(this->scratch_);
+        collectObjects(tip, objects);
+        objectCount = objects.size();
+        require(Err::InvalidInput, objectCount != 0, "cannot export an empty revision graph");
+        sortedFull = std::make_unique<SortedBundleHashes>(this->scratch_);
+        objects.forEach([&](const Hash& hash) { sortedFull->append(hash); });
+        sortedFull->finalize();
+    }
     // The count limit was enforced at each unique discovery, before opening
     // any output file. No partial bundle can be published on rejection.
     int fd = targetFd;
@@ -3436,7 +3642,7 @@ void Repository::exportBundleLocked(std::string_view branch,
             ? incrementalBundleMagic : bundleMagic;
         std::copy(magic.begin(), magic.end(), header.begin());
         std::copy(tip.begin(), tip.end(), header.begin() + 8);
-        storeU64(header.data() + 40, static_cast<std::uint64_t>(objects.size()));
+        storeU64(header.data() + 40, objectCount);
         if (recipientBase) {
             std::copy(recipientBase->begin(), recipientBase->end(), header.begin() + 48);
         }
@@ -3444,7 +3650,7 @@ void Repository::exportBundleLocked(std::string_view branch,
         std::uint64_t offset = headerSize;
         require(Err::LimitExceeded, limits.maxBytes == 0 || offset <= limits.maxBytes,
                 "bundle transfer limit: byte count exceeded");
-        for (const Hash& hash : objects) {
+        const auto appendObject = [&](const Hash& hash) {
             const Bytes bytes = load(hash);
             require(Err::LimitExceeded, limits.maxObjectBytes == 0 || bytes.size() <= limits.maxObjectBytes,
                     "bundle transfer limit: individual object exceeded");
@@ -3460,6 +3666,11 @@ void Repository::exportBundleLocked(std::string_view branch,
             offset += bundleEntryBytes;
             if (!bytes.empty()) writeExact(fd, bytes.data(), bytes.size(), offset);
             offset += bytes.size();
+        };
+        if (delta) {
+            for (const Hash& hash : *delta) appendObject(hash);
+        } else {
+            while (const std::optional<Hash> hash = sortedFull->next()) appendObject(*hash);
         }
         systemCall(::fsync(fd) == 0, "sync replication bundle");
         if (bundlePath == nullptr) return; // caller-owned descriptor stays open
