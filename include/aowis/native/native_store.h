@@ -216,13 +216,10 @@ private:
 // Linux/POSIX prototype. All operations on one instance are thread-safe;
 // processes using the same repository serialize operations with flock(2).
 // A successful commit syncs its append-only pack before publishing its ref.
-// The database uses one append-only, content-addressed pack backend.
-enum class PhysicalStore { Pack };
-
+// Storage is one append-only, content-addressed object pack per repository.
 class Repository final {
 public:
-    explicit Repository(std::filesystem::path directory,
-                        PhysicalStore storage = PhysicalStore::Pack);
+    explicit Repository(std::filesystem::path directory);
     ~Repository();
     Repository(const Repository&) = delete;
     Repository& operator=(const Repository&) = delete;

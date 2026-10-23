@@ -200,8 +200,7 @@ class TestServer {
 public:
     TestServer(aowis::native::ProjectService& service, aowis::native::BundleLimits limits) {
         this->server_.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 128); };
-        aowis::native::http::registerRoutes(this->server_, service,
-                                            aowis::native::PhysicalStore::Pack, limits);
+        aowis::native::http::registerRoutes(this->server_, service, limits);
         const int bound = this->server_.bind_to_any_port("127.0.0.1");
         check(bound > 0, "unable to listen");
         this->port_ = static_cast<quint16>(bound);
@@ -318,6 +317,39 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
               {"uuid", QUuid::createUuid().toString(QUuid::WithoutBraces)}, {"type", 9},
               {"payloadBase64", changed}}}}}).status == 400,
           "mismatching UUID payload accepted");
+    // Review F8: impossible values and non-finite numbers are 400.
+    {
+        HydraulicNodeJunction impossible = junction;
+        impossible.emitter.coefficient = -1;
+        const Response rejected = client.call("POST", networkRoute + "/edits",
+            QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{QJsonObject{
+                {"uuid", junctionId}, {"type", 9},
+                {"payloadBase64", QString::fromLatin1(native::ModelCodec<HydraulicNodeJunction>::encode(impossible).toBase64())}}}}});
+        check(rejected.status == 400 &&
+              rejected.json.value("error").toObject().value("message").toString().contains("emitter.coefficient"),
+              "negative emitter coefficient accepted over HTTP");
+        // A NaN elevation cannot be encoded; patch it into valid bytes.
+        HydraulicNodeJunction patched = junction;
+        patched.elevation_m = 2.0;
+        QByteArray bytes = native::ModelCodec<HydraulicNodeJunction>::encode(patched);
+        patched.elevation_m = -2.0;
+        const QByteArray negative = native::ModelCodec<HydraulicNodeJunction>::encode(patched);
+        qsizetype start = 0;
+        while (bytes[start] == negative[start]) ++start;
+        const char nanBytes[8] = {0x7f, static_cast<char>(0xf8), 0, 0, 0, 0, 0, 0};
+        bytes.replace(start, 8, nanBytes, 8);
+        check(client.call("POST", networkRoute + "/edits",
+            QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{QJsonObject{
+                {"uuid", junctionId}, {"type", 9}, {"payloadBase64", QString::fromLatin1(bytes.toBase64())}}}}}).status == 400,
+              "NaN elevation accepted over HTTP");
+        NetworkHydraulic impossibleNetwork = network;
+        impossibleNetwork.options_hydraulic.specific_gravity = 0;
+        check(client.call("POST", main + "/networks", QJsonObject{{"expectedHead", createdHead},
+            {"payloadBase64", QString::fromLatin1(native::ModelCodec<NetworkHydraulic>::encode(impossibleNetwork).toBase64())}}).status == 400,
+              "network with zero specific gravity accepted over HTTP");
+        check(client.call("GET", main + "/head").json.value("id").toString() == createdHead,
+              "rejected value edit changed the branch");
+    }
     const Response edited = client.call("POST", networkRoute + "/edits",
         QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{update}}});
     check(edited.status == 200, "atomic HTTP entity edit failed");
@@ -415,11 +447,10 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
 // Real TCP bundle transfer: full/incremental between independent repositories, corrupt/truncated,
 // stale/divergent branches, transfer limits, and idempotent retry.
 void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
-                       const QString& sourceId, aowis::native::PhysicalStore backend) {
+                       const QString& sourceId) {
     namespace native = aowis::native;
-    const QString recipientFormat = QStringLiteral("pack");
     const Response destination = client.call("POST", "/api/v1/projects",
-        QJsonObject{{"name", "Replication recipient"}, {"storage", recipientFormat}});
+        QJsonObject{{"name", "Replication recipient"}});
     check(destination.status == 201, "destination creation failed");
     const QString destinationId = destination.json.value("id").toString();
     const QString from = QStringLiteral("/api/v1/projects/") + sourceId + "/branches/sync_demo";
@@ -1085,7 +1116,7 @@ void exerciseConcurrency() {
               << busyAnswers.load() << " busy answers\n";
 }
 
-void exercise(aowis::native::PhysicalStore backend) {
+void exercise() {
     TemporaryRoot root;
     QString firstId;
     QString firstRevision;
@@ -1108,9 +1139,10 @@ void exercise(aowis::native::PhysicalStore backend) {
         check(first.status == 201, "create project failed");
         firstId = first.json.value("id").toString();
         check(first.json.value("name").toString() == "Hydraulik Ü", "project name wrong");
-        check(first.json.value("storage").toString() ==
-            "pack",
-            "incorrect selected backend");
+        check(first.json.keys() == QStringList({"id", "name"}), "project JSON has unexpected fields");
+        check(client.call("POST", "/api/v1/projects",
+                          QJsonObject{{"name", "X"}, {"storage", "pack"}}).status == 400,
+              "removed storage field accepted");
         const Response second = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Independent"}});
         check(second.status == 201 && second.json.value("id").toString() != firstId,
               "second project creation failed");
@@ -1171,7 +1203,7 @@ void exercise(aowis::native::PhysicalStore backend) {
             const std::string saved = previous == nullptr ? std::string() : std::string(previous);
             check(::setenv("TMPDIR", (root.root() / "no-such-tmpdir").c_str(), 1) == 0, "setenv failed");
             try {
-                exerciseBundleApi(client, service, firstId, backend);
+                exerciseBundleApi(client, service, firstId);
             } catch (...) {
                 if (previous == nullptr) ::unsetenv("TMPDIR"); else ::setenv("TMPDIR", saved.c_str(), 1);
                 throw;
@@ -1260,7 +1292,7 @@ void exerciseExecutable(const QString& executable) {
             Client client(port);
             const Response created = client.call("POST", "/api/v1/projects",
                                                  QJsonObject{{"name", "Shutdown test"}});
-            check(created.status == 201 && created.json.value("storage").toString() == "pack",
+            check(created.status == 201 && created.json.value("name").toString() == "Shutdown test",
                   "executable did not create a project");
         });
     check(normal.listened && normal.exitCode == 0, "executable did not shut down cleanly on SIGTERM");
@@ -1317,7 +1349,7 @@ int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     try {
         check(argc == 2, "expected path to aowis-server-db executable");
-        exercise(aowis::native::PhysicalStore::Pack);
+        exercise();
         exerciseConcurrency();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";

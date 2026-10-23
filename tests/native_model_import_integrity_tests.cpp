@@ -24,7 +24,6 @@ using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void expect(bool condition, const std::string& message) {
@@ -304,9 +303,9 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
            "rejected model import changed branch catalogue: " + label);
 }
 
-void testMalformedFull(PhysicalStore store) {
+void testMalformedFull() {
     TemporaryDirectory temporary("forged-full");
-    Repository target(temporary.path / "target", store);
+    Repository target(temporary.path / "target");
     target.createBranch("stable");
     target.commit("stable", {{key(42), Bytes{'s', 'a', 'f', 'e'}}});
     struct Case { Fault fault; const char* label; const char* reason; };
@@ -337,9 +336,9 @@ void testMalformedFull(PhysicalStore store) {
     target.verifyPack();
 }
 
-void testReproducedUnsafeDeletion(PhysicalStore store) {
+void testReproducedUnsafeDeletion() {
     TemporaryDirectory temporary("unsafe-deletion");
-    Repository target(temporary.path / "target", store);
+    Repository target(temporary.path / "target");
     target.createBranch("stable");
     target.commit("stable", {{key(42), Bytes{'b', 'a', 's', 'e'}}});
     BundleBuilder forged;
@@ -371,9 +370,9 @@ void testReproducedUnsafeDeletion(PhysicalStore store) {
            "valid imported model allowed deletion of referenced UUID");
 }
 
-void testValidCyclesAndHistory(PhysicalStore store) {
+void testValidCyclesAndHistory() {
     TemporaryDirectory temporary("valid-graphs");
-    Repository target(temporary.path / "target", store);
+    Repository target(temporary.path / "target");
     BundleBuilder builder;
     std::map<Key, Hash> models{{key(1), builder.modelValue({key(2)})},
                                 {key(2), builder.modelValue({key(1)})},
@@ -395,7 +394,7 @@ void testValidCyclesAndHistory(PhysicalStore store) {
 // Exercise multiple externally sorted runs, including a reverse-index defect
 // after the in-memory sort threshold. Small fixtures do not exercise the
 // disk-backed merge, so this is deliberately >8,192 distinct edges.
-void testLargeReferenceGraph(PhysicalStore store) {
+void testLargeReferenceGraph() {
     TemporaryDirectory temporary("large-reference-graph");
     // Scratch files live in <repository>/tmp (review F6). A nonexistent
     // TMPDIR proves that external sorting no longer depends on it.
@@ -429,7 +428,7 @@ void testLargeReferenceGraph(PhysicalStore store) {
         incoming.emplace(target, builder.incomingValue(sources));
     const Hash valid = builder.revision(root, builder.tree(incoming));
     builder.write(temporary.path / "valid.bundle", valid);
-    Repository receiver(temporary.path / "receiver", store);
+    Repository receiver(temporary.path / "receiver");
     expect(receiver.importBranchBundle(temporary.path / "valid.bundle", "models").head == valid,
            "large reference graph import rejected");
     expect(receiver.referencingModel("models", targets[17]).size() == sources.size(),
@@ -441,7 +440,7 @@ void testLargeReferenceGraph(PhysicalStore store) {
     // If scratch space cannot be created, fail before importing any objects
     // or publishing a branch. This exercises the external-sort failure path
     // rather than allowing a fallback that silently skips verification.
-    Repository inaccessible(temporary.path / "inaccessible", store);
+    Repository inaccessible(temporary.path / "inaccessible");
     const std::filesystem::path unusable = inaccessible.scratchDirectory();
     std::filesystem::remove(unusable);
     { std::ofstream blocker(unusable); } // a regular file where the directory belongs
@@ -471,7 +470,7 @@ void testLargeReferenceGraph(PhysicalStore store) {
     }
     const Hash invalid = forged.revision(forged.tree(badModels), forged.tree(badIncoming));
     forged.write(temporary.path / "forged.bundle", invalid);
-    Repository rejected(temporary.path / "rejected", store);
+    Repository rejected(temporary.path / "rejected");
     rejected.createBranch("stable");
     (void)rejected.commit("stable", {{key(230), Bytes{'s'}}});
     expectRejected(rejected, temporary.path / "forged.bundle", "large missing incoming edge",
@@ -483,7 +482,7 @@ void testLargeReferenceGraph(PhysicalStore store) {
 // Revision IDs are hash-sorted in the bundle, not ancestry-sorted. The
 // verifier must resolve parents before children without a recursive C++ call
 // stack, even when thousands of revisions share the same immutable roots.
-void testDeepSharedModelHistory(PhysicalStore backend) {
+void testDeepSharedModelHistory() {
     TemporaryDirectory temporary("deep-model-history");
     BundleBuilder builder;
     const Hash value = builder.modelValue({});
@@ -494,7 +493,7 @@ void testDeepSharedModelHistory(PhysicalStore backend) {
     }
     const std::filesystem::path bundle = temporary.path / "long.bundle";
     builder.write(bundle, tip);
-    Repository receiver(temporary.path / "receiver", backend);
+    Repository receiver(temporary.path / "receiver");
     expect(receiver.importBranchBundle(bundle, "models").head == tip,
            "deep history model import failed");
     expect(receiver.verifyRepository().revisions == 2501,
@@ -504,7 +503,7 @@ void testDeepSharedModelHistory(PhysicalStore backend) {
 // Independent, correctly hashed historical snapshots exercise the differential
 // validator's trust boundary: a consistent parent alone must never make a
 // forged child safe, particularly when it deletes a still-referenced UUID.
-void testHistoricalReferenceDeltas(PhysicalStore backend) {
+void testHistoricalReferenceDeltas() {
     TemporaryDirectory temporary("reference-deltas");
     BundleBuilder builder;
     const Hash empty = builder.modelValue({});
@@ -601,7 +600,7 @@ void testHistoricalReferenceDeltas(PhysicalStore backend) {
         };
         include(fixture.tip);
         filtered.write(bundle, fixture.tip);
-        Repository receiver(temporary.path / fixture.label, backend);
+        Repository receiver(temporary.path / fixture.label);
         const std::uint64_t initialObjects = receiver.objectCount();
         if (fixture.valid) {
             expect(receiver.importBranchBundle(bundle, "models").head == fixture.tip,
@@ -622,10 +621,10 @@ void testHistoricalReferenceDeltas(PhysicalStore backend) {
     }
 }
 
-void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore destinationStore) {
+void testMalformedIncremental() {
     TemporaryDirectory temporary("incremental");
-    Repository source(temporary.path / "source", sourceStore);
-    Repository destination(temporary.path / "destination", destinationStore);
+    Repository source(temporary.path / "source");
+    Repository destination(temporary.path / "destination");
     source.createBranch("models");
     const Hash base = source.commitModel("models", {
         {key(1), ModelRecord{1, {}, Bytes{'a'}}},
@@ -644,7 +643,7 @@ void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore destinati
     expectRejected(destination, temporary.path / "bad-incremental.bundle",
                    "forged incremental fast-forward", "does not match model records", "stable");
 
-    // A real incremental bundle should still round-trip between both physical
+    // A real incremental bundle should still round-trip between two
     // stores, including borrowed tree/value objects from the existing base.
     const Hash latest = source.commitModel("models", {
         {key(3), ModelRecord{1, {key(1)}, Bytes{'c'}}}}).id;
@@ -662,19 +661,15 @@ void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore destinati
 
 int main() {
     try {
-        for (PhysicalStore backend : {PhysicalStore::Pack}) {
-            testMalformedFull(backend);
-            testReproducedUnsafeDeletion(backend);
-            testValidCyclesAndHistory(backend);
-            testLargeReferenceGraph(backend);
-            testHistoricalReferenceDeltas(backend);
-            testDeepSharedModelHistory(backend);
+        {
+            testMalformedFull();
+            testReproducedUnsafeDeletion();
+            testValidCyclesAndHistory();
+            testLargeReferenceGraph();
+            testHistoricalReferenceDeltas();
+            testDeepSharedModelHistory();
         }
-        for (PhysicalStore source : {PhysicalStore::Pack}) {
-            for (PhysicalStore destination : {PhysicalStore::Pack}) {
-                testMalformedIncremental(source, destination);
-            }
-        }
+        testMalformedIncremental();
         std::cout << "Native model import integrity tests passed\n";
         return 0;
     } catch (const std::exception& error) {

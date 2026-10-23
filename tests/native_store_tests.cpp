@@ -648,10 +648,9 @@ void testMultipleConnections() {
 
 
 void testMoveAwareModelAndRawCommits() {
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo test("move-aware-commits");
-        Repository repository(test.directory, physical);
+        Repository repository(test.directory);
         repository.createBranch("borrowed");
         repository.createBranch("moved");
         repository.createBranch("raw-duplicate");
@@ -696,10 +695,9 @@ void testMoveAwareModelAndRawCommits() {
 }
 
 void testModelExpectedBranchHead() {
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo test("expected-model-head");
-        Repository repository(test.directory, physical);
+        Repository repository(test.directory);
         repository.createBranch("main");
         const aowis::native::ModelRecord initial{1, {}, value("first")};
         const Revision first = repository.commitModel("main", {{key(1), initial}});
@@ -725,10 +723,9 @@ void testModelExpectedBranchHead() {
 }
 
 // Historical APIs operate on immutable revision IDs rather than branch heads.
-// Exercise both physical stores and verify that compaction retains old roots.
+// Verify that compaction retains old roots.
 void testHistoricalRevisionApis() {
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo test("historical-revision-api");
         Hash initial{};
         Hash first{};
@@ -737,7 +734,7 @@ void testHistoricalRevisionApis() {
         Hash indexed{};
         Hash indexedNext{};
         {
-            Repository repository(test.directory, physical);
+            Repository repository(test.directory);
             repository.createBranch("main");
             initial = repository.head("main").id;
             first = repository.commit("main", {{key(1), value("old")},
@@ -836,7 +833,7 @@ void testHistoricalRevisionApis() {
             repository.verifyPack();
         }
         {
-            Repository reopened(test.directory, physical);
+            Repository reopened(test.directory);
             expect(reopened.history("main", 3).size() == 3 &&
                    reopened.getAtRevision(first, key(1)) == value("old") &&
                    reopened.referencingModelAtRevision(indexed, key(101)) ==
@@ -859,13 +856,12 @@ void testThreeWayBranchMerges() {
     using aowis::native::MergeStatus;
     using aowis::native::ModelChange;
     using aowis::native::ModelRecord;
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo test("branch-merging");
         Hash firstMerge{};
         Hash sourceOnly{};
         {
-            Repository repository(test.directory, physical);
+            Repository repository(test.directory);
             repository.createBranch("main");
             const Revision base = repository.commit("main", {
                 {key(1), value("base")}, {key(2), value("stable")},
@@ -909,7 +905,7 @@ void testThreeWayBranchMerges() {
             repository.verifyPack();
         }
         {
-            Repository reopened(test.directory, physical);
+            Repository reopened(test.directory);
             expect(reopened.revision(firstMerge).parents.size() == 2 &&
                    reopened.getAtRevision(firstMerge, key(4)) == value("feature add") &&
                    reopened.getAtRevision(sourceOnly, key(1)) == value("base"),
@@ -925,10 +921,9 @@ void testThreeWayBranchMerges() {
 
 void testMergeConflictsAndFastForward() {
     using aowis::native::MergeStatus;
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo test("merge-conflicts");
-        Repository repository(test.directory, physical);
+        Repository repository(test.directory);
         repository.createBranch("main");
         repository.commit("main", {{key(1), value("initial")}});
         repository.createBranch("feature", "main");
@@ -1001,10 +996,9 @@ void testMergeConflictsAndFastForward() {
 void testIndexedModelMerges() {
     using aowis::native::MergeStatus;
     using aowis::native::ModelRecord;
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo test("indexed-model-merge");
-        Repository repository(test.directory, physical);
+        Repository repository(test.directory);
         repository.createBranch("main");
         repository.commitModel("main", {
             {key(1), ModelRecord{1, {}, value("node")}},
@@ -1082,10 +1076,9 @@ void testMergeHooksAndSemanticPreflight() {
     using aowis::native::MergeOptions;
     using aowis::native::MergeResolution;
     using aowis::native::ModelRecord;
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo fixture("merge-candidate-hooks");
-        Repository repository(fixture.directory, physical);
+        Repository repository(fixture.directory);
         repository.createBranch("main");
         repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("base")}},
                                         {key(2), ModelRecord{2, {key(1)}, value("dependent")}}});
@@ -1192,11 +1185,10 @@ void testWholeObjectMergeChoices() {
     using aowis::native::MergeOptions;
     using aowis::native::MergeStatus;
     using aowis::native::ModelRecord;
-    for (const aowis::native::PhysicalStore physical :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo temporary("merge-object-choices");
         {
-            Repository repository(temporary.directory, physical);
+            Repository repository(temporary.directory);
             repository.createBranch("main");
             repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("base")}},
                                             {key(2), ModelRecord{2, {}, value("other")}}});
@@ -1272,7 +1264,7 @@ void testWholeObjectMergeChoices() {
             repository.verifyPack();
         }
         {
-            Repository reopened(temporary.directory, physical);
+            Repository reopened(temporary.directory);
             expect(!reopened.getModel("deleted", key(1)) &&
                    reopened.getModel("choose-source", key(1))->payload == value("right"),
                    "structural merge choice was lost on reopening");
@@ -1286,10 +1278,9 @@ void testMergeCandidateReconciliation() {
     using aowis::native::MergeStatus;
     using aowis::native::MergeCandidate;
     using aowis::native::ModelRecord;
-    for (const aowis::native::PhysicalStore storage :
-         {aowis::native::PhysicalStore::Pack}) {
+    {
         TemporaryRepo temporary("merge-candidate-reconciliation");
-        Repository repository(temporary.directory, storage);
+        Repository repository(temporary.directory);
         repository.createBranch("main");
         repository.commitModel("main", {{key(1), ModelRecord{1, {}, value("one")}},
                                        {key(2), ModelRecord{1, {}, value("two")}}});

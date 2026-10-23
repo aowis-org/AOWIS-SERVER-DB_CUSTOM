@@ -25,7 +25,6 @@ using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelRecord;
 using aowis::native::ModelChange;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void check(bool condition, std::string_view message) {
@@ -169,12 +168,11 @@ void rejectWithoutPublication(Repository& receiver, const std::filesystem::path&
 // model-indexed revision. Summaries MUST remain distinct by tree kind, since
 // both kinds validate leaf values differently. This also forces retrieval of
 // cached summaries while walking the two historical revisions.
-void exerciseSharedTreesAcrossKinds(PhysicalStore sourceBackend,
-                                    PhysicalStore destinationBackend) {
+void exerciseSharedTreesAcrossKinds() {
     TemporaryRoot temporary;
     ScopedTemporaryIndexDirectory temporaryIndex(temporary.path() / "scratch");
-    Repository source(temporary.path() / "source", sourceBackend);
-    Repository destination(temporary.path() / "destination", destinationBackend);
+    Repository source(temporary.path() / "source");
+    Repository destination(temporary.path() / "destination");
     source.createBranch("main");
     Key first{};
     Key second{};
@@ -217,12 +215,12 @@ void exerciseSharedTreesAcrossKinds(PhysicalStore sourceBackend,
     temporaryIndex.checkEmpty();
 }
 
-void exercise(PhysicalStore sourceBackend, PhysicalStore destinationBackend) {
+void exercise() {
     TemporaryRoot temporary;
     ScopedTemporaryIndexDirectory temporaryIndex(temporary.path() / "scratch");
-    Repository source(temporary.path() / "source", sourceBackend);
-    Repository destination(temporary.path() / "destination", destinationBackend);
-    Repository rejected(temporary.path() / "rejected", destinationBackend);
+    Repository source(temporary.path() / "source");
+    Repository destination(temporary.path() / "destination");
+    Repository rejected(temporary.path() / "rejected");
     source.createBranch("main");
 
     // Many small changes generate many revision, trie and immutable payload
@@ -327,14 +325,8 @@ int main(int argc, char** argv) {
         const bool sharedOnly = argc == 2 &&
             std::string_view(argv[1]) == "--shared-kinds-only";
         check(argc == 1 || sharedOnly, "invalid bundle disk-index test arguments");
-        const std::array<PhysicalStore, 2> backends{
-            PhysicalStore::Pack, PhysicalStore::Pack};
-        for (PhysicalStore source : backends) {
-            for (PhysicalStore destination : backends) {
-                if (!sharedOnly) exercise(source, destination);
-                exerciseSharedTreesAcrossKinds(source, destination);
-            }
-        }
+        if (!sharedOnly) exercise();
+        exerciseSharedTreesAcrossKinds();
         std::cout << "AOWIS native bundle disk-index tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

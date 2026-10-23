@@ -11,14 +11,11 @@ int main(int argc, char** argv) {
     }
     try {
         const std::filesystem::path directory(argv[1]);
-        const bool blocks = std::filesystem::exists(directory / "storage.format");
-        if (blocks) throw std::runtime_error("obsolete block storage is not supported");
-        if (!blocks && !std::filesystem::exists(directory / "objects.pack") &&
+        if (!std::filesystem::exists(directory / "objects.pack") &&
             !std::filesystem::exists(directory / "objects.current")) {
             throw std::runtime_error("repository does not exist");
         }
-        aowis::native::Repository repository(directory,
-            aowis::native::PhysicalStore::Pack);
+        aowis::native::Repository repository(directory);
         const aowis::native::CompactionStats result = repository.compact();
         std::cout << "objects_before=" << result.objectsBefore << '\n'
                   << "objects_after=" << result.objectsAfter << '\n'

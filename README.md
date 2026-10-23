@@ -4,7 +4,7 @@
 
 This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-db` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
-> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads stream from temporary files; uploads still buffer complete request bodies. Preview-only merges and end-to-end streaming uploads remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
+> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
 ## System overview
 
@@ -36,7 +36,7 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | Native storage | Immutable SHA-256 objects, copy-on-write Merkle UUID index, durable branch refs, recoverable index, integrity verification, offline compaction |
 | Physical storage | One append-only content-addressed object pack, with a reconstructible sidecar index |
 | Model serialization | Native-owned `ModelCodec<T>` for AOWIS model definitions; configure-time schema coverage check for 68 persisted structures |
-| Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, indexed lookup/edit/delete |
+| Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, physical value rules ([model value rules](docs/model-value-rules.md)), indexed lookup/edit/delete |
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
 | Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
 | Replication | Portable full/incremental `.aowbundle` exchange, SHA-256, object graph, canonical Merkle trie and model-reference index verification, fast-forward-only import, divergence protection |
@@ -68,15 +68,14 @@ Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraul
 #include <aowis/native/hydraulic_network_persistence.h>
 
 // Use the native repository directly from C++.
-aowis::native::Repository repository("/path/to/repository",
-                                     aowis::native::PhysicalStore::Pack);
+aowis::native::Repository repository("/path/to/repository");
 repository.createBranch("main");
 // Use aowis::native::hydraulic::saveHydraulicNetwork(),
 // loadHydraulicNetwork(), editHydraulicNetwork() and mergeHydraulicBranches()
 // with the canonical AOWIS NetworkHydraulic model.
 ```
 
-Engine failures are `aowis::native::StorageError` exceptions (see `include/aowis/native/storage_error.h`); classify them by `StorageErrorKind`, never by message text.
+Engine failures, including hydraulic load failures, are `aowis::native::StorageError` exceptions (see `include/aowis/native/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
 
 The project catalogue is also available as `AOWIS::NativeProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-db` (binds to 127.0.0.1:8755, project storage `./aowis-db-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/db-http-api.yaml) documents implemented routes.
 
@@ -102,12 +101,12 @@ Portable bundles exchange immutable branches between independent repositories, w
 
 ```bash
 ./build-linux/aowis-native-sync export \
-  /path/to/source pack main /tmp/main.aowbundle
+  /path/to/source main /tmp/main.aowbundle
 ./build-linux/aowis-native-sync import \
-  /path/to/destination pack /tmp/main.aowbundle remote_main
+  /path/to/destination /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Locally resident incremental ancestors and distinct snapshot-root bookkeeping still use memory proportional to their sizes; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads and uploads are streamed through project scratch files, without a full-size buffer in memory. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Objects already stored locally are verified boundaries, so an incremental import does work proportional to the delta, not to the history; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads and uploads are streamed through project scratch files, without a full-size buffer in memory. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 
@@ -119,7 +118,7 @@ run_root="$(mktemp -d /tmp/aowis-db-custom-bench.XXXXXXXX)"
   "$run_root/repository" 100000 20 3
 ```
 
-The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. A dedicated `aowis-native-merge-history-benchmark` measures ancestry/diff/conflict processing without a durable merge commit, using configurable shared/divergent histories on the pack backend. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
+The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. A dedicated `aowis-native-merge-history-benchmark` measures ancestry/diff/conflict processing without a durable merge commit, using configurable shared/divergent histories. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
 
 ## Recovery testing and operational limits
 

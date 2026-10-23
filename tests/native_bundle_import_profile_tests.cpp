@@ -20,7 +20,6 @@ using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void check(bool condition, std::string_view reason) {
@@ -74,9 +73,8 @@ void checkProfile(const BundleImportProfile& profile, bool expectsLocalReads) {
     }
 }
 
-void testPair(PhysicalStore sourceBackend, PhysicalStore destinationBackend,
-              const std::filesystem::path& root) {
-    Repository source(root / "source", sourceBackend);
+void testPair(const std::filesystem::path& root) {
+    Repository source(root / "source");
     source.createBranch("main");
     ModelRecord one;
     one.kind = 1;
@@ -94,7 +92,7 @@ void testPair(PhysicalStore sourceBackend, PhysicalStore destinationBackend,
     source.exportBranchBundle("main", root / "full.aowbundle");
     source.exportIncrementalBranchBundle("main", baseHead, root / "delta.aowbundle");
 
-    Repository fresh(root / "full", destinationBackend);
+    Repository fresh(root / "full");
     BundleImportProfile fullProfile{};
     const BundleImportResult full = fresh.importBranchBundle(root / "full.aowbundle",
                                                               "main", {}, &fullProfile);
@@ -111,7 +109,7 @@ void testPair(PhysicalStore sourceBackend, PhysicalStore destinationBackend,
           repeatedProfile.publicationMs == 0,
           "up-to-date import profile counted nonexistent publication");
 
-    Repository incremental(root / "incremental", destinationBackend);
+    Repository incremental(root / "incremental");
     incremental.importBranchBundle(root / "base.aowbundle", "main");
     BundleImportProfile deltaProfile{};
     const BundleImportResult delta = incremental.importBranchBundle(root / "delta.aowbundle",
@@ -152,15 +150,8 @@ void testPair(PhysicalStore sourceBackend, PhysicalStore destinationBackend,
 
 int main() {
     try {
-        for (unsigned source = 0; source < 2; ++source) {
-            for (unsigned destination = 0; destination < 2; ++destination) {
-                TemporaryRoot root;
-                testPair(source == 0 ? PhysicalStore::Pack :
-                         PhysicalStore::Pack,
-                         destination == 0 ? PhysicalStore::Pack :
-                         PhysicalStore::Pack, root.path());
-            }
-        }
+        TemporaryRoot root;
+        testPair(root.path());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "Bundle import profile test failed: %s\n", error.what());
         return 1;

@@ -23,7 +23,6 @@ using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void expect(bool value, const std::string& message) {
@@ -57,8 +56,8 @@ Bytes value(std::uint8_t number) {
     return Bytes(1024, number);
 }
 
-void baseline(const std::filesystem::path& path, PhysicalStore backend, bool model) {
-    Repository repository(path, backend);
+void baseline(const std::filesystem::path& path, bool model) {
+    Repository repository(path);
     repository.createBranch("main");
     if (model) {
         repository.commitModel("main", {
@@ -71,9 +70,9 @@ void baseline(const std::filesystem::path& path, PhysicalStore backend, bool mod
     expect(repository.verifyRepository().branches == 1, "invalid fixture repository");
 }
 
-void recover(const std::filesystem::path& path, PhysicalStore backend,
+void recover(const std::filesystem::path& path,
              const Hash& original, bool afterPublish, bool model, bool compaction) {
-    Repository repository(path, backend);
+    Repository repository(path);
     const Hash current = repository.head("main").id;
     if (compaction || !afterPublish) {
         expect(current == original, "unpublished operation changed branch head");
@@ -107,13 +106,13 @@ void recover(const std::filesystem::path& path, PhysicalStore backend,
 
 // The production library is not linked into this test executable. Only this
 // test target uses a duplicate, test-instrumented engine build.
-void runFault(std::string_view point, bool crash, PhysicalStore backend,
+void runFault(std::string_view point, bool crash,
               bool model, bool compaction, bool afterPublish) {
     TestDirectory directory(point);
-    baseline(directory.path / "repo", backend, model);
+    baseline(directory.path / "repo", model);
     Hash original{};
     {
-        Repository repository(directory.path / "repo", backend);
+        Repository repository(directory.path / "repo");
         original = repository.head("main").id;
     }
     const pid_t child = ::fork();
@@ -123,7 +122,7 @@ void runFault(std::string_view point, bool crash, PhysicalStore backend,
         ::setenv("AOWIS_NATIVE_TEST_FAULT", selected.c_str(), 1);
         ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
-            Repository repository(directory.path / "repo", backend);
+            Repository repository(directory.path / "repo");
             if (compaction) {
                 (void)repository.compact();
             } else if (model) {
@@ -145,13 +144,13 @@ void runFault(std::string_view point, bool crash, PhysicalStore backend,
            "fault checkpoint not reached: " + std::string(point) +
            "; child status=" + std::to_string(status));
     try {
-        recover(directory.path / "repo", backend, original, afterPublish, model, compaction);
+        recover(directory.path / "repo", original, afterPublish, model, compaction);
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string(point) + ": " + error.what());
     }
 }
 
-void runImportFault(std::string_view point, bool crash, PhysicalStore backend,
+void runImportFault(std::string_view point, bool crash,
                     bool afterPublish) {
     TestDirectory directory("import");
     const std::filesystem::path from = directory.path / "from";
@@ -160,7 +159,7 @@ void runImportFault(std::string_view point, bool crash, PhysicalStore backend,
     const std::filesystem::path incremental = directory.path / "incremental.bundle";
     Hash initialHead{};
     {
-        Repository origin(from, backend);
+        Repository origin(from);
         origin.createBranch("main");
         origin.commitModel("main", {ModelChange{key(1), ModelRecord{1, {}, value(11)}}});
         initialHead = origin.head("main").id;
@@ -170,7 +169,7 @@ void runImportFault(std::string_view point, bool crash, PhysicalStore backend,
         origin.exportIncrementalBranchBundle("main", initialHead, incremental);
     }
     {
-        Repository destination(to, backend);
+        Repository destination(to);
         const aowis::native::BundleImportResult imported =
             destination.importBranchBundle(initial, "main");
         expect(imported.head == initialHead, "incorrect initial import");
@@ -182,7 +181,7 @@ void runImportFault(std::string_view point, bool crash, PhysicalStore backend,
         ::setenv("AOWIS_NATIVE_TEST_FAULT", selected.c_str(), 1);
         ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
-            Repository destination(to, backend);
+            Repository destination(to);
             (void)destination.importBranchBundle(incremental, "main");
         } catch (const std::exception&) { ::_exit(crash ? 95 : 94); }
         ::_exit(96);
@@ -191,7 +190,7 @@ void runImportFault(std::string_view point, bool crash, PhysicalStore backend,
     expect(::waitpid(child, &status, 0) == child, "import waitpid failed");
     expect(WIFEXITED(status) && WEXITSTATUS(status) == (crash ? 93 : 94),
            "import did not reach fault point: " + std::string(point));
-    Repository recovered(to, backend);
+    Repository recovered(to);
     const Hash current = recovered.head("main").id;
     if (afterPublish) {
         expect(current != initialHead, "published import did not advance head");
@@ -213,16 +212,16 @@ void runImportFault(std::string_view point, bool crash, PhysicalStore backend,
     recovered.verifyRepository();
 }
 
-void testBackupAndSidecars(PhysicalStore backend) {
+void testBackupAndSidecars() {
     TestDirectory directory("backup");
     const std::filesystem::path origin = directory.path / "origin";
     const std::filesystem::path backup = directory.path / "backup";
-    baseline(origin, backend, true);
+    baseline(origin, true);
     // Backups are made with all repository handles closed. Copying while the
     // engine is live is NOT promised to yield a consistent filesystem snapshot.
     std::filesystem::copy(origin, backup, std::filesystem::copy_options::recursive);
     {
-        Repository restored(backup, backend);
+        Repository restored(backup);
         restored.verifyRepository();
     }
     // Index sidecars are reconstructible. Simulate a crash that leaves only an
@@ -232,7 +231,7 @@ void testBackupAndSidecars(PhysicalStore backend) {
     expect(oldSize > 16, "fixture lacks an index");
     std::filesystem::resize_file(index, oldSize - 7);
     {
-        Repository restored(origin, backend);
+        Repository restored(origin);
         restored.verifyRepository();
         restored.commitModel("main", {
             ModelChange{key(3), ModelRecord{1, {}, value(33)}}});
@@ -240,9 +239,9 @@ void testBackupAndSidecars(PhysicalStore backend) {
     }
 }
 
-void verifyLocking(PhysicalStore backend) {
+void verifyLocking() {
     TestDirectory directory("locking");
-    baseline(directory.path / "repo", backend, false);
+    baseline(directory.path / "repo", false);
     int ready[2]{};
     int finish[2]{};
     expect(::pipe(ready) == 0 && ::pipe(finish) == 0, "pipe failed");
@@ -252,7 +251,7 @@ void verifyLocking(PhysicalStore backend) {
         ::close(ready[0]);
         ::close(finish[1]);
         try {
-            Repository repository(directory.path / "repo", backend);
+            Repository repository(directory.path / "repo");
             const char yes = 'Y';
             if (::write(ready[1], &yes, 1) != 1) ::_exit(20);
             char signal = 0;
@@ -267,7 +266,7 @@ void verifyLocking(PhysicalStore backend) {
            "child could not open independent repository handle");
     bool refused = false;
     {
-        Repository repository(directory.path / "repo", backend);
+        Repository repository(directory.path / "repo");
         try { (void)repository.compact(); }
         catch (const std::exception&) { refused = true; }
     }
@@ -279,16 +278,16 @@ void verifyLocking(PhysicalStore backend) {
     ::close(ready[0]);
     ::close(finish[1]);
     expect(refused, "compaction permitted a concurrent repository handle");
-    Repository repository(directory.path / "repo", backend);
+    Repository repository(directory.path / "repo");
     repository.verifyRepository();
 }
 
-void testInterruptedCompactionHandle(PhysicalStore backend, bool afterSwitch) {
+void testInterruptedCompactionHandle(bool afterSwitch) {
     TestDirectory directory("compaction-handle");
     const std::filesystem::path path = directory.path / "repo";
-    baseline(path, backend, false);
+    baseline(path, false);
     {
-        Repository repository(path, backend);
+        Repository repository(path);
         const char* point = (afterSwitch ? "compact.pack.after.pointer" : "compact.pack.before.pointer");
         ::setenv("AOWIS_NATIVE_TEST_FAULT", point, 1);
         ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
@@ -304,7 +303,7 @@ void testInterruptedCompactionHandle(PhysicalStore backend, bool afterSwitch) {
         expect(writable != afterSwitch,
                "stale repository handle was writable after generation switch");
     }
-    Repository reopened(path, backend);
+    Repository reopened(path);
     reopened.verifyRepository();
     reopened.commit("main", {Change{key(6), value(66)}});
     reopened.verifyRepository();
@@ -364,17 +363,17 @@ std::vector<std::filesystem::path> recoveredCopies(const std::filesystem::path& 
 void testTornPackTail(std::string_view label, const Bytes& tail) {
     TestDirectory directory(label);
     const std::filesystem::path repo = directory.path / "repo";
-    baseline(repo, PhysicalStore::Pack, true);
+    baseline(repo, true);
     Hash head{};
     {
-        Repository repository(repo, PhysicalStore::Pack);
+        Repository repository(repo);
         head = repository.head("main").id;
     }
     const std::uintmax_t packBefore = std::filesystem::file_size(repo / "objects.pack");
     appendToPack(repo, tail);
     try {
         {
-            Repository repository(repo, PhysicalStore::Pack);
+            Repository repository(repo);
             expect(repository.recoveredPackTailBytes() == tail.size(),
                    "recovered byte count differs from torn tail size");
             expect(std::filesystem::file_size(repo / "objects.pack") == packBefore,
@@ -389,7 +388,7 @@ void testTornPackTail(std::string_view label, const Bytes& tail) {
         const std::vector<std::filesystem::path> copies = recoveredCopies(repo);
         expect(copies.size() == 1, "expected exactly one preserved torn tail copy");
         expect(readFile(copies.front()) == tail, "preserved torn tail differs from discarded bytes");
-        Repository reopened(repo, PhysicalStore::Pack);
+        Repository reopened(repo);
         expect(reopened.recoveredPackTailBytes() == 0, "clean reopen reported tail recovery");
         expect(reopened.getModel("main", key(3)).has_value(), "post-recovery commit lost");
         reopened.verifyRepository();
@@ -431,7 +430,7 @@ void testTornPackTails() {
 void testCorruptionBeforeValidRecord(std::string_view label, std::size_t gap) {
     TestDirectory directory(label);
     const std::filesystem::path repo = directory.path / "repo";
-    baseline(repo, PhysicalStore::Pack, true);
+    baseline(repo, true);
     Bytes damage = garbageRecord(16, 0);
     damage.insert(damage.end(), gap, 0);
     const Bytes later = validRecord(value(77));
@@ -439,7 +438,7 @@ void testCorruptionBeforeValidRecord(std::string_view label, std::size_t gap) {
     appendToPack(repo, damage);
     const std::uintmax_t size = std::filesystem::file_size(repo / "objects.pack");
     bool refused = false;
-    try { Repository repository(repo, PhysicalStore::Pack); }
+    try { Repository repository(repo); }
     catch (const std::exception& error) {
         refused = std::string_view(error.what()).find("followed by a valid record") !=
                   std::string_view::npos;
@@ -455,7 +454,7 @@ void testCorruptionBeforeValidRecord(std::string_view label, std::size_t gap) {
 void testDamagedPublishedHeadIsNotTruncated() {
     TestDirectory directory("damaged-head");
     const std::filesystem::path repo = directory.path / "repo";
-    baseline(repo, PhysicalStore::Pack, true);
+    baseline(repo, true);
     std::filesystem::remove(repo / "objects.idx"); // force a full pack rescan
     const std::filesystem::path pack = repo / "objects.pack";
     const std::uintmax_t size = std::filesystem::file_size(pack);
@@ -470,7 +469,7 @@ void testDamagedPublishedHeadIsNotTruncated() {
         expect(stream.good(), "cannot corrupt head revision record");
     }
     bool refused = false;
-    try { Repository repository(repo, PhysicalStore::Pack); }
+    try { Repository repository(repo); }
     catch (const std::exception& error) {
         refused = std::string_view(error.what()).find("references content inside the damaged") !=
                   std::string_view::npos;
@@ -500,7 +499,7 @@ void crashCompaction(const std::filesystem::path& repo, const char* point) {
         ::setenv("AOWIS_NATIVE_TEST_FAULT", point, 1);
         ::setenv("AOWIS_NATIVE_TEST_ACTION", "crash", 1);
         try {
-            Repository repository(repo, PhysicalStore::Pack);
+            Repository repository(repo);
             (void)repository.compact();
         } catch (...) { ::_exit(95); }
         ::_exit(96);
@@ -513,7 +512,7 @@ void crashCompaction(const std::filesystem::path& repo, const char* point) {
 void testStaleGenerationCleanup() {
     TestDirectory directory("stale-generations");
     const std::filesystem::path repo = directory.path / "repo";
-    baseline(repo, PhysicalStore::Pack, false);
+    baseline(repo, false);
 
     // Crash after writing a complete new generation, before publishing it.
     crashCompaction(repo, "compact.pack.before.pointer");
@@ -522,7 +521,7 @@ void testStaleGenerationCleanup() {
     { std::ofstream(repo / pointerTemp) << "PACK1 0123456789abcdef0123456789abcdef\n"; }
     { std::ofstream(repo / "objects.notes") << "unrelated administrator file\n"; }
     {
-        Repository repository(repo, PhysicalStore::Pack);
+        Repository repository(repo);
         const aowis::native::CompactionStats stats = repository.compact();
         expect(stats.staleFilesRemoved == 3,
                "expected orphan pack, orphan index and pointer temp to be removed, got " +
@@ -538,7 +537,7 @@ void testStaleGenerationCleanup() {
     crashCompaction(repo, "compact.pack.after.pointer");
     expect(countFiles(repo, "objects.", ".pack") == 2, "fixture lacks a retired generation");
     {
-        Repository repository(repo, PhysicalStore::Pack);
+        Repository repository(repo);
         repository.verifyRepository();
         const aowis::native::CompactionStats stats = repository.compact();
         expect(stats.staleFilesRemoved == 2, "retired generation was not removed");
@@ -546,7 +545,7 @@ void testStaleGenerationCleanup() {
         repository.verifyRepository();
     }
     expect(countFiles(repo, "objects.", ".pack") == 1, "more than one generation remains");
-    Repository reopened(repo, PhysicalStore::Pack);
+    Repository reopened(repo);
     reopened.verifyRepository();
 }
 
@@ -558,8 +557,8 @@ void testExportFailureAfterClose() {
     TestDirectory directory("export-after-close");
     const std::filesystem::path repo = directory.path / "repo";
     const std::filesystem::path bundle = directory.path / "main.aowbundle";
-    baseline(repo, PhysicalStore::Pack, true);
-    Repository repository(repo, PhysicalStore::Pack);
+    baseline(repo, true);
+    Repository repository(repo);
     ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.after.close", 1);
     ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
     bool failed = false;
@@ -570,12 +569,12 @@ void testExportFailureAfterClose() {
     expect(failed, "export did not observe injected failure after close");
     expect(!std::filesystem::exists(bundle), "failed export left a bundle behind");
     repository.exportBranchBundle("main", bundle);
-    Repository copy(directory.path / "copy", PhysicalStore::Pack);
+    Repository copy(directory.path / "copy");
     expect(copy.importBranchBundle(bundle, "main").head == repository.head("main").id,
            "export after a failed attempt is not importable");
 }
 
-void runBackend(PhysicalStore backend) {
+void runBackend() {
     const std::vector<std::string_view> packPre{
         "pack.before.header", "pack.after.header", "pack.partial.body",
         "pack.after.body",
@@ -583,38 +582,38 @@ void runBackend(PhysicalStore backend) {
     };
     const std::vector<std::string_view>& checkpoints = packPre;
     for (std::string_view point : checkpoints) {
-        for (bool crash : {true, false}) runFault(point, crash, backend, false, false, false);
+        for (bool crash : {true, false}) runFault(point, crash, false, false, false);
     }
     for (std::string_view point : {
         "ref.partial.temp", "ref.before.fsync", "ref.after.fsync", "ref.before.rename",
         "ref.after.rename", "ref.after.dirsync"}) {
         for (bool crash : {true, false}) {
             const bool after = point == "ref.after.rename" || point == "ref.after.dirsync";
-            runFault(point, crash, backend, false, false, after);
+            runFault(point, crash, false, false, after);
         }
     }
     // Repeat representative checkpoints with model-indexed revisions.
     for (std::string_view point : {"ref.before.rename", "ref.after.rename"}) {
-        runFault(point, true, backend, true, false, point == "ref.after.rename");
+        runFault(point, true, true, false, point == "ref.after.rename");
     }
     for (bool crash : {true, false}) {
         runFault("compact.pack.before.pointer",
-                 crash, backend, false, true, false);
+                 crash, false, true, false);
         runFault("compact.pack.after.pointer",
-                 crash, backend, false, true, false);
+                 crash, false, true, false);
     }
     for (std::string_view point : {"ref.before.rename", "ref.after.rename",
                                    "import.after.sync"}) {
         for (bool crash : {true, false}) {
-            runImportFault(point, crash, backend, point == "ref.after.rename");
+            runImportFault(point, crash, point == "ref.after.rename");
         }
     }
     runImportFault("pack.after.fsync",
-                   true, backend, false);
-    testBackupAndSidecars(backend);
-    testInterruptedCompactionHandle(backend, false);
-    testInterruptedCompactionHandle(backend, true);
-    verifyLocking(backend);
+                   true, false);
+    testBackupAndSidecars();
+    testInterruptedCompactionHandle(false);
+    testInterruptedCompactionHandle(true);
+    verifyLocking();
     testTornPackTails();
     testCorruptionBeforeValidRecord("mid-pack-adjacent", 0);
     testCorruptionBeforeValidRecord("mid-pack-distant", 1024U * 1024U + 3U);
@@ -626,7 +625,7 @@ void runBackend(PhysicalStore backend) {
 
 int main() {
     try {
-        runBackend(PhysicalStore::Pack);
+        runBackend();
         std::cout << "Recovery, torn pack tails, stale generations, injected ENOSPC/crashes and locking: passed on pack storage\n";
         return 0;
     } catch (const std::exception& error) {

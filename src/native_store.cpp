@@ -1499,9 +1499,8 @@ Hash sha256(const Bytes& value) {
     return output;
 }
 
-Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
+Repository::Repository(std::filesystem::path directory)
     : directory_(std::move(directory)), scratch_(this->directory_ / "tmp") {
-    require(Err::InvalidInput, storage == PhysicalStore::Pack, "unsupported storage backend");
     std::filesystem::create_directories(this->directory_ / "refs" / "heads");
     this->lifetimeFd_ = ::open((this->directory_ / "maintenance.lock").c_str(),
                                O_CREAT | O_RDWR | O_CLOEXEC, 0644);
@@ -1509,25 +1508,19 @@ Repository::Repository(std::filesystem::path directory, PhysicalStore storage)
     try {
         systemCall(::flock(this->lifetimeFd_, LOCK_SH) == 0, "lock repository lifetime");
         this->lockFd_ = ::open((this->directory_ / "repo.lock").c_str(),
-                                  O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+                               O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         systemCall(this->lockFd_ >= 0, "open repository lock");
         ScopedFileLock locked(this->lockFd_);
         prepareScratchDirectory();
-        // Prevent either constructor from silently opening the wrong physical
-        // repository type (or creating a second, disconnected object pack).
-        const std::filesystem::path format = this->directory_ / "storage.format";
-        require(Err::Internal, !std::filesystem::exists(this->directory_ / "storage.format") &&
-                !std::filesystem::exists(this->directory_ / "blocks"),
-                "repository uses obsolete block storage; export its history with an older build");
-            this->packToken_ = activePackToken(this->directory_);
-            const int flags = O_RDWR | O_CLOEXEC | (this->packToken_.empty() ? O_CREAT : 0);
-            this->packFd_ = ::open(packPath(this->directory_, this->packToken_, false).c_str(),
-                                   flags, 0644);
-            systemCall(this->packFd_ >= 0, "open active content pack");
-            this->indexFd_ = ::open(packPath(this->directory_, this->packToken_, true).c_str(),
-                                    flags | O_CREAT, 0644);
-            systemCall(this->indexFd_ >= 0, "open active content index");
-            refreshIndex();
+        this->packToken_ = activePackToken(this->directory_);
+        const int flags = O_RDWR | O_CLOEXEC | (this->packToken_.empty() ? O_CREAT : 0);
+        this->packFd_ = ::open(packPath(this->directory_, this->packToken_, false).c_str(),
+                               flags, 0644);
+        systemCall(this->packFd_ >= 0, "open active content pack");
+        this->indexFd_ = ::open(packPath(this->directory_, this->packToken_, true).c_str(),
+                                flags | O_CREAT, 0644);
+        systemCall(this->indexFd_ >= 0, "open active content index");
+        refreshIndex();
         syncDirectory(this->directory_);
         syncDirectory(this->directory_ / "refs");
     } catch (...) {
@@ -1854,7 +1847,7 @@ Hash Repository::store(Bytes&& bytes) {
 }
 
 void Repository::syncPack() {
-    // Branch durability depends on the pack,    // Branch durability depends on the pack, not on this reconstructible
+    // Branch durability depends on the pack, not on this reconstructible
     // sidecar. The index may lag across a crash; refreshIndex hashes the
     // uncovered durable pack suffix to rebuild it on the next open.
     detail::faultCheckpoint("pack.before.fsync");
@@ -2368,276 +2361,372 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    try {
-        const Revision targetHead = readRevision(branchHead(target));
-        const Revision sourceHead = readRevision(branchHead(source));
-        require(Err::Conflict, !options.expectedTargetHead || *options.expectedTargetHead == targetHead.id,
-                "target branch advanced since merge resolution was prepared");
-        require(Err::Conflict, !options.expectedSourceHead || *options.expectedSourceHead == sourceHead.id,
-                "source branch advanced since merge resolution was prepared");
-        const std::function<void()> checkSelections = [&options]() {
-            if (!options.checkSelections) return;
-            const std::optional<std::string> problem = options.checkSelections();
-            require(Err::InvalidInput, !problem, problem.value_or("unconsumed merge resolution choices"));
-        };
-        MergeResult result{};
-        result.targetBefore = targetHead.id;
-        result.sourceHead = sourceHead.id;
-        result.revision = targetHead;
-        if (targetHead.id == sourceHead.id) {
+    const Revision targetHead = readRevision(branchHead(target));
+    const Revision sourceHead = readRevision(branchHead(source));
+    require(Err::Conflict, !options.expectedTargetHead || *options.expectedTargetHead == targetHead.id,
+            "target branch advanced since merge resolution was prepared");
+    require(Err::Conflict, !options.expectedSourceHead || *options.expectedSourceHead == sourceHead.id,
+            "source branch advanced since merge resolution was prepared");
+    const std::function<void()> checkSelections = [&options]() {
+        if (!options.checkSelections) return;
+        const std::optional<std::string> problem = options.checkSelections();
+        require(Err::InvalidInput, !problem, problem.value_or("unconsumed merge resolution choices"));
+    };
+    MergeResult result{};
+    result.targetBefore = targetHead.id;
+    result.sourceHead = sourceHead.id;
+    result.revision = targetHead;
+    if (targetHead.id == sourceHead.id) {
+        checkSelections();
+        result.base = targetHead.id;
+        return result;
+    }
+
+    // Track only target revision identities, not full Revision objects.
+    // Short-circuit up-to-date merges as soon as the source tip is found,
+    // including when it is a *second* parent of an earlier merge.
+    std::unordered_set<Hash, HashHasher> targetAncestors;
+    std::vector<Hash> pending{targetHead.id};
+    while (!pending.empty()) {
+        const Hash current = pending.back();
+        pending.pop_back();
+        require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
+        if (!targetAncestors.insert(current).second) continue;
+        if (current == sourceHead.id) {
+            checkSelections();
+            result.base = sourceHead.id;
+            return result; // source already incorporated
+        }
+        const Revision record = readRevision(current);
+        for (const Hash& parent : record.parents) pending.push_back(parent);
+    }
+
+    // The first target-common revision encountered on each source path
+    // dominates all of its own ancestors. Stop walking that path there:
+    // descending into the shared history only to rediscover older common
+    // revisions is unnecessary. This bounds source-side work by the
+    // divergent graph plus the common frontier in typical histories.
+    std::unordered_set<Hash, HashHasher> sourceVisited;
+    std::unordered_set<Hash, HashHasher> commonFrontier;
+    pending.push_back(sourceHead.id);
+    while (!pending.empty()) {
+        const Hash current = pending.back();
+        pending.pop_back();
+        require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
+        if (!sourceVisited.insert(current).second) continue;
+        if (current == targetHead.id) {
+            // The target is an ancestor of the source: preserve the
+            // source revision identity rather than creating a new merge.
             checkSelections();
             result.base = targetHead.id;
+            publishRef(target, sourceHead.id, false);
+            result.status = MergeStatus::FastForward;
+            result.revision = sourceHead;
             return result;
         }
-
-        // Track only target revision identities, not full Revision objects.
-        // Short-circuit up-to-date merges as soon as the source tip is found,
-        // including when it is a *second* parent of an earlier merge.
-        std::unordered_set<Hash, HashHasher> targetAncestors;
-        std::vector<Hash> pending{targetHead.id};
-        while (!pending.empty()) {
-            const Hash current = pending.back();
-            pending.pop_back();
-            require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
-            if (!targetAncestors.insert(current).second) continue;
-            if (current == sourceHead.id) {
-                checkSelections();
-                result.base = sourceHead.id;
-                return result; // source already incorporated
-            }
-            const Revision record = readRevision(current);
-            for (const Hash& parent : record.parents) pending.push_back(parent);
+        if (targetAncestors.contains(current)) {
+            commonFrontier.insert(current);
+            continue;
         }
+        const Revision record = readRevision(current);
+        for (const Hash& parent : record.parents) pending.push_back(parent);
+    }
+    require(Err::Conflict, !commonFrontier.empty(), "branches have no common revision ancestor");
 
-        // The first target-common revision encountered on each source path
-        // dominates all of its own ancestors. Stop walking that path there:
-        // descending into the shared history only to rediscover older common
-        // revisions is unnecessary. This bounds source-side work by the
-        // divergent graph plus the common frontier in typical histories.
-        std::unordered_set<Hash, HashHasher> sourceVisited;
-        std::unordered_set<Hash, HashHasher> commonFrontier;
-        pending.push_back(sourceHead.id);
-        while (!pending.empty()) {
-            const Hash current = pending.back();
-            pending.pop_back();
-            require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
-            if (!sourceVisited.insert(current).second) continue;
-            if (current == targetHead.id) {
-                // The target is an ancestor of the source: preserve the
-                // source revision identity rather than creating a new merge.
-                checkSelections();
-                result.base = targetHead.id;
-                publishRef(target, sourceHead.id, false);
-                result.status = MergeStatus::FastForward;
-                result.revision = sourceHead;
-                return result;
-            }
-            if (targetAncestors.contains(current)) {
-                commonFrontier.insert(current);
-                continue;
-            }
-            const Revision record = readRevision(current);
-            for (const Hash& parent : record.parents) pending.push_back(parent);
-        }
-        require(Err::Conflict, !commonFrontier.empty(), "branches have no common revision ancestor");
-
-        // Different merge paths can expose common-frontier nodes which are
-        // themselves ancestors of other frontier nodes (criss-cross DAGs).
-        // Remove dominated candidates, visiting any ancestor at most once.
-        // The overwhelmingly common single-frontier case performs no extra
-        // history traversal at all.
-        std::unordered_set<Hash, HashHasher> dominated;
-        if (commonFrontier.size() > 1) {
-            std::unordered_set<Hash, HashHasher> visitedAncestors;
-            for (const Hash& candidate : commonFrontier) {
-                const Revision record = readRevision(candidate);
-                std::vector<Hash> ancestry = record.parents;
-                while (!ancestry.empty()) {
-                    const Hash current = ancestry.back();
-                    ancestry.pop_back();
-                    if (!visitedAncestors.insert(current).second) continue;
-                    if (commonFrontier.contains(current)) dominated.insert(current);
-                    const Revision ancestor = readRevision(current);
-                    for (const Hash& parent : ancestor.parents) ancestry.push_back(parent);
-                }
-            }
-        }
-        std::vector<Hash> lowest;
+    // Different merge paths can expose common-frontier nodes which are
+    // themselves ancestors of other frontier nodes (criss-cross DAGs).
+    // Remove dominated candidates, visiting any ancestor at most once.
+    // The overwhelmingly common single-frontier case performs no extra
+    // history traversal at all.
+    std::unordered_set<Hash, HashHasher> dominated;
+    if (commonFrontier.size() > 1) {
+        std::unordered_set<Hash, HashHasher> visitedAncestors;
         for (const Hash& candidate : commonFrontier) {
-            if (!dominated.contains(candidate)) lowest.push_back(candidate);
-        }
-        require(Err::Conflict, lowest.size() == 1, "multiple independent merge bases require recursive merging");
-        result.base = lowest.front();
-        const Revision base = readRevision(result.base);
-        require(Err::InvalidInput, targetHead.modelIndexed == sourceHead.modelIndexed &&
-                (base.modelIndexed == targetHead.modelIndexed ||
-                 (!base.modelIndexed && isZero(base.root) && targetHead.modelIndexed)),
-                "cannot merge incompatible raw and model-indexed histories");
-
-        std::vector<Difference> targetDiff;
-        std::vector<Difference> sourceDiff;
-        diffHashes(base.root, targetHead.root, targetDiff);
-        diffHashes(base.root, sourceHead.root, sourceDiff);
-        struct Values {
-            std::optional<Hash> base;
-            std::optional<Hash> target;
-            std::optional<Hash> source;
-        };
-        std::map<Key, Values> differences;
-        for (const Difference& change : targetDiff) {
-            differences.emplace(change.key, Values{change.before, change.after, change.before});
-        }
-        for (const Difference& change : sourceDiff) {
-            std::map<Key, Values>::iterator existing = differences.find(change.key);
-            if (existing == differences.end()) {
-                differences.emplace(change.key,
-                                    Values{change.before, change.before, change.after});
-            } else {
-                existing->second.source = change.after;
+            const Revision record = readRevision(candidate);
+            std::vector<Hash> ancestry = record.parents;
+            while (!ancestry.empty()) {
+                const Hash current = ancestry.back();
+                ancestry.pop_back();
+                if (!visitedAncestors.insert(current).second) continue;
+                if (commonFrontier.contains(current)) dominated.insert(current);
+                const Revision ancestor = readRevision(current);
+                for (const Hash& parent : ancestor.parents) ancestry.push_back(parent);
             }
         }
-        std::map<Key, std::optional<Hash>> selected;
-        // Resolutions are checked without writing any pack objects. The
-        // resolver sees authenticated canonical model records at all three
-        // immutable snapshots and must not access this Repository recursively.
-        std::map<Key, ModelRecord> resolved;
-        for (const std::pair<const Key, Values>& item : differences) {
-            const Values& values = item.second;
-            if (values.target == values.source) continue;
-            if (values.target != values.base && values.source != values.base) {
-                if (options.chooseConflict && targetHead.modelIndexed) {
-                    const MergeConflict conflict{item.first, values.base, values.target,
-                        values.source, "concurrent changes to the same UUID"};
-                    const std::optional<MergeChoiceSide> choice = options.chooseConflict(conflict);
-                    if (choice) {
-                        // Also include target-side selections in the candidate
-                        // preview, so reference/semantic validation cannot be
-                        // skipped when the chosen object is already at target.
-                        selected.emplace(item.first, *choice == MergeChoiceSide::Source
-                            ? values.source : values.target);
-                        continue;
-                    }
+    }
+    std::vector<Hash> lowest;
+    for (const Hash& candidate : commonFrontier) {
+        if (!dominated.contains(candidate)) lowest.push_back(candidate);
+    }
+    require(Err::Conflict, lowest.size() == 1, "multiple independent merge bases require recursive merging");
+    result.base = lowest.front();
+    const Revision base = readRevision(result.base);
+    require(Err::InvalidInput, targetHead.modelIndexed == sourceHead.modelIndexed &&
+            (base.modelIndexed == targetHead.modelIndexed ||
+             (!base.modelIndexed && isZero(base.root) && targetHead.modelIndexed)),
+            "cannot merge incompatible raw and model-indexed histories");
+
+    std::vector<Difference> targetDiff;
+    std::vector<Difference> sourceDiff;
+    diffHashes(base.root, targetHead.root, targetDiff);
+    diffHashes(base.root, sourceHead.root, sourceDiff);
+    struct Values {
+        std::optional<Hash> base;
+        std::optional<Hash> target;
+        std::optional<Hash> source;
+    };
+    std::map<Key, Values> differences;
+    for (const Difference& change : targetDiff) {
+        differences.emplace(change.key, Values{change.before, change.after, change.before});
+    }
+    for (const Difference& change : sourceDiff) {
+        std::map<Key, Values>::iterator existing = differences.find(change.key);
+        if (existing == differences.end()) {
+            differences.emplace(change.key,
+                                Values{change.before, change.before, change.after});
+        } else {
+            existing->second.source = change.after;
+        }
+    }
+    std::map<Key, std::optional<Hash>> selected;
+    // Resolutions are checked without writing any pack objects. The
+    // resolver sees authenticated canonical model records at all three
+    // immutable snapshots and must not access this Repository recursively.
+    std::map<Key, ModelRecord> resolved;
+    for (const std::pair<const Key, Values>& item : differences) {
+        const Values& values = item.second;
+        if (values.target == values.source) continue;
+        if (values.target != values.base && values.source != values.base) {
+            if (options.chooseConflict && targetHead.modelIndexed) {
+                const MergeConflict conflict{item.first, values.base, values.target,
+                    values.source, "concurrent changes to the same UUID"};
+                const std::optional<MergeChoiceSide> choice = options.chooseConflict(conflict);
+                if (choice) {
+                    // Also include target-side selections in the candidate
+                    // preview, so reference/semantic validation cannot be
+                    // skipped when the chosen object is already at target.
+                    selected.emplace(item.first, *choice == MergeChoiceSide::Source
+                        ? values.source : values.target);
+                    continue;
                 }
-                if (options.resolve && targetHead.modelIndexed && base.modelIndexed &&
-                    values.base && values.target && values.source) {
-                    const auto decodeAt = [this](const Hash& hash) {
-                        const Bytes envelope = load(hash);
-                        require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
-                                "invalid model envelope in merge conflict");
-                        return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
-                    };
-                    const ModelRecord original = decodeAt(*values.base);
-                    const ModelRecord left = decodeAt(*values.target);
-                    const ModelRecord right = decodeAt(*values.source);
-                    if (original.kind == left.kind && left.kind == right.kind) {
-                        MergeResolution resolution = options.resolve(item.first, original, left, right);
-                        if (resolution.record && resolution.conflictingFields.empty() &&
-                            resolution.record->kind == left.kind) {
-                            resolved.emplace(item.first, std::move(*resolution.record));
-                            continue;
-                        }
-                        if (!resolution.conflictingFields.empty()) {
-                            std::string detail = "conflicting model fields: ";
-                            for (const std::string& field : resolution.conflictingFields) {
-                                if (detail.back() != ' ') detail += ", ";
-                                detail += field;
-                            }
-                            result.conflicts.push_back(MergeConflict{item.first, values.base,
-                                values.target, values.source, std::move(detail)});
-                            continue;
-                        }
-                    }
-                }
-                if (options.resolveConcurrentAddition && targetHead.modelIndexed &&
-                    !values.base && values.target && values.source) {
-                    const auto decodeAt = [this](const Hash& hash) {
-                        const Bytes envelope = load(hash);
-                        require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
-                                "invalid model envelope in concurrent addition");
-                        return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
-                    };
-                    const ModelRecord left = decodeAt(*values.target);
-                    const ModelRecord right = decodeAt(*values.source);
-                    MergeResolution resolution = options.resolveConcurrentAddition(
-                        item.first, left, right);
+            }
+            if (options.resolve && targetHead.modelIndexed && base.modelIndexed &&
+                values.base && values.target && values.source) {
+                const auto decodeAt = [this](const Hash& hash) {
+                    const Bytes envelope = load(hash);
+                    require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
+                            "invalid model envelope in merge conflict");
+                    return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
+                };
+                const ModelRecord original = decodeAt(*values.base);
+                const ModelRecord left = decodeAt(*values.target);
+                const ModelRecord right = decodeAt(*values.source);
+                if (original.kind == left.kind && left.kind == right.kind) {
+                    MergeResolution resolution = options.resolve(item.first, original, left, right);
                     if (resolution.record && resolution.conflictingFields.empty() &&
-                        resolution.record->kind == left.kind && left.kind == right.kind) {
+                        resolution.record->kind == left.kind) {
                         resolved.emplace(item.first, std::move(*resolution.record));
                         continue;
                     }
+                    if (!resolution.conflictingFields.empty()) {
+                        std::string detail = "conflicting model fields: ";
+                        for (const std::string& field : resolution.conflictingFields) {
+                            if (detail.back() != ' ') detail += ", ";
+                            detail += field;
+                        }
+                        result.conflicts.push_back(MergeConflict{item.first, values.base,
+                            values.target, values.source, std::move(detail)});
+                        continue;
+                    }
                 }
-                result.conflicts.push_back(MergeConflict{item.first, values.base,
-                    values.target, values.source, "both branches changed the same UUID"});
-            } else if (values.target == values.base) {
-                selected.emplace(item.first, values.source);
+            }
+            if (options.resolveConcurrentAddition && targetHead.modelIndexed &&
+                !values.base && values.target && values.source) {
+                const auto decodeAt = [this](const Hash& hash) {
+                    const Bytes envelope = load(hash);
+                    require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
+                            "invalid model envelope in concurrent addition");
+                    return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
+                };
+                const ModelRecord left = decodeAt(*values.target);
+                const ModelRecord right = decodeAt(*values.source);
+                MergeResolution resolution = options.resolveConcurrentAddition(
+                    item.first, left, right);
+                if (resolution.record && resolution.conflictingFields.empty() &&
+                    resolution.record->kind == left.kind && left.kind == right.kind) {
+                    resolved.emplace(item.first, std::move(*resolution.record));
+                    continue;
+                }
+            }
+            result.conflicts.push_back(MergeConflict{item.first, values.base,
+                values.target, values.source, "both branches changed the same UUID"});
+        } else if (values.target == values.base) {
+            selected.emplace(item.first, values.source);
+        }
+    }
+    // Validate explicit choices even when other conflicts remain unresolved.
+    // Otherwise a misspelled/unused choice could be silently ignored by
+    // an early conflict return, only to change behavior on a later retry.
+    checkSelections();
+    if (!result.conflicts.empty()) {
+        result.status = MergeStatus::Conflicts;
+        return result;
+    }
+
+    std::vector<ModelChange> modelChanges;
+    std::vector<Change> rawChanges;
+    // Keep the selected records for dependency preflight, so a target can
+    // be checked without decoding unrelated entities.
+    std::map<Key, std::optional<ModelRecord>> selectedRecords;
+    for (const std::pair<const Key, std::optional<Hash>>& item : selected) {
+        if (!item.second) {
+            if (targetHead.modelIndexed) selectedRecords.emplace(item.first, std::nullopt);
+            else rawChanges.push_back(Change{item.first, std::nullopt});
+            continue;
+        }
+        const Bytes value = load(*item.second);
+        require(Err::Corruption, !value.empty() && value.front() == 'V', "invalid merged value envelope");
+        const Bytes payload(value.begin() + 1, value.end());
+        if (targetHead.modelIndexed) {
+            ModelRecord record = decodeModelRecord(payload);
+            selectedRecords.emplace(item.first, std::move(record));
+        } else {
+            rawChanges.push_back(Change{item.first, payload});
+        }
+    }
+    for (std::pair<const Key, ModelRecord>& item : resolved)
+        selectedRecords.emplace(item.first, std::move(item.second));
+    if (targetHead.modelIndexed && options.reconcile) {
+        // Readers inspect authenticated, immutable branch tips; candidate
+        // modifications remain memory-only until ALL preflights complete.
+        const auto readSnapshot = [this](const Hash& root, const Key& key)
+            -> std::optional<ModelRecord> {
+            const std::optional<Hash> hash = lookup(root, key);
+            if (!hash) return std::nullopt;
+            const Bytes value = load(*hash);
+            require(Err::Corruption, !value.empty() && value.front() == 'V',
+                    "invalid model envelope in merge reconciliation");
+            return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
+        };
+        const std::function<std::optional<ModelRecord>(const Key&)> readTarget =
+            [&readSnapshot, &targetHead](const Key& key) {
+                return readSnapshot(targetHead.root, key);
+            };
+        const std::function<std::optional<ModelRecord>(const Key&)> readSource =
+            [&readSnapshot, &sourceHead](const Key& key) {
+                return readSnapshot(sourceHead.root, key);
+            };
+        const std::function<std::optional<ModelRecord>(const Key&)> readMerged =
+            [&selectedRecords, &readTarget](const Key& key) {
+                const std::map<Key, std::optional<ModelRecord>>::const_iterator found =
+                    selectedRecords.find(key);
+                return found == selectedRecords.end() ? readTarget(key) : found->second;
+            };
+        const MergeCandidate candidate{
+            readMerged,
+            [this, &targetHead, &selectedRecords, &readMerged](
+                const std::function<void(const Key&, const ModelRecord&)>& visitor) {
+                std::vector<std::pair<Key, Hash>> hashes;
+                listHashes(targetHead.root, hashes);
+                std::map<Key, std::optional<ModelRecord>>::const_iterator pending =
+                    selectedRecords.begin();
+                for (const std::pair<Key, Hash>& entry : hashes) {
+                    while (pending != selectedRecords.end() && pending->first < entry.first) {
+                        if (pending->second) visitor(pending->first, *pending->second);
+                        ++pending;
+                    }
+                    if (pending != selectedRecords.end() && pending->first == entry.first) {
+                        if (pending->second) visitor(entry.first, *pending->second);
+                        ++pending;
+                    } else {
+                        const std::optional<ModelRecord> record = readMerged(entry.first);
+                        require(Err::Corruption, record.has_value(), "missing record in merge reconciliation");
+                        visitor(entry.first, *record);
+                    }
+                }
+                for (; pending != selectedRecords.end(); ++pending)
+                    if (pending->second) visitor(pending->first, *pending->second);
+            }
+        };
+        const std::function<void(const Key&, std::optional<ModelRecord>)> set =
+            [&selectedRecords](const Key& key, std::optional<ModelRecord> record) {
+                selectedRecords.insert_or_assign(key, std::move(record));
+            };
+        if (const std::optional<std::string> error =
+            options.reconcile(candidate, set, readTarget, readSource)) {
+            result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
+                std::nullopt, std::nullopt, *error});
+            result.status = MergeStatus::Conflicts;
+            return result;
+        }
+    }
+    if (targetHead.modelIndexed) {
+        // Content-hash conflicts are not enough: an unrelated deletion may
+        // invalidate references created independently on the other branch.
+        // Preflight before storing any new objects or publishing a ref.
+        for (const std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
+            if (!item.second) continue;
+            for (const Key& reference : item.second->references) {
+                const std::map<Key, std::optional<ModelRecord>>::const_iterator pendingTarget =
+                    selectedRecords.find(reference);
+                const bool exists = pendingTarget != selectedRecords.end()
+                    ? pendingTarget->second.has_value()
+                    : lookup(targetHead.root, reference).has_value();
+                if (!exists || reference == Key{} || reference == item.first) {
+                    const std::map<Key, Values>::const_iterator values = differences.find(item.first);
+                    result.conflicts.push_back(MergeConflict{item.first,
+                        values == differences.end() ? std::nullopt : values->second.base,
+                        values == differences.end() ? std::nullopt : values->second.target,
+                        values == differences.end() ? std::nullopt : values->second.source,
+                        "merged record has an invalid reference target"});
+                    break;
+                }
             }
         }
-        // Validate explicit choices even when other conflicts remain unresolved.
-        // Otherwise a misspelled/unused choice could be silently ignored by
-        // an early conflict return, only to change behavior on a later retry.
-        checkSelections();
+        for (const std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
+            if (item.second) continue;
+            const std::vector<Key> inbound = readReferrers(targetHead.referencesRoot, item.first);
+            for (const Key& referrer : inbound) {
+                const std::map<Key, std::optional<ModelRecord>>::const_iterator updated =
+                    selectedRecords.find(referrer);
+                if (updated != selectedRecords.end() &&
+                    (!updated->second || std::find(updated->second->references.begin(),
+                        updated->second->references.end(), item.first) ==
+                        updated->second->references.end())) continue;
+                const std::map<Key, Values>::const_iterator values = differences.find(item.first);
+                result.conflicts.push_back(MergeConflict{item.first,
+                    values == differences.end() ? std::nullopt : values->second.base,
+                    values == differences.end() ? std::nullopt : values->second.target,
+                    values == differences.end() ? std::nullopt : values->second.source,
+                    "merged deletion leaves a surviving incoming reference"});
+                break;
+            }
+        }
         if (!result.conflicts.empty()) {
             result.status = MergeStatus::Conflicts;
             return result;
         }
-
-        std::vector<ModelChange> modelChanges;
-        std::vector<Change> rawChanges;
-        // Keep the selected records for dependency preflight, so a target can
-        // be checked without decoding unrelated entities.
-        std::map<Key, std::optional<ModelRecord>> selectedRecords;
-        for (const std::pair<const Key, std::optional<Hash>>& item : selected) {
-            if (!item.second) {
-                if (targetHead.modelIndexed) selectedRecords.emplace(item.first, std::nullopt);
-                else rawChanges.push_back(Change{item.first, std::nullopt});
-                continue;
-            }
-            const Bytes value = load(*item.second);
-            require(Err::Corruption, !value.empty() && value.front() == 'V', "invalid merged value envelope");
-            const Bytes payload(value.begin() + 1, value.end());
-            if (targetHead.modelIndexed) {
-                ModelRecord record = decodeModelRecord(payload);
-                selectedRecords.emplace(item.first, std::move(record));
-            } else {
-                rawChanges.push_back(Change{item.first, payload});
-            }
-        }
-        for (std::pair<const Key, ModelRecord>& item : resolved)
-            selectedRecords.emplace(item.first, std::move(item.second));
-        if (targetHead.modelIndexed && options.reconcile) {
-            // Readers inspect authenticated, immutable branch tips; candidate
-            // modifications remain memory-only until ALL preflights complete.
-            const auto readSnapshot = [this](const Hash& root, const Key& key)
+        if (options.validate) {
+            // Copy-on-write view of the proposed snapshot. Changes override
+            // the current target tree; no callback can mutate the repository.
+            const auto lookupRecord = [this, &targetHead, &selectedRecords](const Key& key)
                 -> std::optional<ModelRecord> {
-                const std::optional<Hash> hash = lookup(root, key);
+                const auto pending = selectedRecords.find(key);
+                if (pending != selectedRecords.end()) return pending->second;
+                const std::optional<Hash> hash = lookup(targetHead.root, key);
                 if (!hash) return std::nullopt;
                 const Bytes value = load(*hash);
                 require(Err::Corruption, !value.empty() && value.front() == 'V',
-                        "invalid model envelope in merge reconciliation");
+                        "invalid model envelope in merge validation");
                 return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
             };
-            const std::function<std::optional<ModelRecord>(const Key&)> readTarget =
-                [&readSnapshot, &targetHead](const Key& key) {
-                    return readSnapshot(targetHead.root, key);
-                };
-            const std::function<std::optional<ModelRecord>(const Key&)> readSource =
-                [&readSnapshot, &sourceHead](const Key& key) {
-                    return readSnapshot(sourceHead.root, key);
-                };
-            const std::function<std::optional<ModelRecord>(const Key&)> readMerged =
-                [&selectedRecords, &readTarget](const Key& key) {
-                    const std::map<Key, std::optional<ModelRecord>>::const_iterator found =
-                        selectedRecords.find(key);
-                    return found == selectedRecords.end() ? readTarget(key) : found->second;
-                };
             const MergeCandidate candidate{
-                readMerged,
-                [this, &targetHead, &selectedRecords, &readMerged](
+                lookupRecord,
+                [this, &targetHead, &selectedRecords, &lookupRecord](
                     const std::function<void(const Key&, const ModelRecord&)>& visitor) {
                     std::vector<std::pair<Key, Hash>> hashes;
                     listHashes(targetHead.root, hashes);
-                    std::map<Key, std::optional<ModelRecord>>::const_iterator pending =
-                        selectedRecords.begin();
+                    auto pending = selectedRecords.begin();
                     for (const std::pair<Key, Hash>& entry : hashes) {
                         while (pending != selectedRecords.end() && pending->first < entry.first) {
                             if (pending->second) visitor(pending->first, *pending->second);
@@ -2647,8 +2736,8 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                             if (pending->second) visitor(entry.first, *pending->second);
                             ++pending;
                         } else {
-                            const std::optional<ModelRecord> record = readMerged(entry.first);
-                            require(Err::Corruption, record.has_value(), "missing record in merge reconciliation");
+                            const std::optional<ModelRecord> record = lookupRecord(entry.first);
+                            require(Err::Corruption, record.has_value(), "missing model in merge preview");
                             visitor(entry.first, *record);
                         }
                     }
@@ -2656,139 +2745,35 @@ MergeResult Repository::mergeBranches(std::string_view target, std::string_view 
                         if (pending->second) visitor(pending->first, *pending->second);
                 }
             };
-            const std::function<void(const Key&, std::optional<ModelRecord>)> set =
-                [&selectedRecords](const Key& key, std::optional<ModelRecord> record) {
-                    selectedRecords.insert_or_assign(key, std::move(record));
-                };
-            if (const std::optional<std::string> error =
-                options.reconcile(candidate, set, readTarget, readSource)) {
+            if (const std::optional<std::string> invalid = options.validate(candidate)) {
                 result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
-                    std::nullopt, std::nullopt, *error});
+                    std::nullopt, std::nullopt, *invalid});
                 result.status = MergeStatus::Conflicts;
                 return result;
             }
         }
-        if (targetHead.modelIndexed) {
-            // Content-hash conflicts are not enough: an unrelated deletion may
-            // invalidate references created independently on the other branch.
-            // Preflight before storing any new objects or publishing a ref.
-            for (const std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
-                if (!item.second) continue;
-                for (const Key& reference : item.second->references) {
-                    const std::map<Key, std::optional<ModelRecord>>::const_iterator pendingTarget =
-                        selectedRecords.find(reference);
-                    const bool exists = pendingTarget != selectedRecords.end()
-                        ? pendingTarget->second.has_value()
-                        : lookup(targetHead.root, reference).has_value();
-                    if (!exists || reference == Key{} || reference == item.first) {
-                        const std::map<Key, Values>::const_iterator values = differences.find(item.first);
-                        result.conflicts.push_back(MergeConflict{item.first,
-                            values == differences.end() ? std::nullopt : values->second.base,
-                            values == differences.end() ? std::nullopt : values->second.target,
-                            values == differences.end() ? std::nullopt : values->second.source,
-                            "merged record has an invalid reference target"});
-                        break;
-                    }
-                }
-            }
-            for (const std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
-                if (item.second) continue;
-                const std::vector<Key> inbound = readReferrers(targetHead.referencesRoot, item.first);
-                for (const Key& referrer : inbound) {
-                    const std::map<Key, std::optional<ModelRecord>>::const_iterator updated =
-                        selectedRecords.find(referrer);
-                    if (updated != selectedRecords.end() &&
-                        (!updated->second || std::find(updated->second->references.begin(),
-                            updated->second->references.end(), item.first) ==
-                            updated->second->references.end())) continue;
-                    const std::map<Key, Values>::const_iterator values = differences.find(item.first);
-                    result.conflicts.push_back(MergeConflict{item.first,
-                        values == differences.end() ? std::nullopt : values->second.base,
-                        values == differences.end() ? std::nullopt : values->second.target,
-                        values == differences.end() ? std::nullopt : values->second.source,
-                        "merged deletion leaves a surviving incoming reference"});
-                    break;
-                }
-            }
-            if (!result.conflicts.empty()) {
-                result.status = MergeStatus::Conflicts;
-                return result;
-            }
-            if (options.validate) {
-                // Copy-on-write view of the proposed snapshot. Changes override
-                // the current target tree; no callback can mutate the repository.
-                const auto lookupRecord = [this, &targetHead, &selectedRecords](const Key& key)
-                    -> std::optional<ModelRecord> {
-                    const auto pending = selectedRecords.find(key);
-                    if (pending != selectedRecords.end()) return pending->second;
-                    const std::optional<Hash> hash = lookup(targetHead.root, key);
-                    if (!hash) return std::nullopt;
-                    const Bytes value = load(*hash);
-                    require(Err::Corruption, !value.empty() && value.front() == 'V',
-                            "invalid model envelope in merge validation");
-                    return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
-                };
-                const MergeCandidate candidate{
-                    lookupRecord,
-                    [this, &targetHead, &selectedRecords, &lookupRecord](
-                        const std::function<void(const Key&, const ModelRecord&)>& visitor) {
-                        std::vector<std::pair<Key, Hash>> hashes;
-                        listHashes(targetHead.root, hashes);
-                        auto pending = selectedRecords.begin();
-                        for (const std::pair<Key, Hash>& entry : hashes) {
-                            while (pending != selectedRecords.end() && pending->first < entry.first) {
-                                if (pending->second) visitor(pending->first, *pending->second);
-                                ++pending;
-                            }
-                            if (pending != selectedRecords.end() && pending->first == entry.first) {
-                                if (pending->second) visitor(entry.first, *pending->second);
-                                ++pending;
-                            } else {
-                                const std::optional<ModelRecord> record = lookupRecord(entry.first);
-                                require(Err::Corruption, record.has_value(), "missing model in merge preview");
-                                visitor(entry.first, *record);
-                            }
-                        }
-                        for (; pending != selectedRecords.end(); ++pending)
-                            if (pending->second) visitor(pending->first, *pending->second);
-                    }
-                };
-                if (const std::optional<std::string> invalid = options.validate(candidate)) {
-                    result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
-                        std::nullopt, std::nullopt, *invalid});
-                    result.status = MergeStatus::Conflicts;
-                    return result;
-                }
-            }
-            modelChanges.reserve(selectedRecords.size());
-            for (std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
-                modelChanges.push_back(ModelChange{item.first, std::move(item.second)});
-            }
+        modelChanges.reserve(selectedRecords.size());
+        for (std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
+            modelChanges.push_back(ModelChange{item.first, std::move(item.second)});
         }
-        // A merge with no primary changes is still a two-parent revision: the
-        // second parent records that the source history was incorporated.
-        if (targetHead.modelIndexed) {
-            result.revision = commitModelLocked(target, std::move(modelChanges),
-                                                targetHead.id, sourceHead.id);
-        } else {
-            result.revision = commitLocked(target, rawChanges, std::nullopt, sourceHead.id);
-        }
-        result.status = MergeStatus::Merged;
-        return result;
-    } catch (...) {
-        throw;
     }
+    // A merge with no primary changes is still a two-parent revision: the
+    // second parent records that the source history was incorporated.
+    if (targetHead.modelIndexed) {
+        result.revision = commitModelLocked(target, std::move(modelChanges),
+                                            targetHead.id, sourceHead.id);
+    } else {
+        result.revision = commitLocked(target, rawChanges, std::nullopt, sourceHead.id);
+    }
+    result.status = MergeStatus::Merged;
+    return result;
 }
 
 Revision Repository::commit(std::string_view branch, const std::vector<Change>& changes) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    try {
-        return commitLocked(branch, changes);
-    } catch (...) {
-        throw;
-    }
+    return commitLocked(branch, changes);
 }
 
 Revision Repository::commitLocked(std::string_view branch, const std::vector<Change>& changes,
@@ -2854,11 +2839,7 @@ Revision Repository::commitModel(std::string_view branch, std::vector<ModelChang
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    try {
-        return commitModelLocked(branch, std::move(changes), expectedHead, std::nullopt);
-    } catch (...) {
-        throw;
-    }
+    return commitModelLocked(branch, std::move(changes), expectedHead, std::nullopt);
 }
 
 Revision Repository::commitModelLocked(std::string_view branch, std::vector<ModelChange> changes,
@@ -3436,7 +3417,9 @@ void Repository::exportBundleLocked(std::string_view branch,
         syncDirectory(parent);
     } catch (...) {
         if (bundlePath == nullptr) {
-            (void)::ftruncate(targetFd, 0); // never leave a partial bundle behind
+            // Never leave a partial bundle behind. The original failure is
+            // reported; a failing truncate cannot add information to it.
+            if (::ftruncate(targetFd, 0) != 0) errno = 0;
             throw;
         }
         if (fd >= 0) ::close(fd);
@@ -3740,7 +3723,7 @@ CompactionStats Repository::compact() {
     require(Err::Corruption, oldIndex.st_size >= 0, "invalid index size");
     stats.indexBytesBefore = static_cast<std::uint64_t>(oldIndex.st_size);
 
-    // The retention policy is intentionally conservative:    // The retention policy is intentionally conservative: preserve EVERY
+    // The retention policy is intentionally conservative: preserve EVERY
     // revision on the parent chain of EVERY branch head, plus both trees and
     // every leaf payload (including reverse-reference index values).
     enum class ReachableKind { Revision, Tree, Value };

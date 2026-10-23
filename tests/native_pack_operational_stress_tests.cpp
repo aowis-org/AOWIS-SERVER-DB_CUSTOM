@@ -186,20 +186,6 @@ void exercise() {
         });
         reopened.verifyRepository();
     }
-
-    // Never silently interpret an obsolete experimental repository as an
-    // empty pack repository, especially when its branch refs are present.
-    const std::filesystem::path legacy = root.path / "obsolete";
-    std::filesystem::create_directories(legacy);
-    {
-        std::ofstream marker(legacy / "storage.format");
-        marker << "AOWIS-BLOCK-EXPERIMENT-1\n";
-    }
-    bool refused = false;
-    try { Repository rejected(legacy); }
-    catch (const std::exception&) { refused = true; }
-    check(refused && !std::filesystem::exists(legacy / "objects.pack"),
-          "obsolete block repository was silently converted");
 }
 }
 

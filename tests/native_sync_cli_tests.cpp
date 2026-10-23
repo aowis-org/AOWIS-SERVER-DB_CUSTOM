@@ -15,7 +15,6 @@ namespace {
 
 using aowis::native::Bytes;
 using aowis::native::Change;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void expect(bool condition, const char* reason) {
@@ -59,56 +58,57 @@ int run(const std::filesystem::path& cli, const std::vector<std::string>& argume
     return WEXITSTATUS(status);
 }
 
-void exercise(const std::filesystem::path& cli,
-              PhysicalStore sourceFormat, PhysicalStore destinationFormat) {
+void exercise(const std::filesystem::path& cli) {
     TemporaryDirectory temp;
     const std::filesystem::path sourcePath = temp.path / "source";
     const std::filesystem::path destinationPath = temp.path / "destination";
     const std::filesystem::path bundle = temp.path / "full.aowbundle";
     const std::filesystem::path delta = temp.path / "incremental.aowbundle";
-    const std::string sourceMode = "pack";
-    const std::string destinationMode = "pack";
     aowis::native::Hash base{};
     aowis::native::Hash tip{};
     aowis::native::Key key{};
     key[0] = 73;
     {
-        Repository source(sourcePath, sourceFormat);
+        Repository source(sourcePath);
         source.createBranch("main");
         base = source.commit("main", {{key, Bytes{4, 5, 6}}}).id;
     }
-    expect(run(cli, {"export", sourcePath.string(), sourceMode, "main", bundle.string()}) == 0,
+    expect(run(cli, {"export", sourcePath.string(), "main", bundle.string()}) == 0,
            "offline full export failed");
-    expect(run(cli, {"import", destinationPath.string(), destinationMode,
+    expect(run(cli, {"import", destinationPath.string(),
                      bundle.string(), "incoming"}) == 0,
            "offline full import failed");
     {
-        Repository destination(destinationPath, destinationFormat);
+        Repository destination(destinationPath);
         expect(destination.head("incoming").id == base, "full CLI sync lost revision ID");
     }
     {
-        Repository source(sourcePath, sourceFormat);
+        Repository source(sourcePath);
         tip = source.commit("main", {{key, Bytes{9, 8, 7}}}).id;
     }
-    expect(run(cli, {"export-incremental", sourcePath.string(), sourceMode, "main",
+    expect(run(cli, {"export-incremental", sourcePath.string(), "main",
                      aowis::native::toHex(base), delta.string()}) == 0,
            "offline incremental export failed");
-    expect(run(cli, {"import", destinationPath.string(), destinationMode,
+    expect(run(cli, {"import", destinationPath.string(),
                      delta.string(), "incoming"}) == 0,
            "offline incremental import failed");
-    expect(run(cli, {"import", destinationPath.string(), destinationMode,
+    expect(run(cli, {"import", destinationPath.string(),
                      delta.string(), "incoming"}) == 0,
            "offline incremental reimport should be idempotent");
     {
-        Repository destination(destinationPath, destinationFormat);
+        Repository destination(destinationPath);
         expect(destination.head("incoming").id == tip, "incremental CLI sync lost revision ID");
         expect(destination.get("incoming", key) == Bytes({9, 8, 7}),
                "incremental CLI sync lost payload");
     }
-    expect(run(cli, {"fetch", destinationPath.string(), destinationMode,
+    // The former storage-mode argument ("pack") is no longer accepted.
+    expect(run(cli, {"head", destinationPath.string(), "pack", "incoming"}) == 2,
+           "obsolete storage-mode argument accepted");
+    expect(run(cli, {"head", destinationPath.string(), "incoming"}) == 0, "head command failed");
+    expect(run(cli, {"fetch", destinationPath.string(),
                      "example.org", "repo", "main", "incoming"}) == 2,
            "removed remote fetch command must not be accepted");
-    expect(run(cli, {"remote-head", destinationPath.string(), destinationMode, "incoming"}) == 2,
+    expect(run(cli, {"remote-head", destinationPath.string(), "incoming"}) == 2,
            "removed remote helper command must not be accepted");
 }
 
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     try {
         expect(argc == 2, "usage: native_sync_cli_tests SYNC_CLI");
         const std::filesystem::path cli = std::filesystem::absolute(argv[1]);
-        exercise(cli, PhysicalStore::Pack, PhysicalStore::Pack);
+        exercise(cli);
         std::cout << "Offline synchronization CLI tests passed\n";
         return 0;
     } catch (const std::exception& error) {

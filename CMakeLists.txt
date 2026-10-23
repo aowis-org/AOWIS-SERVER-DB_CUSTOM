@@ -201,13 +201,27 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
         endif()
         # Check all current Model fields against the explicitly maintained canonical model
         # schema contract. A new field must never be silently ignored.
+        # The same check requires a value rule for every numeric field and
+        # generates the declared enumerators the codec accepts. Changing a
+        # Model header, the codec or the rules re-runs it.
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        set(AOWIS_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        file(GLOB_RECURSE AOWIS_NATIVE_MODEL_HEADERS
+            "${AOWIS_NATIVE_MODEL_SOURCE_DIR}/include/aowis/model/*.h")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            ${AOWIS_NATIVE_MODEL_HEADERS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_codec.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/model_value_validation.cpp")
         execute_process(
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_codec.py"
                 "${AOWIS_NATIVE_MODEL_SOURCE_DIR}/include/aowis/model"
                 "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields.json"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
+                --value-rules "${CMAKE_CURRENT_SOURCE_DIR}/src/model_value_validation.cpp"
+                --emit-enums "${AOWIS_NATIVE_GENERATED_DIR}/model_enum_values.inc"
             RESULT_VARIABLE AOWIS_NATIVE_CODEC_SCHEMA_RESULT
             OUTPUT_VARIABLE AOWIS_NATIVE_CODEC_SCHEMA_OUTPUT
             ERROR_VARIABLE AOWIS_NATIVE_CODEC_SCHEMA_ERROR)
@@ -217,7 +231,9 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
         message(STATUS "Native model serializer: ${AOWIS_NATIVE_CODEC_SCHEMA_OUTPUT}")
         add_library(aowis-native-model-codec STATIC
             src/model_codec.cpp
-            src/model_validation.cpp)
+            src/model_validation.cpp
+            src/model_value_validation.cpp)
+        target_include_directories(aowis-native-model-codec PRIVATE "${AOWIS_NATIVE_GENERATED_DIR}")
         add_library(AOWIS::NativeModelCodec ALIAS aowis-native-model-codec)
         target_compile_features(aowis-native-model-codec PUBLIC cxx_std_20)
         target_include_directories(aowis-native-model-codec PUBLIC
@@ -253,7 +269,17 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
             target_link_libraries(aowis-native-hydraulic-network-tests PRIVATE aowis-native-hydraulic)
             add_test(NAME aowis-native-hydraulic-network-tests COMMAND aowis-native-hydraulic-network-tests)
             set_tests_properties(aowis-native-hydraulic-network-tests PROPERTIES LABELS "aowis")
-            add_dependencies(aowis-db-tests aowis-native-model-codec-tests aowis-native-hydraulic-network-tests)
+            add_executable(aowis-native-model-value-rules-tests tests/model_value_rules_tests.cpp)
+            target_link_libraries(aowis-native-model-value-rules-tests PRIVATE aowis-native-hydraulic)
+            target_include_directories(aowis-native-model-value-rules-tests PRIVATE "${AOWIS_NATIVE_GENERATED_DIR}")
+            add_test(NAME aowis-native-model-value-rules-tests COMMAND aowis-native-model-value-rules-tests)
+            set_tests_properties(aowis-native-model-value-rules-tests PROPERTIES LABELS "aowis")
+            add_test(NAME aowis-native-model-codec-check-tests
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_model_codec_tests.py"
+                    "${CMAKE_CURRENT_SOURCE_DIR}")
+            set_tests_properties(aowis-native-model-codec-check-tests PROPERTIES LABELS "aowis")
+            add_dependencies(aowis-db-tests aowis-native-model-codec-tests aowis-native-hydraulic-network-tests
+                aowis-native-model-value-rules-tests)
         endif()
         message(STATUS "Native model serializer and hydraulic persistence enabled")
     else()

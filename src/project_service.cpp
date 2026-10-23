@@ -156,7 +156,6 @@ ProjectInfo readManifest(const std::filesystem::path& projectDirectory) {
           projectDirectory.filename().string() == info.id, "project manifest UUID mismatch");
     const std::string format = body.substr(second + 1, third - second - 1);
     check(format == "pack", "unsupported project storage format");
-    info.storage = PhysicalStore::Pack;
     info.name = decodeName(body.substr(third + 1, body.size() - third - 2));
     return info;
 }
@@ -276,16 +275,13 @@ std::size_t ProjectService::maxPendingOperations() const noexcept {
     return this->maxPending_;
 }
 
-ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore storage) {
+ProjectInfo ProjectService::createProject(std::string_view name) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
     if (!validName(name)) throw ProjectError(ProjectErrorKind::InvalidInput,
                                             "project name must contain 1..200 non-control bytes");
-    if (storage != PhysicalStore::Pack)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "unsupported storage backend");
     ProjectInfo info;
     info.name = std::string(name);
-    info.storage = storage;
     do { info.id = randomId(); }
     while (std::filesystem::exists(this->projects_ / info.id) ||
            std::filesystem::exists(this->projects_ / (".creating-" + info.id)));
@@ -296,7 +292,7 @@ ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore s
     try {
         writeManifest(staging / "project.meta", info);
         {
-            Repository repository(staging / "repository", storage);
+            Repository repository(staging / "repository");
             repository.createBranch("main");
         }
         syncDirectory(staging / "repository" / "refs" / "heads");
@@ -309,8 +305,12 @@ ProjectInfo ProjectService::createProject(std::string_view name, PhysicalStore s
         syncDirectory(this->projects_);
         this->entries_.emplace(info.id, std::make_shared<Project>(info));
     } catch (...) {
-        if (renamed) this->uncertain_ = true;
-        else std::filesystem::remove_all(staging);
+        if (renamed) {
+            this->uncertain_ = true;
+        } else {
+            std::error_code ignored; // never replace the original exception
+            std::filesystem::remove_all(staging, ignored);
+        }
         throw;
     }
     return info;
@@ -335,7 +335,7 @@ std::shared_ptr<Repository> ProjectService::openRepository(Project& project) con
         const std::filesystem::path directory = this->projects_ / project.info.id / "repository";
         check(!std::filesystem::is_symlink(directory) &&
               std::filesystem::is_directory(directory), "project repository directory is unavailable");
-        project.repository = std::make_shared<Repository>(directory, project.info.storage);
+        project.repository = std::make_shared<Repository>(directory);
         const std::uint64_t recovered = project.repository->recoveredPackTailBytes();
         if (recovered != 0) {
             std::cerr << "AOWIS database: project " << project.info.id << " discarded "

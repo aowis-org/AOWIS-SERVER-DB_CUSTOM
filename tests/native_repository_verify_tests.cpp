@@ -23,7 +23,6 @@ using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 using aowis::native::VerificationReport;
 
@@ -116,8 +115,8 @@ struct ForgedObjects {
 
 // Inject deliberately hash-correct objects without going through the normal
 // import validator. This simulates a previously corrupted on-disk repository.
-// Both physical stores must still pass their independent checksum verification.
-void inject(const std::filesystem::path& directory, PhysicalStore backend,
+// The pack must still pass its independent checksum verification.
+void inject(const std::filesystem::path& directory,
             const ForgedObjects& forged) {
     std::ofstream output(directory / "objects.pack", std::ios::binary | std::ios::app);
     expect(output.good(), "cannot append forged pack objects");
@@ -214,12 +213,12 @@ Hash makeBadHistory(ForgedObjects& objects, Fault fault, const Hash& goodHead) {
     throw std::runtime_error("unhandled forged history type");
 }
 
-void testCorruption(PhysicalStore backend, Fault fault, const std::string& reason) {
+void testCorruption(Fault fault, const std::string& reason) {
     TemporaryDirectory temp("corrupt");
     const std::filesystem::path directory = temp.path / "repo";
     Hash original{};
     {
-        Repository repository(directory, backend);
+        Repository repository(directory);
         repository.createBranch("stable");
         original = repository.commit("stable", {{key(42), Bytes{'g', 'o', 'o', 'd'}}}).id;
         expect(repository.verifyRepository().revisions == 2,
@@ -227,14 +226,14 @@ void testCorruption(PhysicalStore backend, Fault fault, const std::string& reaso
     }
     ForgedObjects forged;
     const Hash tip = makeBadHistory(forged, fault, original);
-    inject(directory, backend, forged);
+    inject(directory, forged);
     if (fault == Fault::InvalidBranchRef) {
         std::ofstream output(directory / "refs" / "heads" / "stable", std::ios::trunc);
         output << "invalid-ref\n";
     } else {
         repoint(directory, tip);
     }
-    Repository repository(directory, backend);
+    Repository repository(directory);
     repository.verifyPack(); // Physically valid even though logically invalid
     const std::uint64_t objects = repository.objectCount();
     const std::uint64_t bytes = repository.packSize();
@@ -251,9 +250,9 @@ void testCorruption(PhysicalStore backend, Fault fault, const std::string& reaso
            "verification changed physical repository contents");
 }
 
-void testValidHistories(PhysicalStore backend) {
+void testValidHistories() {
     TemporaryDirectory temp("valid");
-    Repository repo(temp.path / "repo", backend);
+    Repository repo(temp.path / "repo");
     const VerificationReport empty = repo.verifyRepository();
     expect(empty.branches == 0 && empty.revisions == 0 && empty.physicalObjects == 0,
            "empty repository verification counts are wrong");
@@ -287,13 +286,13 @@ void testValidHistories(PhysicalStore backend) {
 
 void testCrossBackend() {
     TemporaryDirectory temp("transfer");
-    Repository original(temp.path / "pack", PhysicalStore::Pack);
+    Repository original(temp.path / "pack");
     original.createBranch("models");
     (void)original.commitModel("models", {
         {key(1), ModelRecord{1, {}, Bytes{'a'}}},
         {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}});
     original.exportBranchBundle("models", temp.path / "history.bundle");
-    Repository destination(temp.path / "recipient", PhysicalStore::Pack);
+    Repository destination(temp.path / "recipient");
     destination.importBranchBundle(temp.path / "history.bundle", "models");
     expect(destination.verifyRepository().revisions ==
                original.verifyRepository().revisions,
@@ -302,11 +301,11 @@ void testCrossBackend() {
 
 // Physical storage corruption must not be mistaken for a logical failure.
 // Full verification runs the physical check first, including unreachable data.
-void testPhysicalCorruption(PhysicalStore backend) {
+void testPhysicalCorruption() {
     TemporaryDirectory temp("physical");
     const std::filesystem::path directory = temp.path / "repo";
     {
-        Repository repo(directory, backend);
+        Repository repo(directory);
         repo.createBranch("stable");
         (void)repo.commit("stable", {{key(5), Bytes{'x', 'y', 'z'}}});
         (void)repo.verifyRepository();
@@ -326,7 +325,7 @@ void testPhysicalCorruption(PhysicalStore backend) {
     stream.close();
     bool refused = false;
     try {
-        Repository invalid(directory, backend);
+        Repository invalid(directory);
         invalid.verifyPack();
         (void)invalid.verifyRepository();
     } catch (const std::exception&) {
@@ -355,12 +354,12 @@ int runCli(const std::string& executable, const std::filesystem::path& directory
     return WEXITSTATUS(status);
 }
 
-void testCli(const std::string& executable, PhysicalStore backend) {
+void testCli(const std::string& executable) {
     TemporaryDirectory temp("cli");
     const std::filesystem::path directory = temp.path / "repo";
     Hash oldHead{};
     {
-        Repository repo(directory, backend);
+        Repository repo(directory);
         repo.createBranch("main");
         oldHead = repo.head("main").id;
     }
@@ -370,7 +369,7 @@ void testCli(const std::string& executable, PhysicalStore backend) {
            "valid repository CLI verification failed");
     ForgedObjects forged;
     const Hash bad = forged.revision(forged.add(Bytes{'X'}), Hash{}, false, oldHead);
-    inject(directory, backend, forged);
+    inject(directory, forged);
     // Repoint the actual branch to the forged tip; invalid content remains checksum-correct.
     {
         std::ofstream output(directory / "refs" / "heads" / "main", std::ios::trunc);
@@ -386,8 +385,8 @@ void testCli(const std::string& executable, PhysicalStore backend) {
 int main(int argc, char** argv) {
     try {
         expect(argc == 2, "repository verifier test requires CLI executable");
-        for (PhysicalStore backend : {PhysicalStore::Pack}) {
-            testValidHistories(backend);
+        {
+            testValidHistories();
             for (const std::pair<Fault, std::string>& entry :
                  std::vector<std::pair<Fault, std::string>>{
                     {Fault::InvalidRevision, "invalid bundled revision"},
@@ -406,10 +405,10 @@ int main(int argc, char** argv) {
                     {Fault::ZeroModelUuid, "model tree contains zero UUID"},
                     {Fault::InvalidModelValue, "invalid native model record"},
                     {Fault::ZeroIncomingTarget, "incoming-reference target is zero"}}) {
-                testCorruption(backend, entry.first, entry.second);
+                testCorruption(entry.first, entry.second);
             }
-            testCli(argv[1], backend);
-            testPhysicalCorruption(backend);
+            testCli(argv[1]);
+            testPhysicalCorruption();
         }
         testCrossBackend();
         std::cout << "Full repository verification tests passed\n";

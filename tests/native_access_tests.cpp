@@ -61,14 +61,14 @@ int invoke(const std::filesystem::path& executable, const std::vector<std::strin
     return WEXITSTATUS(status);
 }
 
-void exercise(PhysicalStore mode) {
+void exercise() {
     TemporaryDirectory temp;
     const struct passwd* account = ::getpwuid(::geteuid());
     expect(account && account->pw_name, "cannot determine local test account");
     const std::string owner = account->pw_name;
     const std::filesystem::path repoPath = temp.path / "repo";
     {
-        Repository repository(repoPath, mode);
+        Repository repository(repoPath);
         repository.createBranch("main");
         repository.createBranch("restricted");
     }
@@ -197,7 +197,7 @@ void exerciseCli(const std::filesystem::path& accessCli) {
 int main(int argc, char** argv) {
     try {
         expect(argc == 2, "pass the access CLI path");
-        exercise(PhysicalStore::Pack);
+        exercise();
         exerciseCli(std::filesystem::absolute(argv[1]));
         std::cout << "Native access-policy tests passed\n";
         return 0;

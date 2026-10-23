@@ -10,52 +10,45 @@ namespace {
 
 using aowis::native::BundleImportResult;
 using aowis::native::BundleImportStatus;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
-
-PhysicalStore parseStorage(std::string_view mode) {
-    if (mode == "pack") return PhysicalStore::Pack;
-    
-    throw std::runtime_error("storage mode must be pack");
-}
 
 void usage() {
     std::cerr <<
-        "Usage: aowis-native-sync head REPOSITORY pack BRANCH\n"
-        "       aowis-native-sync export REPOSITORY pack BRANCH BUNDLE\n"
-        "       aowis-native-sync export-incremental REPOSITORY pack BRANCH BASE_REVISION BUNDLE\n"
-        "       aowis-native-sync import REPOSITORY pack BUNDLE LOCAL_BRANCH\n";
+        "Usage: aowis-native-sync head REPOSITORY BRANCH\n"
+        "       aowis-native-sync export REPOSITORY BRANCH BUNDLE\n"
+        "       aowis-native-sync export-incremental REPOSITORY BRANCH BASE_REVISION BUNDLE\n"
+        "       aowis-native-sync import REPOSITORY BUNDLE LOCAL_BRANCH\n";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 5) { usage(); return 2; }
+        if (argc < 4) { usage(); return 2; }
         const std::string command = argv[1];
-        if (!((command == "head" && argc == 5) ||
-              (command == "export" && argc == 6) ||
-              (command == "export-incremental" && argc == 7) ||
-              (command == "import" && argc == 6))) {
+        if (!((command == "head" && argc == 4) ||
+              (command == "export" && argc == 5) ||
+              (command == "export-incremental" && argc == 6) ||
+              (command == "import" && argc == 5))) {
             usage();
             return 2;
         }
-        Repository repository(argv[2], parseStorage(argv[3]));
+        Repository repository(argv[2]);
         if (command == "head") {
-            std::cout << aowis::native::toHex(repository.head(argv[4]).id) << '\n';
+            std::cout << aowis::native::toHex(repository.head(argv[3]).id) << '\n';
         } else if (command == "export-incremental") {
             repository.exportIncrementalBranchBundle(
-                argv[4], aowis::native::fromHex(argv[5]), argv[6]);
-            std::cout << "exported incremental branch " << argv[4] << " to " << argv[6] << '\n';
+                argv[3], aowis::native::fromHex(argv[4]), argv[5]);
+            std::cout << "exported incremental branch " << argv[3] << " to " << argv[5] << '\n';
         } else if (command == "export") {
-            repository.exportBranchBundle(argv[4], argv[5]);
-            std::cout << "exported branch " << argv[4] << " to " << argv[5] << '\n';
+            repository.exportBranchBundle(argv[3], argv[4]);
+            std::cout << "exported branch " << argv[3] << " to " << argv[4] << '\n';
         } else {
-            const BundleImportResult result = repository.importBranchBundle(argv[4], argv[5]);
+            const BundleImportResult result = repository.importBranchBundle(argv[3], argv[4]);
             const char* outcome = result.status == BundleImportStatus::Created ?
                 "created" : result.status == BundleImportStatus::FastForward ?
                 "fast-forward" : "already up-to-date";
-            std::cout << outcome << " " << argv[5] << " at " <<
+            std::cout << outcome << " " << argv[4] << " at " <<
                 aowis::native::toHex(result.head) << ", imported " <<
                 result.objectsImported << " objects\n";
         }

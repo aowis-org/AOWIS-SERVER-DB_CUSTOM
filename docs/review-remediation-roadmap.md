@@ -25,8 +25,8 @@ Style findings about `auto` are out of scope by decision.
 | 5 | `aowis-db-custom-httplib-server` | Replace QHttpServer (F5 on all Qt versions, streaming uploads) | Medium | 2, 3, 4 | done |
 | 6 | `aowis-db-custom-incremental-sync` | F3 incremental import/export cost | Medium | 1 | done |
 | 7 | `aowis-db-custom-concurrent-service` | F4 serialized server | Medium | 5 | done |
-| 8 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | open |
-| 9 | `aowis-db-custom-cleanup` | F12 tidy-ups | Low | – | open |
+| 8 | `aowis-db-custom-model-value-validation` | F8 enums, NaN/Inf | Low | – | done |
+| 9 | `aowis-db-custom-cleanup` | F12 tidy-ups | Low | – | done |
 
 Phases 1, 2, 4, 8 and 9 are independent of each other. Phase 1 goes first
 because it is the only finding that can make a repository unusable.
@@ -575,7 +575,51 @@ runs with the thread pool enabled.
 
 ---
 
-## Phase 8: Model value validation (Low)
+## Phase 8: Model value validation (Low) — done
+
+Implemented in `aowis-db-custom-model-value-validation`. There is no stored
+payload yet, so no migration or `--semantic` audit of old data was needed.
+- Codec: an undeclared enum value or a non-finite double (NaN, ±∞) is
+  refused in both directions, in every field, list element and optional.
+  Encode returns empty bytes, decode fails.
+- `tools/check_model_codec.py` now also:
+  - generates `model_enum_values.inc` (declared enumerators of the 39
+    persisted enums) at configure time; an enum without an entry does not
+    compile;
+  - fails the configure step when a numeric Model field (or a struct field
+    containing numbers) is not referenced by its value rule;
+  - re-runs whenever a Model header, the codec or the rules change
+    (`CMAKE_CONFIGURE_DEPENDS`).
+- Value rules (`src/model_value_validation.cpp`, table in
+  `docs/model-value-rules.md`): impossible values are rejected, draft
+  "not set" values (0, empty, null) are accepted. Examples: diameters and
+  roughness > 0 (pipes) or >= 0, efficiencies (0, 100], positions 0..100,
+  fractions 0..1, tank min <= initial <= max, curves strictly increasing in
+  x, tank volume non-decreasing, wall order 0/1, times of day < 86400,
+  timesteps > 0, solver accuracy/gravity/viscosity > 0.
+- Applied by `validateHydraulicNetwork*` (save, merge validation, load) and
+  to every edited entity before any edit path; previously the indexed fast
+  paths stored values without any value check.
+- Tests:
+  - new `aowis-native-model-value-rules-tests`: generated enum table; codec
+    refusal of undeclared enumerators (plain, nested, optional, alias) and
+    NaN/±∞ (field, optional, list element, nested, network option) on encode,
+    and of patched stored bytes on decode; every default-constructed entity
+    and network valid; 106 rule cases (invalid and boundary-valid); all
+    issues reported; save and every edit path (physical, scalar, dependent,
+    catalogue, membership) reject without changing the branch, valid edits
+    keep their fast path;
+  - new `aowis-native-model-codec-check-tests` (Python): unchanged sources
+    pass; a missing field rule, struct rule or rule function fails; a new
+    Model field fails; conditional enumerators fail; 39 enums generated and
+    unchanged output is not rewritten;
+  - `aowis-native-http-tests`: negative emitter coefficient, NaN elevation
+    (patched bytes) and zero specific gravity are 400 and leave the branch
+    unchanged.
+  - Eight mutations (edit check, network value check, codec read/write of
+    enums and doubles, curve order, tank levels) were each caught.
+
+Original analysis:
 
 **F8. Out-of-range enums and non-finite numbers are stored.**
 - `model_codec.cpp` decodes enums with an unchecked `static_cast`.
@@ -602,7 +646,53 @@ NaN → 400.
 
 ---
 
-## Phase 9: Cleanup (Low)
+## Phase 9: Cleanup (Low) — done
+
+Implemented in `aowis-db-custom-cleanup`. With no stored payload and no
+external clients yet, vestigial compatibility code was removed as well.
+- Planned items:
+  - `Repository::Repository`: indentation fixed, unused `format` removed;
+  - duplicated comment text in `syncPack()` and `compact()` removed;
+  - unused `loadMembers()` removed; the unused `backend` parameters are gone
+    with the `PhysicalStore` removal below;
+  - typed failure channel for the hydraulic load APIs: the `QString* error`
+    out-parameter is gone. `nullopt` means not found; every failure throws
+    `StorageError` with its kind, so HTTP maps I/O to 500 and a full disk
+    to 507 (formerly every load failure was reported as corruption). HTTP
+    decode errors now include the codec's reason;
+  - no-op `try { … } catch (...) { throw; }` removed from `mergeBranches`,
+    `commit` and `commitModel`;
+  - `createProject` cleanup uses the `std::error_code` overload of
+    `remove_all`, so it cannot replace the original exception;
+  - systemd unit: `ExecStart` uses `/etc/aowis/aowis-server-db.ini` (the
+    name of `deploy/aowis-server-db.ini`), `ProtectSystem=strict`,
+    `ReadWritePaths=/var/lib/aowis-db`, `LogsDirectory`, `PrivateTmp`,
+    `ProtectHome`, kernel/cgroup/clock protection, address-family and
+    namespace restrictions, `@system-service` syscall filter, no
+    capabilities, `UMask=0077`; `systemd-analyze security` exposure 1.7.
+- Additional removals:
+  - `PhysicalStore` (a one-value enum) from `Repository`, `ProjectService`,
+    `registerRoutes`, tools, tests and benchmarks; the tests' Pack x Pack
+    "backend" loops are gone;
+  - HTTP: projects no longer carry `"storage":"pack"`; a `storage` field in
+    a create request is now 400 (unknown field); INI `storage/default_backend`
+    removed;
+  - `aowis-native-sync` no longer takes the `pack` storage-mode argument
+    (`aowis-native-sync head REPOSITORY BRANCH`, ...); the merge-history
+    benchmark no longer takes `pack`;
+  - the refusal of obsolete pre-release block repositories (engine, verify,
+    compact) and its test.
+- Build: zero `-Wall -Wextra` warnings in Debug and Release.
+- `replication_benchmark_phases_tests.py`: the profile/timer comparison
+  failed under parallel load (`ctest -j16`); it now checks the actual
+  invariant (the native profile runs inside the benchmark timer, so it can
+  never exceed it).
+- Tests adjusted: hydraulic load failures are asserted by `StorageErrorKind`
+  (InvalidInput for bad selectors and zero revisions, NotFound for unknown
+  revisions, Corruption for damaged records); the sync CLI rejects the old
+  `pack` argument; HTTP rejects the removed `storage` field.
+
+Original plan:
 
 - `Repository::Repository`: fix the leftover indentation (former `if` branch)
   and remove the unused `format` variable.
@@ -633,7 +723,7 @@ No functional tests are needed beyond the existing suites.
 ./compile_linux_tests.sh --both
 ```
 
-Phases that change the service (2, 3, 4, 5, 7) additionally need a release
+Phases that change the service (2, 3, 4, 5, 7, 9) additionally need a release
 build and a restart of `aowis-server-db`:
 
 ```

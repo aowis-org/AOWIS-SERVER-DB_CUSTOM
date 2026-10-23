@@ -18,7 +18,6 @@ using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::MergeStatus;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 Key key(std::uint32_t sequence) {
@@ -50,9 +49,9 @@ void commit(Repository& repository, const std::string& branch,
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 5) {
+        if (argc != 4) {
             std::cerr << "Usage: " << argv[0]
-                      << " NEW_REPOSITORY_DIR SHARED_COMMITS DIVERGENT_COMMITS pack\n";
+                      << " NEW_REPOSITORY_DIR SHARED_COMMITS DIVERGENT_COMMITS\n";
             return EXIT_FAILURE;
         }
         const std::filesystem::path directory(argv[1]);
@@ -66,12 +65,7 @@ int main(int argc, char** argv) {
             std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error("requested history exceeds supported benchmark UUID range");
         }
-        const std::string backendName(argv[4]);
-        if (backendName != "pack") {
-            throw std::runtime_error("physical backend must be pack");
-        }
-        const PhysicalStore backend = PhysicalStore::Pack;
-        Repository repository(directory, backend);
+        Repository repository(directory);
         repository.createBranch("main");
         for (std::uint32_t index = 1; index <= shared; ++index) {
             commit(repository, "main", index, "shared");
@@ -109,8 +103,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("getrusage failed");
         }
         const double mergeMs = std::chrono::duration<double, std::milli>(finish - start).count();
-        std::cout << "backend=" << backendName << '\n'
-                  << "shared_commits=" << shared << '\n'
+        std::cout << "shared_commits=" << shared << '\n'
                   << "divergent_commits_per_branch=" << divergent + 1U << '\n'
                   << "merge_conflict_ms=" << mergeMs << '\n'
                   << "process_peak_rss_kib=" << resources.ru_maxrss << '\n'

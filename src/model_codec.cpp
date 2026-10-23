@@ -7,6 +7,7 @@
 #include <QSet>
 #include <QDate>
 #include <QStringList>
+#include <cmath>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -156,6 +157,20 @@ void readStruct(QDataStream &stream, WaterQualityReactionOptions &value);
 void writeStruct(QDataStream &stream, const WaterQualityWallReaction &value);
 void readStruct(QDataStream &stream, WaterQualityWallReaction &value);
 
+// Declared enumerators of every persisted enum, generated at configure time
+// from the Model headers by tools/check_model_codec.py. An enum without a
+// generated entry fails to compile here instead of being stored unchecked.
+template<typename T> struct ModelEnumValues;
+#include "model_enum_values.inc"
+
+template<typename T> bool declaredEnumerator(qint32 raw)
+{
+    for (const T value : ModelEnumValues<T>::values)
+        if (static_cast<qint32>(value) == raw)
+            return true;
+    return false;
+}
+
 template<typename T> struct IsOptional : std::false_type {};
 template<typename T> struct IsOptional<std::optional<T>> : std::true_type { using Value = T; };
 template<typename T> struct IsQList : std::false_type {};
@@ -178,7 +193,21 @@ template<typename T> void writeValue(QDataStream &stream, const T &value)
             writeValue(stream, item);
     }
     else if constexpr (std::is_enum_v<T>)
-        stream << static_cast<qint32>(value);
+    {
+        // Never store a value outside the declared enumerators.
+        if (!declaredEnumerator<T>(static_cast<qint32>(value)))
+            stream.setStatus(QDataStream::WriteFailed);
+        else
+            stream << static_cast<qint32>(value);
+    }
+    else if constexpr (std::is_floating_point_v<T>)
+    {
+        // NaN and infinities are never stored.
+        if (!std::isfinite(value))
+            stream.setStatus(QDataStream::WriteFailed);
+        else
+            stream << value;
+    }
     else if constexpr (std::is_same_v<T, QString> || std::is_same_v<T, QUuid> ||
                        std::is_same_v<T, QDate> || std::is_arithmetic_v<T>)
         stream << value;
@@ -232,7 +261,16 @@ template<typename T> void readValue(QDataStream &stream, T &value)
     {
         qint32 raw = 0;
         stream >> raw;
-        value = static_cast<T>(raw);
+        if (stream.status() == QDataStream::Ok && !declaredEnumerator<T>(raw))
+            stream.setStatus(QDataStream::ReadCorruptData);
+        else
+            value = static_cast<T>(raw);
+    }
+    else if constexpr (std::is_floating_point_v<T>)
+    {
+        stream >> value;
+        if (stream.status() == QDataStream::Ok && !std::isfinite(value))
+            stream.setStatus(QDataStream::ReadCorruptData);
     }
     else if constexpr (std::is_same_v<T, QString> || std::is_same_v<T, QUuid> ||
                        std::is_same_v<T, QDate> || std::is_arithmetic_v<T>)
@@ -281,7 +319,7 @@ template<typename T> std::optional<T> decodeTyped(const QByteArray &bytes,
     readStruct(stream, value);
     if (stream.status() != QDataStream::Ok || !stream.atEnd())
     {
-        if (error) *error = QStringLiteral("Truncated, corrupted or extended model data");
+        if (error) *error = QStringLiteral("Truncated, corrupted or extended model data, or a non-finite number or undeclared enumerator");
         return std::nullopt;
     }
     return value;

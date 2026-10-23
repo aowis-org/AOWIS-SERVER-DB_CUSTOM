@@ -1,6 +1,6 @@
 # Repository integrity verification
 
-The AOWIS native database provides read-only physical and logical verification for both physical storage backends. The full checker uses the **same logical graph validator as replication import**, so accepted portable histories and persisted histories obey the same structural rules.
+The AOWIS native database provides read-only physical and logical verification of pack repositories. The full checker uses the **same logical graph validator as replication import**, so accepted portable histories and persisted histories obey the same structural rules.
 
 ## Administrative commands
 
@@ -29,4 +29,4 @@ The checker holds the repository's interprocess lock throughout verification so 
 - **Resource use:** A full historical check can take substantial CPU, memory and storage I/O, particularly when a repository contains many distinct model snapshots. Per-snapshot dependency edges are sorted with a bounded 8,192-entry buffer and file-backed runs rather than an unbounded in-memory map of incoming references. Revision, Merkle-subtree and snapshot tracking remain in memory, so this is not yet a bounded-memory streaming audit.
 - **No automatic repair:** If full verification fails, keep an untouched backup of the repository and investigate the reported corruption. Do not reset branch heads or regenerate model/reference objects silently: that would change published revision identities.
 
-Run full verification after unexpected shutdowns and before/after backup recovery or replication troubleshooting. A separate recovery suite now exercises deterministic process termination, simulated `ENOSPC`, torn writes, index rebuilding, incremental-import retries and interrupted compaction on both physical backends. These tests establish software recovery behavior at controlled checkpoints, **not** hardware power-failure guarantees. Validate restored offline backups with this full verifier before reuse.
+Run full verification after unexpected shutdowns and before/after backup recovery or replication troubleshooting. A separate recovery suite now exercises deterministic process termination, simulated `ENOSPC`, torn writes, index rebuilding, incremental-import retries and interrupted compaction. These tests establish software recovery behavior at controlled checkpoints, **not** hardware power-failure guarantees. Validate restored offline backups with this full verifier before reuse.

@@ -85,13 +85,12 @@ int main(int argc, char** argv) {
         const std::uint64_t pipes = argc > 2 ? positive(argv[2]) : 1000;
         const std::uint64_t revisions = argc > 3 ? positive(argv[3]) : 10;
         const std::uint64_t edits = argc > 4 ? positive(argv[4]) : 10;
-        const aowis::native::PhysicalStore engine = aowis::native::PhysicalStore::Pack;
         if (pipes > 1000000 || revisions > 10000 || edits > pipes) {
             throw std::runtime_error("invalid size or edits exceed pipe count");
         }
         std::cout << std::fixed << std::setprecision(3);
         const std::chrono::steady_clock::time_point starting = std::chrono::steady_clock::now();
-        std::unique_ptr<Repository> store = std::make_unique<Repository>(directory, engine);
+        std::unique_ptr<Repository> store = std::make_unique<Repository>(directory);
         store->createBranch("main");
         const double openMs = elapsed(starting);
 
@@ -174,7 +173,7 @@ int main(int argc, char** argv) {
         const std::uint64_t packedObjects = store->objectCount();
         store.reset(); // Close the repository before reopening for verification.
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
-        Repository reopened(directory, engine);
+        Repository reopened(directory);
         if (reopened.head("main").root != final.root) throw std::runtime_error("reopen root mismatch");
         const double reopenMs = elapsed(reopening);
         const std::chrono::steady_clock::time_point verifying = std::chrono::steady_clock::now();

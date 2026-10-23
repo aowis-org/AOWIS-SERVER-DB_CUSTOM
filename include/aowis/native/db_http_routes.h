@@ -22,7 +22,6 @@ constexpr std::size_t maxJsonModelBytes = 8U * 1024U * 1024U;   // network saves
 // limits, timeouts). Does not own the catalogue, the listen socket or the
 // process lifecycle. Handlers run on the server's worker threads.
 void registerRoutes(httplib::Server& server, ProjectService& service,
-                    PhysicalStore defaultStorage,
                     BundleLimits transferLimits = BundleLimits{32ULL * 1024ULL * 1024ULL,
                                                                100000ULL, 8ULL * 1024ULL * 1024ULL});
 } // namespace aowis::native::http

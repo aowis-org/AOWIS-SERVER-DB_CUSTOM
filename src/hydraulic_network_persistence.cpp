@@ -59,7 +59,7 @@ constexpr std::uint16_t chunkKind = 101;
 
 struct Manifest {
     NetworkHydraulic metadata;
-    // Populated only by manifestFor()/loadMembers(), never serialized inline.
+    // Populated only by manifestFor()/loadMembersAtRevision(), never serialized inline.
     std::array<QList<QUuid>, collectionCount> members;
     std::array<QList<QUuid>, collectionCount> chunks;
     std::array<quint32, collectionCount> nextChunk{};
@@ -214,13 +214,6 @@ void loadMembersUsing(ReadModel readModel, Manifest& manifest,
                                    "hydraulic entity collection exceeds the requested limit");
         }
     }
-}
-
-void loadMembers(Repository& repository, std::string_view branch, Manifest& manifest,
-                 std::optional<std::size_t> onlyCollection = std::nullopt) {
-    loadMembersUsing([&repository, branch](const Key& key) {
-        return repository.getModel(branch, key);
-    }, manifest, onlyCollection);
 }
 
 void loadMembersAtRevision(Repository& repository, const Hash& revisionId, Manifest& manifest,
@@ -1425,94 +1418,67 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
 
 std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevision(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
-    HydraulicEntityType type, QString* error) {
-    try {
-        std::optional<QList<QUuid>> ids = listHydraulicEntityIdsAtRevisionLimited(
-            repository, revisionId, networkUuid, type, std::numeric_limits<std::size_t>::max());
-        if (error) error->clear();
-        return ids;
-    } catch (const std::exception& failure) {
-        if (error) *error = QString::fromUtf8(failure.what());
-        return std::nullopt;
-    }
+    HydraulicEntityType type) {
+    return listHydraulicEntityIdsAtRevisionLimited(
+        repository, revisionId, networkUuid, type, std::numeric_limits<std::size_t>::max());
 }
 
 std::optional<QList<QUuid>> listHydraulicEntityIds(
     Repository& repository, std::string_view branch, const QUuid& networkUuid,
-    HydraulicEntityType type, QString* error) {
-    try {
-        // Invalid collection selectors must fail even on an empty branch.
-        if (static_cast<std::size_t>(type) >= collectionCount)
-            throw StorageError(StorageErrorKind::InvalidInput, "unknown hydraulic entity collection");
-        const Revision snapshot = repository.head(branch);
-        if (!snapshot.modelIndexed && snapshot.root == Hash{}) {
-            // An untouched branch contains no models, not a malformed network.
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        return listHydraulicEntityIdsAtRevision(repository, snapshot.id, networkUuid, type, error);
-    } catch (const std::exception& failure) {
-        if (error) *error = QString::fromUtf8(failure.what());
+    HydraulicEntityType type) {
+    // Invalid collection selectors must fail even on an empty branch.
+    if (static_cast<std::size_t>(type) >= collectionCount)
+        throw StorageError(StorageErrorKind::InvalidInput, "unknown hydraulic entity collection");
+    const Revision snapshot = repository.head(branch);
+    if (!snapshot.modelIndexed && snapshot.root == Hash{}) {
+        // An untouched branch contains no models, not a malformed network.
         return std::nullopt;
     }
+    return listHydraulicEntityIdsAtRevision(repository, snapshot.id, networkUuid, type);
 }
 
 std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
-    const QUuid& entityUuid, QString* error) {
-    try {
-        if (networkUuid.isNull() || entityUuid.isNull() || networkUuid == entityUuid) {
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        // The root, owning chunk, reverse-reference index and entity payload
-        // must all come from the same immutable snapshot.
-        if (!ownerChunkAtRevision(repository, revisionId, networkUuid, keyFromUuid(entityUuid))) {
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        const std::optional<ModelRecord> record =
-            repository.getModelAtRevision(revisionId, keyFromUuid(entityUuid));
-        if (!record) throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity payload is missing");
-        std::optional<HydraulicEntity> decoded;
-        switch (record->kind) {
-#define LOAD_ONE(name, type, kind) \
-        case static_cast<std::uint16_t>(kind): { \
-            QString decodeError; \
-            std::optional<type> item = ModelCodec<type>::decode(qByteArrayFromBytes(record->payload), &decodeError); \
-            if (!item || item->uuid != entityUuid) \
-                throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic entity payload: " + decodeError.toStdString()); \
-            decoded.emplace(std::move(*item)); \
-            break; \
-        }
-        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(LOAD_ONE)
-#undef LOAD_ONE
-        default:
-            throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity has unknown storage kind");
-        }
-        if (error) error->clear();
-        return decoded;
-    } catch (const std::exception& failure) {
-        if (error) *error = QString::fromUtf8(failure.what());
+    const QUuid& entityUuid) {
+    if (networkUuid.isNull() || entityUuid.isNull() || networkUuid == entityUuid) {
         return std::nullopt;
     }
+    // The root, owning chunk, reverse-reference index and entity payload
+    // must all come from the same immutable snapshot.
+    if (!ownerChunkAtRevision(repository, revisionId, networkUuid, keyFromUuid(entityUuid))) {
+        return std::nullopt;
+    }
+    const std::optional<ModelRecord> record =
+        repository.getModelAtRevision(revisionId, keyFromUuid(entityUuid));
+    if (!record) throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity payload is missing");
+    std::optional<HydraulicEntity> decoded;
+    switch (record->kind) {
+#define LOAD_ONE(name, type, kind) \
+    case static_cast<std::uint16_t>(kind): { \
+        QString decodeError; \
+        std::optional<type> item = ModelCodec<type>::decode(qByteArrayFromBytes(record->payload), &decodeError); \
+        if (!item || item->uuid != entityUuid) \
+            throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic entity payload: " + decodeError.toStdString()); \
+        decoded.emplace(std::move(*item)); \
+        break; \
+    }
+    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(LOAD_ONE)
+#undef LOAD_ONE
+    default:
+        throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity has unknown storage kind");
+    }
+    return decoded;
 }
 
 std::optional<HydraulicEntity> loadHydraulicEntity(
     Repository& repository, std::string_view branch, const QUuid& networkUuid,
-    const QUuid& entityUuid, QString* error) {
-    try {
-        const Revision snapshot = repository.head(branch);
-        if (!snapshot.modelIndexed && snapshot.root == Hash{}) {
-            // An untouched branch contains no models, not a malformed network.
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        return loadHydraulicEntityAtRevision(repository, snapshot.id, networkUuid, entityUuid, error);
-    } catch (const std::exception& failure) {
-        if (error) *error = QString::fromUtf8(failure.what());
+    const QUuid& entityUuid) {
+    const Revision snapshot = repository.head(branch);
+    if (!snapshot.modelIndexed && snapshot.root == Hash{}) {
+        // An untouched branch contains no models, not a malformed network.
         return std::nullopt;
     }
+    return loadHydraulicEntityAtRevision(repository, snapshot.id, networkUuid, entityUuid);
 }
 
 // The candidate is a private, lazy copy-on-write view held under the native
@@ -2072,6 +2038,17 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
             throw StorageError(StorageErrorKind::Conflict, "branch head changed during hydraulic edit");
         return startingRevision;
     }
+    // Physical value rules apply to every edited entity before any of the
+    // indexed fast paths below may store it.
+    for (const HydraulicEntityChange& change : changes) {
+        if (!change.value || change.value->valueless_by_exception()) continue;
+        const aowis::native::ModelValidationReport values = std::visit(
+            [](const auto& entity) { return aowis::native::validateHydraulicEntityValues(entity); },
+            *change.value);
+        if (!values.valid())
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid hydraulic edit: " + values.summary().toStdString());
+    }
     if (const std::optional<Revision> indexed = tryIndexedScalarEdits(
             repository, branch, networkUuid, changes, startingRevision, diagnostics)) {
         return *indexed;
@@ -2102,16 +2079,12 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
     }
 
     // The whole-network loader checks all stored UUIDs, kinds, reference edges and
-    // network semantics. Fail closed if the current aggregate is malformed.
-    QString error;
+    // network semantics; damage it finds propagates as a typed StorageError.
     std::optional<NetworkHydraulic> network =
-        loadHydraulicNetworkAtRevision(repository, startingRevision.id, networkUuid, &error);
+        loadHydraulicNetworkAtRevision(repository, startingRevision.id, networkUuid);
     if (!network) {
-        // Empty error text means "no such network"; anything else is damage
-        // found while loading the stored aggregate.
-        throw StorageError(error.isEmpty() ? StorageErrorKind::NotFound : StorageErrorKind::Corruption,
-                           "cannot edit hydraulic network " + networkUuid.toString().toStdString() +
-                           ": " + (error.isEmpty() ? std::string("not found") : error.toStdString()));
+        throw StorageError(StorageErrorKind::NotFound,
+                           "cannot edit hydraulic network " + networkUuid.toString().toStdString() + ": not found");
     }
     const Manifest previous = manifestFor(*network);
     const std::map<Key, std::size_t> oldOwners = collectionOwners(previous);
@@ -2196,69 +2169,53 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
 
 std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(Repository& repository,
                                                                const Hash& revisionId,
-                                                               const QUuid& networkUuid,
-                                                               QString* error) {
-    try {
-        const std::optional<ModelRecord> root =
-            repository.getModelAtRevision(revisionId, keyFromUuid(networkUuid));
-        if (!root) {
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        if (root->kind != hydraulicNetworkKind) {
-            // Another model entity owns this UUID: there is no such network.
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
-        if (manifest.metadata.uuid != networkUuid) throw StorageError(StorageErrorKind::Corruption, "hydraulic network root UUID mismatch");
-        checkRoot(manifest, *root);
-        loadMembersAtRevision(repository, revisionId, manifest);
-        const std::set<Key> members = memberKeys(manifest);
-
-        NetworkHydraulic network = std::move(manifest.metadata);
-        DependencyIndex storedReferences;
-        std::size_t ordinal = 0;
-#define RESTORE(name, type, kind) \
-        restoreEntities(repository, revisionId, manifest.members[ordinal], \
-                        static_cast<std::uint16_t>(kind), network.name, storedReferences); \
-        ++ordinal;
-        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE)
-#undef RESTORE
-        const aowis::native::HydraulicDependencyValidation validated =
-            aowis::native::validateHydraulicNetworkWithDependencies(network);
-        if (!validated.report.valid())
-            throw StorageError(StorageErrorKind::Corruption, "loaded network invalid: " + validated.report.summary().toStdString());
-        const DependencyIndex canonicalReferences = indexedDependencies(validated.dependencies, members);
-        std::sort(storedReferences.begin(), storedReferences.end());
-        storedReferences.erase(std::unique(storedReferences.begin(), storedReferences.end()),
-                               storedReferences.end());
-        if (storedReferences != canonicalReferences)
-            throw StorageError(StorageErrorKind::Corruption, "stored hydraulic references differ from canonical model payload");
-        if (error) error->clear();
-        return network;
-    } catch (const std::exception& failure) {
-        if (error) *error = QString::fromUtf8(failure.what());
+                                                               const QUuid& networkUuid) {
+    const std::optional<ModelRecord> root =
+        repository.getModelAtRevision(revisionId, keyFromUuid(networkUuid));
+    if (!root) {
         return std::nullopt;
     }
+    if (root->kind != hydraulicNetworkKind) {
+        // Another model entity owns this UUID: there is no such network.
+        return std::nullopt;
+    }
+    Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
+    if (manifest.metadata.uuid != networkUuid) throw StorageError(StorageErrorKind::Corruption, "hydraulic network root UUID mismatch");
+    checkRoot(manifest, *root);
+    loadMembersAtRevision(repository, revisionId, manifest);
+    const std::set<Key> members = memberKeys(manifest);
+
+    NetworkHydraulic network = std::move(manifest.metadata);
+    DependencyIndex storedReferences;
+    std::size_t ordinal = 0;
+#define RESTORE(name, type, kind) \
+    restoreEntities(repository, revisionId, manifest.members[ordinal], \
+                    static_cast<std::uint16_t>(kind), network.name, storedReferences); \
+    ++ordinal;
+    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE)
+#undef RESTORE
+    const aowis::native::HydraulicDependencyValidation validated =
+        aowis::native::validateHydraulicNetworkWithDependencies(network);
+    if (!validated.report.valid())
+        throw StorageError(StorageErrorKind::Corruption, "loaded network invalid: " + validated.report.summary().toStdString());
+    const DependencyIndex canonicalReferences = indexedDependencies(validated.dependencies, members);
+    std::sort(storedReferences.begin(), storedReferences.end());
+    storedReferences.erase(std::unique(storedReferences.begin(), storedReferences.end()),
+                           storedReferences.end());
+    if (storedReferences != canonicalReferences)
+        throw StorageError(StorageErrorKind::Corruption, "stored hydraulic references differ from canonical model payload");
+    return network;
 }
 
 std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
                                                       std::string_view branch,
-                                                      const QUuid& networkUuid,
-                                                      QString* error) {
-    try {
-        const Revision snapshot = repository.head(branch);
-        if (!snapshot.modelIndexed && snapshot.root == Hash{}) {
-            // An untouched branch contains no models, not a malformed network.
-            if (error) error->clear();
-            return std::nullopt;
-        }
-        return loadHydraulicNetworkAtRevision(repository, snapshot.id, networkUuid, error);
-    } catch (const std::exception& failure) {
-        if (error) *error = QString::fromUtf8(failure.what());
+                                                      const QUuid& networkUuid) {
+    const Revision snapshot = repository.head(branch);
+    if (!snapshot.modelIndexed && snapshot.root == Hash{}) {
+        // An untouched branch contains no models, not a malformed network.
         return std::nullopt;
     }
+    return loadHydraulicNetworkAtRevision(repository, snapshot.id, networkUuid);
 }
 
 } // namespace aowis::native::hydraulic

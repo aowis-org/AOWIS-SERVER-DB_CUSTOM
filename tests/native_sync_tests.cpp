@@ -17,7 +17,6 @@ using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 using aowis::native::Revision;
 
@@ -56,7 +55,7 @@ void expectFailure(Callable operation, std::string_view detail) {
     throw std::runtime_error(std::string(detail));
 }
 
-void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationStore) {
+void testPortableBundles() {
     TemporaryDirectory temporary("portable");
     const std::filesystem::path sourcePath = temporary.path / "source";
     const std::filesystem::path destinationPath = temporary.path / "destination";
@@ -68,7 +67,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
     Hash mergeTip{};
     Hash modelTip{};
     {
-        Repository source(sourcePath, sourceStore);
+        Repository source(sourcePath);
         source.createBranch("main");
         base = source.commit("main", {{key(1), bytes("original")}}).id;
         source.createBranch("feature", "main");
@@ -89,7 +88,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
                       "bundle export overwrote existing destination");
     }
     {
-        Repository target(destinationPath, destinationStore);
+        Repository target(destinationPath);
         const BundleImportResult first = target.importBranchBundle(firstBundle, "remote_main");
         expect(first.status == BundleImportStatus::Created && first.head == mergeTip &&
                first.objectsImported > 0,
@@ -114,7 +113,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
         target.verifyPack();
     }
     {
-        Repository source(sourcePath, sourceStore);
+        Repository source(sourcePath);
         source.commit("main", {{key(4), bytes("after-first-bundle")}});
         source.exportBranchBundle("main", secondBundle);
         source.createBranchAtRevision("alternate", "main", mergeTip);
@@ -122,7 +121,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
         source.exportBranchBundle("alternate", alternateBundle);
     }
     {
-        Repository target(destinationPath, destinationStore);
+        Repository target(destinationPath);
         const BundleImportResult updated = target.importBranchBundle(secondBundle, "remote_main");
         expect(updated.status == BundleImportStatus::FastForward &&
                target.get("remote_main", key(4)) == bytes("after-first-bundle"),
@@ -140,7 +139,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
                "divergent bundle changed existing ref or pack");
 
         // Corruption, truncation, and trailing bytes are rejected without
-        // publishing a ref or writing objects to either native backend.
+        // publishing a ref or writing objects.
         const std::filesystem::path tampered = temporary.path / "tampered.aowbundle";
         std::filesystem::copy_file(modelBundle, tampered);
         {
@@ -209,7 +208,7 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
         target.verifyPack();
     }
     {
-        Repository reopened(destinationPath, destinationStore);
+        Repository reopened(destinationPath);
         expect(reopened.get("remote_main", key(4)) == bytes("after-first-bundle") &&
                reopened.get("local", key(5)) == bytes("local-only") &&
                reopened.revision(modelTip).id == modelTip &&
@@ -217,11 +216,10 @@ void testPortableBundles(PhysicalStore sourceStore, PhysicalStore destinationSto
                "imported objects lost after compaction and reopening");
     }
 }
-void testMergeParentIncremental(PhysicalStore sourceStore,
-                                PhysicalStore destinationStore) {
+void testMergeParentIncremental() {
     TemporaryDirectory temporary("merge-parent-delta");
-    Repository source(temporary.path / "source", sourceStore);
-    Repository destination(temporary.path / "destination", destinationStore);
+    Repository source(temporary.path / "source");
+    Repository destination(temporary.path / "destination");
     source.createBranch("main");
     source.commit("main", {{key(1), bytes("common")}});
     source.createBranch("feature", "main");
@@ -246,13 +244,12 @@ void testMergeParentIncremental(PhysicalStore sourceStore,
            "incremental bundle did not preserve second-parent ancestry");
 }
 
-void testIncrementalModelReferences(PhysicalStore sourceStore,
-                                    PhysicalStore destinationStore) {
+void testIncrementalModelReferences() {
     TemporaryDirectory temporary("model-delta");
     const std::filesystem::path full = temporary.path / "models-full.aowbundle";
     const std::filesystem::path delta = temporary.path / "models-delta.aowbundle";
-    Repository source(temporary.path / "source", sourceStore);
-    Repository destination(temporary.path / "destination", destinationStore);
+    Repository source(temporary.path / "source");
+    Repository destination(temporary.path / "destination");
     source.createBranch("models");
     const ModelRecord node{10, {}, bytes("junction")};
     const ModelRecord pipe{11, {key(10)}, bytes("pipe")};
@@ -273,7 +270,7 @@ void testIncrementalModelReferences(PhysicalStore sourceStore,
            "incremental transfer damaged typed model references/history");
 }
 
-void testIncrementalBundles(PhysicalStore sourceStore, PhysicalStore destinationStore) {
+void testIncrementalBundles() {
     TemporaryDirectory temporary("incremental");
     const std::filesystem::path sourcePath = temporary.path / "source";
     const std::filesystem::path destinationPath = temporary.path / "destination";
@@ -286,8 +283,8 @@ void testIncrementalBundles(PhysicalStore sourceStore, PhysicalStore destination
     Hash base{};
     Hash tip{};
     {
-        Repository source(sourcePath, sourceStore);
-        Repository destination(destinationPath, destinationStore);
+        Repository source(sourcePath);
+        Repository destination(destinationPath);
         source.createBranch("main");
         std::vector<aowis::native::Change> initial;
         for (std::uint64_t index = 1; index <= 250; ++index) {
@@ -320,7 +317,7 @@ void testIncrementalBundles(PhysicalStore sourceStore, PhysicalStore destination
         }, "non-ancestor base accepted");
 
         {
-            Repository empty(missingBasePath, destinationStore);
+            Repository empty(missingBasePath);
             expectFailure([&] { empty.importBranchBundle(incremental, "remote_main"); },
                           "incremental bundle imported without recipient baseline");
             expect(empty.objectCount() == 0, "missing baseline import wrote content");
@@ -408,7 +405,7 @@ void testIncrementalBundles(PhysicalStore sourceStore, PhysicalStore destination
         destination.verifyPack();
     }
     {
-        Repository reopened(destinationPath, destinationStore);
+        Repository reopened(destinationPath);
         expect(reopened.head("remote_main").id == tip &&
                    reopened.get("remote_main", key(502)) == bytes("new-object"),
                "incremental objects did not survive reopening");
@@ -420,14 +417,11 @@ void testIncrementalBundles(PhysicalStore sourceStore, PhysicalStore destination
 
 int main() {
     try {
-        testPortableBundles(PhysicalStore::Pack, PhysicalStore::Pack);
-        testIncrementalBundles(PhysicalStore::Pack, PhysicalStore::Pack);
-        testIncrementalModelReferences(PhysicalStore::Pack,
-                                       PhysicalStore::Pack);
-        testIncrementalModelReferences(PhysicalStore::Pack,
-                                       PhysicalStore::Pack);
-        testMergeParentIncremental(PhysicalStore::Pack,
-                                   PhysicalStore::Pack);
+        testPortableBundles();
+        testIncrementalBundles();
+        testIncrementalModelReferences();
+        testIncrementalModelReferences();
+        testMergeParentIncremental();
         std::cout << "AOWIS native offline sync tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -154,54 +154,57 @@ void compareNetworks(const NetworkHydraulic& source, const NetworkHydraulic& res
 #undef CHECK_LIST
 }
 
+// Load APIs report every failure as a typed StorageError (never as text).
+bool throwsStorageError(native::StorageErrorKind expected, const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const native::StorageError& error) {
+        if (error.kind() != expected)
+            throw std::runtime_error(std::string("load failure has kind ") +
+                                     native::StorageError::kindName(error.kind()) + ": " + error.what());
+        return true;
+    }
+    return false;
+}
+
 NetworkHydraulic requiredLoad(native::Repository& repository, std::string_view branch,
                               const QUuid& id) {
-    QString error;
-    const std::optional<NetworkHydraulic> loaded =
-        hydraulic::loadHydraulicNetwork(repository, branch, id, &error);
-    if (!loaded) throw std::runtime_error("network load failed: " + error.toStdString());
+    const std::optional<NetworkHydraulic> loaded = hydraulic::loadHydraulicNetwork(repository, branch, id);
+    if (!loaded) throw std::runtime_error("network not found");
     return *loaded;
 }
 
 NetworkHydraulic requiredLoadAtRevision(native::Repository& repository,
                                          const native::Hash& revisionId, const QUuid& networkId) {
-    QString error;
     const std::optional<NetworkHydraulic> loaded =
-        hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkId, &error);
-    if (!loaded) throw std::runtime_error("historical network load failed: " + error.toStdString());
+        hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkId);
+    if (!loaded) throw std::runtime_error("historical network not found");
     return *loaded;
 }
 
 // First model publication starts from an empty, non-model-indexed genesis
 // revision. Historical model APIs must remain strict without preventing that
 // first save or treating an untouched branch as a corrupted network.
-void exerciseEmptyRawBranch(native::PhysicalStore physical) {
+void exerciseEmptyRawBranch() {
     const std::filesystem::path folder = tempDir();
     try {
-        native::Repository repository(folder, physical);
+        native::Repository repository(folder);
         repository.createBranch("main");
         const native::Revision initial = repository.head("main");
         require(!initial.modelIndexed && initial.root == native::Hash{},
                 "new branch should start with an empty raw revision");
-
-        QString error = QStringLiteral("old error");
-        require(!hydraulic::loadHydraulicNetwork(repository, "main", uuid(1), &error) &&
-                error.isEmpty(), "new branch network lookup did not return clean not-found");
-        error = QStringLiteral("old error");
+        require(!hydraulic::loadHydraulicNetwork(repository, "main", uuid(1)), "new branch network lookup did not return clean not-found");
         require(!hydraulic::listHydraulicEntityIds(
-                    repository, "main", uuid(1), hydraulic::HydraulicEntityType::MapLabel,
-                    &error) && error.isEmpty(),
+                    repository, "main", uuid(1), hydraulic::HydraulicEntityType::MapLabel),
                 "new branch membership lookup did not return clean not-found");
-        require(!hydraulic::listHydraulicEntityIds(
+        require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] { (void)hydraulic::listHydraulicEntityIds(
                     repository, "main", uuid(1),
-                    static_cast<hydraulic::HydraulicEntityType>(999), &error) && !error.isEmpty(),
+                    static_cast<hydraulic::HydraulicEntityType>(999)); }),
                 "invalid collection selector passed on an empty branch");
-        error = QStringLiteral("old error");
-        require(!hydraulic::loadHydraulicEntity(repository, "main", uuid(1), uuid(28), &error) &&
-                error.isEmpty(), "new branch entity lookup did not return clean not-found");
+        require(!hydraulic::loadHydraulicEntity(repository, "main", uuid(1), uuid(28)), "new branch entity lookup did not return clean not-found");
 
-        require(!hydraulic::loadHydraulicNetworkAtRevision(
-                    repository, initial.id, uuid(1), &error) && !error.isEmpty(),
+        require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] { (void)hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, initial.id, uuid(1)); }),
                 "explicit historical model read unexpectedly accepted a raw revision");
 
         const NetworkHydraulic network = completeNetwork();
@@ -233,7 +236,7 @@ void exerciseEmptyRawBranch(native::PhysicalStore physical) {
     std::filesystem::remove_all(folder, ignored);
 }
 
-void exercise(native::PhysicalStore physical) {
+void exercise() {
     const std::filesystem::path folder = tempDir();
     try {
         const NetworkHydraulic initial = completeNetwork();
@@ -265,13 +268,12 @@ void exercise(native::PhysicalStore physical) {
                 "compact validation accepted an invalid endpoint or changed diagnostics");
         native::Hash original{};
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             original = hydraulic::saveHydraulicNetwork(repository, "main", initial).id;
             require(repository.head("main").modelIndexed, "model index was not published");
-            QString error;
             const std::optional<NetworkHydraulic> restored =
-                hydraulic::loadHydraulicNetwork(repository, "main", initial.uuid, &error);
+                hydraulic::loadHydraulicNetwork(repository, "main", initial.uuid);
             require(restored.has_value(), "first network load failed");
             compareNetworks(initial, *restored);
             // Fast indexed reads must return the canonical entity without
@@ -281,7 +283,7 @@ void exercise(native::PhysicalStore physical) {
             { \
                 const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIds( \
                     repository, "main", initial.uuid, \
-                    static_cast<hydraulic::HydraulicEntityType>(checkedCollection), &error); \
+                    static_cast<hydraulic::HydraulicEntityType>(checkedCollection)); \
                 require(ids.has_value() && *ids == [&]() { \
                     QList<QUuid> expected; \
                     for (const type& item : initial.name) expected.append(item.uuid); \
@@ -289,7 +291,7 @@ void exercise(native::PhysicalStore physical) {
                 }(), "fast membership list changed: " #name); \
                 for (const type& expected : initial.name) { \
                     const std::optional<hydraulic::HydraulicEntity> actual = hydraulic::loadHydraulicEntity( \
-                        repository, "main", initial.uuid, expected.uuid, &error); \
+                        repository, "main", initial.uuid, expected.uuid); \
                     require(actual.has_value(), "fast entity lookup missing: " #name); \
                     const type* entity = std::get_if<type>(&*actual); \
                     require(entity != nullptr && \
@@ -319,15 +321,13 @@ void exercise(native::PhysicalStore physical) {
             CHECK_FAST_READ(map_labels, HydraulicMapLabel)
 #undef CHECK_FAST_READ
             require(checkedCollection == 18, "incomplete indexed entity read coverage");
-            require(!hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(999), &error) &&
-                    error.isEmpty(), "unknown UUID unexpectedly resolved");
-            require(!hydraulic::loadHydraulicEntity(repository, "main", uuid(999), uuid(23), &error) &&
-                    error.isEmpty(), "entity unexpectedly belongs to another network");
+            require(!hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(999)), "unknown UUID unexpectedly resolved");
+            require(!hydraulic::loadHydraulicEntity(repository, "main", uuid(999), uuid(23)), "entity unexpectedly belongs to another network");
             require(!hydraulic::listHydraulicEntityIds(repository, "main", uuid(999),
-                     hydraulic::HydraulicEntityType::Pipe, &error) && error.isEmpty(),
+                     hydraulic::HydraulicEntityType::Pipe),
                     "unknown network unexpectedly listed members");
-            require(!hydraulic::listHydraulicEntityIds(repository, "main", initial.uuid,
-                     static_cast<hydraulic::HydraulicEntityType>(99), &error) && !error.isEmpty(),
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] { (void)hydraulic::listHydraulicEntityIds(repository, "main", initial.uuid,
+                     static_cast<hydraulic::HydraulicEntityType>(99)); }),
                     "invalid collection kind not rejected");
             require(repository.referencingModel("main", hydraulic::keyFromUuid(uuid(19))).size() >= 2,
                     "inbound model references were not indexed");
@@ -375,16 +375,15 @@ void exercise(native::PhysicalStore physical) {
             require(!repository.getModel("feature", hydraulic::keyFromUuid(uuid(28))),
                     "removed label still has a model record");
             const std::optional<hydraulic::HydraulicEntity> featurePipe =
-                hydraulic::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(23), &error);
+                hydraulic::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(23));
             require(featurePipe.has_value() &&
                     std::get<HydraulicLinkPipe>(*featurePipe).diameter_mm == 211.5,
                     "indexed entity read did not follow branch changes");
-            require(!hydraulic::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(28), &error) &&
-                    error.isEmpty(), "deleted entity still appears as a member");
+            require(!hydraulic::loadHydraulicEntity(repository, "feature", initial.uuid, uuid(28)), "deleted entity still appears as a member");
             require(hydraulic::listHydraulicEntityIds(repository, "feature", initial.uuid,
-                    hydraulic::HydraulicEntityType::MapLabel, &error)->empty(),
+                    hydraulic::HydraulicEntityType::MapLabel)->empty(),
                     "deleted label still appears in ordered membership");
-            require(hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28), &error).has_value(),
+            require(hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28)).has_value(),
                     "branch isolation failed for indexed lookups");
             // Bounded physical editing of all four non-pipe hydraulic kinds.
             // These test objects have live inbound and outgoing references;
@@ -654,10 +653,10 @@ void exercise(native::PhysicalStore physical) {
             malformedLabel.kind = 999;
             repository.commitModel("corrupt-query", {
                 {hydraulic::keyFromUuid(uuid(28)), std::move(malformedLabel)}});
-            require(!hydraulic::loadHydraulicEntity(repository, "corrupt-query", initial.uuid,
-                    uuid(28), &error) && !error.isEmpty(),
+            require(throwsStorageError(native::StorageErrorKind::Corruption, [&] { (void)hydraulic::loadHydraulicEntity(repository, "corrupt-query", initial.uuid,
+                    uuid(28)); }),
                     "indexed query accepted an unknown entity kind");
-            require(hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28), &error).has_value(),
+            require(hydraulic::loadHydraulicEntity(repository, "main", initial.uuid, uuid(28)).has_value(),
                     "malformed branch damaged the original branch");
 
             // Fast indexed scalar edits must NOT reconstruct the entire
@@ -1209,7 +1208,7 @@ void exercise(native::PhysicalStore physical) {
             repository.verifyPack();
         }
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             compareNetworks(initial, requiredLoad(reopened, "main", initial.uuid));
             const NetworkHydraulic physicalReloaded = requiredLoad(
                 reopened, "physical-indexed", initial.uuid);
@@ -1234,10 +1233,9 @@ void exercise(native::PhysicalStore physical) {
                     QStringLiteral("catalogue-material-revised") &&
                     catalogueReloaded.patterns_time[0].multipliers.size() == 4,
                     "catalogue indexed changes lost after reopen");
-            QString indexedError;
             const std::optional<hydraulic::HydraulicEntity> reopenedPipe =
-                hydraulic::loadHydraulicEntity(reopened, "main", initial.uuid, uuid(23), &indexedError);
-            require(reopenedPipe.has_value() && indexedError.isEmpty() &&
+                hydraulic::loadHydraulicEntity(reopened, "main", initial.uuid, uuid(23));
+            require(reopenedPipe.has_value() &&
                     std::get<HydraulicLinkPipe>(*reopenedPipe).diameter_mm == 110.75,
                     "indexed hydraulic lookup failed after repository reopen");
             require(reopened.head("main").id != original, "new network commit missing");
@@ -1253,7 +1251,7 @@ void exercise(native::PhysicalStore physical) {
     std::error_code ignored;
     std::filesystem::remove_all(folder, ignored);
 }
-void exerciseChunkBoundaries(native::PhysicalStore physical) {
+void exerciseChunkBoundaries() {
     const std::filesystem::path folder = tempDir();
     try {
         NetworkHydraulic network;
@@ -1275,7 +1273,7 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
                 "chunk test fixture not valid");
         native::Hash original{};
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             original = hydraulic::saveHydraulicNetwork(repository, "main", network).id;
             const std::optional<native::ModelRecord> root = repository.getModel(
@@ -1330,13 +1328,12 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
             repository.verifyPack();
         }
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             require(reopened.head("main").id == original,
                     "original chunked branch head changed");
             compareNetworks(network, requiredLoad(reopened, "main", network.uuid));
-            QString error;
             require(hydraulic::loadHydraulicEntity(reopened, "feature", network.uuid,
-                            uuid(804000), &error).has_value() && error.isEmpty(),
+                            uuid(804000)).has_value(),
                     "added chunk member lost on reopen");
             reopened.verifyPack();
         }
@@ -1352,8 +1349,8 @@ void exerciseChunkBoundaries(native::PhysicalStore physical) {
 // Demand points and controls have typed references, and pipe-attached demand
 // points additionally constrain assigned junctions to the pipe's endpoints.
 // Verify that the bounded indexed path agrees with the canonical validator
-// on both physical backends, including a single-batch dependency graph.
-void exerciseDependentMembership(native::PhysicalStore physical) {
+// including a single-batch dependency graph.
+void exerciseDependentMembership() {
     const std::filesystem::path folder = tempDir();
     try {
         NetworkHydraulic baseline = completeNetwork();
@@ -1361,7 +1358,7 @@ void exerciseDependentMembership(native::PhysicalStore physical) {
         require(aowis::native::validateHydraulicNetwork(baseline).valid(),
                 "dependent membership fixture invalid");
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             hydraulic::saveHydraulicNetwork(repository, "main", baseline);
             repository.createBranch("dependent", "main");
@@ -1545,7 +1542,7 @@ void exerciseDependentMembership(native::PhysicalStore physical) {
             repository.verifyPack();
         }
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             compareNetworks(baseline, requiredLoad(reopened, "dependent", baseline.uuid));
             compareNetworks(baseline, requiredLoad(reopened, "main", baseline.uuid));
             reopened.verifyPack();
@@ -1561,14 +1558,14 @@ void exerciseDependentMembership(native::PhysicalStore physical) {
 
 // Existing demand/control edits may change referenced UUIDs without touching
 // network membership. Exercise the real canonical validator and reference index
-// on both physical backends, including no-op, rejection and reopening.
-void exerciseDependentUpdates(native::PhysicalStore physical) {
+// including no-op, rejection and reopening.
+void exerciseDependentUpdates() {
     const std::filesystem::path folder = tempDir();
     try {
         NetworkHydraulic baseline = completeNetwork();
         NetworkHydraulic expected = baseline;
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             hydraulic::saveHydraulicNetwork(repository, "main", baseline);
             repository.createBranch("dependent-updates", "main");
@@ -1723,7 +1720,7 @@ void exerciseDependentUpdates(native::PhysicalStore physical) {
             repository.verifyPack();
         } // Release the writer lock before checking durability via a fresh handle.
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             compareNetworks(expected, requiredLoad(reopened, "dependent-updates", baseline.uuid));
             compareNetworks(baseline, requiredLoad(reopened, "main", baseline.uuid));
             reopened.verifyPack();
@@ -1737,12 +1734,12 @@ void exerciseDependentUpdates(native::PhysicalStore physical) {
     std::filesystem::remove_all(folder, ignored);
 }
 
-void exerciseHydraulicMerging(native::PhysicalStore physical) {
+void exerciseHydraulicMerging() {
     const std::filesystem::path folder = tempDir();
     try {
         const NetworkHydraulic baseline = completeNetwork();
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             hydraulic::saveHydraulicNetwork(repository, "main", baseline);
             repository.createBranch("feature", "main");
@@ -1903,7 +1900,7 @@ void exerciseHydraulicMerging(native::PhysicalStore physical) {
             repository.verifyPack();
         }
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             NetworkHydraulic expected = baseline;
             expected.links_pipes[0].diameter_mm = 179.0;
             expected.links_pipes[0].length_calculated_m = 37.5;
@@ -1920,12 +1917,12 @@ void exerciseHydraulicMerging(native::PhysicalStore physical) {
 }
 
 
-void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
+void exerciseStructuralMergeChoices() {
     const std::filesystem::path folder = tempDir();
     try {
         const NetworkHydraulic baseline = completeNetwork();
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             hydraulic::saveHydraulicNetwork(repository, "main", baseline);
             repository.createBranch("delete-left", "main");
@@ -2066,7 +2063,7 @@ void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
             repository.verifyPack();
         }
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             NetworkHydraulic expected = baseline;
             expected.map_labels.clear();
             compareNetworks(expected, requiredLoad(reopened, "delete-left", baseline.uuid));
@@ -2085,12 +2082,12 @@ void exerciseStructuralMergeChoices(native::PhysicalStore physical) {
     std::filesystem::remove_all(folder, ignored);
 }
 
-void exerciseCoordinatedMembershipMerges(native::PhysicalStore physical) {
+void exerciseCoordinatedMembershipMerges() {
     const std::filesystem::path folder = tempDir();
     try {
         const NetworkHydraulic baseline = completeNetwork();
         {
-            native::Repository repository(folder, physical);
+            native::Repository repository(folder);
             repository.createBranch("main");
             hydraulic::saveHydraulicNetwork(repository, "main", baseline);
             repository.createBranch("append-left", "main");
@@ -2170,7 +2167,7 @@ void exerciseCoordinatedMembershipMerges(native::PhysicalStore physical) {
             repository.verifyPack();
         }
         {
-            native::Repository reopened(folder, physical);
+            native::Repository reopened(folder);
             NetworkHydraulic combined = baseline;
             HydraulicMapLabel labelA = item<HydraulicMapLabel>(8101);
             HydraulicMapLabel labelB = item<HydraulicMapLabel>(8102);
@@ -2200,32 +2197,30 @@ void exerciseCoordinatedMembershipMerges(native::PhysicalStore physical) {
 
 // A revision is an immutable read boundary: branch movement must never
 // combine metadata, membership, and model payloads from different commits.
-void exerciseSnapshotReads(native::PhysicalStore physical) {
+void exerciseSnapshotReads() {
     const std::filesystem::path folder = tempDir();
     try {
-        native::Repository repository(folder, physical);
+        native::Repository repository(folder);
         repository.createBranch("main");
         NetworkHydraulic initial = completeNetwork();
         initial.title_line_1 = QStringLiteral("0");
         initial.nodes_junctions[0].metadata.description = QStringLiteral("0");
         initial.map_labels[0].text = QStringLiteral("0");
         const native::Revision original = hydraulic::saveHydraulicNetwork(repository, "main", initial);
-
-        QString error = QStringLiteral("stale error");
         const std::optional<NetworkHydraulic> originalCopy =
-            hydraulic::loadHydraulicNetworkAtRevision(repository, original.id, initial.uuid, &error);
-        require(originalCopy.has_value() && error.isEmpty(), "cannot read original revision");
+            hydraulic::loadHydraulicNetworkAtRevision(repository, original.id, initial.uuid);
+        require(originalCopy.has_value(), "cannot read original revision");
         compareNetworks(initial, *originalCopy);
         const std::optional<QList<QUuid>> originalLabels =
             hydraulic::listHydraulicEntityIdsAtRevision(repository, original.id, initial.uuid,
-                                                       hydraulic::HydraulicEntityType::MapLabel, &error);
+                                                       hydraulic::HydraulicEntityType::MapLabel);
         require(originalLabels && originalLabels->size() == 1 &&
-                originalLabels->first() == uuid(28) && error.isEmpty(),
+                originalLabels->first() == uuid(28),
                 "original membership list is incorrect");
         const std::optional<hydraulic::HydraulicEntity> originalLabel =
-            hydraulic::loadHydraulicEntityAtRevision(repository, original.id, initial.uuid, uuid(28), &error);
+            hydraulic::loadHydraulicEntityAtRevision(repository, original.id, initial.uuid, uuid(28));
         require(originalLabel && std::get_if<HydraulicMapLabel>(&*originalLabel) != nullptr &&
-                std::get<HydraulicMapLabel>(*originalLabel).text == QStringLiteral("0") && error.isEmpty(),
+                std::get<HydraulicMapLabel>(*originalLabel).text == QStringLiteral("0"),
                 "original targeted read is incorrect");
 
         NetworkHydraulic updated = initial;
@@ -2243,34 +2238,37 @@ void exerciseSnapshotReads(native::PhysicalStore physical) {
         compareNetworks(updated, requiredLoadAtRevision(repository, second.id, initial.uuid));
         const std::optional<QList<QUuid>> before =
             hydraulic::listHydraulicEntityIdsAtRevision(repository, original.id, initial.uuid,
-                                                       hydraulic::HydraulicEntityType::MapLabel, &error);
+                                                       hydraulic::HydraulicEntityType::MapLabel);
         const std::optional<QList<QUuid>> after =
             hydraulic::listHydraulicEntityIdsAtRevision(repository, second.id, initial.uuid,
-                                                       hydraulic::HydraulicEntityType::MapLabel, &error);
+                                                       hydraulic::HydraulicEntityType::MapLabel);
         require(before && before->size() == 1 && after && after->size() == 2,
                 "membership lists did not honor requested revision");
         require(!hydraulic::loadHydraulicEntityAtRevision(
-                    repository, original.id, initial.uuid, additional.uuid, &error) && error.isEmpty(),
+                    repository, original.id, initial.uuid, additional.uuid),
                 "future entity was visible in historical revision");
         const std::optional<hydraulic::HydraulicEntity> inserted =
             hydraulic::loadHydraulicEntityAtRevision(
-                repository, second.id, initial.uuid, additional.uuid, &error);
-        require(inserted && std::get_if<HydraulicMapLabel>(&*inserted) != nullptr && error.isEmpty(),
+                repository, second.id, initial.uuid, additional.uuid);
+        require(inserted && std::get_if<HydraulicMapLabel>(&*inserted) != nullptr,
                 "new member missing in new revision");
         require(!hydraulic::loadHydraulicNetworkAtRevision(
-                    repository, original.id, uuid(98765), &error) && error.isEmpty(),
-                "missing historical network did not clear error");
+                    repository, original.id, uuid(98765)),
+                "missing historical network was not a clean not-found");
         require(!hydraulic::listHydraulicEntityIdsAtRevision(
                     repository, original.id, uuid(98765),
-                    hydraulic::HydraulicEntityType::MapLabel, &error) && error.isEmpty(),
-                "missing historical network list did not clear error");
-        require(!hydraulic::loadHydraulicNetworkAtRevision(
-                    repository, native::Hash{}, initial.uuid, &error) && !error.isEmpty(),
+                    hydraulic::HydraulicEntityType::MapLabel),
+                "missing historical network list was not a clean not-found");
+        require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] { (void)hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, native::Hash{}, initial.uuid); }),
                 "invalid revision was not rejected");
-        error.clear();
-        require(!hydraulic::listHydraulicEntityIdsAtRevision(
+        require(throwsStorageError(native::StorageErrorKind::NotFound, [&] {
+                    (void)hydraulic::loadHydraulicNetworkAtRevision(
+                        repository, native::sha256(native::Bytes{9, 9}), initial.uuid); }),
+                "unknown revision was not a typed NotFound");
+        require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] { (void)hydraulic::listHydraulicEntityIdsAtRevision(
                     repository, original.id, initial.uuid,
-                    static_cast<hydraulic::HydraulicEntityType>(999), &error) && !error.isEmpty(),
+                    static_cast<hydraulic::HydraulicEntityType>(999)); }),
                 "invalid collection was not rejected");
 
         // Concurrent writers repeatedly replace every snapshot marker and
@@ -2289,10 +2287,9 @@ void exerciseSnapshotReads(native::PhysicalStore physical) {
             try {
                 while (!begin.load()) std::this_thread::yield();
                 for (int iteration = 0; iteration < 100; ++iteration) {
-                    QString readError;
                     const std::optional<NetworkHydraulic> observed =
-                        hydraulic::loadHydraulicNetwork(repository, "main", initial.uuid, &readError);
-                    require(observed && readError.isEmpty(), "concurrent network read failed");
+                        hydraulic::loadHydraulicNetwork(repository, "main", initial.uuid);
+                    require(observed.has_value(), "concurrent network read failed");
                     const QString marker = observed->title_line_1;
                     bool numeric = false;
                     const int generation = marker.toInt(&numeric);
@@ -2308,9 +2305,8 @@ void exerciseSnapshotReads(native::PhysicalStore physical) {
                         // but must still return an internally valid member.
                         const std::optional<hydraulic::HydraulicEntity> targeted =
                             hydraulic::loadHydraulicEntity(
-                                repository, "main", initial.uuid, uuid(28), &readError);
-                        require(targeted && std::get_if<HydraulicMapLabel>(&*targeted) != nullptr &&
-                                readError.isEmpty(), "concurrent targeted lookup failed");
+                                repository, "main", initial.uuid, uuid(28));
+                        require(targeted && std::get_if<HydraulicMapLabel>(&*targeted) != nullptr, "concurrent targeted lookup failed");
                         const QString entityMarker = std::get<HydraulicMapLabel>(*targeted).text;
                         bool validMarker = false;
                         const int entityGeneration = entityMarker.toInt(&validMarker);
@@ -2319,9 +2315,9 @@ void exerciseSnapshotReads(native::PhysicalStore physical) {
                         const std::optional<QList<QUuid>> listed =
                             hydraulic::listHydraulicEntityIds(
                                 repository, "main", initial.uuid,
-                                hydraulic::HydraulicEntityType::MapLabel, &readError);
+                                hydraulic::HydraulicEntityType::MapLabel);
                         require(listed && (listed->size() == 1 || listed->size() == 2) &&
-                                listed->first() == uuid(28) && readError.isEmpty(),
+                                listed->first() == uuid(28),
                                 "concurrent membership listing failed");
                         compareNetworks(initial, requiredLoadAtRevision(
                             repository, original.id, initial.uuid));
@@ -2372,10 +2368,10 @@ void exerciseSnapshotReads(native::PhysicalStore physical) {
 
 // Explicit caller-provided optimistic pins must survive the entire adapter
 // preparation path and reach the store's atomic compare-and-publish boundary.
-void exerciseCallerPinnedWrites(native::PhysicalStore physical) {
+void exerciseCallerPinnedWrites() {
     const std::filesystem::path folder = tempDir();
     try {
-        native::Repository repository(folder, physical);
+        native::Repository repository(folder);
         repository.createBranch("main");
         NetworkHydraulic network = completeNetwork();
         const native::Hash emptyHead = repository.head("main").id;
@@ -2428,17 +2424,17 @@ void exerciseCallerPinnedWrites(native::PhysicalStore physical) {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
-        exerciseEmptyRawBranch(native::PhysicalStore::Pack);
-        exercise(native::PhysicalStore::Pack);
-        exerciseChunkBoundaries(native::PhysicalStore::Pack);
-        exerciseDependentMembership(native::PhysicalStore::Pack);
-        exerciseDependentUpdates(native::PhysicalStore::Pack);
-        exerciseHydraulicMerging(native::PhysicalStore::Pack);
-        exerciseStructuralMergeChoices(native::PhysicalStore::Pack);
-        exerciseCoordinatedMembershipMerges(native::PhysicalStore::Pack);
-        exerciseSnapshotReads(native::PhysicalStore::Pack);
-        exerciseCallerPinnedWrites(native::PhysicalStore::Pack);
-        std::cout << "Complete hydraulic network persistence tests passed on pack backend\n";
+        exerciseEmptyRawBranch();
+        exercise();
+        exerciseChunkBoundaries();
+        exerciseDependentMembership();
+        exerciseDependentUpdates();
+        exerciseHydraulicMerging();
+        exerciseStructuralMergeChoices();
+        exerciseCoordinatedMembershipMerges();
+        exerciseSnapshotReads();
+        exerciseCallerPinnedWrites();
+        std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
     } catch (const std::exception& failure) {
         std::cerr << "Hydraulic network persistence test failed: " << failure.what() << '\n';

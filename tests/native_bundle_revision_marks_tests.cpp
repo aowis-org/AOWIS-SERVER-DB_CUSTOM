@@ -25,7 +25,6 @@ using aowis::native::MergeResult;
 using aowis::native::MergeStatus;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 using aowis::native::VerificationReport;
 
@@ -99,11 +98,10 @@ void expectRejected(Repository& repository, const std::filesystem::path& path,
     throw std::runtime_error("invalid bundle import was accepted");
 }
 
-void testRevisionMarks(PhysicalStore sourceBackend, PhysicalStore destinationBackend,
-                       bool modelIndexed) {
+void testRevisionMarks(bool modelIndexed) {
     TemporaryDirectory temporary;
-    Repository source(temporary.path() / "source", sourceBackend);
-    Repository destination(temporary.path() / "destination", destinationBackend);
+    Repository source(temporary.path() / "source");
+    Repository destination(temporary.path() / "destination");
     source.createBranch("main");
     const unsigned commonCommits = modelIndexed ? 20U : 190U;
     const unsigned divergentCommits = modelIndexed ? 18U : 70U;
@@ -166,7 +164,7 @@ void testRevisionMarks(PhysicalStore sourceBackend, PhysicalStore destinationBac
 
     const std::filesystem::path complete = temporary.path() / "complete.aowbundle";
     source.exportBranchBundle("main", complete);
-    Repository independent(temporary.path() / "independent", destinationBackend);
+    Repository independent(temporary.path() / "independent");
     check(independent.importBranchBundle(complete, "main").status ==
           BundleImportStatus::Created, "fresh full merge DAG import failed");
     verifySameHistory(source, independent);
@@ -176,14 +174,8 @@ void testRevisionMarks(PhysicalStore sourceBackend, PhysicalStore destinationBac
 
 int main() {
     try {
-        const std::array<PhysicalStore, 2> backends{
-            PhysicalStore::Pack, PhysicalStore::Pack};
-        for (PhysicalStore sourceBackend : backends) {
-            for (PhysicalStore destinationBackend : backends) {
-                testRevisionMarks(sourceBackend, destinationBackend, false);
-                testRevisionMarks(sourceBackend, destinationBackend, true);
-            }
-        }
+        testRevisionMarks(false);
+        testRevisionMarks(true);
         std::cout << "AOWIS native bundle revision-mark tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -62,7 +62,6 @@ int main(int argc, char** argv) {
             throw std::runtime_error("invalid benchmark counts");
         if (argc != 3 && argc != 4 && argc != 5)
             throw std::runtime_error("unexpected benchmark arguments");
-        const native::PhysicalStore physical = native::PhysicalStore::Pack;
 
         NetworkHydraulic network;
         network.uuid = uuid(1);
@@ -101,7 +100,7 @@ int main(int argc, char** argv) {
         physicalValve.node_uuid_from = network.nodes_junctions[1].uuid;
         physicalValve.node_uuid_to = physicalTank.uuid;
         network.links_valves.append(physicalValve);
-        native::Repository repository(directory, physical);
+        native::Repository repository(directory);
         repository.createBranch("main");
         const std::chrono::steady_clock::time_point importStart = std::chrono::steady_clock::now();
         hydraulic::saveHydraulicNetwork(repository, "main", network);

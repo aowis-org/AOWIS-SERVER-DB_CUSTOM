@@ -177,6 +177,8 @@ public:
             for (const QUuid &uuid : this->network_.options_report.selection_links.uuids)
                 check(uuid, this->links_, QStringLiteral("network"), QStringLiteral("options_report.selection_links.uuids"));
         msx();
+        // Physical value rules belong to the same canonical validation.
+        this->result_.issues.append(validateHydraulicValues(this->network_).issues);
         return this->result_;
     }
 

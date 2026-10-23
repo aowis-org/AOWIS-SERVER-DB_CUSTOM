@@ -144,7 +144,7 @@ def prepare_fixtures(binary, root, args, kinds, backends):
             digests = {filename: bundle_checksum(fixture / f"{filename}.aowbundle")
                        for filename in ("base", "full", "delta")}
             if reference_digests is not None and digests != reference_digests:
-                raise RuntimeError("physical backends exported different bundle bytes")
+                raise RuntimeError("repeated exports produced different bundle bytes")
             reference_digests = digests
             manifest["fixtures"][name] = {"head": metrics["source_head"],
                                            "fixture_ms": metrics["fixture_ms"],
@@ -179,7 +179,7 @@ def load_fixtures(root, args, kinds, backends):
             if digests != item["sha256"]:
                 raise RuntimeError(f"fixture checksum mismatch: {name}")
             if previous_digests is not None and previous_digests != digests:
-                raise RuntimeError("physical backends exported different bundle bytes")
+                raise RuntimeError("repeated exports produced different bundle bytes")
             previous_digests = digests
             heads = (fixture / "heads.txt").read_text(encoding="utf-8").splitlines()
             if len(heads) != 2 or heads[1] != item["head"]:

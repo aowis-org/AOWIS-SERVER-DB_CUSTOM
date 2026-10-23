@@ -134,7 +134,6 @@ int main(int argc, char** argv) {
             settings.value("server/max_pending_per_project", "").toString();
         const QString rootValue = parser.isSet(dataRoot) ? parser.value(dataRoot) :
             settings.value("storage/root", "./aowis-db-data").toString();
-        const QString storageValue = settings.value("storage/default_backend", "pack").toString();
         const QString logPath = parser.isSet(logFile) ? parser.value(logFile) :
             settings.value("logging/file", "").toString();
 
@@ -167,9 +166,8 @@ int main(int argc, char** argv) {
         const std::string address = bindValue.toStdString();
         if (!numericAddress(address) || !validPort || requestedPort == 0 || requestedPort > 65535 ||
             !validWorkers || workerCount == 0 || workerCount > 256 ||
-            (storageValue != "pack") || rootValue.trimmed().isEmpty()) {
-            std::cerr << "Invalid bind address, port, worker threads, data root or storage backend "
-                         "configuration\n";
+            rootValue.trimmed().isEmpty()) {
+            std::cerr << "Invalid bind address, port, worker threads or data root configuration\n";
             return 2;
         }
         // One busy project may hold at most this many workers (waiting for its
@@ -194,7 +192,7 @@ int main(int argc, char** argv) {
             const std::size_t threads = static_cast<std::size_t>(workerCount);
             return new httplib::ThreadPool(threads, threads, threads * 16U);
         };
-        aowis::native::http::registerRoutes(server, service, aowis::native::PhysicalStore::Pack, limits);
+        aowis::native::http::registerRoutes(server, service, limits);
         if (!server.bind_to_port(address, static_cast<int>(requestedPort))) {
             std::cerr << "Unable to bind HTTP listener on " << address << ':' << requestedPort
                       << ": " << std::strerror(errno) << '\n';

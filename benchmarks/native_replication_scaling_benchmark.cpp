@@ -27,7 +27,6 @@ using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 using aowis::native::VerificationReport;
 
@@ -44,9 +43,9 @@ std::uint32_t positiveNumber(const char* text, const char* label) {
     return static_cast<std::uint32_t>(parsed);
 }
 
-PhysicalStore backend(std::string_view value) {
-    if (value == "pack") return PhysicalStore::Pack;
-    throw std::runtime_error("backend must be pack");
+// The result tables keep a backend column; the only storage is the pack.
+void requirePackBackend(std::string_view value) {
+    if (value != "pack") throw std::runtime_error("backend must be pack");
 }
 
 Key key(std::uint32_t sequence) {
@@ -138,7 +137,8 @@ void prepare(const std::filesystem::path& directory, std::uint32_t objects,
     require(objects < std::numeric_limits<std::uint32_t>::max(),
             "object count exceeds benchmark UUID capacity");
     std::filesystem::create_directories(directory);
-    Repository source(directory / "source", backend(backendName));
+    requirePackBackend(backendName);
+    Repository source(directory / "source");
     source.createBranch("main");
     Hash base{};
     const std::uint32_t baseCommits = commits / 2U;
@@ -221,7 +221,8 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
     const std::filesystem::path bundle = fixture /
         (delta ? "delta.aowbundle" : (phase == "import-base" ? "base.aowbundle" : "full.aowbundle"));
     const Hash expected = phase == "import-base" ? heads.first : heads.second;
-    Repository receiver(destination, backend(backendName));
+    requirePackBackend(backendName);
+    Repository receiver(destination);
     if (delta) require(receiver.head("main").id == heads.first, "destination is not at base revision");
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     BundleImportProfile profile{};

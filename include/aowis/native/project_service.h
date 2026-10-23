@@ -28,7 +28,6 @@ namespace aowis::native {
 struct ProjectInfo {
     std::string id;
     std::string name;
-    PhysicalStore storage = PhysicalStore::Pack;
 };
 
 // Busy: the project already has its maximum number of scoped operations
@@ -69,7 +68,7 @@ public:
     ProjectService(const ProjectService&) = delete;
     ProjectService& operator=(const ProjectService&) = delete;
 
-    ProjectInfo createProject(std::string_view name, PhysicalStore storage);
+    ProjectInfo createProject(std::string_view name);
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);

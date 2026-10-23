@@ -1,6 +1,6 @@
 # Hydraulic network persistence and indexed editing
 
-`aowis::native::hydraulic` stores complete `NetworkHydraulic` objects using this repository's canonical `ModelCodec<T>` and native reference validator. It works on both physical backends and can be called directly from C++ without a database service or HTTP.
+`aowis::native::hydraulic` stores complete `NetworkHydraulic` objects using this repository's canonical `ModelCodec<T>` and native reference validator. It can be called directly from C++ without a database service or HTTP.
 
 Public API: `include/aowis/native/hydraulic_network_persistence.h`.
 
@@ -28,15 +28,14 @@ The **18 top-level collections** are: pipe materials; time patterns; tank volume
 const aowis::native::Revision revision =
     aowis::native::hydraulic::saveHydraulicNetwork(repository, "main", network);
 
-QString error;
+// nullopt: no such network. Failures throw StorageError with their kind.
 const std::optional<NetworkHydraulic> loaded =
-    aowis::native::hydraulic::loadHydraulicNetwork(
-        repository, "main", network.uuid, &error);
+    aowis::native::hydraulic::loadHydraulicNetwork(repository, "main", network.uuid);
 
 // Explicit, reproducible historical read (does not follow a moving branch).
 const std::optional<NetworkHydraulic> historical =
     aowis::native::hydraulic::loadHydraulicNetworkAtRevision(
-        repository, revision.id, network.uuid, &error);
+        repository, revision.id, network.uuid);
 ```
 
 `saveHydraulicNetwork()` validates and replaces one complete network atomically, without changing other networks on the branch. It encodes all incoming top-level entities and is therefore a **full-network operation**. The native store performs reference and expected-head checks before publishing one new revision. Whole-network operations still require substantial work and memory proportional to the network size.
@@ -44,15 +43,13 @@ const std::optional<NetworkHydraulic> historical =
 ## Indexed entity queries
 
 ```cpp
-QString error;
-const auto pipe = aowis::native::hydraulic::loadHydraulicEntity(
-    repository, "main", networkUuid, pipeUuid, &error);
-const auto pipeIds = aowis::native::hydraulic::listHydraulicEntityIds(
-    repository, "main", networkUuid,
-    aowis::native::hydraulic::HydraulicEntityType::Pipe, &error);
+const std::optional<aowis::native::hydraulic::HydraulicEntity> pipe =
+    aowis::native::hydraulic::loadHydraulicEntity(repository, "main", networkUuid, pipeUuid);
+const std::optional<QList<QUuid>> pipeIds = aowis::native::hydraulic::listHydraulicEntityIds(
+    repository, "main", networkUuid, aowis::native::hydraulic::HydraulicEntityType::Pipe);
 ```
 
-`loadHydraulicEntity()` uses the reverse-reference membership index to find a single entity without reconstructing the network. It validates the requested record's type and canonical UUID; it does not perform a full network semantic audit on each read. `listHydraulicEntityIds()` returns one selected collection in its original order, without decoding every entity payload. A missing network/member returns `std::nullopt`; a corrupt or inconsistent stored object is an error. Branch-oriented queries pin a revision on entry; they never combine records from different branch heads. The corresponding `loadHydraulicEntityAtRevision()` and `listHydraulicEntityIdsAtRevision()` APIs accept an explicit revision hash, so several separate queries can be made against the same historical snapshot. A branch may advance between two *different* branch-oriented calls; clients requiring a consistent multi-call view must obtain the branch head once and pass its revision ID to each call.
+`loadHydraulicEntity()` uses the reverse-reference membership index to find a single entity without reconstructing the network. It validates the requested record's type and canonical UUID; it does not perform a full network semantic audit on each read. `listHydraulicEntityIds()` returns one selected collection in its original order, without decoding every entity payload. A missing network/member returns `std::nullopt`; a corrupt or inconsistent stored object throws `StorageError(Corruption)`, and I/O or full-disk failures keep their own kind (HTTP 500/507). Branch-oriented queries pin a revision on entry; they never combine records from different branch heads. The corresponding `loadHydraulicEntityAtRevision()` and `listHydraulicEntityIdsAtRevision()` APIs accept an explicit revision hash, so several separate queries can be made against the same historical snapshot. A branch may advance between two *different* branch-oriented calls; clients requiring a consistent multi-call view must obtain the branch head once and pass its revision ID to each call.
 
 ## Atomic indexed editing
 
@@ -87,7 +84,7 @@ The editor re-encodes only changed entities when its indexed rules can prove val
 
 Examples of enforced domain constraints include valid node types for pipe/pump/valve endpoints; curve/pattern types; assigned demand-point junctions being actual pipe endpoints; typed rule premises and actions; surviving inbound references; and network metadata/MSX dependencies. Safe deletion may remove a pipe and its otherwise-unreferenced junction in one transaction. Cross-network UUID ownership is checked.
 
-`HydraulicEditDiagnostics` reports whether indexed scalar, topology, membership, catalogue, physical or dependent-update validation was used, and how many changed entity payloads the fast path validated. **Fast-path availability is deliberately conservative**: it is not a guarantee that any arbitrary model edit is O(1). Full-model fallback is authoritative where local validation cannot establish safety.
+`HydraulicEditDiagnostics` reports whether indexed scalar, topology, membership, catalogue, physical or dependent-update validation was used, and how many changed entity payloads the fast path validated. Physical value rules ([model value rules](model-value-rules.md)) are checked for every edited entity before any path, fast or full, may store it. **Fast-path availability is deliberately conservative**: it is not a guarantee that any arbitrary model edit is O(1). Full-model fallback is authoritative where local validation cannot establish safety.
 
 ## Whole-network merging
 
@@ -95,6 +92,6 @@ Hydraulic branches should use `mergeHydraulicBranches()` rather than the generic
 
 ## Format, performance and limitations
 
-The serializer, ordered membership and persistent reference-index formats are common to both native physical backends. Indexed entity reads and suitable edits avoid decoding the whole network, while full saves, fallbacks and proposed merged-snapshot validation still work over the whole aggregate. Solver feasibility and arbitrary conflicting membership reorder resolution remain separate work. The REST service also exposes canonical complete-network reads/saves, revision-pinned targeted entity reads, atomic validated edits and semantic merges, reusing this native library. See [REST design](rest-api-design.md) for HTTP request envelopes, size limits and operations still planned.
+The serializer, ordered membership and persistent reference-index formats are part of the pack repository format. Indexed entity reads and suitable edits avoid decoding the whole network, while full saves, fallbacks and proposed merged-snapshot validation still work over the whole aggregate. Solver feasibility and arbitrary conflicting membership reorder resolution remain separate work. The REST service also exposes canonical complete-network reads/saves, revision-pinned targeted entity reads, atomic validated edits and semantic merges, reusing this native library. See [REST design](rest-api-design.md) for HTTP request envelopes, size limits and operations still planned.
 
-Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-native-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency on both storage backends.
+Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-native-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency.

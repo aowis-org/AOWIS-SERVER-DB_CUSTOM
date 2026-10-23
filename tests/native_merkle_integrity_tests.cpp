@@ -20,7 +20,6 @@ using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void expect(bool condition, const std::string& message) {
@@ -210,9 +209,9 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
            "rejected bundle modified repository: " + label);
 }
 
-void testMalformedTrees(PhysicalStore physicalStore) {
+void testMalformedTrees() {
     TemporaryDirectory temporary("malformed");
-    Repository target(temporary.path / "target", physicalStore);
+    Repository target(temporary.path / "target");
     target.createBranch("stable");
     target.commit("stable", {{key(42), Bytes{'s', 'a', 'f', 'e'}}});
 
@@ -263,9 +262,9 @@ void testMalformedTrees(PhysicalStore physicalStore) {
     target.verifyPack();
 }
 
-void testValidCompressedAndSharedTrees(PhysicalStore physicalStore) {
+void testValidCompressedAndSharedTrees() {
     TemporaryDirectory temporary("valid");
-    Repository target(temporary.path / "target", physicalStore);
+    Repository target(temporary.path / "target");
     BundleBuilder builder;
     const Hash value = addValue(builder, TreeKind::Raw);
     const Hash one = builder.leaf(key(1), value);
@@ -287,9 +286,9 @@ void testValidCompressedAndSharedTrees(PhysicalStore physicalStore) {
     target.verifyPack();
 }
 
-void testValidNonzeroCompressedPrefix(PhysicalStore physicalStore) {
+void testValidNonzeroCompressedPrefix() {
     TemporaryDirectory temporary("nonzero-prefix");
-    Repository target(temporary.path / "target", physicalStore);
+    Repository target(temporary.path / "target");
     BundleBuilder builder;
     const Hash value = addValue(builder, TreeKind::Raw);
     Key first{};
@@ -314,9 +313,9 @@ void testValidNonzeroCompressedPrefix(PhysicalStore physicalStore) {
            "valid nonzero compressed prefix was not accepted");
 }
 
-void testValidMaximumTrieDepth(PhysicalStore physicalStore) {
+void testValidMaximumTrieDepth() {
     TemporaryDirectory temporary("maximum-depth");
-    Repository target(temporary.path / "target", physicalStore);
+    Repository target(temporary.path / "target");
     BundleBuilder builder;
     const Hash value = addValue(builder, TreeKind::Raw);
     const Key zero{};
@@ -340,10 +339,10 @@ void testValidMaximumTrieDepth(PhysicalStore physicalStore) {
            "valid maximum-depth compressed Merkle tree was rejected");
 }
 
-void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore targetStore) {
+void testMalformedIncremental() {
     TemporaryDirectory temporary("incremental");
-    Repository source(temporary.path / "source", sourceStore);
-    Repository target(temporary.path / "target", targetStore);
+    Repository source(temporary.path / "source");
+    Repository target(temporary.path / "target");
     source.createBranch("stable");
     const Hash base = source.commit("stable", {{key(33), Bytes{'b', 'a', 's', 'e'}}}).id;
     const std::filesystem::path baseline = temporary.path / "baseline.aowbundle";
@@ -374,11 +373,11 @@ void testMalformedIncremental(PhysicalStore sourceStore, PhysicalStore targetSto
 
 int main() {
     try {
-        testMalformedTrees(PhysicalStore::Pack);
-        testValidCompressedAndSharedTrees(PhysicalStore::Pack);
-        testValidNonzeroCompressedPrefix(PhysicalStore::Pack);
-        testValidMaximumTrieDepth(PhysicalStore::Pack);
-        testMalformedIncremental(PhysicalStore::Pack, PhysicalStore::Pack);
+        testMalformedTrees();
+        testValidCompressedAndSharedTrees();
+        testValidNonzeroCompressedPrefix();
+        testValidMaximumTrieDepth();
+        testMalformedIncremental();
         std::cout << "AOWIS native Merkle integrity tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -22,14 +22,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        const bool blocks = std::filesystem::exists(directory / "storage.format");
-        if (blocks) throw std::runtime_error("obsolete block storage is not supported");
-        if (!blocks && !std::filesystem::exists(directory / "objects.pack") &&
+        if (!std::filesystem::exists(directory / "objects.pack") &&
             !std::filesystem::exists(directory / "objects.current")) {
             throw std::runtime_error("repository has no objects.pack");
         }
-        aowis::native::Repository repository(directory,
-            aowis::native::PhysicalStore::Pack);
+        aowis::native::Repository repository(directory);
         const std::uint64_t recovered = repository.recoveredPackTailBytes();
         if (recovered != 0) {
             std::cout << "Recovered: discarded " << recovered

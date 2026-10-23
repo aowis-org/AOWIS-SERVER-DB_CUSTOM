@@ -24,7 +24,6 @@ using aowis::native::MergeResult;
 using aowis::native::MergeStatus;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 using aowis::native::Revision;
 
@@ -171,9 +170,9 @@ void checkMerge(Repository& repository, const std::string& target,
     }
 }
 
-void testRandomizedMergeDag(PhysicalStore backend, bool modelIndexed) {
+void testRandomizedMergeDag(bool modelIndexed) {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo", backend);
+    Repository repository(temporary.path() / "repo");
     repository.createBranch("b0");
     makeCommit(repository, "b0", 1, modelIndexed);
     const std::array<std::string, 5> branches{"b0", "b1", "b2", "b3", "b4"};
@@ -205,9 +204,9 @@ void testRandomizedMergeDag(PhysicalStore backend, bool modelIndexed) {
     (void)repository.verifyRepository();
 }
 
-void testCrissCross(PhysicalStore backend) {
+void testCrissCross() {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo", backend);
+    Repository repository(temporary.path() / "repo");
     repository.createBranch("main");
     makeCommit(repository, "main", 1, false);
     repository.createBranch("left", "main");
@@ -221,9 +220,9 @@ void testCrissCross(PhysicalStore backend) {
     (void)repository.verifyRepository();
 }
 
-void testDominatedCommonFrontier(PhysicalStore backend) {
+void testDominatedCommonFrontier() {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo", backend);
+    Repository repository(temporary.path() / "repo");
     repository.createBranch("main");
     makeCommit(repository, "main", 1, false);
     repository.createBranch("old", "main");
@@ -244,9 +243,9 @@ void testDominatedCommonFrontier(PhysicalStore backend) {
     (void)repository.verifyRepository();
 }
 
-void testLongSharedHistory(PhysicalStore backend) {
+void testLongSharedHistory() {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo", backend);
+    Repository repository(temporary.path() / "repo");
     repository.createBranch("main");
     for (std::uint32_t sequence = 1; sequence <= 260; ++sequence) {
         makeCommit(repository, "main", sequence, false);
@@ -272,16 +271,15 @@ void testLongSharedHistory(PhysicalStore backend) {
 
 int main() {
     try {
-        for (const PhysicalStore backend :
-             {PhysicalStore::Pack}) {
-            testRandomizedMergeDag(backend, false);
-            testRandomizedMergeDag(backend, true);
-            testCrissCross(backend);
-            testDominatedCommonFrontier(backend);
-            testLongSharedHistory(backend);
+        {
+            testRandomizedMergeDag(false);
+            testRandomizedMergeDag(true);
+            testCrissCross();
+            testDominatedCommonFrontier();
+            testLongSharedHistory();
         }
         std::cout << "Merge ancestry: exhaustive oracle, deterministic DAGs, criss-cross, "
-                     "long shared history, and both storage backends passed\n";
+                     "and long shared history passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "Merge ancestry test failed: " << error.what() << '\n';

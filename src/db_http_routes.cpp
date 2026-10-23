@@ -136,12 +136,6 @@ Reply storageFailure(const StorageError& error) {
     return errorReply(500, QStringLiteral("internal_error"), QStringLiteral("database operation failed"));
 }
 
-// A failing hydraulic load reports damage as text only (an empty text means
-// "not found" and is handled by the caller).
-[[noreturn]] void throwLoadFailure(const QString& error) {
-    throw StorageError(StorageErrorKind::Corruption, error.toStdString());
-}
-
 Reply failureReply(const std::exception_ptr& failure) {
     try {
         std::rethrow_exception(failure);
@@ -232,8 +226,7 @@ QJsonObject revisionJson(const Revision& revision) {
 
 QJsonObject projectJson(const ProjectInfo& project) {
     return QJsonObject{{"id", QString::fromStdString(project.id)},
-                       {"name", QString::fromStdString(project.name)},
-                       {"storage", QStringLiteral("pack")}};
+                       {"name", QString::fromStdString(project.name)}};
 }
 
 void requireBranch(Repository& repository, const std::string& branch) {
@@ -309,7 +302,8 @@ HydraulicEntity decodeEntity(std::size_t requested, const QByteArray& payload) {
             using Type = std::variant_alternative_t<Index, HydraulicEntity>;
             QString error;
             std::optional<Type> entity = ModelCodec<Type>::decode(payload, &error);
-            requireInput(entity.has_value(), "invalid canonical hydraulic entity payload");
+            if (!entity) throw ProjectError(ProjectErrorKind::InvalidInput,
+                                            "invalid canonical hydraulic entity payload: " + error.toStdString());
             return HydraulicEntity{std::move(*entity)};
         }
         return decodeEntity<Index + 1>(requested, payload);
@@ -562,13 +556,10 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
                 const Hash revisionId = revisionForRead(repository, pathParam(request, "branch"), request);
                 requireModelIndexed(repository, revisionId, "hydraulic network not found");
-                QString error;
+                // Load failures are typed StorageErrors (500/507); nullopt is 404.
                 const std::optional<NetworkHydraulic> loaded =
-                    hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkUuid, &error);
-                if (!loaded) {
-                    if (!error.isEmpty()) throwLoadFailure(error);
-                    throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
-                }
+                    hydraulic::loadHydraulicNetworkAtRevision(repository, revisionId, networkUuid);
+                if (!loaded) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
                 result = QJsonObject{{"revision", hashString(revisionId)},
                                      {"uuid", uuidString(networkUuid)},
                                      {"payloadBase64",
@@ -585,8 +576,9 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             QString error;
             const std::optional<NetworkHydraulic> network = ModelCodec<NetworkHydraulic>::decode(
                 decodePayload(object, "payloadBase64"), &error);
-            requireInput(network.has_value() && !network->uuid.isNull(),
-                         "invalid canonical hydraulic network payload");
+            if (!network) throw ProjectError(ProjectErrorKind::InvalidInput,
+                                             "invalid canonical hydraulic network payload: " + error.toStdString());
+            requireInput(!network->uuid.isNull(), "hydraulic network UUID is null");
             const std::string branch = pathParam(request, "branch");
             Revision committed;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
@@ -630,13 +622,9 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
                 const Hash revisionId = revisionForRead(repository, pathParam(request, "branch"), request);
                 requireModelIndexed(repository, revisionId, "hydraulic network not found");
-                QString error;
                 const std::optional<HydraulicEntity> item = hydraulic::loadHydraulicEntityAtRevision(
-                    repository, revisionId, networkUuid, entity, &error);
-                if (!item) {
-                    if (!error.isEmpty()) throwLoadFailure(error);
-                    throw ProjectError(ProjectErrorKind::NotFound, "hydraulic entity not found");
-                }
+                    repository, revisionId, networkUuid, entity);
+                if (!item) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic entity not found");
                 result = QJsonObject{{"revision", hashString(revisionId)},
                                      {"uuid", uuidString(entity)},
                                      {"type", static_cast<int>(item->index())},
@@ -744,7 +732,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
 } // namespace
 
 void registerRoutes(httplib::Server& server, ProjectService& service,
-                    PhysicalStore defaultStorage, BundleLimits transferLimits) {
+                    BundleLimits transferLimits) {
     // Global ceiling: no request body larger than the bundle transfer limit
     // (or the largest JSON body) is ever read. Exceeding it yields 413.
     const std::size_t payloadLimit = static_cast<std::size_t>(std::max<std::uint64_t>(
@@ -807,18 +795,12 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, QJsonObject{{"projects", projects}}};
         });
     });
-    server.Post(routeProjects, [&service, defaultStorage](const httplib::Request& request,
-                                                           httplib::Response& response) {
+    server.Post(routeProjects, [&service](const httplib::Request& request,
+                                          httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject object = parseBody(request, maxJsonSmallBytes);
-            requireKeys(object, {"name", "storage"});
-            const std::string name = requiredString(object, "name");
-            PhysicalStore storage = defaultStorage;
-            if (object.contains("storage")) {
-                requireInput(requiredString(object, "storage") == "pack", "invalid storage backend");
-                storage = PhysicalStore::Pack;
-            }
-            return Reply{201, projectJson(service.createProject(name, storage))};
+            requireKeys(object, {"name"});
+            return Reply{201, projectJson(service.createProject(requiredString(object, "name")))};
         });
     });
     server.Get("/api/v1/projects/:id", [&service](const httplib::Request& request,

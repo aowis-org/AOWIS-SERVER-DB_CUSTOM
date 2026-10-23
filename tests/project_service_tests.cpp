@@ -15,7 +15,6 @@
 
 namespace {
 using aowis::native::ProjectService;
-using aowis::native::PhysicalStore;
 using aowis::native::ProjectError;
 using aowis::native::ProjectErrorKind;
 
@@ -41,7 +40,7 @@ void expectError(const std::function<void()>& action, ProjectErrorKind kind) {
     require(rejected, "operation was not rejected");
 }
 
-void exerciseBackend(PhysicalStore backend) {
+void exerciseBackend() {
     TemporaryRoot root;
     std::string firstId;
     std::string secondId;
@@ -49,13 +48,13 @@ void exerciseBackend(PhysicalStore backend) {
     {
         ProjectService service(root.directory);
         require(service.listProjects().empty(), "new catalogue is not empty");
-        const aowis::native::ProjectInfo first = service.createProject("Engineering Å", backend);
-        const aowis::native::ProjectInfo second = service.createProject("Second project", backend);
+        const aowis::native::ProjectInfo first = service.createProject("Engineering Å");
+        const aowis::native::ProjectInfo second = service.createProject("Second project");
         firstId = first.id;
         secondId = second.id;
         require(ProjectService::validProjectId(firstId), "invalid generated UUID");
         require(firstId != secondId, "duplicate project IDs");
-        require(first.name == "Engineering Å" && first.storage == backend, "bad metadata");
+        require(first.name == "Engineering Å", "bad metadata");
         require(service.project(firstId).name == first.name, "catalogue read differs");
         require(service.listProjects().size() == 2, "missing published project");
         require(service.listBranches(firstId) == std::vector<std::string>{"main"}, "missing initial main branch");
@@ -104,11 +103,11 @@ void exerciseBackend(PhysicalStore backend) {
         expectError([&]{ service.head(firstId, "missing"); }, ProjectErrorKind::NotFound);
         expectError([&]{ service.createBranch(firstId, "fork", "missing"); }, ProjectErrorKind::NotFound);
         expectError([&]{ service.revision(firstId, aowis::native::sha256(aowis::native::Bytes{1,2,3,4})); }, ProjectErrorKind::NotFound);
-        expectError([&]{ service.createProject("", backend); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createProject("bad\nname", backend); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createProject(std::string("\xc0\xaf", 2), backend); },
+        expectError([&]{ service.createProject(""); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.createProject("bad\nname"); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.createProject(std::string("\xc0\xaf", 2)); },
                     ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createProject(std::string("\xed\xa0\x80", 3), backend); },
+        expectError([&]{ service.createProject(std::string("\xed\xa0\x80", 3)); },
                     ProjectErrorKind::InvalidInput);
         expectError([&]{ service.createBranch(firstId, "../invalid"); }, ProjectErrorKind::InvalidInput);
         expectError([&]{ service.createBranch(firstId, "fork", std::nullopt, firstHead); }, ProjectErrorKind::InvalidInput);
@@ -132,7 +131,7 @@ void exerciseBackend(PhysicalStore backend) {
         std::vector<std::thread> workers;
         for (int worker = 0; worker < 6; ++worker) {
             workers.emplace_back([&, worker] {
-                const aowis::native::ProjectInfo item = service.createProject("thread-" + std::to_string(worker), backend);
+                const aowis::native::ProjectInfo item = service.createProject("thread-" + std::to_string(worker));
                 require(!item.id.empty(), "concurrent create failed");
                 ++completed;
             });
@@ -144,7 +143,7 @@ void exerciseBackend(PhysicalStore backend) {
     {
         ProjectService reopened(root.directory);
         require(reopened.listProjects().size() == 8, "restart lost catalogue entries");
-        require(reopened.project(firstId).storage == backend, "restart changed storage format");
+        require(reopened.project(firstId).name == "Engineering Å", "restart changed project metadata");
         require(reopened.head(firstId, "design").id == firstHead, "restart lost branch");
         require(reopened.listBranches(secondId).size() == 1, "restart crossed project boundaries");
     }
@@ -180,7 +179,7 @@ void exerciseUnsafeCatalogue() {
 
 int main() {
     try {
-        exerciseBackend(PhysicalStore::Pack);
+        exerciseBackend();
         exerciseUnsafeCatalogue();
         std::cout << "Project catalogue and lifecycle tests passed\n";
         return 0;

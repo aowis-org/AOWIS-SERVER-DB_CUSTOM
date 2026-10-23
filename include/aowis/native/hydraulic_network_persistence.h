@@ -22,26 +22,27 @@ inline constexpr std::uint16_t hydraulicNetworkKind = 100;
 // model commit. Other networks in the branch are unaffected. All 18 top-level
 // entity lists are stored as individually addressable canonical model records.
 // Validation is the native canonical hydraulic-model validator, including typed refs.
-// Throws std::runtime_error on validation, ownership, or storage failures.
+// Throws StorageError (InvalidInput, Conflict, ...) on validation, ownership or storage failures.
 Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
                               const NetworkHydraulic& network,
                               std::optional<Hash> expectedHead = std::nullopt);
 
+// Load APIs: a missing network or entity returns nullopt. Every failure
+// throws StorageError with its kind (Corruption for malformed stored data,
+// InvalidInput for a bad selector or revision, Io/ResourceExhausted for
+// storage failures), so callers map it like any other storage error.
+//
 // Reconstructs the complete network in the original list order. All members,
-// identities, kinds and declared reference sets are checked. A missing root
-// returns nullopt; malformed/incomplete stored networks set error and fail.
-// The branch head is captured once; subsequent writes cannot mix revisions.
-// A missing network clears error.
+// identities, kinds and declared reference sets are checked. The branch head
+// is captured once; subsequent writes cannot mix revisions.
 std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
                                                       std::string_view branch,
-                                                      const QUuid& networkUuid,
-                                                      QString* error = nullptr);
+                                                      const QUuid& networkUuid);
 
 // Load a historical immutable snapshot, independent of any branch movement.
 // The revision must identify a model-indexed revision stored in this repository.
 std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(
-    Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
-    QString* error = nullptr);
+    Repository& repository, const Hash& revisionId, const QUuid& networkUuid);
 
 // Exactly the 18 top-level types persisted by saveHydraulicNetwork().
 // The alternative order follows the manifest's collection order.
@@ -78,17 +79,16 @@ enum class HydraulicEntityType : std::size_t {
 };
 
 // Returns UUIDs in network collection order without decoding model entities.
-// Missing network -> nullopt with no error. Corrupt/mismatched chunks fail
-// closed and set error. Complexity is O(members in the requested collection),
+// Missing network -> nullopt. Corrupt/mismatched chunks throw. Complexity is O(members in the requested collection),
 // not the entire network.
 // Historical counterpart: membership chunks are read at exactly revisionId.
 std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevision(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
-    HydraulicEntityType type, QString* error = nullptr);
+    HydraulicEntityType type);
 
 std::optional<QList<QUuid>> listHydraulicEntityIds(
     Repository& repository, std::string_view branch, const QUuid& networkUuid,
-    HydraulicEntityType type, QString* error = nullptr);
+    HydraulicEntityType type);
 
 // Bounded listing for untrusted callers. Missing network -> nullopt. Failures
 // throw StorageError; a collection with more than maxCount members throws
@@ -100,16 +100,16 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
 // Targeted, index-backed entity read. Membership is tested via the persistent
 // reverse-reference index; the complete network is NOT reconstructed. This
 // checks the canonical payload and entity type but intentionally does not run
-// full-network semantic validation. Missing/unowned UUID -> nullopt with no
-// error; malformed records fail closed. Branch reads pin a single revision.
+// full-network semantic validation. Missing/unowned UUID -> nullopt;
+// malformed records throw. Branch reads pin a single revision.
 // The historical counterpart also pins ownership and reverse-reference reads.
 std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
-    const QUuid& entityUuid, QString* error = nullptr);
+    const QUuid& entityUuid);
 
 std::optional<HydraulicEntity> loadHydraulicEntity(
     Repository& repository, std::string_view branch, const QUuid& networkUuid,
-    const QUuid& entityUuid, QString* error = nullptr);
+    const QUuid& entityUuid);
 
 struct HydraulicEntityChange {
     QUuid uuid;

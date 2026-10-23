@@ -1,6 +1,6 @@
 # Canonical AOWIS model codec
 
-The native database owns `aowis::native::ModelCodec<T>`, its hydraulic validator and field-aware merge helpers. Implementation is in `src/model_codec.cpp` and `src/model_validation.cpp`, with public headers under `include/aowis/native/`. Canonical model type definitions come from the pinned `AOWIS-SERVER-MODEL` submodule. Qt6 Core is required for the typed layer; the low-level native store can build without Qt.
+The native database owns `aowis::native::ModelCodec<T>`, its hydraulic validator and field-aware merge helpers. Implementation is in `src/model_codec.cpp`, `src/model_validation.cpp` and `src/model_value_validation.cpp`, with public headers under `include/aowis/native/`. The codec never encodes or decodes an undeclared enum value or a non-finite number; the declared enumerators are generated from the Model headers at configure time. Physical value ranges are listed in [model value rules](model-value-rules.md). Canonical model type definitions come from the pinned `AOWIS-SERVER-MODEL` submodule. Qt6 Core is required for the typed layer; the low-level native store can build without Qt.
 
 The codec is independent of the transport and physical object-store layout. Direct library calls and the planned REST service use the same canonical model payloads.
 

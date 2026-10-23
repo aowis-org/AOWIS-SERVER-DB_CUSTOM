@@ -13,7 +13,6 @@ using aowis::native::BundleLimits;
 using aowis::native::Bytes;
 using aowis::native::Hash;
 using aowis::native::Key;
-using aowis::native::PhysicalStore;
 using aowis::native::Repository;
 
 void check(bool condition, std::string_view message) {
@@ -49,10 +48,10 @@ private:
     std::filesystem::path root_;
 };
 
-void exercise(PhysicalStore senderStore, PhysicalStore receiverStore) {
+void exercise() {
     TemporaryRoot temporary;
-    Repository source(temporary.path() / "sender", senderStore);
-    Repository destination(temporary.path() / "receiver", receiverStore);
+    Repository source(temporary.path() / "sender");
+    Repository destination(temporary.path() / "receiver");
     source.createBranch("main");
     Key key{};
     key[15] = 42;
@@ -107,7 +106,7 @@ void exercise(PhysicalStore senderStore, PhysicalStore receiverStore) {
 
 int main() {
     try {
-        exercise(PhysicalStore::Pack, PhysicalStore::Pack);
+        exercise();
         std::cout << "AOWIS native bundle limit tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

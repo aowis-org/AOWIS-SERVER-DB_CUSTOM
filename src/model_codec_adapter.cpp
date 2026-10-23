@@ -47,6 +47,7 @@ ModelChange changeFor(const HydraulicNodeJunction& junction) {
     ModelRecord record;
     record.kind = junctionKind;
     record.payload = bytesFromQByteArray(aowis::native::ModelCodec<HydraulicNodeJunction>::encode(junction));
+    if (record.payload.empty()) throw StorageError(StorageErrorKind::InvalidInput, "junction has a non-finite number or an undeclared enumerator");
     return ModelChange{keyFromUuid(junction.uuid), std::move(record)};
 }
 
@@ -56,6 +57,7 @@ ModelChange changeFor(const HydraulicLinkPipe& pipe) {
     record.references.push_back(keyFromUuid(pipe.node_uuid_from));
     record.references.push_back(keyFromUuid(pipe.node_uuid_to));
     record.payload = bytesFromQByteArray(aowis::native::ModelCodec<HydraulicLinkPipe>::encode(pipe));
+    if (record.payload.empty()) throw StorageError(StorageErrorKind::InvalidInput, "pipe has a non-finite number or an undeclared enumerator");
     return ModelChange{keyFromUuid(pipe.uuid), std::move(record)};
 }
 

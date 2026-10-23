@@ -27,7 +27,6 @@ using aowis::native::Hash;
 using aowis::native::Key;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
-using aowis::native::PhysicalStore;
 using aowis::native::ProjectError;
 using aowis::native::ProjectErrorKind;
 using aowis::native::ProjectService;
@@ -153,14 +152,14 @@ void expectProjectError(ProjectErrorKind kind, const std::string& label, const s
 void testProjectsIndependent() {
     TestDirectory directory("independent");
     ProjectService service(directory.path, 4);
-    const std::string a = service.createProject("A", PhysicalStore::Pack).id;
-    const std::string b = service.createProject("B", PhysicalStore::Pack).id;
+    const std::string a = service.createProject("A").id;
+    const std::string b = service.createProject("B").id;
     Holder held(service, a);
     completesWithin(std::chrono::milliseconds(2000), "other project and catalogue", [&] {
         const Clock::time_point start = Clock::now();
         expect(service.listProjects().size() == 2, "catalogue listing failed");
         expect(service.project(a).name == "A", "project lookup failed");
-        (void)service.createProject("C", PhysicalStore::Pack);
+        (void)service.createProject("C");
         service.withRepository(b, [](Repository& repository) {
             repository.commit("main", {Change{key(1), Bytes{1}}});
         });
@@ -178,7 +177,7 @@ void testProjectsIndependent() {
 void testSameProjectSerialized() {
     TestDirectory directory("serialized");
     ProjectService service(directory.path, 4);
-    const std::string a = service.createProject("A", PhysicalStore::Pack).id;
+    const std::string a = service.createProject("A").id;
     std::atomic<bool> entered{false};
     bool enteredWhileHeld = false;
     std::thread second;
@@ -203,8 +202,8 @@ void testQueueLimit() {
                        [&] { ProjectService invalid(directory.path / "zero", 0); });
     ProjectService service(directory.path / "root", 2);
     expect(service.maxPendingOperations() == 2, "limit not stored");
-    const std::string a = service.createProject("A", PhysicalStore::Pack).id;
-    const std::string b = service.createProject("B", PhysicalStore::Pack).id;
+    const std::string a = service.createProject("A").id;
+    const std::string b = service.createProject("B").id;
     std::thread waiting;
     const Joiner joinWaiting(waiting);
     {
@@ -249,7 +248,7 @@ void testQueueLimit() {
 void testExpectedHeadRace() {
     TestDirectory directory("race");
     ProjectService service(directory.path, 16);
-    const std::string a = service.createProject("A", PhysicalStore::Pack).id;
+    const std::string a = service.createProject("A").id;
     service.withRepository(a, [](Repository& repository) {
         repository.commitModel("main", {ModelChange{key(1), ModelRecord{1, {}, Bytes{1}}}});
     });
@@ -301,8 +300,8 @@ void testConcurrentOpenAndImport() {
     std::string b;
     {
         ProjectService service(directory.path / "root");
-        a = service.createProject("A", PhysicalStore::Pack).id;
-        b = service.createProject("B", PhysicalStore::Pack).id;
+        a = service.createProject("A").id;
+        b = service.createProject("B").id;
     }
     Repository source(directory.path / "source");
     source.createBranch("main");

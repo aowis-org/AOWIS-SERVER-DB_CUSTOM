@@ -6,11 +6,41 @@ After=network.target
 Type=simple
 User=aowis-db
 Group=aowis-db
+# /var/lib/aowis-db, created with the right owner; matches [storage] root.
 StateDirectory=aowis-db
-ExecStart=/usr/local/bin/aowis-server-db --config /etc/aowis/server-db.ini
+StateDirectoryMode=0700
+# /var/log/aowis-db for an optional [logging] file=; journald is the default.
+LogsDirectory=aowis-db
+# Install deploy/aowis-server-db.ini as /etc/aowis/aowis-server-db.ini.
+ExecStart=/usr/local/bin/aowis-server-db --config /etc/aowis/aowis-server-db.ini
 Restart=on-failure
 RestartSec=2
+# SIGTERM closes the listener; running requests finish first.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# Hardening: the service writes only its state directory.
 NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aowis-db
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

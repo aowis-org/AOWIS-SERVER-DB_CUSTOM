@@ -79,13 +79,12 @@ int main(int argc, char** argv) {
         const std::uint64_t pipes = argc >= 3 ? positive(argv[2]) : 1000;
         const std::uint64_t revisions = argc >= 4 ? positive(argv[3]) : 10;
         const std::uint64_t edits = argc >= 5 ? positive(argv[4]) : 10;
-        const aowis::native::PhysicalStore engine = aowis::native::PhysicalStore::Pack;
         if (pipes > 1000000 || revisions > 10000 || edits > pipes) {
             throw std::runtime_error("invalid size or edits exceed pipe count");
         }
         std::cout << std::fixed << std::setprecision(3);
         const std::chrono::steady_clock::time_point opening = std::chrono::steady_clock::now();
-        std::unique_ptr<Repository> repository = std::make_unique<Repository>(path, engine);
+        std::unique_ptr<Repository> repository = std::make_unique<Repository>(path);
         repository->createBranch("main");
         const double openMs = elapsed(opening);
 
@@ -148,7 +147,7 @@ int main(int argc, char** argv) {
         const std::uint64_t packObjects = repository->objectCount();
         repository.reset();
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
-        Repository reopened(path, engine);
+        Repository reopened(path);
         if (reopened.head("main").root != last.root) throw std::runtime_error("reopen root mismatch");
         if (!reopened.getModel("main", keyFor(2, pipes - 1))) {
             throw std::runtime_error("missing reopened pipe");
