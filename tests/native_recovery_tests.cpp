@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -308,6 +310,271 @@ void testInterruptedCompactionHandle(PhysicalStore backend, bool afterSwitch) {
     reopened.verifyRepository();
 }
 
+// ---------------------------------------------------------------------------
+// Torn pack tails (review finding F1). After power loss a file system may keep
+// an extended file size while losing the data (zero-filled tail) or persist
+// only part of a full-length body. Neither may make the repository
+// unopenable, because no published ref can name an unsynced object.
+
+void appendToPack(const std::filesystem::path& repository, const Bytes& bytes) {
+    std::ofstream output(repository / "objects.pack", std::ios::binary | std::ios::app);
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    expect(output.good(), "cannot append test bytes to pack");
+}
+
+Bytes readFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    expect(input.good(), "cannot read " + path.string());
+    return Bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+}
+
+void appendU64(Bytes& bytes, std::uint64_t number) {
+    for (unsigned i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<std::uint8_t>(number >> (56U - 8U * i)));
+}
+
+// Well-formed header, wrong SHA-256: the shape of a body that never reached disk.
+Bytes garbageRecord(std::uint64_t payloadSize, std::uint8_t fill) {
+    Bytes record{'A', 'O', 'B', 'J', 1};
+    record.insert(record.end(), 32, 0x5a);
+    appendU64(record, payloadSize);
+    record.insert(record.end(), static_cast<std::size_t>(payloadSize), fill);
+    return record;
+}
+
+Bytes validRecord(const Bytes& payload) {
+    const Hash hash = aowis::native::sha256(payload);
+    Bytes record{'A', 'O', 'B', 'J', 1};
+    record.insert(record.end(), hash.begin(), hash.end());
+    appendU64(record, payload.size());
+    record.insert(record.end(), payload.begin(), payload.end());
+    return record;
+}
+
+std::vector<std::filesystem::path> recoveredCopies(const std::filesystem::path& repository) {
+    std::vector<std::filesystem::path> copies;
+    const std::filesystem::path directory = repository / "recovered-pack-tails";
+    if (!std::filesystem::exists(directory)) return copies;
+    for (const std::filesystem::directory_entry& entry :
+            std::filesystem::directory_iterator(directory)) copies.push_back(entry.path());
+    return copies;
+}
+
+void testTornPackTail(std::string_view label, const Bytes& tail) {
+    TestDirectory directory(label);
+    const std::filesystem::path repo = directory.path / "repo";
+    baseline(repo, PhysicalStore::Pack, true);
+    Hash head{};
+    {
+        Repository repository(repo, PhysicalStore::Pack);
+        head = repository.head("main").id;
+    }
+    const std::uintmax_t packBefore = std::filesystem::file_size(repo / "objects.pack");
+    appendToPack(repo, tail);
+    try {
+        {
+            Repository repository(repo, PhysicalStore::Pack);
+            expect(repository.recoveredPackTailBytes() == tail.size(),
+                   "recovered byte count differs from torn tail size");
+            expect(std::filesystem::file_size(repo / "objects.pack") == packBefore,
+                   "torn tail was not truncated to the last valid record");
+            expect(repository.head("main").id == head, "torn tail recovery changed head");
+            expect(repository.referencingModel("main", key(1)) == std::vector<Key>{key(2)},
+                   "torn tail recovery damaged reverse references");
+            repository.verifyRepository();
+            repository.commitModel("main", {ModelChange{key(3), ModelRecord{1, {}, value(33)}}});
+            repository.verifyRepository();
+        }
+        const std::vector<std::filesystem::path> copies = recoveredCopies(repo);
+        expect(copies.size() == 1, "expected exactly one preserved torn tail copy");
+        expect(readFile(copies.front()) == tail, "preserved torn tail differs from discarded bytes");
+        Repository reopened(repo, PhysicalStore::Pack);
+        expect(reopened.recoveredPackTailBytes() == 0, "clean reopen reported tail recovery");
+        expect(reopened.getModel("main", key(3)).has_value(), "post-recovery commit lost");
+        reopened.verifyRepository();
+    } catch (const std::exception& error) {
+        throw std::runtime_error("torn tail " + std::string(label) + ": " + error.what());
+    }
+}
+
+void testTornPackTails() {
+    testTornPackTail("short-header", Bytes{'A', 'O', 'B'});
+    testTornPackTail("zero-filled", Bytes(45 + 100, 0));
+    testTornPackTail("zero-short-header", Bytes(20, 0));
+    testTornPackTail("garbage-body", garbageRecord(16, 0));
+    testTornPackTail("short-body", [] {
+        Bytes bytes = garbageRecord(4096, 0x33);
+        bytes.resize(bytes.size() - 1000);
+        return bytes;
+    }());
+    {
+        Bytes several = garbageRecord(4096, 0x77);
+        const Bytes second = garbageRecord(10, 0);
+        several.insert(several.end(), second.begin(), second.end());
+        several.insert(several.end(), 7, 'Z');
+        testTornPackTail("several-records", several);
+    }
+    {
+        // Larger than the 1 MiB search window, with a record magic straddling
+        // the window boundary that does not start a valid record.
+        Bytes large(3U * 1024U * 1024U + 17U, 0);
+        const std::size_t straddle = 1024U * 1024U - 2U;
+        const Bytes magic{'A', 'O', 'B', 'J', 1};
+        std::copy(magic.begin(), magic.end(), large.begin() + static_cast<std::ptrdiff_t>(straddle));
+        testTornPackTail("large-zero-filled", large);
+    }
+}
+
+// Mid-pack damage is NOT a torn tail: a valid record after the damage proves
+// the region was once durable. Fail closed and leave the pack untouched.
+void testCorruptionBeforeValidRecord(std::string_view label, std::size_t gap) {
+    TestDirectory directory(label);
+    const std::filesystem::path repo = directory.path / "repo";
+    baseline(repo, PhysicalStore::Pack, true);
+    Bytes damage = garbageRecord(16, 0);
+    damage.insert(damage.end(), gap, 0);
+    const Bytes later = validRecord(value(77));
+    damage.insert(damage.end(), later.begin(), later.end());
+    appendToPack(repo, damage);
+    const std::uintmax_t size = std::filesystem::file_size(repo / "objects.pack");
+    bool refused = false;
+    try { Repository repository(repo, PhysicalStore::Pack); }
+    catch (const std::exception& error) {
+        refused = std::string_view(error.what()).find("followed by a valid record") !=
+                  std::string_view::npos;
+    }
+    expect(refused, std::string(label) + ": mid-pack corruption was not refused");
+    expect(std::filesystem::file_size(repo / "objects.pack") == size,
+           std::string(label) + ": refused open modified the pack");
+    expect(recoveredCopies(repo).empty(), std::string(label) + ": refused open preserved a tail");
+}
+
+// Bit rot inside the newest PUBLISHED revision record must never be
+// mistaken for a torn tail, even when nothing valid follows it.
+void testDamagedPublishedHeadIsNotTruncated() {
+    TestDirectory directory("damaged-head");
+    const std::filesystem::path repo = directory.path / "repo";
+    baseline(repo, PhysicalStore::Pack, true);
+    std::filesystem::remove(repo / "objects.idx"); // force a full pack rescan
+    const std::filesystem::path pack = repo / "objects.pack";
+    const std::uintmax_t size = std::filesystem::file_size(pack);
+    {
+        std::fstream stream(pack, std::ios::in | std::ios::out | std::ios::binary);
+        stream.seekg(-1, std::ios::end);
+        char byte = 0;
+        stream.read(&byte, 1);
+        byte = static_cast<char>(static_cast<unsigned char>(byte) ^ 0xffU);
+        stream.seekp(-1, std::ios::end);
+        stream.write(&byte, 1);
+        expect(stream.good(), "cannot corrupt head revision record");
+    }
+    bool refused = false;
+    try { Repository repository(repo, PhysicalStore::Pack); }
+    catch (const std::exception& error) {
+        refused = std::string_view(error.what()).find("references content inside the damaged") !=
+                  std::string_view::npos;
+    }
+    expect(refused, "damaged published head was truncated as a torn tail");
+    expect(std::filesystem::file_size(pack) == size, "damaged published head modified the pack");
+}
+
+// ---------------------------------------------------------------------------
+// Stale compaction generations (review finding F11).
+
+std::size_t countFiles(const std::filesystem::path& directory, std::string_view prefix,
+                       std::string_view suffix) {
+    std::size_t count = 0;
+    for (const std::filesystem::directory_entry& entry :
+            std::filesystem::directory_iterator(directory)) {
+        const std::string name = entry.path().filename().string();
+        if (name.starts_with(prefix) && name.ends_with(suffix)) ++count;
+    }
+    return count;
+}
+
+void crashCompaction(const std::filesystem::path& repo, const char* point) {
+    const pid_t child = ::fork();
+    expect(child >= 0, "fork failed");
+    if (child == 0) {
+        ::setenv("AOWIS_NATIVE_TEST_FAULT", point, 1);
+        ::setenv("AOWIS_NATIVE_TEST_ACTION", "crash", 1);
+        try {
+            Repository repository(repo, PhysicalStore::Pack);
+            (void)repository.compact();
+        } catch (...) { ::_exit(95); }
+        ::_exit(96);
+    }
+    int status = 0;
+    expect(::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 93, std::string("compaction did not crash at ") + point);
+}
+
+void testStaleGenerationCleanup() {
+    TestDirectory directory("stale-generations");
+    const std::filesystem::path repo = directory.path / "repo";
+    baseline(repo, PhysicalStore::Pack, false);
+
+    // Crash after writing a complete new generation, before publishing it.
+    crashCompaction(repo, "compact.pack.before.pointer");
+    expect(countFiles(repo, "objects.", ".pack") == 2, "fixture lacks an orphan generation");
+    const std::string pointerTemp = ".objects.current.0123456789abcdef0123456789abcdef.tmp";
+    { std::ofstream(repo / pointerTemp) << "PACK1 0123456789abcdef0123456789abcdef\n"; }
+    { std::ofstream(repo / "objects.notes") << "unrelated administrator file\n"; }
+    {
+        Repository repository(repo, PhysicalStore::Pack);
+        const aowis::native::CompactionStats stats = repository.compact();
+        expect(stats.staleFilesRemoved == 3,
+               "expected orphan pack, orphan index and pointer temp to be removed, got " +
+               std::to_string(stats.staleFilesRemoved));
+        repository.verifyRepository();
+    }
+    expect(countFiles(repo, "objects.", ".pack") == 1 &&
+           countFiles(repo, "objects.", ".idx") == 1, "stale generation survived compaction");
+    expect(!std::filesystem::exists(repo / pointerTemp), "pointer temp survived compaction");
+    expect(std::filesystem::exists(repo / "objects.notes"), "compaction removed an unrelated file");
+
+    // Crash after publishing the pointer, before retiring the old generation.
+    crashCompaction(repo, "compact.pack.after.pointer");
+    expect(countFiles(repo, "objects.", ".pack") == 2, "fixture lacks a retired generation");
+    {
+        Repository repository(repo, PhysicalStore::Pack);
+        repository.verifyRepository();
+        const aowis::native::CompactionStats stats = repository.compact();
+        expect(stats.staleFilesRemoved == 2, "retired generation was not removed");
+        repository.commit("main", {Change{key(7), value(77)}});
+        repository.verifyRepository();
+    }
+    expect(countFiles(repo, "objects.", ".pack") == 1, "more than one generation remains");
+    Repository reopened(repo, PhysicalStore::Pack);
+    reopened.verifyRepository();
+}
+
+// ---------------------------------------------------------------------------
+// Export failure after the bundle descriptor was closed (review finding F7):
+// the error path must remove the bundle without closing the descriptor again.
+
+void testExportFailureAfterClose() {
+    TestDirectory directory("export-after-close");
+    const std::filesystem::path repo = directory.path / "repo";
+    const std::filesystem::path bundle = directory.path / "main.aowbundle";
+    baseline(repo, PhysicalStore::Pack, true);
+    Repository repository(repo, PhysicalStore::Pack);
+    ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.after.close", 1);
+    ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
+    bool failed = false;
+    try { repository.exportBranchBundle("main", bundle); }
+    catch (const std::exception&) { failed = true; }
+    ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
+    ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
+    expect(failed, "export did not observe injected failure after close");
+    expect(!std::filesystem::exists(bundle), "failed export left a bundle behind");
+    repository.exportBranchBundle("main", bundle);
+    Repository copy(directory.path / "copy", PhysicalStore::Pack);
+    expect(copy.importBranchBundle(bundle, "main").head == repository.head("main").id,
+           "export after a failed attempt is not importable");
+}
+
 void runBackend(PhysicalStore backend) {
     const std::vector<std::string_view> packPre{
         "pack.before.header", "pack.after.header", "pack.partial.body",
@@ -348,13 +615,19 @@ void runBackend(PhysicalStore backend) {
     testInterruptedCompactionHandle(backend, false);
     testInterruptedCompactionHandle(backend, true);
     verifyLocking(backend);
+    testTornPackTails();
+    testCorruptionBeforeValidRecord("mid-pack-adjacent", 0);
+    testCorruptionBeforeValidRecord("mid-pack-distant", 1024U * 1024U + 3U);
+    testDamagedPublishedHeadIsNotTruncated();
+    testStaleGenerationCleanup();
+    testExportFailureAfterClose();
 }
 } // namespace
 
 int main() {
     try {
         runBackend(PhysicalStore::Pack);
-        std::cout << "Recovery, injected ENOSPC/crashes and locking: passed on pack storage\n";
+        std::cout << "Recovery, torn pack tails, stale generations, injected ENOSPC/crashes and locking: passed on pack storage\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Native recovery test failed: " << error.what() << '\n';

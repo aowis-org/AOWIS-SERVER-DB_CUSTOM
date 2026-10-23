@@ -167,6 +167,9 @@ struct CompactionStats {
     std::uint64_t packBytesAfter = 0;
     std::uint64_t indexBytesBefore = 0;
     std::uint64_t indexBytesAfter = 0;
+    // Leftover pack generations and pointer temporaries from interrupted
+    // earlier compactions, removed before this compaction started.
+    std::uint64_t staleFilesRemoved = 0;
 };
 
 struct Revision {
@@ -273,6 +276,10 @@ public:
     // Refuses to run while another Repository instance has this directory open.
     // Publishes an immutable replacement pack using an fsynced atomic pointer.
     CompactionStats compact();
+    // Bytes of an unpublished, torn pack tail discarded by this handle while
+    // opening or refreshing the repository. A copy of every discarded region
+    // is kept under <repository>/recovered-pack-tails/ for inspection.
+    std::uint64_t recoveredPackTailBytes();
 
 private:
     struct Location {
@@ -308,11 +315,15 @@ private:
     std::uint64_t scanOffset_ = 0;
     std::uint64_t indexReadOffset_ = 0;
     bool needsReopen_ = false; // fatal failure after publishing a compaction pointer
+    std::uint64_t recoveredPackTailBytes_ = 0;
     Bytes pendingIndex_;
 
     void exportBundleLocked(std::string_view branch, const std::filesystem::path& bundlePath,
                             std::optional<Hash> recipientBase, BundleLimits limits);
     void scanPackTail();
+    void discardTornPackTail(std::uint64_t position, std::uint64_t size);
+    void preserveDiscardedPackBytes(std::uint64_t position, std::uint64_t size);
+    std::uint64_t removeStalePackGenerations();
     void rebuildIndex();
 
     void verifyPackLocked();

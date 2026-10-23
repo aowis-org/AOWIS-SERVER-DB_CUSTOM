@@ -676,6 +676,63 @@ Hash sha256FileRegion(int fd, std::uint64_t offset, std::uint64_t length) {
     return result;
 }
 
+constexpr std::array<std::uint8_t, 5> packRecordMagic{'A', 'O', 'B', 'J', 1};
+
+struct PackRecord {
+    Hash hash{};
+    std::uint64_t payloadSize = 0;
+};
+
+// A record is valid only when its header is well-formed, its payload lies
+// completely before `end`, and the payload hashes to the recorded SHA-256.
+// Payloads are hashed in bounded chunks, never materialized.
+std::optional<PackRecord> validPackRecord(int fd, std::uint64_t position, std::uint64_t end) {
+    if (end < position || end - position < headerSize) return std::nullopt;
+    std::array<std::uint8_t, headerSize> header{};
+    readExact(fd, header.data(), header.size(), position);
+    if (!std::equal(packRecordMagic.begin(), packRecordMagic.end(), header.begin()))
+        return std::nullopt;
+    PackRecord record{};
+    record.payloadSize = readU64(header.data() + 37);
+    if (record.payloadSize > maxObjectBytes ||
+        end - position - headerSize < record.payloadSize) return std::nullopt;
+    std::copy_n(header.begin() + 5, record.hash.size(), record.hash.begin());
+    if (sha256FileRegion(fd, position + headerSize, record.payloadSize) != record.hash)
+        return std::nullopt;
+    return record;
+}
+
+// Search [begin, end) for the start of any complete, checksum-valid record.
+// Distinguishes a torn tail (nothing valid follows) from mid-pack corruption.
+std::optional<std::uint64_t> findValidPackRecord(int fd, std::uint64_t begin,
+                                                 std::uint64_t end) {
+    constexpr std::size_t window = 1024U * 1024U;
+    std::vector<std::uint8_t> buffer(window + packRecordMagic.size() - 1U);
+    std::uint64_t position = begin;
+    while (position < end && end - position >= headerSize) {
+        // Candidate starts are position .. end - headerSize (inclusive).
+        const std::uint64_t candidates = end - headerSize - position + 1U;
+        const std::size_t count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(window, candidates));
+        const std::size_t bytes = count + packRecordMagic.size() - 1U;
+        readExact(fd, buffer.data(), bytes, position);
+        for (std::size_t offset = 0; offset < count; ++offset) {
+            if (buffer[offset] != packRecordMagic[0]) continue;
+            if (!std::equal(packRecordMagic.begin(), packRecordMagic.end(),
+                            buffer.begin() + static_cast<std::ptrdiff_t>(offset))) continue;
+            if (validPackRecord(fd, position + offset, end)) return position + offset;
+        }
+        position += count;
+    }
+    return std::nullopt;
+}
+
+bool isLowerHexToken(std::string_view text) {
+    return text.size() == 32 && std::all_of(text.begin(), text.end(), [](char character) {
+        return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+    });
+}
+
 void syncDirectory(const std::filesystem::path& directory) {
     int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     systemCall(fd >= 0, "open directory for sync");
@@ -1412,32 +1469,131 @@ void Repository::scanPackTail() {
     require(size >= this->scanOffset_, "content pack shrank while repository was open");
     std::uint64_t position = this->scanOffset_;
     while (position < size) {
-        if (size - position < headerSize) break;
-        std::array<std::uint8_t, headerSize> header{};
-        readExact(this->packFd_, header.data(), header.size(), position);
-        require(header[0] == 'A' && header[1] == 'O' && header[2] == 'B' &&
-                header[3] == 'J' && header[4] == 1, "corrupt pack record header");
-        const std::uint64_t payloadSize = readU64(header.data() + 37);
-        require(payloadSize <= maxObjectBytes, "invalid content object length");
-        if (size - position - headerSize < payloadSize) break;
-        Bytes payload(static_cast<std::size_t>(payloadSize));
-        if (!payload.empty()) readExact(this->packFd_, payload.data(), payload.size(),
-                                        position + headerSize);
-        Hash expected{};
-        std::copy_n(header.begin() + 5, 32, expected.begin());
-        require(sha256(payload) == expected, "content pack checksum mismatch");
-        this->index_[expected] = Location{position + headerSize, payloadSize};
+        const std::optional<PackRecord> record = validPackRecord(this->packFd_, position, size);
+        if (!record) break;
+        this->index_[record->hash] = Location{position + headerSize, record->payloadSize};
         const std::array<std::uint8_t, indexEntrySize> entry =
-            encodeIndexEntry(expected, position + headerSize, payloadSize);
+            encodeIndexEntry(record->hash, position + headerSize, record->payloadSize);
         this->pendingIndex_.insert(this->pendingIndex_.end(), entry.begin(), entry.end());
-        position += headerSize + payloadSize;
+        position += headerSize + record->payloadSize;
     }
-    if (position != size) {
-        systemCall(::ftruncate(this->packFd_, static_cast<off_t>(position)) == 0,
-                   "discard incomplete trailing pack record");
-    }
+    const bool truncated = position != size;
+    if (truncated) discardTornPackTail(position, size);
     this->scanOffset_ = position;
-    if (!this->pendingIndex_.empty() || position != size) syncPack();
+    if (!this->pendingIndex_.empty() || truncated) syncPack();
+}
+
+// [position, size) begins with an invalid record. After power loss a file
+// system may persist an extended size without data (zeros) or only part of
+// a full-length body; a killed writer leaves a short record. Published refs
+// only name objects fsynced before the ref rename, so an invalid region that
+// runs to EOF is unpublished and can be removed. Anything else fails closed.
+void Repository::discardTornPackTail(std::uint64_t position, std::uint64_t size) {
+    if (const std::optional<std::uint64_t> later =
+            findValidPackRecord(this->packFd_, position + 1U, size)) {
+        throw std::runtime_error(
+            "corrupt content pack record at offset " + std::to_string(position) +
+            " is followed by a valid record at offset " + std::to_string(*later) +
+            "; refusing automatic repair (restore from backup)");
+    }
+    // Defense in depth: never drop bytes a published branch still needs.
+    // Each commit appends its revision object last, so damage that reaches a
+    // published head is detected here instead of being silently truncated.
+    const std::filesystem::path heads = this->directory_ / "refs" / "heads";
+    for (const std::filesystem::directory_entry& entry :
+            std::filesystem::directory_iterator(heads)) {
+        if (entry.is_symlink() || !entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        Hash head{};
+        try { head = branchHead(name); }
+        catch (const std::exception&) { continue; } // temporary or malformed refs
+        require(this->index_.contains(head),
+                "branch '" + name + "' references content inside the damaged pack tail at offset " +
+                std::to_string(position) + "; refusing automatic repair (restore from backup)");
+    }
+    preserveDiscardedPackBytes(position, size);
+    systemCall(::ftruncate(this->packFd_, static_cast<off_t>(position)) == 0,
+               "discard torn trailing pack records");
+    this->recoveredPackTailBytes_ += size - position;
+}
+
+void Repository::preserveDiscardedPackBytes(std::uint64_t position, std::uint64_t size) {
+    const std::filesystem::path directory = this->directory_ / "recovered-pack-tails";
+    if (!std::filesystem::exists(directory)) {
+        std::filesystem::create_directory(directory);
+        syncDirectory(this->directory_);
+    }
+    const std::string stem = "pack-" + (this->packToken_.empty()
+        ? std::string("initial") : this->packToken_) + "-offset-" + std::to_string(position);
+    int fd = -1;
+    std::filesystem::path target;
+    for (unsigned attempt = 0; fd < 0; ++attempt) {
+        require(attempt < 1000, "too many preserved copies of one torn pack tail");
+        target = directory / (stem + (attempt == 0 ? std::string() :
+                                      "-" + std::to_string(attempt)) + ".bin");
+        fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0 && errno != EEXIST) systemCall(false, "create torn pack tail copy");
+    }
+    try {
+        std::vector<std::uint8_t> buffer(1024U * 1024U);
+        std::uint64_t done = 0;
+        while (done < size - position) {
+            const std::size_t chunk = static_cast<std::size_t>(
+                std::min<std::uint64_t>(buffer.size(), size - position - done));
+            readExact(this->packFd_, buffer.data(), chunk, position + done);
+            writeExact(fd, buffer.data(), chunk, done);
+            done += chunk;
+        }
+        systemCall(::fsync(fd) == 0, "sync torn pack tail copy");
+        const int closing = fd;
+        fd = -1;
+        systemCall(::close(closing) == 0, "close torn pack tail copy");
+        // The copy must be durable before the original bytes are truncated.
+        syncDirectory(directory);
+    } catch (...) {
+        if (fd >= 0) ::close(fd);
+        std::error_code ignored;
+        std::filesystem::remove(target, ignored);
+        throw;
+    }
+}
+
+std::uint64_t Repository::recoveredPackTailBytes() {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    return this->recoveredPackTailBytes_;
+}
+
+// Called only under exclusive maintenance ownership. Deletes complete or
+// partial generations left by an interrupted compaction; never the active
+// generation, recovered tails, refs or unrelated files.
+std::uint64_t Repository::removeStalePackGenerations() {
+    std::vector<std::filesystem::path> stale;
+    for (const std::filesystem::directory_entry& entry :
+            std::filesystem::directory_iterator(this->directory_)) {
+        if (entry.is_symlink() || !entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        bool remove = false;
+        if (name == "objects.pack" || name == "objects.idx") {
+            remove = !this->packToken_.empty(); // retired initial generation
+        }
+        // objects.<32 hex>.pack / objects.<32 hex>.idx of another generation
+        for (const std::string_view suffix : {std::string_view(".pack"), std::string_view(".idx")}) {
+            if (name.size() == 8 + 32 + suffix.size() && name.starts_with("objects.") &&
+                name.ends_with(suffix)) {
+                const std::string_view token(name.data() + 8, 32);
+                if (isLowerHexToken(token) && token != this->packToken_) remove = true;
+            }
+        }
+        // .objects.current.<32 hex>.tmp: unpublished generation pointer
+        if (name.size() == 17 + 32 + 4 && name.starts_with(".objects.current.") &&
+            name.ends_with(".tmp") &&
+            isLowerHexToken(std::string_view(name.data() + 17, 32))) remove = true;
+        if (remove) stale.push_back(entry.path());
+    }
+    for (const std::filesystem::path& path : stale)
+        systemCall(::unlink(path.c_str()) == 0, "remove stale pack generation file");
+    if (!stale.empty()) syncDirectory(this->directory_);
+    return static_cast<std::uint64_t>(stale.size());
 }
 
 // The sidecar is derived data. If missing, torn, or internally inconsistent,
@@ -2953,8 +3109,8 @@ void Repository::exportBundleLocked(std::string_view branch,
             "cannot export an empty revision graph");
     require(limits.maxObjects == 0 || objects.size() <= limits.maxObjects,
             "bundle transfer limit: object count exceeded");
-    const int fd = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL |
-                          O_NOFOLLOW | O_CLOEXEC, 0600);
+    int fd = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+                    O_NOFOLLOW | O_CLOEXEC, 0600);
     systemCall(fd >= 0, "create replication bundle (must not already exist)");
     try {
         const std::uint64_t headerSize = recipientBase
@@ -2990,12 +3146,18 @@ void Repository::exportBundleLocked(std::string_view branch,
             offset += bytes.size();
         }
         systemCall(::fsync(fd) == 0, "sync replication bundle");
-        systemCall(::close(fd) == 0, "close replication bundle");
+        // Linux releases the descriptor even when close() reports an error.
+        // Forget it first so the handler below can never close it twice (in a
+        // multi-threaded server the number may already belong to another file).
+        const int closing = fd;
+        fd = -1;
+        systemCall(::close(closing) == 0, "close replication bundle");
+        detail::faultCheckpoint("export.after.close");
         const std::filesystem::path parent = bundlePath.parent_path().empty()
             ? std::filesystem::path(".") : bundlePath.parent_path();
         syncDirectory(parent);
     } catch (...) {
-        ::close(fd);
+        if (fd >= 0) ::close(fd);
         std::error_code ignored;
         std::filesystem::remove(bundlePath, ignored);
         throw;
@@ -3238,6 +3400,7 @@ CompactionStats Repository::compact() {
     refreshIndex();
 
     CompactionStats stats{};
+    stats.staleFilesRemoved = removeStalePackGenerations();
     stats.objectsBefore = static_cast<std::uint64_t>(this->index_.size());
     stats.packBytesBefore = this->scanOffset_;
     struct stat oldIndex{};

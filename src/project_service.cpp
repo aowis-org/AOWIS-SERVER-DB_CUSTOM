@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <optional>
 #include <sys/file.h>
@@ -288,6 +289,12 @@ ProjectService::Entry& ProjectService::repositoryEntry(std::string_view id) {
         check(!std::filesystem::is_symlink(directory) &&
               std::filesystem::is_directory(directory), "project repository directory is unavailable");
         entry.repository = std::make_unique<Repository>(directory, entry.info.storage);
+        const std::uint64_t recovered = entry.repository->recoveredPackTailBytes();
+        if (recovered != 0) {
+            std::cerr << "AOWIS database: project " << entry.info.id << " discarded "
+                      << recovered << " bytes of an unpublished torn pack tail; a copy is in "
+                      << (directory / "recovered-pack-tails").string() << '\n';
+        }
     }
     return entry;
 }

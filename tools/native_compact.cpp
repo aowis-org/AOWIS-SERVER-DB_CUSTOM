@@ -25,7 +25,8 @@ int main(int argc, char** argv) {
                   << "pack_bytes_before=" << result.packBytesBefore << '\n'
                   << "pack_bytes_after=" << result.packBytesAfter << '\n'
                   << "index_bytes_before=" << result.indexBytesBefore << '\n'
-                  << "index_bytes_after=" << result.indexBytesAfter << '\n';
+                  << "index_bytes_after=" << result.indexBytesAfter << '\n'
+                  << "stale_files_removed=" << result.staleFilesRemoved << '\n';
         repository.verifyPack();
         std::cout << "Compacted repository verified.\n";
         return 0;

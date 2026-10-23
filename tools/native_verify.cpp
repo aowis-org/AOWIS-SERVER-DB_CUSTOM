@@ -1,5 +1,6 @@
 #include "aowis/native/native_store.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -29,6 +30,12 @@ int main(int argc, char** argv) {
         }
         aowis::native::Repository repository(directory,
             aowis::native::PhysicalStore::Pack);
+        const std::uint64_t recovered = repository.recoveredPackTailBytes();
+        if (recovered != 0) {
+            std::cout << "Recovered: discarded " << recovered
+                      << " bytes of an unpublished torn pack tail on open; a copy is kept in "
+                      << (directory / "recovered-pack-tails").string() << "\n";
+        }
         if (physicalOnly) {
             repository.verifyPack();
             std::cout << "Physical integrity verified: " << repository.objectCount()

@@ -55,3 +55,10 @@ hydraulic semantic checks in CI. Complete the C++ naming/style cleanup,
 review the HTTP operational limits, and freeze the physical format only when
 preparing the first public release. No SQL dependency or separate database
 adapter is planned.
+
+## Review remediation (2026-10)
+
+Findings from the October 2026 code review (torn pack tail recovery, typed
+storage errors, request bounds, scratch storage location, incremental sync
+cost, concurrent service, model value validation and cleanup) are scheduled
+phase by phase in the [review remediation roadmap](review-remediation-roadmap.md).
