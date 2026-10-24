@@ -179,3 +179,9 @@ The HTTP service bounds internal replication/verification temporary file extents
 with `[storage] max_internal_scratch_mib` (default 1024 MiB); this is separate
 from `[sync] max_inflight_mib` and does not replace filesystem quotas. See
 `docs/operations.md` for the scope and recovery procedures.
+
+The optional full HTTP build also registers a real-process concurrent bundle
+transfer stress test (`aowis-native-http-transfer-stress-tests`) in CTest; it
+starts and stops the service on disposable ports and verifies three projects
+after concurrent imports, downloads, and interrupted connections. See
+[`docs/operations.md`](docs/operations.md).

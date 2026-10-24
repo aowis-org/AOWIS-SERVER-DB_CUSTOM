@@ -367,6 +367,22 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
             $<TARGET_FILE:aowis-server-db>)
         set_tests_properties(aowis-native-http-tests PROPERTIES LABELS "aowis")
         add_dependencies(aowis-db-tests aowis-native-http-tests)
+        # Separate real-process transfer/admission stress: independent of Qt
+        # test helpers, but runs against the production HTTP executable.
+        add_executable(aowis-native-http-transfer-stress-tests
+            tests/native_http_transfer_stress_tests.cpp)
+        target_link_libraries(aowis-native-http-transfer-stress-tests PRIVATE
+            aowis-native-store aowis-cpp-httplib)
+        add_dependencies(aowis-native-http-transfer-stress-tests aowis-server-db)
+        add_test(NAME aowis-native-http-stress-fixture-tests
+            COMMAND aowis-native-http-transfer-stress-tests --fixture-only)
+        set_tests_properties(aowis-native-http-stress-fixture-tests PROPERTIES
+            LABELS "aowis;http-stress" TIMEOUT 45)
+        add_test(NAME aowis-native-http-transfer-stress-tests
+            COMMAND aowis-native-http-transfer-stress-tests $<TARGET_FILE:aowis-server-db>)
+        set_tests_properties(aowis-native-http-transfer-stress-tests PROPERTIES
+            LABELS "aowis;http-stress" TIMEOUT 180 RUN_SERIAL TRUE)
+        add_dependencies(aowis-db-tests aowis-native-http-transfer-stress-tests)
     endif()
     message(STATUS "Native multi-project HTTP server enabled (cpp-httplib)")
 else()

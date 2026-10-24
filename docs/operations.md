@@ -114,6 +114,27 @@ solution and does not replace a separate physically isolated backup policy.
   Keep filesystem headroom and an OS quota if a physical per-volume guarantee
   is required. A sparse file extent reservation is not a disk-block guarantee.
 
+## Concurrent HTTP transfer qualification
+
+The test `aowis-native-http-transfer-stress-tests` runs the real server on an
+isolated loopback port with a disposable multi-project root. It first tests
+HTTP transfer staging admission at a one-transfer budget, including an
+incomplete upload and interrupted download, then restarts the server with a
+larger staging budget and runs six concurrent clients performing repeated
+multi-megabyte imports, downloads and head checks across three projects.
+It verifies the repositories after stopping the server. Run it through CTest:
+
+```bash
+./compile_linux_tests.sh --both
+ctest --test-dir build-linux-tests-release -R '^aowis-native-http-transfer-stress-tests$' --output-on-failure
+```
+
+The test creates temporary data under `/tmp` and keeps its private directory
+and server log if it fails. Successful completion demonstrates basic admission,
+cleanup, response correctness and short-run cross-project stability. It does
+**not** measure throughput under sustained production loads, test true disk-full
+conditions, or establish CPU, memory, or service latency SLAs.
+
 ## Recovery and maintenance
 
 - On reopening after an interrupted append, the engine may preserve an

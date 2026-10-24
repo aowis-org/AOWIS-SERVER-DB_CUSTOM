@@ -1,0 +1,496 @@
+#include "aowis/native/native_store.h"
+
+#include <httplib.h>
+
+#include <arpa/inet.h>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstring>
+#include <cstdint>
+#include <exception>
+#include <iterator>
+#include <latch>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <netinet/in.h>
+#include <regex>
+#include <stdexcept>
+#include <string>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+#include <fcntl.h>
+
+namespace {
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
+
+void require(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+struct WorkRoot {
+    WorkRoot() {
+        char pattern[] = "/tmp/aowis-http-transfer-stress-XXXXXXXX";
+        char* created = ::mkdtemp(pattern);
+        require(created != nullptr, "mkdtemp failed");
+        this->path = created;
+    }
+    ~WorkRoot() {
+        if (!this->preserved_) {
+            std::error_code error;
+            fs::remove_all(this->path, error);
+        }
+    }
+    void preserve() { this->preserved_ = true; }
+    fs::path path;
+private:
+    bool preserved_ = false;
+};
+
+unsigned short freePort() {
+    int socketFd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    require(socketFd >= 0, "unable to open port reservation socket");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    socklen_t size = sizeof(address);
+    const bool success = ::bind(socketFd, reinterpret_cast<sockaddr*>(&address), size) == 0 &&
+        ::getsockname(socketFd, reinterpret_cast<sockaddr*>(&address), &size) == 0;
+    ::close(socketFd);
+    require(success, "could not find free loopback port");
+    return ntohs(address.sin_port);
+}
+
+std::string field(const std::string& json, const std::string& key) {
+    const std::regex expression("\\\"" + key + "\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+    std::smatch match;
+    require(std::regex_search(json, match, expression), "missing JSON field: " + key);
+    return match[1].str();
+}
+
+httplib::Client clientFor(unsigned short port) {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(2s);
+    client.set_read_timeout(12s);
+    client.set_write_timeout(12s);
+    return client;
+}
+
+struct HttpResponse {
+    int status;
+    std::string body;
+    std::string retry;
+};
+
+HttpResponse request(unsigned short port, const std::string& method, const std::string& path,
+                     const std::string& body = {}, const std::string& contentType = "application/json") {
+    httplib::Client client = clientFor(port);
+    httplib::Result reply = method == "GET" ? client.Get(path)
+        : client.Post(path, body, contentType);
+    require(static_cast<bool>(reply), "request failed " + method + " " + path +
+                                  ": " + httplib::to_string(reply.error()));
+    return {reply->status, reply->body, reply->get_header_value("Retry-After")};
+}
+
+std::string project(unsigned short port, const std::string& name) {
+    const HttpResponse reply = request(port, "POST", "/api/v1/projects", "{\"name\":\"" + name + "\"}");
+    require(reply.status == 201, "unable to create project: " + reply.body);
+    return field(reply.body, "id");
+}
+
+std::string prefix(const std::string& projectId) {
+    return "/api/v1/projects/" + projectId + "/branches/";
+}
+
+void health(unsigned short port) {
+    const HttpResponse reply = request(port, "GET", "/api/v1/health");
+    require(reply.status == 200, "server health failed: " + reply.body);
+}
+
+std::string startupDiagnostics(const fs::path& log) {
+    std::ifstream input(log, std::ios::binary);
+    if (!input) return " (server log unavailable: " + log.string() + ")";
+    input.seekg(0, std::ios::end);
+    const std::streamoff length = input.tellg();
+    if (length > 8192) input.seekg(length - 8192, std::ios::beg);
+    else input.seekg(0, std::ios::beg);
+    const std::string tail((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return " (server log " + log.string() + ": " + tail + ")";
+}
+
+class ServerProcess {
+public:
+    ServerProcess(const std::string& binary, const fs::path& root, const fs::path& log,
+                  unsigned short port, unsigned inflightMiB) {
+        this->pid_ = ::fork();
+        require(this->pid_ >= 0, "fork failed");
+        if (this->pid_ == 0) {
+            const int output = ::open(log.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+            if (output >= 0) {
+                ::dup2(output, STDOUT_FILENO);
+                ::dup2(output, STDERR_FILENO);
+                ::close(output);
+            }
+            const std::string portText = std::to_string(port);
+            const std::string inflightText = std::to_string(inflightMiB);
+            const std::string configPath = (root.parent_path() / "stress-server.ini").string();
+            // Isolate the test from any developer-machine server configuration.
+            // The object ceiling cannot exceed the 4 MiB bundle ceiling.
+            ::execl(binary.c_str(), binary.c_str(), "--config", configPath.c_str(),
+                    "--bind", "127.0.0.1", "--port", portText.c_str(),
+                    "--data-root", root.c_str(), "--worker-threads", "8",
+                    "--max-pending-per-project", "3", "--sync-max-mib", "4",
+                    "--sync-max-object-mib", "4", "--sync-max-objects", "100000",
+                    "--sync-max-inflight-mib", inflightText.c_str(),
+                    "--max-internal-scratch-mib", "128", static_cast<char*>(nullptr));
+            ::_exit(127);
+        }
+        try {
+            const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + 12s;
+            while (std::chrono::steady_clock::now() < deadline) {
+                int status = 0;
+                const pid_t exited = ::waitpid(this->pid_, &status, WNOHANG);
+                if (exited == this->pid_) {
+                    this->pid_ = -1; // waitpid has already reaped the child
+                    const std::string cause = WIFEXITED(status)
+                        ? "exit code " + std::to_string(WEXITSTATUS(status))
+                        : WIFSIGNALED(status) ? "signal " + std::to_string(WTERMSIG(status))
+                                              : "unknown status";
+                    throw std::runtime_error("HTTP server exited during startup (" + cause + ")" +
+                                             startupDiagnostics(log));
+                }
+                require(exited >= 0, "waitpid failed during HTTP server startup");
+                try {
+                    health(port);
+                    return;
+                } catch (const std::exception&) {
+                    std::this_thread::sleep_for(100ms);
+                }
+            }
+            throw std::runtime_error("HTTP server did not become ready" + startupDiagnostics(log));
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+    ~ServerProcess() { stop(); }
+    ServerProcess(const ServerProcess&) = delete;
+    ServerProcess& operator=(const ServerProcess&) = delete;
+    void stop() {
+        if (this->pid_ <= 0) return;
+        ::kill(this->pid_, SIGTERM);
+        const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + 12s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            int status = 0;
+            if (::waitpid(this->pid_, &status, WNOHANG) == this->pid_) {
+                this->pid_ = -1;
+                return;
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+        ::kill(this->pid_, SIGKILL);
+        ::waitpid(this->pid_, nullptr, 0);
+        this->pid_ = -1;
+        throwIfUncleanShutdown_ = true;
+    }
+    bool forcedShutdown() const { return this->throwIfUncleanShutdown_; }
+private:
+    pid_t pid_ = -1;
+    bool throwIfUncleanShutdown_ = false;
+};
+
+class RawSocket {
+public:
+    explicit RawSocket(unsigned short port) {
+        this->descriptor_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        require(this->descriptor_ >= 0, "socket failed");
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        require(::connect(this->descriptor_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+                "raw socket connect failed");
+    }
+    ~RawSocket() { if (this->descriptor_ >= 0) ::close(this->descriptor_); }
+    RawSocket(const RawSocket&) = delete;
+    RawSocket& operator=(const RawSocket&) = delete;
+    void send(const std::string& content) {
+        std::size_t written = 0;
+        while (written < content.size()) {
+            const ssize_t count = ::send(this->descriptor_, content.data() + written,
+                                         content.size() - written, MSG_NOSIGNAL);
+            require(count > 0, "raw socket write failed");
+            written += static_cast<std::size_t>(count);
+        }
+    }
+    void close() {
+        if (this->descriptor_ >= 0) ::close(this->descriptor_);
+        this->descriptor_ = -1;
+    }
+    std::string readFirst(std::chrono::milliseconds timeout) {
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+        tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+        ::setsockopt(this->descriptor_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        char buffer[8192];
+        const ssize_t bytes = ::recv(this->descriptor_, buffer, sizeof(buffer), 0);
+        return bytes > 0 ? std::string(buffer, static_cast<std::size_t>(bytes)) : std::string();
+    }
+private:
+    int descriptor_ = -1;
+};
+
+std::string makeBundle(const fs::path& root, std::string& expected) {
+    using namespace aowis::native;
+    const fs::path sourcePath = root / "source";
+    Repository repository(sourcePath);
+    repository.createBranch("main");
+    std::vector<Change> changes;
+    changes.reserve(1024);
+    for (unsigned index = 0; index < 1024; ++index) {
+        Key key{};
+        key[0] = static_cast<std::uint8_t>((index >> 8U) & 0xffU);
+        key[1] = static_cast<std::uint8_t>(index & 0xffU);
+        Bytes value(2048);
+        std::uint32_t generator = (index + 1U) * 2654435761U;
+        for (std::size_t byte = 0; byte < value.size(); ++byte) {
+            generator ^= generator << 13U;
+            generator ^= generator >> 17U;
+            generator ^= generator << 5U;
+            value[byte] = static_cast<std::uint8_t>(generator);
+        }
+        changes.push_back(Change{key, std::move(value)});
+    }
+    expected = toHex(repository.commit("main", changes).id);
+    const fs::path output = root / "fixture.bundle";
+    repository.exportBranchBundle("main", output);
+    std::ifstream file(output, std::ios::binary);
+    require(static_cast<bool>(file), "fixture bundle missing");
+    const std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    require(content.size() > 1024 * 1024 && content.size() < 4 * 1024 * 1024,
+            "stress fixture is not between 1 and 4 MiB");
+    return content;
+}
+
+void tightBudget(unsigned short port, const std::string& a, const std::string& b,
+                 const std::string& originalHead, const std::string& fixture) {
+    const std::string aRoot = prefix(a);
+    const std::string bRoot = prefix(b);
+    {
+        RawSocket stalled(port);
+        stalled.send("POST " + aRoot + "stalled/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 3000000\r\n\r\n" +
+                     fixture.substr(0, 4096));
+        bool refused = false;
+        const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const HttpResponse result = request(port, "GET", bRoot + "main/bundle");
+            if (result.status == 503) {
+                require(result.retry == "1" && result.body.find("staging_busy") != std::string::npos,
+                        "missing structured global staging rejection");
+                refused = true;
+                break;
+            }
+            require(result.status == 200, "unexpected status before staging contention");
+            std::this_thread::sleep_for(30ms);
+        }
+        require(refused, "stalled upload did not saturate cross-project transfer budget");
+        const auto begin = std::chrono::steady_clock::now();
+        health(port);
+        require(std::chrono::steady_clock::now() - begin < 2s,
+                "health blocked by stalled bundle upload");
+    }
+    bool recovered = false;
+    const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + 6s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const HttpResponse result = request(port, "GET", bRoot + "main/bundle");
+        if (result.status == 200) { recovered = true; break; }
+        require(result.status == 503, "unexpected status waiting for staging cleanup");
+        std::this_thread::sleep_for(40ms);
+    }
+    require(recovered, "aborted upload retained transfer reservation");
+    require(field(request(port, "GET", aRoot + "seed/head").body, "id") == originalHead,
+            "aborted upload moved existing head");
+    require(request(port, "GET", aRoot + "stalled/head").status == 404,
+            "aborted transfer created an incomplete branch");
+    const HttpResponse imported = request(port, "POST", bRoot + "from_a/bundle", fixture,
+                                           "application/vnd.aowis.bundle");
+    require(imported.status == 201 && field(imported.body, "head") == originalHead,
+            "valid import after budget cleanup failed");
+    {
+        RawSocket download(port);
+        download.send("GET " + bRoot + "from_a/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      "Connection: close\r\n\r\n");
+        const std::string first = download.readFirst(5s);
+        require(first.find("200") != std::string::npos, "aborted download did not begin");
+    }
+    recovered = false;
+    const std::chrono::steady_clock::time_point downloadDeadline = std::chrono::steady_clock::now() + 6s;
+    while (std::chrono::steady_clock::now() < downloadDeadline) {
+        const HttpResponse result = request(port, "GET", bRoot + "from_a/bundle");
+        if (result.status == 200) { recovered = true; break; }
+        require(result.status == 503, "unexpected status waiting for download cleanup");
+        std::this_thread::sleep_for(40ms);
+    }
+    require(recovered, "aborted download retained transfer reservation");
+}
+
+void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
+                    const std::string& originalHead, const std::string& fixture) {
+    std::atomic<unsigned> imports{0};
+    std::atomic<unsigned> downloads{0};
+    std::atomic<unsigned> busy{0};
+    std::atomic<bool> failed{false};
+    std::string failure;
+    std::mutex failureMutex;
+    std::latch startingLine(6);
+    std::vector<std::thread> workers;
+    for (unsigned worker = 0; worker < 6; ++worker) {
+        workers.emplace_back([&, worker] {
+            try {
+                const std::string path = prefix(ids[worker % ids.size()]);
+                startingLine.arrive_and_wait();
+                for (unsigned iteration = 0; iteration < 4; ++iteration) {
+                    const std::string branch = "stress_" + std::to_string(worker) + "_" +
+                                               std::to_string(iteration);
+                    bool completed = false;
+                    for (unsigned attempt = 0; attempt < 25; ++attempt) {
+                        const HttpResponse uploaded = request(port, "POST", path + branch + "/bundle", fixture,
+                                                              "application/vnd.aowis.bundle");
+                        if (uploaded.status == 503) {
+                            require(uploaded.retry == "1", "busy import omitted Retry-After");
+                            ++busy;
+                            std::this_thread::sleep_for(70ms);
+                            continue;
+                        }
+                        require(uploaded.status == 201 && field(uploaded.body, "head") == originalHead,
+                                "concurrent import published wrong head or returned unexpected status");
+                        ++imports;
+                        completed = true;
+                        break;
+                    }
+                    require(completed, "concurrent import exhausted retries");
+                    bool downloaded = false;
+                    for (unsigned attempt = 0; attempt < 25; ++attempt) {
+                        const HttpResponse exported = request(port, "GET", path + branch + "/bundle");
+                        if (exported.status == 503) {
+                            require(exported.retry == "1", "busy export omitted Retry-After");
+                            ++busy;
+                            std::this_thread::sleep_for(70ms);
+                            continue;
+                        }
+                        require(exported.status == 200 && exported.body == fixture,
+                                "concurrent export differs from immutable input bundle");
+                        ++downloads;
+                        downloaded = true;
+                        break;
+                    }
+                    require(downloaded, "concurrent export exhausted retries");
+                    require(field(request(port, "GET", path + branch + "/head").body, "id") == originalHead,
+                            "concurrent branch head mismatch");
+                }
+            } catch (const std::exception& error) {
+                std::lock_guard<std::mutex> lock(failureMutex);
+                if (!failed.exchange(true)) failure = error.what();
+            }
+        });
+    }
+    std::exception_ptr probeFailure;
+    std::chrono::milliseconds slowestHealth{0};
+    try {
+        for (unsigned index = 0; index < 30; ++index) {
+            const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+            health(port);
+            slowestHealth = std::max(slowestHealth,
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started));
+            std::this_thread::sleep_for(35ms);
+        }
+    } catch (...) { probeFailure = std::current_exception(); }
+    for (std::thread& worker : workers) worker.join();
+    if (probeFailure) std::rethrow_exception(probeFailure);
+    require(!failed, "concurrent worker failed: " + failure);
+    require(slowestHealth < 3000ms, "health endpoint blocked during parallel transfers");
+    require(imports == 24 && downloads == 24, "concurrent transfer count mismatch");
+    std::cout << "  concurrent transfers: imports=" << imports << " exports=" << downloads
+              << " busy=" << busy << " slowest_health_ms=" << slowestHealth.count() << '\n';
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "Usage: aowis-native-http-transfer-stress-tests SERVER_EXECUTABLE|--fixture-only\n";
+        return 2;
+    }
+    WorkRoot root;
+    try {
+        std::string head;
+        const std::string fixture = makeBundle(root.path, head);
+        if (std::string(argv[1]) == "--fixture-only") {
+            const fs::path path = root.path / "fixture.bundle";
+            aowis::native::Repository recipient(root.path / "fixture-recipient");
+            const aowis::native::BundleImportResult result = recipient.importBranchBundle(path, "received");
+            require(aowis::native::toHex(result.head) == head, "fixture import head mismatch");
+            require(recipient.verifyRepository().revisions >= 2, "fixture import verification failed");
+            std::cout << "HTTP stress fixture verified: " << fixture.size() << " bytes\n";
+            return 0;
+        }
+        const fs::path serviceRoot = root.path / "server";
+        const fs::path log = root.path / "server.log";
+        std::vector<std::string> projects;
+        std::vector<std::string> emptyHeads;
+        {
+            const unsigned short port = freePort();
+            ServerProcess server(argv[1], serviceRoot, log, port, 4);
+            projects.push_back(project(port, "alpha"));
+            projects.push_back(project(port, "beta"));
+            projects.push_back(project(port, "gamma"));
+            for (const std::string& id : projects)
+                emptyHeads.push_back(field(request(port, "GET", prefix(id) + "main/head").body, "id"));
+            const HttpResponse imported = request(port, "POST", prefix(projects[0]) + "seed/bundle", fixture,
+                                                   "application/vnd.aowis.bundle");
+            require(imported.status == 201 && field(imported.body, "head") == head,
+                    "initial import failed");
+            tightBudget(port, projects[0], projects[1], head, fixture);
+            server.stop();
+            require(!server.forcedShutdown(), "staging test server did not stop cleanly");
+        }
+        {
+            const unsigned short port = freePort();
+            ServerProcess server(argv[1], serviceRoot, log, port, 32);
+            concurrentLoad(port, projects, head, fixture);
+            server.stop();
+            require(!server.forcedShutdown(), "concurrent test server did not stop cleanly");
+        }
+        for (std::size_t index = 0; index < projects.size(); ++index) {
+            const std::string& id = projects[index];
+            aowis::native::Repository repository(serviceRoot / "projects" / id / "repository");
+            require(repository.verifyRepository().revisions >= 2, "post-stress repository verification failed");
+            const std::vector<std::string> branches = repository.listBranches();
+            require(branches.size() == (index == 2 ? 9U : 10U), "unexpected post-stress branch count");
+            for (const std::string& branch : branches) {
+                require(aowis::native::toHex(repository.head(branch).id) ==
+                            (branch == "main" ? emptyHeads[index] : head),
+                        "post-stress branch points at an unexpected revision");
+            }
+        }
+        std::cout << "HTTP concurrent transfer stress passed; projects=3, payload="
+                  << fixture.size() << " bytes\n";
+        return 0;
+    } catch (const std::exception& error) {
+        root.preserve();
+        std::cerr << "HTTP concurrent transfer stress FAILED: " << error.what()
+                  << " (kept fixtures and server log at " << root.path << ")\n";
+        return 1;
+    }
+}

@@ -162,8 +162,15 @@ Implemented:
 
 Still required:
 
-- Test simultaneous large HTTP imports/exports across projects, slow clients,
-  disconnects, timeouts and scratch disk exhaustion. Define and enforce
+- The `aowis-native-http-transfer-stress-tests` regression launches the production
+  HTTP executable in two configurations. It imports/exports a multi-MiB native
+  bundle across three projects, saturates global staging with a partial upload,
+  checks a cross-project 503 and `Retry-After`, aborts downloads, checks health
+  responsiveness, runs concurrent transfers, then restarts/reopens all projects
+  and verifies the stored history. This is a short real-process qualification,
+  not a sustained load or a physical disk-full simulation.
+- Extend those tests to long-duration large HTTP imports/exports across projects,
+  slow clients, read/write timeouts and physical scratch disk exhaustion. Define and enforce
   request CPU/time budgets, cross-process disk quotas and pack-growth budgets
   in addition to the native internal scratch and HTTP transfer admission
   budgets and the
