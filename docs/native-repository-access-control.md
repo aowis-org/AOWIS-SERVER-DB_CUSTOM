@@ -1,6 +1,6 @@
 # Provisional native access-policy subsystem
 
-**Current code, not the planned REST security design.** The repository includes `AccessPolicyStore` and the `aowis-native-access` utility. This is an optional standalone policy implementation, not a deployed HTTP security layer. The agreed future REST server will **not enforce this policy initially**. Identity, authentication, authorization and HTTPS will be designed later as an AOWIS-wide system.
+**Current code, not the planned REST security design.** The repository includes `AccessPolicyStore` and the `aowis-native-access` utility. This is an optional standalone policy implementation, not a deployed HTTP security layer. The implemented REST server **does not enforce this policy**. Identity, authentication, authorization and HTTPS will be designed later as an AOWIS-wide system.
 
 ## What is implemented today
 

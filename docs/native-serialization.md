@@ -10,4 +10,4 @@ Key interfaces: `aowis/native/model_codec.h`, `aowis/native/model_validation.h`,
 
 A `ModelRecord` wraps payload bytes and required UUID references. The storage engine validates generic existence/deletion safety and publishes a reverse-reference index. The hydraulic adapter performs the domain-specific typed and whole-network validation. See [canonical codec](canonical-model-codec.md), [model record format](model-records.md) and [hydraulic persistence](native-hydraulic-network.md).
 
-The planned HTTP REST service will use this same codec and native library; canonical persistence bytes remain independent of transport.
+The implemented HTTP REST service uses this same codec and native library; canonical persistence bytes remain independent of transport.

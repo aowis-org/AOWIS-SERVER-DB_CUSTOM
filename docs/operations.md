@@ -211,11 +211,11 @@ live AOWIS repositories or host block devices.
 
 Deployment on particular filesystems, power-loss guarantees, automated online
 snapshots, multi-process scratch enforcement and long-duration fault tests are
-still Phase 6/7 qualification work.
+still outstanding deployment qualification.
 
 ## VM power-cut and sustained HTTP qualification
 
 See [durability qualification](durability-qualification.md) for the opt-in
-QEMU ext4/XFS guest-cache-loss procedure and one-server sustained HTTP soak.
-Neither is run by the normal CTest matrix. The QEMU result must not be
-represented as proof of physical SSD/controller power-loss durability.
+QEMU ext4/XFS guest-cache-loss procedure and the one-server sustained HTTP
+soak. Neither is included in the short CTest matrix. Killing a QEMU guest is
+not proof of physical SSD/controller power-loss durability.

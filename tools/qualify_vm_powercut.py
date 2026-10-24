@@ -249,6 +249,7 @@ def main():
     parser.add_argument("--cloud-init-seed", type=Path,
                         help="optional cloud-localds seed.img (attached read-only as /dev/vdc)")
     parser.add_argument("--worker", type=Path, required=True, help="guest-compatible Release worker binary")
+    parser.add_argument("--report-json", type=Path, help="write final verified JSON report outside disposable workspace")
     parser.add_argument("--filesystems", nargs="+", choices=["ext4", "xfs"], default=["ext4", "xfs"])
     parser.add_argument("--rounds", type=int, default=16)
     parser.add_argument("--disk-mib", type=int, default=512)
@@ -275,6 +276,8 @@ def main():
     try:
         results = [run_fs(args, workspace, filesystem) for filesystem in args.filesystems]
         (workspace / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        if args.report_json:
+            args.report_json.write_text(json.dumps(results, indent=2) + "\n")
         print("Power-cut guest-cache-loss qualification passed:", workspace, flush=True)
     except Exception:
         print("Power-cut qualification FAILED; preserved evidence:", workspace,

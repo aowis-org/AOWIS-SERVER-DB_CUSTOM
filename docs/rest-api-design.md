@@ -1,6 +1,6 @@
-# AOWIS database REST API — implemented foundation and next capabilities
+# AOWIS database REST API — design and implemented interface
 
-**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-db` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](db-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and streaming HTTP bundles remain planned; bounded buffered full/incremental bundles are implemented.
+**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-db` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](db-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and end-to-end zero-staging streaming bundles remain planned; bounded file-staged, chunk-transferred full/incremental bundles are implemented.
 
 ## Goals and deployment
 
@@ -41,7 +41,7 @@ An implemented incremental export supplies a known base revision as a `base` que
 
 ## Response and request principles
 
-- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Bounded buffered binary bundles** for synchronization; true streaming remains future work. The current HTTP model API uses canonical ModelCodec bytes encoded as `payloadBase64` in JSON; this is a deliberately simple initial format, not streaming, and is limited to 8 MiB per mutation request.
+- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Bounded file-staged, chunk-transferred binary bundles** for synchronization; true streaming remains future work. The current HTTP model API uses canonical ModelCodec bytes encoded as `payloadBase64` in JSON; this is a deliberately simple initial format, not streaming, and is limited to 8 MiB per mutation request.
 - Use appropriate HTTP status codes (`400` malformed input, `404` unknown resource, `409` revision conflict or divergence, `413` size limit, `422` semantic validation failure where appropriate, `5xx` internal/server errors). Provide stable machine-readable error codes and useful human-readable descriptions.
 - Pagination and limits for large collections/history. Use immutable revision IDs for reproducible historical reads, with explicit semantics when a branch moves.
 - Each **mutating** request identifies the expected branch-head revision (for example via an `If-Match`/ETag contract or an explicit expected revision field). Validate it under the same repository lock as publication. Return a conflict on stale writes; do not silently retry against a different model.
@@ -64,6 +64,6 @@ The initial REST service intentionally has **no authentication, authorization en
 
 An AOWIS-wide security design will later specify identity/session lifecycle, trust across the GUI and all AOWIS services, project and branch permissions, service-to-service access, TLS/reverse proxies, and audit requirements. Only then should the REST service enforce those decisions.
 
-## Implementation sequence
+## Remaining interface work
 
-See [roadmap](roadmap.md). The configurable TCP/HTTP service, durable multi-project catalogue, canonical hydraulic editing and semantic merges have been implemented. Preview-only merges, streaming and further resource hardening follow. At every step, current and planned behavior must remain explicitly distinguished in documentation.
+The implemented surface is specified in [OpenAPI](db-http-api.yaml) and exercised by HTTP integration tests. Preview-only merges, network enumeration and optional deeper transfer streaming are possible extensions, not promised existing endpoints. Remaining release qualification is tracked in the [roadmap](roadmap.md).

@@ -112,6 +112,14 @@ if(BUILD_TESTING)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(aowis-native-store-fault-tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     endif()
+    # Docker qualification setup can be validated offline without Docker/QEMU.
+    add_test(NAME aowis-native-vm-powercut-docker-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_powercut_docker_tests.py"
+            --wrapper "${CMAKE_CURRENT_SOURCE_DIR}/qualify_vm_powercut_docker.sh"
+            --helper "${CMAKE_CURRENT_SOURCE_DIR}/tools/vm_powercut_docker.py")
+    set_tests_properties(aowis-native-vm-powercut-docker-tests PROPERTIES
+        LABELS "aowis;durability" TIMEOUT 30)
     # Standalone production-library worker for optional, externally orchestrated
     # QEMU power-cut qualification. Not registered in default CTest: it needs a
     # separately provisioned guest OS and disposable virtual disk.

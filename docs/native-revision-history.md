@@ -21,4 +21,4 @@ Compaction follows parent revision graphs from active heads and preserves their 
 
 ## Service exposure and limitations
 
-Historical native methods are direct library operations, not authorization-gated by the storage engine. There is no HTTP service yet; complete historical and project-scoped routes are **planned** for the HTTP/TCP REST server. Authentication and authorization in that future service are deliberately deferred for an AOWIS-wide security design. [REST API design](rest-api-design.md).
+Historical native methods are direct library operations, not authorization-gated by the storage engine. Project-scoped branch history, immutable revision metadata and revision diffs are exposed by the implemented HTTP/TCP service. Authentication and authorization are not enforced by that service pending an AOWIS-wide security design. See [service API](native-database-service.md) and [OpenAPI](db-http-api.yaml).

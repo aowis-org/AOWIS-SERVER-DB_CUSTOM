@@ -9,7 +9,7 @@
 - `MergeStatus::Merged`: divergent compatible changes produce one new two-parent revision (`previous target head`, `source head`), preserving both histories.
 - `MergeStatus::Conflicts`: conflicting UUID updates/deletions are returned with hashes and reasons; no branch head is moved.
 
-Both parents are traversed to determine ancestry. A unique lowest common ancestor is required; ambiguous criss-cross merge bases are rejected rather than guessed. When `MergeOptions::validate` is provided, a model-indexed fast-forward candidate is validated before publishing the source tip as the target. A rejected validation returns `Conflicts` without writing or advancing either branch; a non-model-indexed fast-forward cannot satisfy a model validator. `UpToDate` does not invoke the validator because it does not publish a new snapshot. Optimistic head pins and unused-selection checks still apply in all cases.
+Both parents are traversed to determine ancestry. When there are multiple independent lowest common ancestors (criss-cross histories), deterministic in-memory recursive virtual merge bases are constructed; genuine conflicts in the virtual base are reported, not guessed. The virtual bases are not written as repository revisions. When `MergeOptions::validate` is provided, a model-indexed fast-forward candidate is validated before publishing the source tip as the target. A rejected validation returns `Conflicts` without writing or advancing either branch; a non-model-indexed fast-forward cannot satisfy a model validator. `UpToDate` does not invoke the validator because it does not publish a new snapshot. Optimistic head pins and unused-selection checks still apply in all cases.
 
 ## Generic merge rules
 
@@ -23,4 +23,4 @@ Generic reference existence is **not** sufficient for hydraulic integrity. A pip
 
 ## Boundaries
 
-No implicit overwrite policy resolves conflicts. Complicated criss-cross ancestry, incompatible membership order and arbitrary multi-object topology still require explicit review or further algorithms. No HTTP service exists yet; [REST merge resources are planned](rest-api-design.md).
+No implicit overwrite policy resolves conflicts. Complex semantic conflicts, incompatible membership order and arbitrary multi-object topology may still require explicit review; recursive ancestry does not silently resolve conflicting edits. The implemented HTTP merge endpoint uses hydraulic-aware validation; see [service API](native-database-service.md) and [OpenAPI](db-http-api.yaml).

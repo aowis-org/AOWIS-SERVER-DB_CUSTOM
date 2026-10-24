@@ -1,272 +1,73 @@
-# Native AOWIS database — remaining work
+# Remaining development and release qualification
 
-This document tracks work that is **not yet complete**. The implemented database
-already uses a single append-only, content-addressed pack backend; persistent
-Merkle model and reverse-reference indexes; durable revision/branch publication;
-verification; hydraulic persistence and merge conflict handling; full and
-incremental bundles; and a multi-project HTTP service with bounded streaming
-bundle transfers and per-project operation coordination. Those capabilities
-are not alternative backends or future proposals.
+This document records **unfinished work only**. Current features are described
+in [architecture](architecture.md), [service](native-database-service.md),
+[merging](native-branch-merging.md), [replication](offline-repository-synchronization.md)
+and [operations](operations.md). Verified measurements and design tradeoffs
+are preserved in [engineering findings](engineering-findings.md).
 
-The [October 2026 review remediation plan](review-remediation-roadmap.md)
-documents completed hardening phases. Do not reopen completed work without a
-measured regression or a new requirement. No SQL adapter or authentication
-system is planned in this project; AOWIS-wide security is a separate design.
+## Current baseline
 
-## P0 — Semantic correctness before new database features
+AOWIS-SERVER-DB_CUSTOM is one native C++ versioned model database using a
+content-addressed pack, durable branch references, Merkle indexes, distributed
+full/incremental bundles and recursive merge bases. Canonical hydraulic
+persistence/validation and the multi-project HTTP service are implemented.
+The server has separate aggregate HTTP-staging and internal-scratch budgets,
+per-project operation control, atomic named-bundle exports, full repository
+verification and offline backup/restore. The executable can also be embedded
+as native libraries. Authentication and TLS are reserved for the future
+AOWIS-wide security design, not to be improvised here.
 
-### 1. Validate hydraulic fast-forward merges — implemented
+Existing tests include process crash/restart, native fault injection, a
+private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
+and a whole-service offline restore drill. On the October 24, 2026 developer
+snapshot, **38/38 CTest suites passed in Debug and Release**, and an opt-in
+300-second HTTP soak passed. The QEMU-free worker smoke test is among these
+38; **the actual QEMU ext4/XFS drill has not yet been reported as run**.
 
-Native fast-forwards with `MergeOptions::validate` check the model-indexed
-source snapshot under the publication lock and reject invalid candidates
-without writing or moving refs. The hydraulic adapter supplies its full network
-validator. `UpToDate` is explicitly a no-op, not a revalidation operation.
-Native, hydraulic and HTTP regression cases cover valid and invalid sources,
-stale head pins and equal-head merges. Keep this invariant in future changes.
+## Durability and failure qualification
 
-### 2. Make export limits effective during traversal — implemented
+- Execute [`qualify_vm_powercut_docker.sh`](durability-qualification.md) on
+  disposable ext4 and XFS virtual disks, with repeated acknowledged and
+  in-flight commits. Archive guest/kernel/QEMU versions and JSON reports.
+- Repeat on deployment filesystems, hardware and storage stacks. VM-kill
+  tests do not simulate loss of the host/controller's volatile cache; document
+  exactly which guarantees are supported by the target filesystem and device.
+- Repeat kernel ENOSPC tests for deployed ext4/XFS and the HTTP staging path;
+  exercise filesystem quota, inode exhaustion, and crash during compaction.
+- Confirm recovery of branch heads, pack generations and export publication
+  after abnormal process shutdowns and across version upgrades.
 
-`Repository::exportBundleLocked` now enforces `BundleLimits::maxObjects` as
-unique object hashes enter the full or incremental export set, **before**
-opening an output path or writing to a caller-owned descriptor. Shared Merkle
-objects and revisions count once. Exceeding the limit reports `LimitExceeded`
-without creating a partial output file or disturbing an existing destination.
+## Scalability and operations
 
-`aowis-native-bundle-limit-tests` covers exact and over-limit exports,
-repeated payload objects, two-parent revision histories, both export variants,
-descriptor output safety, and successful imports of bounded bundles.
+- Run longer, repeated mixed-read/write/merge/replication soaks on realistic
+  project sizes. Monitor RSS, CPU, pack/index growth, scratch usage, per-project
+  fairness, queue saturation and latency under slow clients.
+- Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,
+  including sidecar regeneration and compaction. Re-evaluate the compact
+  lookup only if representative regressions justify it.
+- Test much larger full-history exports and incremental deltas under scratch
+  limits; profile disk space, wall time and cancellation behavior. The
+  incremental path still collects a sorted in-memory set for emitted delta
+  hashes; bound it if measurements show an actual need.
+- Extend offline backup/restore drills to larger multi-project roots and
+  storage migrations; online snapshots and online compaction are not yet
+  implemented. Define retention, restore and orphan-scratch cleanup policy.
+- Evaluate optional administrative project deletion/renaming, preview-only
+  hydraulic merges and network enumeration only when demanded by clients.
 
-The limit caps objects **emitted**, not the pre-existing ancestry inspected to
-establish a valid incremental base. The successful full-export hash set has
-since moved to disk-backed scratch storage (Phase 4); large incremental
-deltas continue to use an in-memory sorted set.
+## Release gates
 
-## P1 — Complete distributed version control
+- Run native-only, Qt/model, HTTP, Debug and Release CI on supported targets;
+  add fuzz/property testing for malformed bundles, merge DAGs and failure
+  interleavings. No known critical integrity regression may remain open.
+- Define supported platforms/filesystems and explicitly freeze the pack,
+  sidecar and portable bundle compatibility policy before a stable release.
+- Publish a measurable resource envelope, backup/restore procedure, version
+  migration guide and operational troubleshooting guide. Validate field
+  deployment/upgrade on disposable representative datasets.
+- Specify and implement the cross-AOWIS security system before exposure to
+  untrusted networks; current plain HTTP does **not** enforce access rules.
 
-### 3. Merge criss-cross revision histories — implemented
-
-Multiple independent lowest common ancestors are combined into deterministic
-virtual merge bases without writing temporary revisions or pack objects. The
-ancestry tests exercise two and three bases, nested criss-cross histories,
-reversed merges, and genuinely conflicting virtual bases. Keep the recursive
-merge result deterministic and benchmark very large/shared DAGs as part of
-release qualification.
-
-### 4. Bound full-history replication memory — disk-backed core implemented
-
-Full-history export now discovers reachable hashes in an open-addressed table
-held in private, repository-local scratch files. The table grows on disk and
-uses `pread`/`pwrite` rather than writable file mappings, so scratch ENOSPC
-raises an error rather than SIGBUS. A bounded-chunk external merge sort emits
-objects in unchanged SHA-256 order. Neither an in-memory `std::set` of all
-reachable hashes nor a complete in-memory sorted output is required. Both
-path and descriptor exports retain the existing wire format and error behavior.
-
-- Measure peak RSS, scratch bytes and throughput at 100k, 1m and 10m objects.
-- Define and enforce operational scratch-disk and transfer-time budgets;
-  exercise ENOSPC, cancellations and interrupted exports on deployed filesystems.
-- Incremental export still collects a sorted in-memory set of emitted delta
-  hashes to preserve efficient changed-trie traversal. Consider externalizing
-  large deltas only if profiling demonstrates a need.
-
-**Remaining exit criterion:** verify large-export RSS under a documented budget,
-quota enforcement, and failure recovery on the supported production filesystems.
-
-## P2 — Capacity and service operations
-
-### 5. Compact physical object lookup — verified at 10m objects
-
-The Release baseline measured on the developer machine (October 23, 2026)
-showed 101,387 / 1,001,959 / 10,001,723 physical objects using approximately
-8.4 / 72.8 / 703.5 MiB extra RSS on open and 49.5 / 690 / 8,612 ms to
-reconstruct the old in-memory `unordered_map`. Two 10m-object repositories
-reached approximately 1.38 GiB RSS (1.48 GB). See [benchmark-plan.md](benchmark-plan.md)
-for the repeatable benchmarking procedure.
-
-The physical lookup accelerator now stores 8-byte open-addressed slots
-(32-bit FNV-derived hash fingerprint plus a 32-bit ordinal referencing the
-existing checksummed `objects.idx`). A fingerprint match **must** compare the
-full SHA-256 hash in the sidecar before using its pack offset. A small 4096-slot
-direct-mapped hot-object cache reduces repeated sidecar reads. The append-only
-pack, sidecar encoding, revision IDs, and replication format are unchanged.
-`pread` is used for random sidecar reads, so the index does not mmap the full
-sidecar into process RSS. Rebuilding a lost/corrupt derived sidecar still
-verifies the pack. This accelerator currently supports at most 2^32-1
-physical sidecar entries per generation; that bound must be revisited before
-exceeding it.
-
-The matched Release benchmark on the developer machine (October 23, 2026)
-verified the compact index at 101,387 / 1,001,959 / 10,001,723 physical
-objects. Additional RSS on reopen fell to approximately 2.73 / 16.7 /
-128.8 MiB, compared with 8.35 / 72.8 / 703.5 MiB for the former map index.
-Reopen time at 10m fell from 8.61 seconds to 3.66 seconds, and simultaneous
-open of two 10m-object repositories decreased from about 1.48 GB RSS to
-278 MB RSS. The complete 30-test Debug and Release suites passed, including
-the model and HTTP integration tests. Those benchmarks used one warm or
-uncontrolled page-cache run per size; they are not cold-disk production SLAs.
-
-**Phase 5 capacity decision:** retain the compact accelerator, pack, and
-unchanged sidecar format. Do not introduce a disk-backed full-hash lookup
-engine without further evidence. The target build is now rebuilt by the
-benchmark driver to avoid comparing stale binaries.
-
-Further qualification belongs to Phase 7: repeat on deployment hardware with
-multiple runs, cold-cache/random reads, fingerprint collisions, corrupted or
-truncated sidecars, interruption during publication, long-lived cross-process
-handles, plus sidecar rebuild and compaction on the large fixtures. Profile
-the bounded cache under representative loads before adjusting its size.
-
-### 6. Operational resource bounds and maintenance — underway
-
-The HTTP service now has a configurable **process-wide transfer staging
-admission budget** (`[sync] max_inflight_mib`, default at least 128 MiB or
-twice the per-transfer maximum). Every upload/download reserves its entire
-per-transfer maximum before allocating its spool; a full budget returns 503
-`staging_busy` with `Retry-After: 1`. Incoming transfers close the connection
-without reading the body, and reservations outlive download route handlers
-until response providers are destroyed. Native concurrency tests exercise
-reservation accounting and movement; real HTTP regression tests hold a stalled
-upload while checking cross-project rejection, health responsiveness, aborted
-upload cleanup and recovery. This is **not** an aggregate quota on native
-verification/sort scratch, nor a physical disk-space guarantee.
-
-The native internal scratch paths now have a process-wide logical extent
-budget (`[storage] max_internal_scratch_mib`, default 1024 MiB for the HTTP
-server). Export visited sets/sorters and import indices, verification marks,
-trie summaries and reference sorters reserve capacity before writing or
-allocating, and release it when their descriptors close. This is distinct
-from HTTP staging and does not bound other processes, pack growth or offline
-compaction. The native recovery and scratch suites now also exercise **test-only partial
-scratch writes, partial bundle payload writes, and import failure after at
-least one object has been stored**, using both deterministic ENOSPC errors and
-process termination where applicable. These tests verify unpublished head
-isolation, rejected incomplete bundles, reservation cleanup and successful
-reopen/retry. The hooks exist only in the dedicated fault-test library.
-Those injected faults do not establish physical full-filesystem or power-loss
-persistence guarantees. A separate `aowis-native-physical-enospc-tests`
-CTest now uses the **production native library** on a disposable 32 MiB Linux
-`tmpfs`, filled with real allocated filesystem pages. It verifies kernel
-ENOSPC rejection during a large commit, atomic named bundle export, and
-incremental import, followed by space reclamation, independent repository
-reopen/full verification and successful retries. Its Linux user/mount namespace
-launcher reports a CTest **skip**, not success, if isolated mounts are
-unavailable. No existing host filesystem is filled. This tests actual tmpfs
-allocation failures; ext4/XFS journaling, block-device flush behavior and
-power-loss durability still require separate release qualification.
-
-Implemented:
-
-- **Filesystem-path bundle publication:** Full and incremental
-  path exports now fsync an anonymous `O_TMPFILE` or private named fallback
-  in the destination directory, atomically link the complete bundle without
-  overwriting a pre-existing name, and fsync the parent directory. Regression
-  tests inject errors and crashes during payload writing and before/after
-  publication, exercise the named-file fallback, and prevent symlink
-  replacement. A killed fallback writer can leave an orphan `.aowis-export-*`
-  file, and a failure after publication can leave an already complete bundle
-  visible; see [operations](operations.md). Real power-loss filesystem tests
-  and descriptor-owner publication remain outside this guarantee.
-
-An independent production-library `aowis-native-sigkill-restart-tests`
-regression now kills separate writer/exporter processes with `SIGKILL`, then
-reopens and fully verifies the native repositories. It checks monotonic
-acknowledged commit recovery, single-publication acknowledgement ambiguity,
-continued writes, and completeness/importability of all published named
-bundles. It uses disposable paths and no test-only storage fault hooks.
-This **does not simulate real power loss**: kernel page cache, filesystem
-journaling and storage-controller persistence still need controlled VM/block-
-device qualification on ext4/XFS.
-
-Optional qualification tooling is now available in
-[durability-qualification.md](durability-qualification.md):
-`tools/qualify_vm_powercut.py` boots a disposable QEMU guest OS overlay with
-separate ext4/XFS raw data images, kills the **VM** without guest shutdown,
-reboots and fully verifies acknowledged native revisions. The production-linked
-`aowis-native-vm-powercut-worker` implements a host-acknowledged one-in-flight
-commit protocol. A lightweight worker smoke test runs in CTest; the **actual
-QEMU drill has not yet been run** on an appropriate host and must be executed
-explicitly with a provisioned guest image. This drops guest page cache but
-not the host device's cache or power. It is not a hardware-power-loss proof.
-
-The HTTP stress executable also has an opt-in `--soak-seconds` mode that
-keeps the same real server running, with concurrent multi-project imports,
-exports and health probes, then reopens and verifies the repositories. The
-soak is intentionally not part of the quick CTest matrix. It requires a
-measured run on the developer/deployment machine before qualification can
-be considered complete.
-
-Still required:
-
-- The `aowis-native-http-transfer-stress-tests` regression launches the production
-  HTTP executable in two configurations. It imports/exports a multi-MiB native
-  bundle across three projects, saturates global staging with a partial upload,
-  checks a cross-project 503 and `Retry-After`, aborts downloads, checks health
-  responsiveness, runs concurrent transfers, then restarts/reopens all projects
-  and verifies the stored history. This is a short real-process qualification,
-  not a sustained load or a physical disk-full simulation. The separate
-  `aowis-native-physical-enospc-tests` covers native pack/import/export ENOSPC
-  on an isolated small Linux tmpfs, but not the complete HTTP transfer path.
-- Extend those tests to long-duration large HTTP imports/exports across projects,
-  slow clients, read/write timeouts and HTTP scratch disk exhaustion (the
-  native physical ENOSPC test is not an HTTP test). Define and enforce
-  request CPU/time budgets, cross-process disk quotas and pack-growth budgets
-  in addition to the native internal scratch and HTTP transfer admission
-  budgets and the
-  existing per-project pending-operation limits.
-- Extend coordinated cold backup/restore qualification beyond the new
-  `tools/offline_backup.py` tool and `aowis-native-offline-backup-tests`:
-  larger multi-project roots, cross-volume replication and disaster drills.
-  The current workflow holds catalogue and per-repository lifetime locks,
-  verifies all copied repositories, preserves published head identities and
-  atomically publishes a new destination without replacing existing data.
-  Online filesystem snapshots and managed offline compaction are still future work.
-  Project delete/rename and online maintenance remain optional follow-on API
-  work, subject to actual product needs.
-- Write operator runbooks for full disks, recovery-tail evidence, unexpected
-  corruption, partial publication ambiguity and service restart.
-
-**Exit criterion:** adversarial service tests demonstrate bounded resource use
-and actionable recovery steps.
-
-## P3 — Release confidence and documentation
-
-### 7. System-level correctness and compatibility
-
-- Run Debug and Release, native-only and full Qt/model/HTTP suites in CI.
-- Add long-running multireplica push/pull/merge tests, fuzzed corrupt bundles,
-  independent integrity audits, process crash/ENOSPC injection and controlled
-  device/filesystem power-loss tests where feasible.
-- Define the supported Linux filesystems, resource assumptions and durability
-  guarantees before freezing a public pack/bundle format.
-- Recheck CMake/Ninja full rebuilds and ZIP snapshots after modifying submodules.
-
-**Exit criterion:** documented, repeatable release gates; no open critical
-integrity bugs; backup/restore and replication exercised end-to-end.
-
-### 8. Keep documentation synchronized with the implementation
-
-- Remove stale claims that HTTP only supports catalogue operations or does not
-  exist in `docs/architecture.md`, `docs/native-branch-merging.md`, and
-  `docs/native-revision-history.md`.
-- Align service, OpenAPI, architecture, README and merge semantics; distinguish
-  implemented functionality from future requirements.
-- Retain concise explanations of actual behavior; do not turn historical patch
-  mechanics into permanent architecture documentation.
-
-**Exit criterion:** the documentation accurately describes the released APIs,
-formats, limits and operational constraints.
-
-## Repository snapshot packaging — addressed
-
-`tools/zip_db.sh` includes the actual working-tree files of all initialized
-Git submodules recursively, with non-ignored untracked and modified files.
-Git metadata, ignored artifacts and configured private-file patterns are
-excluded. Packaging fails for an uninitialized submodule and only replaces the
-previous archive after a successful run. `aowis-native-zip-submodule-tests`
-uses disposable nested Git repositories to guard this behavior.
-
-For a first checkout, run `git submodule update --init --recursive` (or the
-project's `./git_submodule_init.sh`) before creating the ZIP. The resulting
-`db_custom.zip` is a self-contained **source snapshot**, not a Git clone: its
-submodule trees contain files but no `.git` directories. Future packaging
-changes must preserve that distinction.
+A new feature or major storage rewrite is **not** implied by this roadmap.
+Prefer reproducible evidence and direct changes to the single native engine.

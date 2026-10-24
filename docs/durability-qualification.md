@@ -5,7 +5,87 @@ normal unit tests. They do not modify the AOWIS native pack/bundle formats.
 The VM drill runs the production native library, not the fault-injected library.
 Never point the tools at real repositories or physical host disks.
 
-## 1. Guest-cache-loss power-cut drill (QEMU, ext4 and XFS)
+## One-command Docker workflow (recommended)
+
+The top-level `qualify_vm_powercut_docker.sh` is a containerized **launcher for QEMU**, not a replacement for QEMU. Docker supplies the guest-compatible build tools, QEMU binaries and cloud-image provisioning. The actual durability operation still boots a full Linux guest and abruptly kills the entire QEMU process. **Only a working
+Docker installation is required on the Linux x86_64 host.** It builds the
+Debian 12 qualification image (cached across runs), compiles the production
+worker **inside the Debian 12 container**, downloads and SHA-512-verifies the
+official Debian 12 genericcloud guest image, generates a new disposable
+cloud-init/SSH identity, and launches `tools/qualify_vm_powercut.py`. The
+**actual** drill repeatedly kills QEMU and reboots its disposable data disk.
+It is not the QEMU-free CTest worker smoke test.
+
+Run from the repository root:
+
+```bash
+./qualify_vm_powercut_docker.sh --rounds 4
+```
+
+For the more thorough run (24 power cuts for each filesystem):
+
+```bash
+./qualify_vm_powercut_docker.sh --rounds 24 --filesystems ext4 xfs
+```
+
+You can prepare the reusable container separately without starting QEMU:
+
+```bash
+./tools/prepare_vm_powercut_docker.sh
+```
+
+The script automatically passes `/dev/kvm` if it is usable by your account;
+otherwise QEMU uses software emulation, which can be **much slower**. The
+host is not required to install QEMU, `mkfs`, a compiler or `cloud-localds`
+directly. Docker uses **host networking by default** for both image building and
+qualification execution. This avoids Docker bridge DNS failures when Debian
+packages or the guest image must be downloaded, and provides network access
+for cloud-init inside the QEMU guest. The VM's SSH port forwarding binds only
+to 127.0.0.1. Host networking gives the container access to the host network
+namespace; use only in a trusted qualification environment. Set
+`AOWIS_VM_DOCKER_NETWORK=bridge` to explicitly use Docker bridge networking
+if your host supports functional DNS there. Neither mode requires
+`--privileged`, host block disks or a writable source checkout.
+
+### Docker DNS troubleshooting
+
+A Docker build error such as `Temporary failure resolving deb.debian.org`
+during `apt-get update` means the Docker **build container** cannot resolve
+Debian package servers; it is not a storage-engine failure and no QEMU test
+has run. The wrapper now uses `docker build --network host` (including with
+the legacy Docker builder) rather than relying on bridge DNS. The same network
+choice applies to `docker run`. If this still fails, first check that the
+host itself resolves `deb.debian.org`, Docker's proxy configuration and
+local firewall/network policy. Fix the underlying Docker/host networking
+before treating any qualification attempt as an executed test. Do not silently
+skip package installation or mistake the QEMU-free CTest worker smoke for a
+successful VM drill. The explicit bridge option is primarily useful on hosts
+whose Docker bridge DNS is already functional.
+
+The official Debian cloud image and compiled worker are cached in
+`~/.cache/aowis-db-powercut/`. Logs and the JSON qualification reports are
+saved under `build-vm-powercut/run-*/`. First execution requires internet
+access both to build the container/download the guest image and for the guest
+to install ext4/XFS utilities using Debian package repositories. Subsequent
+runs reuse the verified image and build cache; `--refresh-image` explicitly
+updates the cached guest. A first-time run can download hundreds of megabytes.
+A full run may require gigabytes of scratch space for VM overlays and images.
+
+The Docker container runs with your UID/GID. No production repositories or
+real host block devices are mounted. VM data disks are **new sparse files**.
+The test refuses unexpected in-guest disk layouts before formatting. On
+failure, isolated evidence (which may include an ephemeral SSH private key)
+is retained under `build-vm-powercut/` for inspection; protect or delete it
+after diagnosis. On success, private keys and cloud-init artifacts are removed
+and the JSON result is retained. To override locations, set `AOWIS_VM_CACHE`
+or `AOWIS_VM_RESULTS` in the shell environment.
+
+A successful Docker-launched QEMU run qualifies *guest cache loss on disposable ext4/XFS
+virtual disks*. It does **not** prove physical SSD/controller power-loss
+semantics. The manual runner below remains available for custom distributions
+and guest images.
+
+## 1. Manual guest-cache-loss drill (QEMU, ext4 and XFS)
 
 `tools/qualify_vm_powercut.py` boots an x86_64 Linux guest from a **new qcow2
 overlay** of a pre-existing boot image and attaches a **new sparse raw data

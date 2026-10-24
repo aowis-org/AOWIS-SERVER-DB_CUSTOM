@@ -87,7 +87,7 @@ For model semantics, query APIs and safe indexed edit rules, see [hydraulic pers
 
 ## Repository storage and maintenance
 
-Each repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. The pack is the sole supported physical repository format. An obsolete experimental block repository is rejected rather than silently opened as a pack; before applying this patch, export any such pre-release repository with the older executable and import its bundle afterward.
+Each repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. The pack is the sole supported physical repository format. An obsolete experimental block repository is rejected rather than silently opened as a pack; export such a pre-release repository with its compatible older executable and import its bundle into a fresh pack repository.
 
 ```bash
 ./build-linux/aowis-native-verify /path/to/repository             # full (default)
@@ -117,7 +117,7 @@ Portable bundles exchange immutable branches between independent repositories, w
   /path/to/destination /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Objects already stored locally are verified boundaries, so an incremental import does work proportional to the delta, not to the history; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads and uploads are streamed through project scratch files, without a full-size buffer in memory. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Objects already stored locally form trusted verification boundaries, avoiding rechecking their entire history during small incremental imports; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads and uploads are streamed through project scratch files, without a full-size buffer in memory. Details: [portable synchronization](docs/offline-repository-synchronization.md).
 
 ## Benchmarking
 
@@ -172,25 +172,33 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [Branch merging](docs/native-branch-merging.md) | Native three-way merge |
 | [Hydraulic merging](docs/native-hydraulic-merging.md) | Field and structural conflict resolution |
 | [Portable sync](docs/offline-repository-synchronization.md) | Full and incremental bundles |
-| [Benchmarks](docs/benchmark-plan.md) | Workloads, commands and measurement rules |
+| [Benchmarks](docs/benchmark-plan.md) | Reproducible workloads and measurement methodology |
+| [Engineering findings](docs/engineering-findings.md) | Measured storage and replication behavior, design tradeoffs and limitations |
+| [Durability qualification](docs/durability-qualification.md) | SIGKILL, ENOSPC, optional QEMU VM power-cut and HTTP soak |
 
-`AOWIS-SERVER-MODEL` is an external model-definition submodule; its README is maintained in that repository, not rewritten here.
+`AOWIS-SERVER-MODEL` is the external model-definition submodule; its
+README is maintained in that repository. The specialized documents above
+cover the model codec, HTTP contracts, failure recovery and all operational
+limits.
 
+## Qualification commands
 
-The HTTP server exposes canonical hydraulic network reads/writes, revision-pinned entity queries, atomic edits, revision diffs and validated hydraulic merges when built with the AOWIS model codec. See [HTTP service](docs/native-database-service.md) and [OpenAPI](docs/db-http-api.yaml) for implemented routes and request limits.
+The short Debug/Release suites include genuine disk-full and process-restart
+cases as well as an HTTP real-process stress test; the VM-worker **smoke** is
+not a QEMU run. The longer drills are opt-in:
 
-The [benchmark guide](docs/benchmark-plan.md) covers canonical hydraulic operations, replication, recovery, and maintenance on the native pack backend.
+```bash
+# QEMU ext4/XFS guest power-cut test (Docker provisions QEMU and Debian guest):
+./tools/prepare_vm_powercut_docker.sh  # optional; run wrapper also builds image
+./qualify_vm_powercut_docker.sh --rounds 4
 
-The HTTP service bounds internal replication/verification temporary file extents
-with `[storage] max_internal_scratch_mib` (default 1024 MiB); this is separate
-from `[sync] max_inflight_mib` and does not replace filesystem quotas. See
-`docs/operations.md` for the scope and recovery procedures.
+# Five-minute real-process HTTP mixed import/export soak:
+./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
+  --soak-seconds 300 ./build-linux-tests-release/aowis-server-db
+```
 
-The optional full HTTP build also registers a real-process concurrent bundle
-transfer stress test (`aowis-native-http-transfer-stress-tests`) in CTest; it
-starts and stops the service on disposable ports and verifies three projects
-after concurrent imports, downloads, and interrupted connections. See
-[`docs/operations.md`](docs/operations.md).
-
-For opt-in QEMU ext4/XFS VM power-cut tests and sustained HTTP soak runs,
-see [durability qualification](docs/durability-qualification.md).
+Docker uses host networking by default to avoid Docker bridge DNS failures;
+the actual durability drill still runs QEMU and kills the entire VM. The
+procedure, expected evidence and hardware-level caveats are documented in
+[durability qualification](docs/durability-qualification.md). Historical
+storage and replication comparisons are in [engineering findings](docs/engineering-findings.md).

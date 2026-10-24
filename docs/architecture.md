@@ -8,7 +8,7 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 2. **Domain persistence:** the hydraulic adapter validates `NetworkHydraulic`, persists network metadata, up to 256 ordered UUIDs per membership chunk, and one independently addressed record per top-level entity.
 3. **Logical object store:** content-addressed immutable values, compressed 16-way UUID Merkle trie, persistent reverse-reference index, revision DAG and named branch refs.
 4. **Physical store:** append-only content-addressed object pack with a derived/rebuildable index.
-5. **Service boundary:** `aowis-server-db` uses the vendored cpp-httplib over HTTP/TCP (worker thread pool) with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Only catalogue/branch/history operations are HTTP-accessible so far.
+5. **Service boundary:** `aowis-server-db` uses the vendored cpp-httplib over HTTP/TCP (worker thread pool) with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Implemented HTTP routes cover catalogue, branches, immutable revisions and diffs, canonical hydraulic reads/edits/merges, and bounded full/incremental bundle transfers.
 
 ## Logical identities and history
 
@@ -59,7 +59,7 @@ portable bundle before upgrading, then import into a new pack repository.
 - Repository operations coordinate using POSIX locks. Commits preflight references and optimistic expected-head checks under the same lock as branch publication.
 - Newly encoded immutable objects are appended, flushed with `fsync`, and only then does the engine atomically publish a synced branch ref. An interrupted commit may leave unreachable objects but should not expose an incompletely flushed revision through a published ref on supported filesystems.
 - Offline compaction retains **all** objects reachable from every branch's revision ancestry (including merge parents and both Merkle indexes). The replacement generation is synchronized before the active-generation pointer is published. If compaction fails after switching this pointer, the in-memory repository handle is invalidated and must be reopened before any further commit; continuing to write the old pack is prohibited.
-- Compaction requires exclusive lifetime access; do not compact a live service repository. Deterministic process-crash and simulated write-failure recovery tests cover the pack and offline backup/restore; device-level power-loss validation, operational backup procedures and online maintenance remain outstanding.
+- Compaction requires exclusive lifetime access; do not compact a live service repository. Deterministic process-crash and simulated write-failure recovery tests cover the pack and offline backup/restore; device-level power-loss validation and online maintenance remain outstanding; coordinated offline backup/restore is implemented.
 
 ## Concurrency and physical limits
 
@@ -67,13 +67,13 @@ Hydraulic read operations capture one immutable revision and resolve their entir
 
 ## Replication independence
 
-Portable `.aowbundle` files contain a complete reachable branch graph or a delta relative to a shared base revision. Import verifies object hashes, graph completeness and canonical Merkle trie structure (including path/UUID correspondence and branch-depth ordering) before creating or fast-forwarding a branch. Every imported model-indexed revision is checked against the exact reverse-reference mapping derived from its canonical model records, including historical revisions and locally borrowed incremental ancestors. Missing, extra and dangling references and noncanonical model reference lists are rejected before writes. Divergent branch heads are refused. The transport format is independent of both disk layouts; HTTP synchronization is planned on top of this existing core. See [synchronization](offline-repository-synchronization.md).
+Portable `.aowbundle` files contain a complete reachable branch graph or a delta relative to a shared base revision. Import verifies object hashes, graph completeness and canonical Merkle trie structure (including path/UUID correspondence and branch-depth ordering) before creating or fast-forwarding a branch. Every imported model-indexed revision is checked against the exact reverse-reference mapping derived from its canonical model records, including historical revisions and locally borrowed incremental ancestors. Missing, extra and dangling references and noncanonical model reference lists are rejected before writes. Divergent branch heads are refused. The transport format is independent of both disk layouts; Bounded HTTP bundle synchronization and offline CLI transfer both use this core. See [synchronization](offline-repository-synchronization.md).
 
 ## API ownership
 
 - `aowis::native::Repository` — low-level storage, history, compaction, bundles and generic merges.
 - `aowis::native::ModelCodec<T>` — typed serialization.
 - `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
-- Implemented `aowis-server-db` catalogue/branch/history handlers — thin Qt transport adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. Model edit/merge/sync HTTP operations follow.
+- Implemented `aowis-server-db` HTTP route handlers — thin REST adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
 
 The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [roadmap](roadmap.md).

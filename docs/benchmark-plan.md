@@ -60,7 +60,7 @@ Compaction is not supported while other handles are open. Measurements from
 individual storage benchmarks are workload-specific and should not be used as
 production guarantees.
 
-## Physical object index (Phase 5)
+## Physical object index
 
 `aowis-native-index-scaling-benchmark` and `tools/benchmark_native_index.py`
 measure the **existing** SHA-256-to-pack-location index. They do not
@@ -132,8 +132,5 @@ subject to page granularity, allocator retention and process overhead;
 memory but is not an isolated allocator measurement. Record the actual
 `physical_objects` value because batches can overshoot the requested target.
 
-**Do not replace the resident index solely on theoretical concerns.** Decide
-budgets for multi-project RSS, reopening and read/commit latency from these
-measurements first; retain the pack's wire and crash-recovery semantics in any
-optimization. This benchmark does not yet qualify cold-cache reads, sustained
+**Retain the compact sidecar-backed index** unless reproducible benchmarks establish a regression or stronger alternative. The before/after evidence and assumptions are recorded in [engineering findings](engineering-findings.md). Any future changes must preserve pack integrity and publication guarantees. This benchmark does not yet qualify cold-cache reads, sustained
 production mixed workloads, or network-service contention.
