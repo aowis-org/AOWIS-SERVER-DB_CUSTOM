@@ -191,3 +191,6 @@ transfer stress test (`aowis-native-http-transfer-stress-tests`) in CTest; it
 starts and stops the service on disposable ports and verifies three projects
 after concurrent imports, downloads, and interrupted connections. See
 [`docs/operations.md`](docs/operations.md).
+
+For opt-in QEMU ext4/XFS VM power-cut tests and sustained HTTP soak runs,
+see [durability qualification](docs/durability-qualification.md).

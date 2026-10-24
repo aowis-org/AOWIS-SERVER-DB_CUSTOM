@@ -158,6 +158,40 @@ journaling, ext4/XFS behavior, controller write caches, actual storage-device
 power loss or sustained HTTP staging exhaustion. Those require isolated
 block-device/VM qualification before broader durability claims.
 
+## Abrupt process termination qualification
+
+`aowis-native-sigkill-restart-tests` exercises the **production native library**,
+not the fault-instrumented library. An independent child process repeatedly
+commits to a repository and reports each completed commit through a pipe. The
+parent terminates it with `SIGKILL` at varying points, reopens the repository,
+fully verifies its history, and checks that every acknowledged commit remains
+visible. A commit that was durably published but not yet acknowledged may also
+be present; its counter must be exactly one ahead of the last acknowledgement.
+The test then proves that further commits still succeed.
+
+A second fixture repeatedly terminates a process during filesystem-path
+bundle exports, verifies every final `*.bundle` name by importing it into an
+independent repository, and checks that source history remains unchanged.
+Private orphan staging files are **not** treated as published bundles.
+The entire test uses disposable directories with randomized names.
+
+```bash
+./compile_linux_tests.sh --both
+ctest --test-dir build-linux-tests-release \
+  -R '^aowis-native-sigkill-restart-tests$' --output-on-failure -V
+```
+
+**Limits of evidence:** `SIGKILL` does not drop the kernel page cache, emulate
+lost disk-controller write caches, or interrupt block-device flushes the way a
+machine power cut might. Passing this test establishes process-death recovery
+on the tested host, **not** filesystem or hardware power-loss durability.
+Controlled ext4/XFS-on-virtual-disk tests must abruptly terminate the VM or
+virtual storage device without orderly guest shutdown, then remount/check and
+verify the recovered native repository and expected committed branch heads.
+Record the filesystem, mount options, virtual-disk cache mode, flush behavior,
+cut timing, and results. Never run destructive power-cut experiments against
+live AOWIS repositories or host block devices.
+
 ## Recovery and maintenance
 
 - On reopening after an interrupted append, the engine may preserve an
@@ -178,3 +212,10 @@ block-device/VM qualification before broader durability claims.
 Deployment on particular filesystems, power-loss guarantees, automated online
 snapshots, multi-process scratch enforcement and long-duration fault tests are
 still Phase 6/7 qualification work.
+
+## VM power-cut and sustained HTTP qualification
+
+See [durability qualification](durability-qualification.md) for the opt-in
+QEMU ext4/XFS guest-cache-loss procedure and one-server sustained HTTP soak.
+Neither is run by the normal CTest matrix. The QEMU result must not be
+represented as proof of physical SSD/controller power-loss durability.

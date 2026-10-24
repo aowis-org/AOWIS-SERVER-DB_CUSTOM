@@ -167,6 +167,34 @@ Implemented:
   visible; see [operations](operations.md). Real power-loss filesystem tests
   and descriptor-owner publication remain outside this guarantee.
 
+An independent production-library `aowis-native-sigkill-restart-tests`
+regression now kills separate writer/exporter processes with `SIGKILL`, then
+reopens and fully verifies the native repositories. It checks monotonic
+acknowledged commit recovery, single-publication acknowledgement ambiguity,
+continued writes, and completeness/importability of all published named
+bundles. It uses disposable paths and no test-only storage fault hooks.
+This **does not simulate real power loss**: kernel page cache, filesystem
+journaling and storage-controller persistence still need controlled VM/block-
+device qualification on ext4/XFS.
+
+Optional qualification tooling is now available in
+[durability-qualification.md](durability-qualification.md):
+`tools/qualify_vm_powercut.py` boots a disposable QEMU guest OS overlay with
+separate ext4/XFS raw data images, kills the **VM** without guest shutdown,
+reboots and fully verifies acknowledged native revisions. The production-linked
+`aowis-native-vm-powercut-worker` implements a host-acknowledged one-in-flight
+commit protocol. A lightweight worker smoke test runs in CTest; the **actual
+QEMU drill has not yet been run** on an appropriate host and must be executed
+explicitly with a provisioned guest image. This drops guest page cache but
+not the host device's cache or power. It is not a hardware-power-loss proof.
+
+The HTTP stress executable also has an opt-in `--soak-seconds` mode that
+keeps the same real server running, with concurrent multi-project imports,
+exports and health probes, then reopens and verifies the repositories. The
+soak is intentionally not part of the quick CTest matrix. It requires a
+measured run on the developer/deployment machine before qualification can
+be considered complete.
+
 Still required:
 
 - The `aowis-native-http-transfer-stress-tests` regression launches the production

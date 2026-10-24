@@ -112,6 +112,28 @@ if(BUILD_TESTING)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(aowis-native-store-fault-tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     endif()
+    # Standalone production-library worker for optional, externally orchestrated
+    # QEMU power-cut qualification. Not registered in default CTest: it needs a
+    # separately provisioned guest OS and disposable virtual disk.
+    add_executable(aowis-native-vm-powercut-worker
+        tests/native_vm_powercut_worker.cpp)
+    target_link_libraries(aowis-native-vm-powercut-worker PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-vm-powercut-worker-smoke
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_powercut_worker_tests.py"
+            --binary "$<TARGET_FILE:aowis-native-vm-powercut-worker>")
+    set_tests_properties(aowis-native-vm-powercut-worker-smoke PROPERTIES
+        LABELS "aowis;durability" TIMEOUT 90)
+
+    # Abrupt SIGKILL of the production store in independent processes,
+    # followed by fresh-process verification and continued writes. This is
+    # not equivalent to removing power from the block device.
+    add_executable(aowis-native-sigkill-restart-tests tests/native_sigkill_restart_tests.cpp)
+    target_link_libraries(aowis-native-sigkill-restart-tests PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-sigkill-restart-tests
+        COMMAND aowis-native-sigkill-restart-tests)
+    set_tests_properties(aowis-native-sigkill-restart-tests PROPERTIES
+        LABELS "aowis;durability" TIMEOUT 120)
     add_executable(aowis-native-project-service-tests tests/project_service_tests.cpp)
     target_link_libraries(aowis-native-project-service-tests PRIVATE aowis-native-project-service)
     add_test(NAME aowis-native-project-service-tests COMMAND aowis-native-project-service-tests)
@@ -233,7 +255,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-physical-enospc-tests aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-vm-powercut-worker aowis-native-sigkill-restart-tests aowis-native-physical-enospc-tests aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

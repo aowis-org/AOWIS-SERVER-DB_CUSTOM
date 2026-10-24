@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -425,12 +426,139 @@ void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
               << " busy=" << busy << " slowest_health_ms=" << slowestHealth.count() << '\n';
 }
 
+
+// Opt-in sustained test. Unlike CTest's short scenario, the *same server*
+// remains up for the requested duration. Each new branch is fully checked.
+void sustainedLoad(const std::string& executable, unsigned seconds, const fs::path& root,
+                   const std::string& fixture, const std::string& expectedHead) {
+    const fs::path serviceRoot = root / "soak-server";
+    const fs::path log = root / "soak-server.log";
+    const unsigned short port = freePort();
+    std::vector<std::string> projectIds;
+    std::array<std::uint64_t, 3> completedByProject{};
+    std::atomic<unsigned> completedImports{0};
+    std::atomic<unsigned> completedExports{0};
+    std::atomic<unsigned> busyResponses{0};
+    std::atomic<bool> failed{false};
+    std::mutex failureMutex;
+    std::string failure;
+    unsigned long worstHealthMs = 0;
+    {
+        ServerProcess server(executable, serviceRoot, log, port, 32);
+        for (const char* name : {"soak-alpha", "soak-beta", "soak-gamma"})
+            projectIds.push_back(project(port, name));
+        const std::chrono::steady_clock::time_point end =
+            std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        std::latch start(6);
+        std::vector<std::thread> clients;
+        for (unsigned worker = 0; worker < 6U; ++worker) {
+            clients.emplace_back([&, worker]() {
+                unsigned iteration = 0;
+                const std::string base = prefix(projectIds[worker % projectIds.size()]);
+                start.arrive_and_wait();
+                try {
+                    while (!failed && std::chrono::steady_clock::now() < end) {
+                        const std::string branch = "soak_" + std::to_string(worker) + "_" +
+                            std::to_string(iteration++);
+                        bool inserted = false;
+                        for (unsigned attempt = 0; attempt < 100U; ++attempt) {
+                            const HttpResponse result = request(port, "POST", base + branch + "/bundle",
+                                fixture, "application/vnd.aowis.bundle");
+                            if (result.status == 503) {
+                                require(result.retry == "1", "soak import missing Retry-After");
+                                ++busyResponses;
+                                std::this_thread::sleep_for(70ms);
+                                continue;
+                            }
+                            require(result.status == 201 && field(result.body, "head") == expectedHead,
+                                    "soak import published incorrect revision");
+                            ++completedImports;
+                            inserted = true;
+                            break;
+                        }
+                        require(inserted, "soak import could not complete");
+                        bool exported = false;
+                        for (unsigned attempt = 0; attempt < 100U; ++attempt) {
+                            const HttpResponse result = request(port, "GET", base + branch + "/bundle");
+                            if (result.status == 503) {
+                                require(result.retry == "1", "soak export missing Retry-After");
+                                ++busyResponses;
+                                std::this_thread::sleep_for(70ms);
+                                continue;
+                            }
+                            require(result.status == 200 && result.body == fixture,
+                                    "soak export bytes differ from immutable source");
+                            ++completedExports;
+                            exported = true;
+                            break;
+                        }
+                        require(exported, "soak export could not complete");
+                        require(field(request(port, "GET", base + branch + "/head").body, "id") ==
+                                    expectedHead, "soak branch head changed unexpectedly");
+                    }
+                } catch (const std::exception& error) {
+                    std::lock_guard<std::mutex> lock(failureMutex);
+                    if (!failed.exchange(true)) failure = error.what();
+                }
+            });
+        }
+        while (!failed && std::chrono::steady_clock::now() < end) {
+            const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+            try {
+                health(port);
+            } catch (const std::exception& error) {
+                std::lock_guard<std::mutex> lock(failureMutex);
+                if (!failed.exchange(true)) failure = error.what();
+                break;
+            }
+            const unsigned long delay = static_cast<unsigned long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+            worstHealthMs = std::max(worstHealthMs, delay);
+            std::this_thread::sleep_for(250ms);
+        }
+        for (std::thread& thread : clients) thread.join();
+        require(!failed, "soak client failed: " + failure + startupDiagnostics(log));
+        require(worstHealthMs < 3000UL, "health endpoint response exceeded 3s");
+        require(completedImports > 0 && completedExports == completedImports,
+                "soak did not complete all import/export pairs");
+        server.stop();
+        require(!server.forcedShutdown(), "soak server needed forced shutdown");
+    }
+    for (std::size_t index = 0; index < projectIds.size(); ++index) {
+        aowis::native::Repository repository(serviceRoot / "projects" / projectIds[index] / "repository");
+        repository.verifyRepository();
+        const std::vector<std::string> branches = repository.listBranches();
+        for (const std::string& branch : branches) {
+            if (branch == "main") continue;
+            require(aowis::native::toHex(repository.head(branch).id) == expectedHead,
+                    "soak branch head wrong on disk after service stop");
+            ++completedByProject[index];
+        }
+    }
+    require(completedByProject[0] + completedByProject[1] + completedByProject[2] ==
+                completedImports.load(), "soak branch count differs from successful imports");
+    std::cout << "Sustained HTTP soak passed: duration_s=" << seconds
+              << " imports=" << completedImports << " exports=" << completedExports
+              << " admission_503=" << busyResponses << " worst_health_ms=" << worstHealthMs
+              << " projects=3" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "Usage: aowis-native-http-transfer-stress-tests SERVER_EXECUTABLE|--fixture-only\n";
+    if (argc != 2 && argc != 4) {
+        std::cerr << "Usage: aowis-native-http-transfer-stress-tests SERVER_EXECUTABLE|--fixture-only\n"
+                     "       aowis-native-http-transfer-stress-tests --soak-seconds SECONDS SERVER_EXECUTABLE\n";
         return 2;
+    }
+    const bool soak = argc == 4 && std::string_view(argv[1]) == "--soak-seconds";
+    unsigned soakSeconds = 0;
+    if (argc == 4) {
+        if (!soak) return 2;
+        try { soakSeconds = static_cast<unsigned>(std::stoul(argv[2])); }
+        catch (const std::exception&) { return 2; }
+        if (soakSeconds < 5 || soakSeconds > 86400) return 2;
     }
     WorkRoot root;
     try {
@@ -443,6 +571,10 @@ int main(int argc, char** argv) {
             require(aowis::native::toHex(result.head) == head, "fixture import head mismatch");
             require(recipient.verifyRepository().revisions >= 2, "fixture import verification failed");
             std::cout << "HTTP stress fixture verified: " << fixture.size() << " bytes\n";
+            return 0;
+        }
+        if (soak) {
+            sustainedLoad(argv[3], soakSeconds, root.path, fixture, head);
             return 0;
         }
         const fs::path serviceRoot = root.path / "server";
