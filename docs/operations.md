@@ -135,6 +135,29 @@ cleanup, response correctness and short-run cross-project stability. It does
 **not** measure throughput under sustained production loads, test true disk-full
 conditions, or establish CPU, memory, or service latency SLAs.
 
+## Real filesystem-full regression
+
+`aowis-native-physical-enospc-tests` uses the **production native store** and
+an isolated **32 MiB Linux tmpfs** mounted in a new user/mount namespace. The
+fixture allocates real filesystem blocks until a kernel write produces ENOSPC,
+then checks a failed commit, atomic named export and incremental import. After
+space reclamation it independently reopens, fully verifies and retries the
+repositories. No existing host filesystem or database is filled.
+
+```bash
+./compile_linux_tests.sh --both
+ctest --test-dir build-linux-tests-release \
+  -R '^aowis-native-physical-enospc-tests$' --output-on-failure -V
+```
+
+The test returns **SKIP** (not pass) when unprivileged user/mount namespaces or
+private tmpfs mounts are prohibited by the host or CI sandbox. A skipped test
+is not evidence of ENOSPC safety; run it on a supported isolated Linux host.
+The test covers genuine tmpfs space exhaustion, **not** filesystem metadata
+journaling, ext4/XFS behavior, controller write caches, actual storage-device
+power loss or sustained HTTP staging exhaustion. Those require isolated
+block-device/VM qualification before broader durability claims.
+
 ## Recovery and maintenance
 
 - On reopening after an interrupted append, the engine may preserve an

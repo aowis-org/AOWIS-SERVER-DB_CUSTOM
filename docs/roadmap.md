@@ -142,10 +142,17 @@ least one object has been stored**, using both deterministic ENOSPC errors and
 process termination where applicable. These tests verify unpublished head
 isolation, rejected incomplete bundles, reservation cleanup and successful
 reopen/retry. The hooks exist only in the dedicated fault-test library.
-They do not exercise an actual full filesystem or power-loss persistence.
-
-Physical quota / ENOSPC stress and cross-process interruption testing are
-still required.
+Those injected faults do not establish physical full-filesystem or power-loss
+persistence guarantees. A separate `aowis-native-physical-enospc-tests`
+CTest now uses the **production native library** on a disposable 32 MiB Linux
+`tmpfs`, filled with real allocated filesystem pages. It verifies kernel
+ENOSPC rejection during a large commit, atomic named bundle export, and
+incremental import, followed by space reclamation, independent repository
+reopen/full verification and successful retries. Its Linux user/mount namespace
+launcher reports a CTest **skip**, not success, if isolated mounts are
+unavailable. No existing host filesystem is filled. This tests actual tmpfs
+allocation failures; ext4/XFS journaling, block-device flush behavior and
+power-loss durability still require separate release qualification.
 
 Implemented:
 
@@ -168,9 +175,12 @@ Still required:
   checks a cross-project 503 and `Retry-After`, aborts downloads, checks health
   responsiveness, runs concurrent transfers, then restarts/reopens all projects
   and verifies the stored history. This is a short real-process qualification,
-  not a sustained load or a physical disk-full simulation.
+  not a sustained load or a physical disk-full simulation. The separate
+  `aowis-native-physical-enospc-tests` covers native pack/import/export ENOSPC
+  on an isolated small Linux tmpfs, but not the complete HTTP transfer path.
 - Extend those tests to long-duration large HTTP imports/exports across projects,
-  slow clients, read/write timeouts and physical scratch disk exhaustion. Define and enforce
+  slow clients, read/write timeouts and HTTP scratch disk exhaustion (the
+  native physical ENOSPC test is not an HTTP test). Define and enforce
   request CPU/time budgets, cross-process disk quotas and pack-growth budgets
   in addition to the native internal scratch and HTTP transfer admission
   budgets and the

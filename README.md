@@ -135,7 +135,13 @@ The hydraulic edit benchmark reports import time, indexed edit/merge-related ope
 
 The native test suite includes `aowis-native-recovery-tests`. It links a **separate test-only build** of the engine with deterministic fault checkpoints; ordinary library/server binaries contain no environment-variable crash hooks. The tests inject process exits, simulated `ENOSPC` and partial writes across object append, synchronization, branch publication, incremental import and compaction. They verify recovered physical/logical integrity, immutable model references, derived-index rebuilding and subsequent writes. An error **after** an atomic branch-ref rename can mean the operation already took effect: reopen the repository and inspect its head before retrying. An interrupted compaction **after** generation-pointer publication requires reopening the handle. External backups must be made with repository handles closed, or from a separately coordinated filesystem snapshot, and fully verified after restore. See the [operator recovery and backup runbook](docs/operations.md) for coordinated snapshots, disk-full response, publication ambiguity and offline compaction.
 
-These tests exercise deterministic software failure paths; they cannot by themselves establish durability under a real electrical outage or failing storage device. Device-level crash testing, prolonged disk-full conditions and production recovery procedures still need verification.
+A separate `aowis-native-physical-enospc-tests` CTest uses the **production**
+native library on a private 32 MiB Linux tmpfs. It forces actual kernel ENOSPC
+while committing, exporting and importing, then checks published heads,
+repository reopening and retries. It skips explicitly where user/mount
+namespaces are disabled. Neither injected faults nor real tmpfs exhaustion
+establish durability under electrical outages or failing storage hardware;
+device-level and deployment-filesystem qualification remain outstanding.
 
 ## HTTP/TCP project service
 

@@ -137,6 +137,17 @@ if(BUILD_TESTING)
     add_test(NAME aowis-native-pack-operational-stress-tests
         COMMAND aowis-native-pack-operational-stress-tests)
     set_tests_properties(aowis-native-pack-operational-stress-tests PROPERTIES LABELS "aowis")
+    # True kernel ENOSPC on a disposable, 32-MiB private tmpfs. The launcher
+    # skips cleanly on hosts without unprivileged user/mount namespaces.
+    add_executable(aowis-native-physical-enospc-tests
+        tests/native_physical_enospc_tests.cpp)
+    target_link_libraries(aowis-native-physical-enospc-tests PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-physical-enospc-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/physical_enospc_mount.py"
+            --binary "$<TARGET_FILE:aowis-native-physical-enospc-tests>")
+    set_tests_properties(aowis-native-physical-enospc-tests PROPERTIES
+        LABELS "aowis;physical-enospc" SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_executable(aowis-native-recovery-tests tests/native_recovery_tests.cpp)
     target_link_libraries(aowis-native-recovery-tests PRIVATE aowis-native-store-fault-tests)
     add_test(NAME aowis-native-recovery-tests COMMAND aowis-native-recovery-tests)
@@ -222,7 +233,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-physical-enospc-tests aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
