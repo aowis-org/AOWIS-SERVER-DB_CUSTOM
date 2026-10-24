@@ -1,6 +1,7 @@
 #include "aowis/native/native_store.h"
 
 #include <array>
+#include <fcntl.h>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +25,8 @@ using aowis::native::Key;
 using aowis::native::ModelChange;
 using aowis::native::ModelRecord;
 using aowis::native::Repository;
+using aowis::native::StorageError;
+using aowis::native::StorageErrorKind;
 
 void expect(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
@@ -574,6 +577,80 @@ void testExportFailureAfterClose() {
            "export after a failed attempt is not importable");
 }
 
+// ENOSPC after part of a bundle payload reaches disk must not produce a
+// successful, importable bundle. Error injection unwinds and removes named
+// outputs; a process crash may leave a visibly incomplete named output, which
+// callers must not mistake for a completed transfer.
+void testPartialBundleOutput(bool crash, bool descriptor) {
+    TestDirectory directory("partial-export");
+    const std::filesystem::path repo = directory.path / "repo";
+    const std::filesystem::path bundle = directory.path / "partial.bundle";
+    baseline(repo, false);
+    Hash original{};
+    {
+        Repository repository(repo);
+        original = repository.head("main").id;
+    }
+    const pid_t child = ::fork();
+    expect(child >= 0, "partial export fork failed");
+    if (child == 0) {
+        ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.partial.object", 1);
+        ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
+        try {
+            Repository repository(repo);
+            if (descriptor) {
+                const int fd = ::open(bundle.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+                if (fd < 0) ::_exit(97);
+                try { repository.exportBranchBundle("main", fd); }
+                catch (...) {
+                    if (::lseek(fd, 0, SEEK_END) != 0) ::_exit(98);
+                    ::close(fd);
+                    throw;
+                }
+                ::close(fd);
+            } else {
+                repository.exportBranchBundle("main", bundle);
+            }
+        } catch (const StorageError& error) {
+            ::_exit(!crash && error.kind() == StorageErrorKind::ResourceExhausted ? 94 : 95);
+        } catch (...) { ::_exit(96); }
+        ::_exit(97);
+    }
+    int status = 0;
+    expect(::waitpid(child, &status, 0) == child, "partial export waitpid failed");
+    expect(WIFEXITED(status) && WEXITSTATUS(status) == (crash ? 93 : 94),
+           "partial export failure did not reach injected payload write");
+    if (!descriptor && !crash) {
+        expect(!std::filesystem::exists(bundle), "failed named export left a partial bundle");
+    } else {
+        expect(std::filesystem::exists(bundle), "interrupted export fixture missing");
+        // Normal exception cleanup truncates a caller-owned descriptor. An
+        // abrupt process death cannot execute that cleanup.
+        expect((std::filesystem::file_size(bundle) == 0) == !crash,
+               "partial descriptor output cleanup mismatch");
+        if (crash) {
+            Repository destination(directory.path / "destination");
+            bool rejected = false;
+            try { (void)destination.importBranchBundle(bundle, "main"); }
+            catch (const StorageError&) { rejected = true; }
+            expect(rejected, "interrupted bundle was accepted as valid");
+            expect(destination.listBranches().empty(),
+                   "interrupted bundle published a branch");
+            destination.verifyRepository();
+        }
+    }
+    Repository reopened(repo);
+    expect(reopened.head("main").id == original,
+           "failed export changed source branch head");
+    reopened.verifyRepository();
+    const std::filesystem::path retry = directory.path / "retry.bundle";
+    reopened.exportBranchBundle("main", retry);
+    Repository restored(directory.path / "restored");
+    expect(restored.importBranchBundle(retry, "main").head == original,
+           "export retry failed after interruption");
+    restored.verifyRepository();
+}
+
 void runBackend() {
     const std::vector<std::string_view> packPre{
         "pack.before.header", "pack.after.header", "pack.partial.body",
@@ -608,8 +685,14 @@ void runBackend() {
             runImportFault(point, crash, point == "ref.after.rename");
         }
     }
-    runImportFault("pack.after.fsync",
-                   true, false);
+    runImportFault("pack.after.fsync", true, false);
+    // At least one imported object has entered the pack, but its revision
+    // must remain unreachable until publication has completed.
+    for (bool crash : {true, false}) runImportFault("import.after.object", crash, false);
+    for (bool crash : {true, false}) {
+        testPartialBundleOutput(crash, false);
+        testPartialBundleOutput(crash, true);
+    }
     testBackupAndSidecars();
     testInterruptedCompactionHandle(false);
     testInterruptedCompactionHandle(true);

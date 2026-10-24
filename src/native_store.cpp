@@ -190,6 +190,7 @@ public:
         require(Err::LimitExceeded, offset <= std::numeric_limits<std::uint64_t>::max() - bytes,
                 "native scratch file offset overflow");
         reserve(offset + bytes);
+        detail::faultPartialWrite(this->fd_, data, bytes, offset, "scratch.partial.write");
         writeExact(this->fd_, data, bytes, offset);
     }
     void allocate(std::uint64_t bytes, const char* operation) {
@@ -3855,7 +3856,11 @@ void Repository::exportBundleLocked(std::string_view branch,
             storeU64(entry.data() + 32, static_cast<std::uint64_t>(bytes.size()));
             writeExact(fd, entry.data(), entry.size(), offset);
             offset += bundleEntryBytes;
-            if (!bytes.empty()) writeExact(fd, bytes.data(), bytes.size(), offset);
+            if (!bytes.empty()) {
+                detail::faultPartialWrite(fd, bytes.data(), bytes.size(), offset,
+                                          "export.partial.object");
+                writeExact(fd, bytes.data(), bytes.size(), offset);
+            }
             offset += bytes.size();
         };
         if (delta) {
@@ -4151,6 +4156,7 @@ BundleImportResult Repository::importBranchBundle(int fd, std::string_view local
             require(Err::Internal, store(std::move(payload)) == entry.first,
                     "replication content hash changed before publication");
             ++imported;
+            detail::faultCheckpoint("import.after.object");
         }
         if (profile != nullptr) {
             profile->objectWriteMs = elapsedImportMs(writeStart, ImportClock::now());

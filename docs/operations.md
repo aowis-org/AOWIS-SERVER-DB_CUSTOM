@@ -44,6 +44,15 @@ service instance and compare expected heads.
 - Scratch files are repository-local and normally unlinked. Space held by an
   open descriptor is freed when that operation/process exits. A restart
   removes the named scratch fallback leftovers on repository open.
+- **Interrupted filesystem-path bundle exports:** a process killed during
+  `exportBranchBundle(path)` can leave a partial file at the requested
+  destination path, even though ordinary exceptions remove that file. Treat
+  such a file as incomplete until an exporter has returned successfully;
+  do not distribute it. The importer validates bundle bounds and object
+  hashes and rejects incomplete data, without publishing a branch. Remove
+  the abandoned output only after confirming no producer still owns it, and
+  export again to a new path. File-descriptor exports similarly rely on the
+  caller to coordinate their publication to downstream consumers.
 - Internal export/import verification scratch is bounded independently by
   `[storage] max_internal_scratch_mib` (default 1024 MiB in the HTTP service,
   or `--max-internal-scratch-mib`), across all native projects in that server

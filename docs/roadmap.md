@@ -136,10 +136,25 @@ server). Export visited sets/sorters and import indices, verification marks,
 trie summaries and reference sorters reserve capacity before writing or
 allocating, and release it when their descriptors close. This is distinct
 from HTTP staging and does not bound other processes, pack growth or offline
-compaction. Fault/ENOSPC stress and physical quota testing are still required.
+compaction. The native recovery and scratch suites now also exercise **test-only partial
+scratch writes, partial bundle payload writes, and import failure after at
+least one object has been stored**, using both deterministic ENOSPC errors and
+process termination where applicable. These tests verify unpublished head
+isolation, rejected incomplete bundles, reservation cleanup and successful
+reopen/retry. The hooks exist only in the dedicated fault-test library.
+They do not exercise an actual full filesystem or power-loss persistence.
+
+Physical quota / ENOSPC stress and cross-process interruption testing are
+still required.
 
 Still required:
 
+- Ensure **filesystem-path bundle exports publish atomically** after successful
+  write and fsync. At present, an abrupt process death can leave the final
+  requested filename containing a partial bundle. Its invalid contents are
+  rejected by import verification, but consumers cannot rely on the filename
+  alone as a completion marker. Test crash-before/after-publication behavior
+  without replacing existing destination files.
 - Test simultaneous large HTTP imports/exports across projects, slow clients,
   disconnects, timeouts and scratch disk exhaustion. Define and enforce
   request CPU/time budgets, cross-process disk quotas and pack-growth budgets

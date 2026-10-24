@@ -291,6 +291,49 @@ void testInternalScratchBudget() {
     aowis::native::setInternalScratchLimit(0);
 }
 
+// Exercise actual partial scratch writes, not just admission-limit rejection.
+// The test-only writer persists half a hash-table entry before simulating
+// ENOSPC, forcing RAII cleanup and correct repository reopening.
+void testPartialScratchWrite() {
+    TestDirectory directory("partial-write");
+    const std::filesystem::path repo = directory.path / "source";
+    const std::filesystem::path bundle = directory.path / "good.bundle";
+    Repository source(repo);
+    const Hash head = buildModelHistory(source);
+    ScratchFile output = source.createScratchFile();
+    {
+        ScopedEnvironment point("AOWIS_NATIVE_TEST_FAULT", "scratch.partial.write");
+        ScopedEnvironment action("AOWIS_NATIVE_TEST_ACTION", "error");
+        expectKind(StorageErrorKind::ResourceExhausted, "partial scratch export write",
+                   [&] { source.exportBranchBundle("main", output.fd()); });
+    }
+    expect(fileSize(output.fd()) == 0, "partial scratch export wrote output");
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "partial scratch export leaked quota reservations");
+    source.exportBranchBundle("main", bundle);
+    const std::filesystem::path targetPath = directory.path / "target";
+    {
+        Repository target(targetPath);
+        {
+            ScopedEnvironment point("AOWIS_NATIVE_TEST_FAULT", "scratch.partial.write");
+            ScopedEnvironment action("AOWIS_NATIVE_TEST_ACTION", "error");
+            expectKind(StorageErrorKind::ResourceExhausted, "partial scratch import write",
+                       [&] { (void)target.importBranchBundle(bundle, "main"); });
+        }
+        expect(target.listBranches().empty(), "partial scratch import published branch");
+        expect(aowis::native::internalScratchReservedBytes() == 0,
+               "partial scratch import leaked quota reservations");
+    }
+    Repository reopened(targetPath);
+    expect(reopened.listBranches().empty(), "partial scratch import published on reopen");
+    reopened.verifyRepository();
+    expect(reopened.importBranchBundle(bundle, "main").head == head,
+           "import retry after partial scratch failed");
+    reopened.verifyRepository();
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "scratch quota remained reserved after retry");
+}
+
 } // namespace
 
 int main() {
@@ -303,6 +346,7 @@ int main() {
         testScratchFileApi();
         testDescriptorTransfer();
         testInternalScratchBudget();
+        testPartialScratchWrite();
         std::cout << "Repository scratch storage tests passed\n";
         return 0;
     } catch (const std::exception& error) {
