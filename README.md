@@ -126,7 +126,7 @@ The hydraulic edit benchmark reports import time, indexed edit/merge-related ope
 
 ## Recovery testing and operational limits
 
-The native test suite includes `aowis-native-recovery-tests`. It links a **separate test-only build** of the engine with deterministic fault checkpoints; ordinary library/server binaries contain no environment-variable crash hooks. The tests inject process exits, simulated `ENOSPC` and partial writes across object append, synchronization, branch publication, incremental import and compaction. They verify recovered physical/logical integrity, immutable model references, derived-index rebuilding and subsequent writes. An error **after** an atomic branch-ref rename can mean the operation already took effect: reopen the repository and inspect its head before retrying. An interrupted compaction **after** generation-pointer publication requires reopening the handle. External backups must be made with repository handles closed, or from a separately coordinated filesystem snapshot, and fully verified after restore.
+The native test suite includes `aowis-native-recovery-tests`. It links a **separate test-only build** of the engine with deterministic fault checkpoints; ordinary library/server binaries contain no environment-variable crash hooks. The tests inject process exits, simulated `ENOSPC` and partial writes across object append, synchronization, branch publication, incremental import and compaction. They verify recovered physical/logical integrity, immutable model references, derived-index rebuilding and subsequent writes. An error **after** an atomic branch-ref rename can mean the operation already took effect: reopen the repository and inspect its head before retrying. An interrupted compaction **after** generation-pointer publication requires reopening the handle. External backups must be made with repository handles closed, or from a separately coordinated filesystem snapshot, and fully verified after restore. See the [operator recovery and backup runbook](docs/operations.md) for coordinated snapshots, disk-full response, publication ambiguity and offline compaction.
 
 These tests exercise deterministic software failure paths; they cannot by themselves establish durability under a real electrical outage or failing storage device. Device-level crash testing, prolonged disk-full conditions and production recovery procedures still need verification.
 
@@ -151,6 +151,7 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [REST API design](docs/rest-api-design.md) | Agreed service boundaries, proposed resources and wire contracts |
 | [Roadmap](docs/roadmap.md) | Remaining implementation work |
 | [Database service](docs/native-database-service.md) | Implemented multi-project HTTP service, configuration, catalogue and endpoints |
+| [Operations](docs/operations.md) | Coordinated backups, restore verification, disk-full response and maintenance |
 | [Hydraulic model](docs/native-hydraulic-network.md) | Persistence, entity queries, indexed editing, validation |
 | [Canonical serialization](docs/canonical-model-codec.md) | Model codec/schema contract |
 | [Model records](docs/model-records.md) | Generic typed envelope and reference index |

@@ -198,9 +198,10 @@ private:
 // In-process server on a loopback port, serving from worker threads.
 class TestServer {
 public:
-    TestServer(aowis::native::ProjectService& service, aowis::native::BundleLimits limits) {
+    TestServer(aowis::native::ProjectService& service, aowis::native::BundleLimits limits,
+               std::shared_ptr<aowis::native::http::TransferStagingBudget> stagingBudget = nullptr) {
         this->server_.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 128); };
-        aowis::native::http::registerRoutes(this->server_, service, limits);
+        aowis::native::http::registerRoutes(this->server_, service, limits, stagingBudget);
         const int bound = this->server_.bind_to_any_port("127.0.0.1");
         check(bound > 0, "unable to listen");
         this->port_ = static_cast<quint16>(bound);
@@ -1306,6 +1307,55 @@ struct ServerRun {
     QString diagnostics;
 };
 
+// Holding an incomplete upload on project A must reserve the global HTTP
+// staging budget and reject new staging on project B, but not block /health.
+// Closing A must release capacity without changing any branch.
+void exerciseTransferStagingBudget() {
+    namespace native = aowis::native;
+    TemporaryRoot root;
+    native::ProjectService service(root.root());
+    constexpr std::uint64_t transferBytes = 1024ULL * 1024ULL;
+    std::shared_ptr<native::http::TransferStagingBudget> staging =
+        std::make_shared<native::http::TransferStagingBudget>(transferBytes);
+    TestServer server(service, native::BundleLimits{transferBytes, 10000, transferBytes}, staging);
+    Client client(server.port());
+    const Response first = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Slow source"}});
+    const Response second = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Other project"}});
+    check(first.status == 201 && second.status == 201, "staging test projects not created");
+    const QString firstId = first.json.value("id").toString();
+    const QString secondId = second.json.value("id").toString();
+    const QString otherBundle = "/api/v1/projects/" + secondId + "/branches/main/bundle";
+    {
+        RawConnection slow(server.port());
+        check(slow.connected(), "slow staging client failed to connect");
+        slow.send("POST /api/v1/projects/" + firstId.toUtf8() +
+                  "/branches/unpublished/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 100000\r\n\r\n"
+                  "partially-sent");
+        const std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (staging->reservedBytes() == 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        check(staging->reservedBytes() == transferBytes, "slow upload did not reserve staging budget");
+        const BinaryResponse rejected = client.callRaw("GET", otherBundle);
+        check(rejected.status == 503 && rejected.body.contains("staging_busy") &&
+              rejected.retryAfter == "1", "other project staging was not rejected with retry hint");
+        check(client.call("GET", "/api/v1/health").status == 200,
+              "health endpoint blocked by exhausted staging budget");
+        slow.close();
+    }
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (staging->reservedBytes() != 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    check(staging->reservedBytes() == 0, "disconnected upload retained staging reservation");
+    check(client.callRaw("GET", otherBundle).status == 200,
+          "transfer not admitted after disconnected upload released quota");
+    check(staging->reservedBytes() == 0, "completed download retained staging reservation");
+    check(client.call("GET", "/api/v1/projects/" + firstId + "/branches/unpublished/head").status == 404,
+          "abandoned upload published an incomplete branch");
+}
+
 // Starts the real executable, probes /api/v1/health on 127.0.0.1, optionally
 // runs `whileRunning`, then stops it with SIGTERM. A process that exits on
 // its own is reported with its exit code.
@@ -1383,6 +1433,8 @@ void exerciseExecutable(const QString& executable) {
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("0")},
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("257")},
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--sync-max-mib"), QStringLiteral("0")},
+        {QStringLiteral("--sync-max-mib"), QStringLiteral("32"), QStringLiteral("--sync-max-inflight-mib"), QStringLiteral("16")},
+        {QStringLiteral("--sync-max-inflight-mib"), QStringLiteral("4097")},
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--max-pending-per-project"), QStringLiteral("0")},
         {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"), QStringLiteral("--worker-threads"), QStringLiteral("4"),
          QStringLiteral("--max-pending-per-project"), QStringLiteral("5")},
@@ -1423,6 +1475,7 @@ int main(int argc, char** argv) {
         check(argc == 2, "expected path to aowis-server-db executable");
         exercise();
         exerciseConcurrency();
+        exerciseTransferStagingBudget();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
         return 0;

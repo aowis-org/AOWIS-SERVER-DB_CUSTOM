@@ -393,10 +393,11 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     return std::nullopt;
 }
 
-void registerBundleRoutes(httplib::Server& server, ProjectService& service, BundleLimits limits) {
+void registerBundleRoutes(httplib::Server& server, ProjectService& service, BundleLimits limits,
+                          const std::shared_ptr<TransferStagingBudget>& stagingBudget) {
     // Export into a nameless project scratch file, then stream it in chunks.
     // The file lives exactly as long as the response (content provider).
-    server.Get(routeBundle, [&service, limits](const httplib::Request& request,
+    server.Get(routeBundle, [&service, limits, stagingBudget](const httplib::Request& request,
                                                httplib::Response& response) {
         try {
             const std::string id = pathParam(request, "id");
@@ -407,6 +408,15 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
             const std::optional<std::string> baseText = queryValue(request, "base");
             const std::optional<Hash> base = baseText ? std::optional<Hash>(parseHash(*baseText))
                                                       : std::nullopt;
+            std::optional<TransferStagingBudget::Reservation> slot = stagingBudget->reserve(limits.maxBytes);
+            if (!slot) {
+                send(response, errorReply(503, "staging_busy",
+                                          QStringLiteral("bundle staging capacity is currently exhausted")));
+                response.set_header("Retry-After", "1");
+                return;
+            }
+            std::shared_ptr<TransferStagingBudget::Reservation> reservation =
+                std::make_shared<TransferStagingBudget::Reservation>(std::move(*slot));
             std::shared_ptr<ScratchFile> exported = std::make_shared<ScratchFile>();
             try {
                 service.withRepository(id, [&](Repository& repository) {
@@ -435,7 +445,8 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
             }
             response.status = 200;
             response.set_content_provider(static_cast<std::size_t>(size), bundleMime,
-                [exported](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
+                [exported, reservation](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
+                    (void)reservation; // keep global quota until the provider is destroyed
                     std::array<char, 64 * 1024> buffer{};
                     const std::size_t chunk = std::min(length, buffer.size());
                     const ssize_t count = ::pread(exported->fd(), buffer.data(), chunk,
@@ -450,7 +461,7 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
 
     // Stream the upload into a project scratch file while it arrives: the body
     // is never held in memory and no project lock is held during the transfer.
-    server.Post(routeBundle, [&service, limits](const httplib::Request& request,
+    server.Post(routeBundle, [&service, limits, stagingBudget](const httplib::Request& request,
                                                 httplib::Response& response,
                                                 const httplib::ContentReader& reader) {
         bool bodyConsumed = false; // before that, every rejection closes the connection
@@ -467,6 +478,14 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
             // 400/404, and 503 when the project's queue is full, before any
             // body byte is read. The reservation is held through the import.
             ProjectService::Operation operation = service.reserveOperation(id);
+            std::optional<TransferStagingBudget::Reservation> reservation =
+                stagingBudget->reserve(limits.maxBytes);
+            if (!reservation) {
+                sendAndClose(response, errorReply(503, "staging_busy",
+                                                  QStringLiteral("bundle staging capacity is currently exhausted")));
+                response.set_header("Retry-After", "1");
+                return;
+            }
             ScratchFile spool = service.createScratchFile(id);
             std::uint64_t received = 0;
             bool tooLarge = false;
@@ -732,7 +751,17 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
 } // namespace
 
 void registerRoutes(httplib::Server& server, ProjectService& service,
-                    BundleLimits transferLimits) {
+                    BundleLimits transferLimits,
+                    std::shared_ptr<TransferStagingBudget> stagingBudget) {
+    // Standalone library integrations have a bounded default even when they
+    // use the three-argument API. The production executable configures this.
+    if (!stagingBudget) {
+        const std::uint64_t maximumTransfer = transferLimits.maxBytes == 0
+            ? 32ULL * 1024ULL * 1024ULL : transferLimits.maxBytes;
+        stagingBudget = std::make_shared<TransferStagingBudget>(maximumTransfer * 4ULL);
+    }
+    if (transferLimits.maxBytes == 0 || stagingBudget->maximumBytes() < transferLimits.maxBytes)
+        throw std::invalid_argument("HTTP transfer limit must be finite and fit the staging budget");
     // Global ceiling: no request body larger than the bundle transfer limit
     // (or the largest JSON body) is ever read. Exceeding it yields 413.
     const std::size_t payloadLimit = static_cast<std::size_t>(std::max<std::uint64_t>(
@@ -809,7 +838,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, projectJson(service.project(pathParam(request, "id")))};
         });
     });
-    registerBundleRoutes(server, service, transferLimits);
+    registerBundleRoutes(server, service, transferLimits, stagingBudget);
     server.Get(routeBranches, [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             QJsonArray branches;

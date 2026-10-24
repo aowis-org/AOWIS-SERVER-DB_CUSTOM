@@ -116,11 +116,26 @@ truncated sidecars, interruption during publication, long-lived cross-process
 handles, plus sidecar rebuild and compaction on the large fixtures. Profile
 the bounded cache under representative loads before adjusting its size.
 
-### 6. Operational resource bounds and maintenance
+### 6. Operational resource bounds and maintenance — underway
+
+The HTTP service now has a configurable **process-wide transfer staging
+admission budget** (`[sync] max_inflight_mib`, default at least 128 MiB or
+twice the per-transfer maximum). Every upload/download reserves its entire
+per-transfer maximum before allocating its spool; a full budget returns 503
+`staging_busy` with `Retry-After: 1`. Incoming transfers close the connection
+without reading the body, and reservations outlive download route handlers
+until response providers are destroyed. Native concurrency tests exercise
+reservation accounting and movement; real HTTP regression tests hold a stalled
+upload while checking cross-project rejection, health responsiveness, aborted
+upload cleanup and recovery. This is **not** an aggregate quota on native
+verification/sort scratch, nor a physical disk-space guarantee.
+
+Still required:
 
 - Test simultaneous large HTTP imports/exports across projects, slow clients,
   disconnects, timeouts and scratch disk exhaustion. Define and enforce
-  request CPU/time budgets and global scratch/disk quotas in addition to the
+  request CPU/time budgets and aggregate **native internal** scratch/disk
+  quotas in addition to the new HTTP transfer admission budget and the
   existing per-project pending-operation limits.
 - Provide a coordinated backup/recovery procedure with explicit snapshot
   consistency, verification after restore, and managed offline compaction.

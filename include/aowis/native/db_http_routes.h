@@ -1,8 +1,10 @@
 #pragma once
 
 #include "aowis/native/project_service.h"
+#include "aowis/native/transfer_staging_budget.h"
 
 #include <cstddef>
+#include <memory>
 
 namespace httplib {
 class Server;
@@ -23,5 +25,6 @@ constexpr std::size_t maxJsonModelBytes = 8U * 1024U * 1024U;   // network saves
 // process lifecycle. Handlers run on the server's worker threads.
 void registerRoutes(httplib::Server& server, ProjectService& service,
                     BundleLimits transferLimits = BundleLimits{32ULL * 1024ULL * 1024ULL,
-                                                               100000ULL, 8ULL * 1024ULL * 1024ULL});
+                                                               100000ULL, 8ULL * 1024ULL * 1024ULL},
+                    std::shared_ptr<TransferStagingBudget> stagingBudget = nullptr);
 } // namespace aowis::native::http

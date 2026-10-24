@@ -9,6 +9,8 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <algorithm>
+#include <memory>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -119,6 +121,9 @@ int main(int argc, char** argv) {
     parser.addOption(bundleMib);
     parser.addOption(bundleObjects);
     parser.addOption(objectMib);
+    const QCommandLineOption inflightMib("sync-max-inflight-mib",
+        "Maximum simultaneous HTTP bundle staging reservations in MiB (1..4096)", "MiB");
+    parser.addOption(inflightMib);
     parser.process(app);
 
     try {
@@ -149,9 +154,14 @@ int main(int argc, char** argv) {
         const unsigned transferMib = transferMibValue.toUInt(&validTransfer);
         const unsigned count = countValue.toUInt(&validCount);
         const unsigned individualMib = objectMibValue.toUInt(&validObject);
+        const QString inflightValue = parser.isSet(inflightMib) ? parser.value(inflightMib) :
+            settings.value("sync/max_inflight_mib", std::max(128U, transferMib * 2U)).toString();
+        bool validInflight = false;
+        const unsigned inflight = inflightValue.toUInt(&validInflight);
         if (!validTransfer || !validCount || !validObject || transferMib == 0 || transferMib > 256 ||
             count == 0 || count > 1000000 || individualMib == 0 || individualMib > 64 ||
-            individualMib > transferMib) {
+            individualMib > transferMib || !validInflight || inflight < transferMib ||
+            inflight > 4096) {
             std::cerr << "Invalid synchronization transfer limits\n";
             return 2;
         }
@@ -192,7 +202,10 @@ int main(int argc, char** argv) {
             const std::size_t threads = static_cast<std::size_t>(workerCount);
             return new httplib::ThreadPool(threads, threads, threads * 16U);
         };
-        aowis::native::http::registerRoutes(server, service, limits);
+        std::shared_ptr<aowis::native::http::TransferStagingBudget> stagingBudget =
+            std::make_shared<aowis::native::http::TransferStagingBudget>(
+                static_cast<std::uint64_t>(inflight) * 1024ULL * 1024ULL);
+        aowis::native::http::registerRoutes(server, service, limits, stagingBudget);
         if (!server.bind_to_port(address, static_cast<int>(requestedPort))) {
             std::cerr << "Unable to bind HTTP listener on " << address << ':' << requestedPort
                       << ": " << std::strerror(errno) << '\n';

@@ -3,6 +3,7 @@ project(AOWIS_Server_DB_Custom VERSION 0.1.0 LANGUAGES CXX)
 
 include(CTest)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+find_package(Threads REQUIRED)
 
 add_library(aowis-native-store STATIC
     src/native_store.cpp
@@ -56,6 +57,14 @@ add_executable(aowis-native-model-benchmark benchmarks/model_network_benchmark.c
 target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
+    add_executable(aowis-native-transfer-staging-budget-tests
+        tests/native_transfer_staging_budget_tests.cpp)
+    target_include_directories(aowis-native-transfer-staging-budget-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_features(aowis-native-transfer-staging-budget-tests PRIVATE cxx_std_20)
+    target_link_libraries(aowis-native-transfer-staging-budget-tests PRIVATE Threads::Threads)
+    add_test(NAME aowis-native-transfer-staging-budget-tests
+        COMMAND aowis-native-transfer-staging-budget-tests)
+    set_tests_properties(aowis-native-transfer-staging-budget-tests PROPERTIES LABELS "aowis")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME aowis-native-index-scaling-smoke
         COMMAND "${Python3_EXECUTABLE}"
@@ -203,7 +212,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
