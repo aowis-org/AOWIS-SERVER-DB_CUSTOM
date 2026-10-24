@@ -3757,9 +3757,10 @@ std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base,
     return output;
 }
 
-// Writes to a new file at *bundlePath (O_EXCL, removed on failure) or, when
-// bundlePath is null, to the caller's empty descriptor targetFd (truncated
-// back to empty on failure; the caller keeps ownership).
+// Filesystem-path exports write into a private file in the destination
+// directory, fsync it, then atomically install the finished file without
+// replacing an existing name. Caller-owned descriptor exports retain their
+// previous contract: the caller handles publication and keeps ownership.
 void Repository::exportBundleLocked(std::string_view branch,
                                     const std::filesystem::path* bundlePath, int targetFd,
                                     std::optional<Hash> recipientBase, BundleLimits limits) {
@@ -3817,9 +3818,37 @@ void Repository::exportBundleLocked(std::string_view branch,
     // The count limit was enforced at each unique discovery, before opening
     // any output file. No partial bundle can be published on rejection.
     int fd = targetFd;
+    int directoryFd = -1;
+    std::string temporaryName; // empty for an anonymous O_TMPFILE export
+    std::string destinationName;
     if (bundlePath != nullptr) {
-        fd = ::open(bundlePath->c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-        systemCall(fd >= 0, "create replication bundle (must not already exist)");
+        const std::filesystem::path parent = bundlePath->parent_path().empty()
+            ? std::filesystem::path(".") : bundlePath->parent_path();
+        destinationName = bundlePath->filename().string();
+        require(Err::InvalidInput, !destinationName.empty() && destinationName != "." &&
+                destinationName != "..", "invalid replication bundle destination");
+        directoryFd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        systemCall(directoryFd >= 0, "open replication bundle destination directory");
+        try {
+            // On supporting filesystems a crash before publication leaves no
+            // directory entry. Named fallback files are deliberately hidden;
+            // they can be removed after a crashed exporter has exited.
+            if (!detail::forceNamedScratchFiles()) {
+                fd = ::openat(directoryFd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+                if (fd < 0 && errno != EOPNOTSUPP && errno != EISDIR &&
+                    errno != EINVAL && errno != ENOTSUP)
+                    throwSystemError("create anonymous replication bundle");
+            }
+            if (fd < 0) {
+                std::string name = (parent / ".aowis-export-XXXXXX").string();
+                fd = ::mkostemp(name.data(), O_CLOEXEC);
+                systemCall(fd >= 0, "create private replication bundle");
+                temporaryName = std::filesystem::path(name).filename().string();
+            }
+        } catch (...) {
+            ::close(directoryFd);
+            throw;
+        }
     } else {
         struct stat target{};
         systemCall(fd >= 0 && ::fstat(fd, &target) == 0, "stat replication bundle target");
@@ -3870,16 +3899,35 @@ void Repository::exportBundleLocked(std::string_view branch,
         }
         systemCall(::fsync(fd) == 0, "sync replication bundle");
         if (bundlePath == nullptr) return; // caller-owned descriptor stays open
-        // Linux releases the descriptor even when close() reports an error.
-        // Forget it first so the handler below can never close it twice (in a
-        // multi-threaded server the number may already belong to another file).
+        detail::faultCheckpoint("export.before.publish");
+        // linkat is no-replace: two concurrent exporters cannot overwrite
+        // one another, and neither can replace a symlink or existing file.
+        // The completed file is the only content that can become visible at
+        // the requested name, even if the process dies immediately afterward.
+        if (temporaryName.empty()) {
+            systemCall(::linkat(fd, "", directoryFd, destinationName.c_str(), AT_EMPTY_PATH) == 0,
+                       "publish anonymous replication bundle (destination must not exist)");
+        } else {
+            systemCall(::linkat(directoryFd, temporaryName.c_str(), directoryFd,
+                                destinationName.c_str(), 0) == 0,
+                       "publish replication bundle (destination must not exist)");
+        }
+        detail::faultCheckpoint("export.after.publish");
+        if (!temporaryName.empty()) {
+            systemCall(::unlinkat(directoryFd, temporaryName.c_str(), 0) == 0,
+                       "remove private replication bundle name");
+            temporaryName.clear();
+        }
+        systemCall(::fsync(directoryFd) == 0, "sync replication bundle directory");
+        detail::faultCheckpoint("export.after.dirsync");
+        // Close only after publication. A close failure does not remove the
+        // already completed/published file (the caller can retry by name).
         const int closing = fd;
         fd = -1;
         systemCall(::close(closing) == 0, "close replication bundle");
-        detail::faultCheckpoint("export.after.close");
-        const std::filesystem::path parent = bundlePath->parent_path().empty()
-            ? std::filesystem::path(".") : bundlePath->parent_path();
-        syncDirectory(parent);
+        const int closingDirectory = directoryFd;
+        directoryFd = -1;
+        systemCall(::close(closingDirectory) == 0, "close replication bundle directory");
     } catch (...) {
         if (bundlePath == nullptr) {
             // Never leave a partial bundle behind. The original failure is
@@ -3888,8 +3936,11 @@ void Repository::exportBundleLocked(std::string_view branch,
             throw;
         }
         if (fd >= 0) ::close(fd);
-        std::error_code ignored;
-        std::filesystem::remove(*bundlePath, ignored);
+        if (directoryFd >= 0) {
+            if (!temporaryName.empty())
+                (void)::unlinkat(directoryFd, temporaryName.c_str(), 0);
+            ::close(directoryFd);
+        }
         throw;
     }
 }

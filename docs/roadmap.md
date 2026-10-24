@@ -147,14 +147,21 @@ They do not exercise an actual full filesystem or power-loss persistence.
 Physical quota / ENOSPC stress and cross-process interruption testing are
 still required.
 
+Implemented:
+
+- **Filesystem-path bundle publication:** Full and incremental
+  path exports now fsync an anonymous `O_TMPFILE` or private named fallback
+  in the destination directory, atomically link the complete bundle without
+  overwriting a pre-existing name, and fsync the parent directory. Regression
+  tests inject errors and crashes during payload writing and before/after
+  publication, exercise the named-file fallback, and prevent symlink
+  replacement. A killed fallback writer can leave an orphan `.aowis-export-*`
+  file, and a failure after publication can leave an already complete bundle
+  visible; see [operations](operations.md). Real power-loss filesystem tests
+  and descriptor-owner publication remain outside this guarantee.
+
 Still required:
 
-- Ensure **filesystem-path bundle exports publish atomically** after successful
-  write and fsync. At present, an abrupt process death can leave the final
-  requested filename containing a partial bundle. Its invalid contents are
-  rejected by import verification, but consumers cannot rely on the filename
-  alone as a completion marker. Test crash-before/after-publication behavior
-  without replacing existing destination files.
 - Test simultaneous large HTTP imports/exports across projects, slow clients,
   disconnects, timeouts and scratch disk exhaustion. Define and enforce
   request CPU/time budgets, cross-process disk quotas and pack-growth budgets

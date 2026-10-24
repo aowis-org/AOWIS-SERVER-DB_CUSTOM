@@ -4,7 +4,7 @@ Independent AOWIS native repositories exchange revision history through `.aowbun
 
 ## Core native APIs
 
-- `Repository::exportBranchBundle(branch, path)` produces a complete self-contained transfer.
+- `Repository::exportBranchBundle(branch, path)` produces a complete self-contained transfer. Path exports publish the finished, fsynced bundle atomically at a previously unused destination name (including on the incremental path). A crash before publication leaves the final name absent; a crash after publication leaves a complete bundle, though the name may not yet be durable until the parent directory is synchronized. Caller-owned descriptor exports are not published by the native engine.
 - `Repository::exportIncrementalBranchBundle(branch, baseRevision, path)` sends the revisions reachable from the branch tip but not from the known base revision and, for each of them, the trie objects that differ from one of its parents (preferably a parent the recipient already holds). The exporter reads the base's revision ancestry and the changed trie paths only, not the base's trees. The bundle can contain objects the recipient already has (for example when an older snapshot is restored); the importer does not store them twice.
 - `Repository::importBranchBundle(path, destinationBranch)` verifies hashes and full object graph before publication, then creates or **fast-forwards** the destination branch. An already incorporated tip is an idempotent no-op. Divergent history is **never overwritten** automatically.
 

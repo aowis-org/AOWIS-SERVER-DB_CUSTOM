@@ -44,15 +44,22 @@ service instance and compare expected heads.
 - Scratch files are repository-local and normally unlinked. Space held by an
   open descriptor is freed when that operation/process exits. A restart
   removes the named scratch fallback leftovers on repository open.
-- **Interrupted filesystem-path bundle exports:** a process killed during
-  `exportBranchBundle(path)` can leave a partial file at the requested
-  destination path, even though ordinary exceptions remove that file. Treat
-  such a file as incomplete until an exporter has returned successfully;
-  do not distribute it. The importer validates bundle bounds and object
-  hashes and rejects incomplete data, without publishing a branch. Remove
-  the abandoned output only after confirming no producer still owns it, and
-  export again to a new path. File-descriptor exports similarly rely on the
-  caller to coordinate their publication to downstream consumers.
+- **Interrupted filesystem-path bundle exports:** `exportBranchBundle(path)`
+  and its incremental variant write and fsync a private file in the final
+  destination directory, then atomically link the completed file at the
+  requested name **without replacing existing files or symlinks**. The
+  directory is fsynced before a successful return. A crash before publication
+  leaves the final name absent; a crash afterward can leave the final name
+  present with a **complete** bundle. After a publication-stage error, the
+  caller may not know which outcome occurred: inspect the destination name
+  and verify/import its contents before retrying under a new name. On
+  filesystems without `O_TMPFILE`, a killed exporter may leave a hidden
+  `.aowis-export-*` staging file in the destination directory. Remove only
+  stale staging files after confirming all exporters have stopped; never
+  treat staging filenames as completed bundles. Filesystem-path staging is
+  outside the repository's internal scratch budget. Caller-owned descriptor
+  exports do **not** get automatic name publication or crash cleanup: their
+  owner must coordinate visibility and durability.
 - Internal export/import verification scratch is bounded independently by
   `[storage] max_internal_scratch_mib` (default 1024 MiB in the HTTP service,
   or `--max-internal-scratch-mib`), across all native projects in that server

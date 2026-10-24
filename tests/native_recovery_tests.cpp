@@ -553,23 +553,23 @@ void testStaleGenerationCleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// Export failure after the bundle descriptor was closed (review finding F7):
-// the error path must remove the bundle without closing the descriptor again.
+// A failure immediately before atomic publication must leave the requested
+// path absent; the temporary descriptor and any named fallback are cleaned.
 
-void testExportFailureAfterClose() {
-    TestDirectory directory("export-after-close");
+void testExportFailureBeforePublish() {
+    TestDirectory directory("export-before-publish");
     const std::filesystem::path repo = directory.path / "repo";
     const std::filesystem::path bundle = directory.path / "main.aowbundle";
     baseline(repo, true);
     Repository repository(repo);
-    ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.after.close", 1);
+    ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.before.publish", 1);
     ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
     bool failed = false;
     try { repository.exportBranchBundle("main", bundle); }
     catch (const std::exception&) { failed = true; }
     ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
     ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
-    expect(failed, "export did not observe injected failure after close");
+    expect(failed, "export did not observe injected failure before publication");
     expect(!std::filesystem::exists(bundle), "failed export left a bundle behind");
     repository.exportBranchBundle("main", bundle);
     Repository copy(directory.path / "copy");
@@ -577,10 +577,9 @@ void testExportFailureAfterClose() {
            "export after a failed attempt is not importable");
 }
 
-// ENOSPC after part of a bundle payload reaches disk must not produce a
-// successful, importable bundle. Error injection unwinds and removes named
-// outputs; a process crash may leave a visibly incomplete named output, which
-// callers must not mistake for a completed transfer.
+// ENOSPC after part of a bundle payload reaches disk must not expose a
+// partial bundle under the requested name. Descriptor exports are caller-owned
+// and can still remain partial after a process crash.
 void testPartialBundleOutput(bool crash, bool descriptor) {
     TestDirectory directory("partial-export");
     const std::filesystem::path repo = directory.path / "repo";
@@ -620,10 +619,11 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
     expect(::waitpid(child, &status, 0) == child, "partial export waitpid failed");
     expect(WIFEXITED(status) && WEXITSTATUS(status) == (crash ? 93 : 94),
            "partial export failure did not reach injected payload write");
-    if (!descriptor && !crash) {
-        expect(!std::filesystem::exists(bundle), "failed named export left a partial bundle");
+    if (!descriptor) {
+        expect(!std::filesystem::exists(bundle),
+               "failed or crashed named export exposed a partial final bundle");
     } else {
-        expect(std::filesystem::exists(bundle), "interrupted export fixture missing");
+        expect(std::filesystem::exists(bundle), "interrupted descriptor export fixture missing");
         // Normal exception cleanup truncates a caller-owned descriptor. An
         // abrupt process death cannot execute that cleanup.
         expect((std::filesystem::file_size(bundle) == 0) == !crash,
@@ -633,9 +633,9 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
             bool rejected = false;
             try { (void)destination.importBranchBundle(bundle, "main"); }
             catch (const StorageError&) { rejected = true; }
-            expect(rejected, "interrupted bundle was accepted as valid");
+            expect(rejected, "interrupted descriptor bundle was accepted as valid");
             expect(destination.listBranches().empty(),
-                   "interrupted bundle published a branch");
+                   "interrupted descriptor bundle published a branch");
             destination.verifyRepository();
         }
     }
@@ -649,6 +649,97 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
     expect(restored.importBranchBundle(retry, "main").head == original,
            "export retry failed after interruption");
     restored.verifyRepository();
+}
+
+// Both the anonymous-file and the named fallback paths must keep the final
+// output invisible until a complete file has been fsynced. Once the name is
+// published a crash or injected error may make the caller uncertain whether
+// export succeeded, but the published bundle must be complete and importable.
+void testAtomicNamedBundlePublication() {
+    for (bool namedFallback : {false, true}) {
+        for (std::string_view point : {"export.partial.object", "export.before.publish",
+                                       "export.after.publish", "export.after.dirsync"}) {
+            for (bool crash : {false, true}) {
+                TestDirectory directory("atomic-bundle");
+                const std::filesystem::path repo = directory.path / "repo";
+                const std::filesystem::path bundle = directory.path / "main.bundle";
+                baseline(repo, false);
+                Hash expected{};
+                {
+                    Repository source(repo);
+                    expected = source.head("main").id;
+                }
+                const pid_t child = ::fork();
+                expect(child >= 0, "atomic export fork failed");
+                if (child == 0) {
+                    const std::string checkpoint(point);
+                    ::setenv("AOWIS_NATIVE_TEST_FAULT", checkpoint.c_str(), 1);
+                    ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
+                    if (namedFallback) ::setenv("AOWIS_NATIVE_TEST_NAMED_SCRATCH", "1", 1);
+                    try {
+                        Repository source(repo);
+                        source.exportBranchBundle("main", bundle);
+                    } catch (const StorageError& error) {
+                        ::_exit(!crash && error.kind() == StorageErrorKind::ResourceExhausted ? 94 : 95);
+                    } catch (...) { ::_exit(96); }
+                    ::_exit(97);
+                }
+                int status = 0;
+                expect(::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                       WEXITSTATUS(status) == (crash ? 93 : 94),
+                       "atomic named export did not reach injected failure");
+                const bool published = point == "export.after.publish" ||
+                                       point == "export.after.dirsync";
+                expect(std::filesystem::exists(bundle) == published,
+                       "atomic named export visibility differs from publication point");
+                if (published) {
+                    Repository receiver(directory.path / "receiver");
+                    expect(receiver.importBranchBundle(bundle, "main").head == expected,
+                           "atomically published bundle cannot be imported");
+                    receiver.verifyRepository();
+                    // Re-export must never overwrite an already published file.
+                    const std::uint64_t previousBytes = std::filesystem::file_size(bundle);
+                    Repository source(repo);
+                    bool rejected = false;
+                    try { source.exportBranchBundle("main", bundle); }
+                    catch (const StorageError&) { rejected = true; }
+                    expect(rejected && std::filesystem::file_size(bundle) == previousBytes,
+                           "export unexpectedly replaced existing bundle");
+                } else {
+                    Repository source(repo);
+                    const std::filesystem::path retry = directory.path / "retry.bundle";
+                    source.exportBranchBundle("main", retry);
+                    Repository receiver(directory.path / "receiver");
+                    expect(receiver.importBranchBundle(retry, "main").head == expected,
+                           "export cannot be retried after aborted publication");
+                }
+                // A normal failure cleans up private fallback files. A crash
+                // can orphan one; operators can remove it once no writer owns it.
+                if (!crash) {
+                    expect(countFiles(directory.path, ".aowis-export-", "") == 0,
+                           "exception left a named export staging file behind");
+                }
+            }
+        }
+    }
+    // A pre-existing symlink must never be followed or replaced.
+    TestDirectory directory("bundle-symlink");
+    const std::filesystem::path repo = directory.path / "repo";
+    const std::filesystem::path target = directory.path / "other";
+    const std::filesystem::path bundle = directory.path / "export.bundle";
+    baseline(repo, false);
+    { std::ofstream output(target); output << "unchanged\n"; }
+    std::filesystem::create_symlink(target, bundle);
+    Repository source(repo);
+    bool rejected = false;
+    try { source.exportBranchBundle("main", bundle); }
+    catch (const StorageError&) { rejected = true; }
+    expect(rejected && std::filesystem::is_symlink(bundle),
+           "export unexpectedly replaced existing symlink");
+    std::ifstream input(target);
+    std::string contents;
+    std::getline(input, contents);
+    expect(contents == "unchanged", "export followed existing destination symlink");
 }
 
 void runBackend() {
@@ -702,7 +793,8 @@ void runBackend() {
     testCorruptionBeforeValidRecord("mid-pack-distant", 1024U * 1024U + 3U);
     testDamagedPublishedHeadIsNotTruncated();
     testStaleGenerationCleanup();
-    testExportFailureAfterClose();
+    testExportFailureBeforePublish();
+    testAtomicNamedBundlePublication();
 }
 } // namespace
 
