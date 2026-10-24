@@ -124,6 +124,9 @@ int main(int argc, char** argv) {
     const QCommandLineOption inflightMib("sync-max-inflight-mib",
         "Maximum simultaneous HTTP bundle staging reservations in MiB (1..4096)", "MiB");
     parser.addOption(inflightMib);
+    const QCommandLineOption internalScratchMib("max-internal-scratch-mib",
+        "Maximum native internal scratch extents across projects in MiB (1..16384)", "MiB");
+    parser.addOption(internalScratchMib);
     parser.process(app);
 
     try {
@@ -156,12 +159,18 @@ int main(int argc, char** argv) {
         const unsigned individualMib = objectMibValue.toUInt(&validObject);
         const QString inflightValue = parser.isSet(inflightMib) ? parser.value(inflightMib) :
             settings.value("sync/max_inflight_mib", std::max(128U, transferMib * 2U)).toString();
+        const QString internalScratchValue = parser.isSet(internalScratchMib) ?
+            parser.value(internalScratchMib) :
+            settings.value("storage/max_internal_scratch_mib", 1024).toString();
+        bool validInternalScratch = false;
+        const unsigned internalScratch = internalScratchValue.toUInt(&validInternalScratch);
         bool validInflight = false;
         const unsigned inflight = inflightValue.toUInt(&validInflight);
         if (!validTransfer || !validCount || !validObject || transferMib == 0 || transferMib > 256 ||
             count == 0 || count > 1000000 || individualMib == 0 || individualMib > 64 ||
             individualMib > transferMib || !validInflight || inflight < transferMib ||
-            inflight > 4096) {
+            inflight > 4096 || !validInternalScratch || internalScratch == 0 ||
+            internalScratch > 16384) {
             std::cerr << "Invalid synchronization transfer limits\n";
             return 2;
         }
@@ -194,6 +203,8 @@ int main(int argc, char** argv) {
         // Default: errors go to stderr/journald. Optional file logging
         // redirects the C++ service diagnostics, restoring stderr on exit.
         ScopedErrorLog errorLog(logPath);
+        aowis::native::setInternalScratchLimit(
+            static_cast<std::uint64_t>(internalScratch) * 1024ULL * 1024ULL);
         aowis::native::ProjectService service(rootValue.toStdString(), pendingLimit);
         httplib::Server server;
         // Fixed pool; at most 16 waiting connections per worker are queued,

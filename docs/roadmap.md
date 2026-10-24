@@ -130,12 +130,21 @@ upload while checking cross-project rejection, health responsiveness, aborted
 upload cleanup and recovery. This is **not** an aggregate quota on native
 verification/sort scratch, nor a physical disk-space guarantee.
 
+The native internal scratch paths now have a process-wide logical extent
+budget (`[storage] max_internal_scratch_mib`, default 1024 MiB for the HTTP
+server). Export visited sets/sorters and import indices, verification marks,
+trie summaries and reference sorters reserve capacity before writing or
+allocating, and release it when their descriptors close. This is distinct
+from HTTP staging and does not bound other processes, pack growth or offline
+compaction. Fault/ENOSPC stress and physical quota testing are still required.
+
 Still required:
 
 - Test simultaneous large HTTP imports/exports across projects, slow clients,
   disconnects, timeouts and scratch disk exhaustion. Define and enforce
-  request CPU/time budgets and aggregate **native internal** scratch/disk
-  quotas in addition to the new HTTP transfer admission budget and the
+  request CPU/time budgets, cross-process disk quotas and pack-growth budgets
+  in addition to the native internal scratch and HTTP transfer admission
+  budgets and the
   existing per-project pending-operation limits.
 - Provide a coordinated backup/recovery procedure with explicit snapshot
   consistency, verification after restore, and managed offline compaction.

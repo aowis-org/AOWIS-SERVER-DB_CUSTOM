@@ -167,3 +167,8 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 The HTTP server exposes canonical hydraulic network reads/writes, revision-pinned entity queries, atomic edits, revision diffs and validated hydraulic merges when built with the AOWIS model codec. See [HTTP service](docs/native-database-service.md) and [OpenAPI](docs/db-http-api.yaml) for implemented routes and request limits.
 
 The [benchmark guide](docs/benchmark-plan.md) covers canonical hydraulic operations, replication, recovery, and maintenance on the native pack backend.
+
+The HTTP service bounds internal replication/verification temporary file extents
+with `[storage] max_internal_scratch_mib` (default 1024 MiB); this is separate
+from `[sync] max_inflight_mib` and does not replace filesystem quotas. See
+`docs/operations.md` for the scope and recovery procedures.

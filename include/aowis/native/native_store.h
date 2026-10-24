@@ -24,6 +24,14 @@ using Bytes = std::vector<std::uint8_t>;
 using Hash = std::array<std::uint8_t, 32>;
 using Key = std::array<std::uint8_t, 16>;
 
+// Process-wide logical-extent cap for native internal replication/verification
+// scratch files. Zero disables the limit (offline library default). Configure
+// before starting operations; changing while scratch is active is rejected.
+// Does not include HTTP transfer spools, pack growth or compaction copies;
+// not a physical-space guarantee or an interprocess filesystem quota.
+void setInternalScratchLimit(std::uint64_t maximumBytes);
+std::uint64_t internalScratchReservedBytes();
+
 std::string toHex(const Hash& value);
 Hash fromHex(std::string_view value);
 Hash sha256(const Bytes& value);

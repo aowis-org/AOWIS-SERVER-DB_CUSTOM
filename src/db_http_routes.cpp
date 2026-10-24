@@ -118,6 +118,12 @@ Reply storageFailure(const StorageError& error) {
         return errorReply(409, QStringLiteral("conflict"), message);
     case StorageErrorKind::LimitExceeded:
         return errorReply(413, QStringLiteral("limit_exceeded"), message);
+    case StorageErrorKind::Busy: {
+        Reply reply = errorReply(503, QStringLiteral("scratch_busy"),
+                                 QStringLiteral("native internal scratch budget is busy"));
+        reply.retryAfterSeconds = 1;
+        return reply;
+    }
     case StorageErrorKind::Unavailable:
         std::cerr << "AOWIS database unavailable: " << error.what() << '\n';
         return errorReply(503, QStringLiteral("unavailable"),

@@ -44,9 +44,18 @@ service instance and compare expected heads.
 - Scratch files are repository-local and normally unlinked. Space held by an
   open descriptor is freed when that operation/process exits. A restart
   removes the named scratch fallback leftovers on repository open.
-- Internal export/import verification scratch is **not yet included** in the
-  HTTP staging budget. Reserve additional filesystem headroom for sorting,
-  reachability verification, compaction and physical pack growth.
+- Internal export/import verification scratch is bounded independently by
+  `[storage] max_internal_scratch_mib` (default 1024 MiB in the HTTP service,
+  or `--max-internal-scratch-mib`), across all native projects in that server
+  process. The quota tracks the sum of **logical file extents**, including
+  overlapping export-table resize files, and rejects expansions with
+  `Busy` before they write (HTTP 503 `scratch_busy` with `Retry-After: 1`). Accounting is released on close, even
+  after a failed operation. The standalone native library defaults to no cap;
+  callers may set one with `setInternalScratchLimit()` before starting work.
+  It does not include HTTP transfer spools, pack growth, offline compaction,
+  named recovery evidence or other processes using the same filesystem.
+  Keep filesystem headroom and an OS quota if a physical per-volume guarantee
+  is required. A sparse file extent reservation is not a disk-block guarantee.
 
 ## Recovery and maintenance
 
@@ -66,5 +75,5 @@ service instance and compare expected heads.
   commit or merge. Retrying blindly may create duplicate logical work.
 
 Deployment on particular filesystems, power-loss guarantees, automated online
-snapshots, aggregate internal scratch quotas and long-duration fault tests are
+snapshots, multi-process scratch enforcement and long-duration fault tests are
 still Phase 6/7 qualification work.

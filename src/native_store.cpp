@@ -18,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <queue>
+#include <utility>
 #include <sys/mman.h>
 #include <stdexcept>
 #include <unordered_set>
@@ -134,6 +135,87 @@ int createScratchFile(const std::filesystem::path& directory, std::string_view p
     }
     return fd;
 }
+
+// Process-wide accounting for internal native scratch files. Reserve logical
+// file extent BEFORE allocation or writing; account overlapping resize files
+// separately and release on close. This is intentionally distinct from HTTP
+// transfer spools and is not a cross-process filesystem quota.
+struct InternalScratchAccounting {
+    std::mutex mutex;
+    std::uint64_t maximum = 0; // zero disables accounting limit (offline library default)
+    std::uint64_t reserved = 0;
+};
+
+InternalScratchAccounting& scratchAccounting() {
+    static InternalScratchAccounting state;
+    return state;
+}
+
+void writeExact(int fd, const std::uint8_t* bytes, std::size_t size, std::uint64_t offset);
+
+class AccountedScratchFile {
+public:
+    AccountedScratchFile() = default;
+    AccountedScratchFile(const std::filesystem::path& directory, std::string_view purpose)
+        : fd_(createScratchFile(directory, purpose)) {}
+    ~AccountedScratchFile() { reset(); }
+    AccountedScratchFile(const AccountedScratchFile&) = delete;
+    AccountedScratchFile& operator=(const AccountedScratchFile&) = delete;
+    AccountedScratchFile(AccountedScratchFile&& other) noexcept
+        : fd_(std::exchange(other.fd_, -1)), extent_(std::exchange(other.extent_, 0)) {}
+    AccountedScratchFile& operator=(AccountedScratchFile&& other) noexcept {
+        if (this != &other) {
+            reset();
+            this->fd_ = std::exchange(other.fd_, -1);
+            this->extent_ = std::exchange(other.extent_, 0);
+        }
+        return *this;
+    }
+    int fd() const noexcept { return this->fd_; }
+    void reserve(std::uint64_t end) {
+        if (end <= this->extent_) return;
+        const std::uint64_t increase = end - this->extent_;
+        InternalScratchAccounting& accounting = scratchAccounting();
+        const std::lock_guard<std::mutex> lock(accounting.mutex);
+        require(Err::Busy,
+                increase <= std::numeric_limits<std::uint64_t>::max() - accounting.reserved &&
+                (accounting.maximum == 0 ||
+                 (accounting.reserved <= accounting.maximum &&
+                  increase <= accounting.maximum - accounting.reserved)),
+                "native internal scratch limit exceeded");
+        accounting.reserved += increase;
+        this->extent_ = end;
+    }
+    void write(const std::uint8_t* data, std::size_t bytes, std::uint64_t offset) {
+        require(Err::LimitExceeded, offset <= std::numeric_limits<std::uint64_t>::max() - bytes,
+                "native scratch file offset overflow");
+        reserve(offset + bytes);
+        writeExact(this->fd_, data, bytes, offset);
+    }
+    void allocate(std::uint64_t bytes, const char* operation) {
+        require(Err::LimitExceeded, bytes <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()),
+                "native scratch allocation exceeds file size limit");
+        reserve(bytes);
+        const int result = ::posix_fallocate(this->fd_, 0, static_cast<off_t>(bytes));
+        if (result != 0) {
+            errno = result;
+            systemCall(false, operation);
+        }
+    }
+private:
+    void reset() noexcept {
+        if (this->fd_ >= 0) ::close(this->fd_);
+        this->fd_ = -1;
+        if (this->extent_ != 0) {
+            InternalScratchAccounting& accounting = scratchAccounting();
+            const std::lock_guard<std::mutex> lock(accounting.mutex);
+            accounting.reserved -= this->extent_;
+            this->extent_ = 0;
+        }
+    }
+    int fd_ = -1;
+    std::uint64_t extent_ = 0;
+};
 
 // Every open Repository holds a shared lifetime lock. Maintenance requires
 // exclusive ownership: otherwise an existing process could keep writing to
@@ -328,23 +410,16 @@ void writeExact(int fd, const std::uint8_t* bytes, std::size_t size, std::uint64
 class DiskBundleHashes {
 public:
     explicit DiskBundleHashes(const std::filesystem::path& scratch)
-        : scratch_(scratch), fd_(createScratchFile(scratch, "export-visited")) {
-        try {
-            resize(1024);
-        } catch (...) {
-            ::close(this->fd_);
-            this->fd_ = -1;
-            throw;
-        }
+        : scratch_(scratch), fd_(scratch, "export-visited") {
+        resize(1024);
     }
 
-    ~DiskBundleHashes() { if (this->fd_ >= 0) ::close(this->fd_); }
     DiskBundleHashes(const DiskBundleHashes&) = delete;
     DiskBundleHashes& operator=(const DiskBundleHashes&) = delete;
 
     bool insert(const Hash& hash, std::uint64_t maxObjects) {
         require(Err::Internal, !isZero(hash), "zero object in export graph");
-        const std::pair<std::uint64_t, bool> found = slot(hash, this->fd_, this->capacity_);
+        const std::pair<std::uint64_t, bool> found = slot(hash, this->fd_.fd(), this->capacity_);
         if (found.second) return false;
         require(Err::LimitExceeded, maxObjects == 0 || this->count_ < maxObjects,
                 "bundle transfer limit: object count exceeded");
@@ -353,9 +428,9 @@ public:
             require(Err::LimitExceeded, this->capacity_ <= maximumSlots / 2,
                     "temporary export hash table exceeds file size limit");
             resize(this->capacity_ * 2);
-            destination = slot(hash, this->fd_, this->capacity_).first;
+            destination = slot(hash, this->fd_.fd(), this->capacity_).first;
         }
-        writeExact(this->fd_, hash.data(), hash.size(), destination * hash.size());
+        this->fd_.write(hash.data(), hash.size(), destination * hash.size());
         ++this->count_;
         return true;
     }
@@ -369,7 +444,7 @@ public:
         for (std::uint64_t index = 0; index < this->capacity_;) {
             const std::size_t count = static_cast<std::size_t>(
                 std::min<std::uint64_t>(batchHashes, this->capacity_ - index));
-            readExact(this->fd_, reinterpret_cast<std::uint8_t*>(batch.data()),
+            readExact(this->fd_.fd(), reinterpret_cast<std::uint8_t*>(batch.data()),
                       count * sizeof(Hash), index * sizeof(Hash));
             for (std::size_t offset = 0; offset < count; ++offset)
                 if (!isZero(batch[offset])) consume(batch[offset]);
@@ -401,28 +476,22 @@ private:
     void resize(std::uint64_t newCapacity) {
         require(Err::LimitExceeded, newCapacity <= maximumSlots,
                 "temporary export hash table exceeds file size limit");
-        const int replacement = createScratchFile(this->scratch_, "export-visited-grow");
-        try {
-            systemCall(::ftruncate(replacement, static_cast<off_t>(newCapacity * sizeof(Hash))) == 0,
-                       "size export visited table");
-            if (this->capacity_ != 0) {
-                this->forEach([&](const Hash& value) {
-                    const std::uint64_t position = slot(value, replacement, newCapacity).first;
-                    writeExact(replacement, value.data(), value.size(), position * value.size());
-                });
-            }
-        } catch (...) {
-            ::close(replacement);
-            throw;
+        AccountedScratchFile replacement(this->scratch_, "export-visited-grow");
+        replacement.reserve(newCapacity * sizeof(Hash));
+        systemCall(::ftruncate(replacement.fd(), static_cast<off_t>(newCapacity * sizeof(Hash))) == 0,
+                   "size export visited table");
+        if (this->capacity_ != 0) {
+            this->forEach([&](const Hash& value) {
+                const std::uint64_t position = slot(value, replacement.fd(), newCapacity).first;
+                replacement.write(value.data(), value.size(), position * value.size());
+            });
         }
-        const int previous = this->fd_;
-        this->fd_ = replacement;
+        this->fd_ = std::move(replacement);
         this->capacity_ = newCapacity;
-        if (previous >= 0) ::close(previous);
     }
 
     std::filesystem::path scratch_;
-    int fd_ = -1;
+    AccountedScratchFile fd_;
     std::uint64_t capacity_ = 0;
     std::uint64_t count_ = 0;
 };
@@ -438,7 +507,6 @@ public:
         this->buffer_.reserve(chunkHashes);
     }
 
-    ~SortedBundleHashes() { if (this->fd_ >= 0) ::close(this->fd_); }
     SortedBundleHashes(const SortedBundleHashes&) = delete;
     SortedBundleHashes& operator=(const SortedBundleHashes&) = delete;
 
@@ -488,19 +556,19 @@ private:
 
     Hash readRunHash(std::uint64_t ordinal) const {
         Hash hash{};
-        readExact(this->fd_, hash.data(), hash.size(), ordinal * hash.size());
+        readExact(this->fd_.fd(), hash.data(), hash.size(), ordinal * hash.size());
         return hash;
     }
 
     void flush() {
         if (this->buffer_.empty()) return;
         std::sort(this->buffer_.begin(), this->buffer_.end());
-        if (this->fd_ < 0) this->fd_ = createScratchFile(this->scratch_, "export-sort");
+        if (this->fd_.fd() < 0) this->fd_ = AccountedScratchFile(this->scratch_, "export-sort");
         require(Err::LimitExceeded,
                 this->records_ <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max() /
                                      sizeof(Hash)) - this->buffer_.size(),
                 "temporary export sorter exceeds file size limit");
-        writeExact(this->fd_, reinterpret_cast<const std::uint8_t*>(this->buffer_.data()),
+        this->fd_.write(reinterpret_cast<const std::uint8_t*>(this->buffer_.data()),
                    this->buffer_.size() * sizeof(Hash), this->records_ * sizeof(Hash));
         this->runs_.push_back(Run{this->records_, this->buffer_.size(), 0});
         this->records_ += this->buffer_.size();
@@ -508,7 +576,7 @@ private:
     }
 
     std::filesystem::path scratch_;
-    int fd_ = -1;
+    AccountedScratchFile fd_;
     std::uint64_t records_ = 0;
     std::size_t cursor_ = 0;
     bool finalized_ = false;
@@ -534,13 +602,12 @@ public:
         require(Err::LimitExceeded, capacity <= std::numeric_limits<std::size_t>::max() /
                                 bundleLocationRecordBytes,
                 "replication bundle index exceeds addressable memory");
-        this->fd_ = createScratchFile(scratch, "bundle-index");
+        this->fd_ = AccountedScratchFile(scratch, "bundle-index");
     }
 
     ~BundleLocationIndex() {
         if (this->mapped_ != nullptr)
             ::munmap(this->mapped_, this->count_ * bundleLocationRecordBytes);
-        if (this->fd_ >= 0) ::close(this->fd_);
     }
 
     BundleLocationIndex(const BundleLocationIndex&) = delete;
@@ -552,7 +619,7 @@ public:
         std::copy(hash.begin(), hash.end(), record.begin());
         storeU64(record.data() + 32, location.offset);
         storeU64(record.data() + 40, location.size);
-        writeExact(this->fd_, record.data(), record.size(),
+        this->fd_.write(record.data(), record.size(),
                    static_cast<std::uint64_t>(this->count_) * bundleLocationRecordBytes);
         ++this->count_;
     }
@@ -560,7 +627,7 @@ public:
     void finalize() {
         if (this->count_ == 0) return;
         void* const mapped = ::mmap(nullptr, this->count_ * bundleLocationRecordBytes,
-                                    PROT_READ, MAP_SHARED, this->fd_, 0);
+                                    PROT_READ, MAP_SHARED, this->fd_.fd(), 0);
         systemCall(mapped != MAP_FAILED, "map temporary replication index");
         this->mapped_ = mapped;
     }
@@ -602,7 +669,7 @@ public:
     }
 
 private:
-    int fd_ = -1;
+    AccountedScratchFile fd_;
     std::size_t count_ = 0;
     void* mapped_ = nullptr;
 };
@@ -615,33 +682,25 @@ class BundleVisitMarks {
 public:
     BundleVisitMarks(std::size_t count, const std::filesystem::path& scratch) : count_(count) {
         if (count == 0) return;
-        this->fd_ = createScratchFile(scratch, "bundle-marks");
+        this->fd_ = AccountedScratchFile(scratch, "bundle-marks");
         try {
             require(Err::LimitExceeded, count <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()),
                     "verification marks exceed file address limits");
             // ftruncate() can leave sparse pages whose first write would
             // SIGBUS under ENOSPC. Reserve the temporary storage now so a
             // full disk produces a catchable import error before publication.
-            const int allocation = ::posix_fallocate(this->fd_, 0,
-                                                      static_cast<off_t>(count));
-            if (allocation != 0) {
-                errno = allocation;
-                systemCall(false, "reserve temporary verification marks");
-            }
+            this->fd_.allocate(count, "reserve temporary verification marks");
             void* const mapped = ::mmap(nullptr, count, PROT_READ | PROT_WRITE,
-                                        MAP_SHARED, this->fd_, 0);
+                                        MAP_SHARED, this->fd_.fd(), 0);
             systemCall(mapped != MAP_FAILED, "map temporary verification marks");
             this->mapped_ = static_cast<std::uint8_t*>(mapped);
         } catch (...) {
-            ::close(this->fd_);
-            this->fd_ = -1;
             throw;
         }
     }
 
     ~BundleVisitMarks() {
         if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->count_);
-        if (this->fd_ >= 0) ::close(this->fd_);
     }
     BundleVisitMarks(const BundleVisitMarks&) = delete;
     BundleVisitMarks& operator=(const BundleVisitMarks&) = delete;
@@ -661,7 +720,7 @@ public:
     std::uint64_t markedCount() const { return this->marked_; }
 
 private:
-    int fd_ = -1;
+    AccountedScratchFile fd_;
     std::size_t count_ = 0;
     std::uint8_t* mapped_ = nullptr;
     std::uint64_t marked_ = 0;
@@ -691,30 +750,23 @@ public:
                     count <= static_cast<std::uint64_t>(
                         std::numeric_limits<off_t>::max()) / entryBytes,
                 "replication trie summary table exceeds file address limits");
-        this->fd_ = createScratchFile(scratch, "trie-summaries");
+        this->fd_ = AccountedScratchFile(scratch, "trie-summaries");
         try {
             const std::size_t bytes = count * entryBytes;
             // A sparse mapped file can SIGBUS on first access under ENOSPC.
             // Reserve its blocks up front and fail the import cleanly instead.
-            const int allocation = ::posix_fallocate(this->fd_, 0, static_cast<off_t>(bytes));
-            if (allocation != 0) {
-                errno = allocation;
-                systemCall(false, "reserve temporary trie summary table");
-            }
+            this->fd_.allocate(bytes, "reserve temporary trie summary table");
             void* const mapped = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                                        MAP_SHARED, this->fd_, 0);
+                                        MAP_SHARED, this->fd_.fd(), 0);
             systemCall(mapped != MAP_FAILED, "map temporary trie summary table");
             this->mapped_ = static_cast<std::uint8_t*>(mapped);
         } catch (...) {
-            ::close(this->fd_);
-            this->fd_ = -1;
             throw;
         }
     }
 
     ~BundleTreeSummaries() {
         if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->count_ * entryBytes);
-        if (this->fd_ >= 0) ::close(this->fd_);
     }
     BundleTreeSummaries(const BundleTreeSummaries&) = delete;
     BundleTreeSummaries& operator=(const BundleTreeSummaries&) = delete;
@@ -751,7 +803,7 @@ private:
         return this->mapped_ + ordinal * entryBytes + kind * slotBytes;
     }
 
-    int fd_ = -1;
+    AccountedScratchFile fd_;
     std::size_t count_ = 0;
     std::uint8_t* mapped_ = nullptr;
     std::uint64_t saved_ = 0;
@@ -773,7 +825,6 @@ public:
     }
     ~SortedReferenceEdges() {
         if (this->mapped_ != nullptr) ::munmap(this->mapped_, this->records_ * sizeof(Edge));
-        if (this->fd_ >= 0) ::close(this->fd_);
     }
     SortedReferenceEdges(const SortedReferenceEdges&) = delete;
     SortedReferenceEdges& operator=(const SortedReferenceEdges&) = delete;
@@ -798,7 +849,7 @@ public:
         require(Err::LimitExceeded, this->records_ <= std::numeric_limits<std::size_t>::max() / sizeof(Edge),
                 "sorted references exceed addressable memory");
         void* const mapped = ::mmap(nullptr, this->records_ * sizeof(Edge),
-                                    PROT_READ, MAP_SHARED, this->fd_, 0);
+                                    PROT_READ, MAP_SHARED, this->fd_.fd(), 0);
         systemCall(mapped != MAP_FAILED, "map sorted model references");
         this->mapped_ = mapped;
         for (std::size_t index = 0; index < this->runs_.size(); ++index) {
@@ -848,12 +899,12 @@ private:
     void flush() {
         if (this->buffer_.empty()) return;
         std::sort(this->buffer_.begin(), this->buffer_.end());
-        if (this->fd_ < 0) this->fd_ = createScratchFile(this->scratch_, "reference-edges");
+        if (this->fd_.fd() < 0) this->fd_ = AccountedScratchFile(this->scratch_, "reference-edges");
         require(Err::LimitExceeded, this->records_ <= static_cast<std::uint64_t>(
                     std::numeric_limits<off_t>::max() / sizeof(Edge)) -
                     this->buffer_.size(),
                 "temporary model reference sorter exceeds file size limit");
-        writeExact(this->fd_, reinterpret_cast<const std::uint8_t*>(this->buffer_.data()),
+        this->fd_.write(reinterpret_cast<const std::uint8_t*>(this->buffer_.data()),
                    this->buffer_.size() * sizeof(Edge),
                    static_cast<std::uint64_t>(this->records_) * sizeof(Edge));
         this->runs_.push_back(Run{this->records_, this->buffer_.size(), 0});
@@ -862,7 +913,7 @@ private:
     }
 
     std::filesystem::path scratch_;
-    int fd_ = -1;
+    AccountedScratchFile fd_;
     void* mapped_ = nullptr;
     bool finalized_ = false;
     std::size_t records_ = 0;
@@ -1677,6 +1728,20 @@ LogicalVerification verifyLogicalGraph(
     return summary;
 }
 } // namespace
+
+void setInternalScratchLimit(std::uint64_t maximumBytes) {
+    InternalScratchAccounting& accounting = scratchAccounting();
+    const std::lock_guard<std::mutex> lock(accounting.mutex);
+    if (accounting.reserved != 0)
+        throw StorageError(Err::Conflict, "cannot change internal scratch limit while files are active");
+    accounting.maximum = maximumBytes;
+}
+
+std::uint64_t internalScratchReservedBytes() {
+    InternalScratchAccounting& accounting = scratchAccounting();
+    const std::lock_guard<std::mutex> lock(accounting.mutex);
+    return accounting.reserved;
+}
 
 std::string toHex(const Hash& value) {
     constexpr char alphabet[] = "0123456789abcdef";

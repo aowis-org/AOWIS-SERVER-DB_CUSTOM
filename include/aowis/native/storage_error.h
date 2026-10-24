@@ -18,6 +18,7 @@ enum class StorageErrorKind {
     Conflict,          // valid request, but incompatible with the current state
     LimitExceeded,     // a configured or format size/count limit was exceeded
     Unavailable,       // handle unusable until reopened (e.g. after interrupted compaction)
+    Busy,              // temporary process resource budget saturation; retry later
     Corruption,        // stored repository data violates an integrity invariant
     ResourceExhausted, // ENOSPC / EDQUOT
     Io,                // any other operating-system failure
@@ -37,6 +38,7 @@ public:
         case StorageErrorKind::Conflict: return "conflict";
         case StorageErrorKind::LimitExceeded: return "limit_exceeded";
         case StorageErrorKind::Unavailable: return "unavailable";
+        case StorageErrorKind::Busy: return "busy";
         case StorageErrorKind::Corruption: return "corruption";
         case StorageErrorKind::ResourceExhausted: return "resource_exhausted";
         case StorageErrorKind::Io: return "io";

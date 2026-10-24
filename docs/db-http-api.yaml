@@ -62,7 +62,7 @@ paths:
         delta relative to a base ancestor. The binary result is capped by
         configured transfer size, object-count and individual-object limits.
         The response is streamed in chunks from a nameless scratch file in the project repository, which is released when the response ends.
-        A server-wide HTTP transfer staging budget reserves the configured maximum transfer size until the response ends. Saturation returns 503 staging_busy with Retry-After: 1.
+        A server-wide HTTP transfer staging budget reserves the configured maximum transfer size until the response ends. Saturation returns 503 staging_busy with Retry-After: 1. Native internal scratch has a separate process-wide logical extent ceiling (`storage/max_internal_scratch_mib`); when busy it returns 503 scratch_busy with Retry-After: 1.
       parameters:
         - name: base
           in: query

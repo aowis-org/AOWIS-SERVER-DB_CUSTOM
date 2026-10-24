@@ -250,6 +250,47 @@ void testDescriptorTransfer() {
     ::close(pipeEnds[1]);
 }
 
+void testInternalScratchBudget() {
+    TestDirectory directory("quota");
+    Repository source(directory.path / "source");
+    const Hash head = buildModelHistory(source);
+    const std::filesystem::path bundle = directory.path / "baseline.bundle";
+    source.exportBranchBundle("main", bundle);
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "full export leaked internal scratch accounting");
+
+    // Full export needs a 32 KiB initial hash table and additional sorter
+    // storage; reject before writing into an output file.
+    aowis::native::setInternalScratchLimit(1024);
+    ScratchFile output = source.createScratchFile();
+    expectKind(StorageErrorKind::Busy, "full export internal scratch budget",
+               [&] { source.exportBranchBundle("main", output.fd()); });
+    expect(fileSize(output.fd()) == 0, "scratch rejection left a partial bundle");
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "failed export did not release internal scratch accounting");
+
+    Repository target(directory.path / "target");
+    expectKind(StorageErrorKind::Busy, "import internal scratch budget",
+               [&] { (void)target.importBranchBundle(bundle, "main"); });
+    expect(target.listBranches().empty(), "failed import published a branch");
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "failed import did not release internal scratch accounting");
+
+    // Budget can be reconfigured after operations finish. All paths work
+    // again without recreating the repositories or changing stored history.
+    aowis::native::setInternalScratchLimit(256ULL * 1024ULL * 1024ULL);
+    source.exportBranchBundle("main", output.fd());
+    expect(fileSize(output.fd()) > 0, "export did not resume after raising quota");
+    expect(target.importBranchBundle(bundle, "main").head == head,
+           "import did not resume after raising quota");
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "successful imports or exports leaked scratch accounting");
+    target.verifyRepository();
+    expect(aowis::native::internalScratchReservedBytes() == 0,
+           "repository verification leaked internal scratch accounting");
+    aowis::native::setInternalScratchLimit(0);
+}
+
 } // namespace
 
 int main() {
@@ -261,6 +302,7 @@ int main() {
         testUnsafeScratchPath();
         testScratchFileApi();
         testDescriptorTransfer();
+        testInternalScratchBudget();
         std::cout << "Repository scratch storage tests passed\n";
         return 0;
     } catch (const std::exception& error) {
