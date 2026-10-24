@@ -211,8 +211,13 @@ def run_fs(args, workspace, filesystem):
                 if args.cloud_init_seed:
                     remote(args, port, "cloud-init", "status", "--wait", timeout=600)
                 setup_mount(args, port, filesystem, round_index == 0)
+                # The worker lives on the guest OS overlay, NOT the durable
+                # data disk under test. QEMU SIGKILL can discard guest-cached
+                # writes that installed the binary on the previous boot.
+                # Stage it again before *every* recovery verification, so an
+                # unrelated missing test executable cannot obscure the result.
+                install_worker(args, port)
                 if round_index == 0:
-                    install_worker(args, port)
                     state, head = worker_state(args, port, "init")
                     if state != 0:
                         raise RuntimeError("initial repository state is nonzero")

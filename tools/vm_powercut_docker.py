@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shutil
@@ -28,6 +29,21 @@ DEBIAN_CLOUD = "https://cloudfront.debian.net/cdimage/cloud/bookworm/latest"
 def run(command, **kwargs):
     print("+", " ".join(str(value) for value in command), flush=True)
     subprocess.run([str(value) for value in command], check=True, **kwargs)
+
+
+def require_container_identity():
+    """Fail before costly VM setup if Docker's numeric UID has no NSS identity."""
+    uid = os.geteuid()
+    try:
+        user = pwd.getpwuid(uid)
+    except KeyError as error:
+        raise RuntimeError(
+            f"Docker UID {uid} is not present in the container passwd database; "
+            "rebuild the VM qualification image using "
+            "./tools/prepare_vm_powercut_docker.sh"
+        ) from error
+    if not user.pw_name:
+        raise RuntimeError(f"Docker UID {uid} has an empty account name")
 
 
 def checksum_for(text, name=IMAGE_NAME):
@@ -141,6 +157,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.rounds < 1 or args.disk_mib < 256 or args.memory_mib < 512 or args.boot_timeout < 30:
         parser.error("rounds >= 1, disk-mib >= 256, memory-mib >= 512, boot-timeout >= 30")
+    require_container_identity()
     CACHE.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
     image = download_guest(CACHE, refresh=args.refresh_image)

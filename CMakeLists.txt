@@ -120,6 +120,14 @@ if(BUILD_TESTING)
             --helper "${CMAKE_CURRENT_SOURCE_DIR}/tools/vm_powercut_docker.py")
     set_tests_properties(aowis-native-vm-powercut-docker-tests PROPERTIES
         LABELS "aowis;durability" TIMEOUT 30)
+    # Offline orchestration regression: a whole-VM kill may discard the worker
+    # installed on the *guest OS* disk; recovery must restage it each boot.
+    # Mocked QEMU operations never format, boot, or open any real disk.
+    add_test(NAME aowis-native-vm-powercut-runner-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_powercut_runner_tests.py")
+    set_tests_properties(aowis-native-vm-powercut-runner-tests PROPERTIES
+        LABELS "aowis;durability" TIMEOUT 30)
     # Standalone production-library worker for optional, externally orchestrated
     # QEMU power-cut qualification. Not registered in default CTest: it needs a
     # separately provisioned guest OS and disposable virtual disk.

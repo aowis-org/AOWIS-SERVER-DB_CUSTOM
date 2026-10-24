@@ -50,7 +50,12 @@ fi
 
 # Sending only the Dockerfile directory prevents copying large repositories,
 # test fixtures, build products, or submodules to the Docker daemon.
+# Match the host's numeric identity inside Debian's account database. Docker
+# --user alone sets the UID/GID but does not create a passwd entry; OpenSSH
+# ssh-keygen requires getpwuid() to succeed for the running UID.
 "$docker_cmd" build --network "$network" --tag "$image" \
+    --build-arg "AOWIS_HOST_UID=$(id -u)" \
+    --build-arg "AOWIS_HOST_GID=$(id -g)" \
     --file "$project_dir/tools/vm-powercut/Dockerfile" \
     "$project_dir/tools/vm-powercut"
 

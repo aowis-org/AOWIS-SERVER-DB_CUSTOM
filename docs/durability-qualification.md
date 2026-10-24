@@ -71,8 +71,13 @@ runs reuse the verified image and build cache; `--refresh-image` explicitly
 updates the cached guest. A first-time run can download hundreds of megabytes.
 A full run may require gigabytes of scratch space for VM overlays and images.
 
-The Docker container runs with your UID/GID. No production repositories or
-real host block devices are mounted. VM data disks are **new sparse files**.
+The Docker container runs with your UID/GID. Its image build also creates a
+matching account entry when that numeric UID is absent from Debian's
+`/etc/passwd`; this is required by OpenSSH's `ssh-keygen`. Merely passing
+`docker run --user UID:GID` is insufficient because it does not create the
+account. The runner checks this immediately, before downloading an image or
+compiling the worker. No production repositories or real host block devices
+are mounted. VM data disks are **new sparse files**.
 The test refuses unexpected in-guest disk layouts before formatting. On
 failure, isolated evidence (which may include an ephemeral SSH private key)
 is retained under `build-vm-powercut/` for inspection; protect or delete it
@@ -96,6 +101,11 @@ and the AOWIS test directory really resolves to its mount before writing.
 Each round uses the following protocol:
 
 1. Boot Linux, mount the disposable ext4/XFS data disk at `/mnt/aowis-powercut`.
+   Stage the guest-compatible worker executable on **every** boot. Its installation
+   is on the guest OS overlay, not the data disk being tested; unsynchronized OS
+   writes can disappear when QEMU is killed. Re-staging the test executable is
+   separate from recovery of the AOWIS repository and must not repair or
+   reinitialize that repository.
 2. On first boot, initialize the native repository. On later boots, reopen it
    in a new process and run full `Repository::verifyRepository()`.
 3. Start an independent write worker. After every synchronous commit it emits

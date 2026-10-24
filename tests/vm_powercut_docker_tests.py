@@ -25,6 +25,27 @@ def main():
     helper = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(helper)
 
+    # Verify the early check, without Docker or a QEMU guest. The uid mapping
+    # must be correct before downloading a cloud image or compiling a worker.
+    with patch.object(helper.os, "geteuid", return_value=123456), \
+         patch.object(helper.pwd, "getpwuid", side_effect=KeyError):
+        try:
+            helper.require_container_identity()
+        except RuntimeError as error:
+            check("UID 123456" in str(error) and "prepare_vm_powercut_docker.sh" in str(error),
+                  "missing passwd entry did not produce actionable guidance")
+        else:
+            raise AssertionError("unmapped Docker UID was accepted")
+    with patch.object(helper.os, "geteuid", return_value=123456), \
+         patch.object(helper.pwd, "getpwuid", return_value=type("User", (), {"pw_name": "aowis-vm"})()):
+        helper.require_container_identity()
+
+    dockerfile = args.wrapper.resolve().parent / "tools" / "vm-powercut" / "Dockerfile"
+    dockerfile_text = dockerfile.read_text()
+    check("getent passwd" in dockerfile_text and "AOWIS_HOST_UID" in dockerfile_text and
+          "AOWIS_HOST_GID" in dockerfile_text and "/etc/passwd" in dockerfile_text,
+          "container does not provision a passwd entry for the host UID")
+
     digest = "a" * 128
     check(helper.checksum_for(digest + "  ./" + helper.IMAGE_NAME + "\n") == digest,
           "SHA-512 manifest parser rejected valid checksum")
@@ -102,6 +123,11 @@ def main():
         check("/src:ro\n" in data and "/cache\n" in data and "/results\n" in data,
               "missing read-only source mount or disposable cache/results mounts")
         check("--network\nhost\n" in data, "default Docker network must use host DNS")
+        check("--build-arg\nAOWIS_HOST_UID=" + str(os.getuid()) + "\n" in data and
+              "--build-arg\nAOWIS_HOST_GID=" + str(os.getgid()) + "\n" in data,
+              "Docker build must create the current UID/GID account")
+        check("--user\n" + str(os.getuid()) + ":" + str(os.getgid()) + "\n" in data,
+              "Docker run must use the same numeric UID/GID as the image build")
         check("--privileged" not in data and "/dev/sda" not in data,
               "unexpected host disk or privileged mount")
         check(data.count("--network\nhost\n") == 2,
