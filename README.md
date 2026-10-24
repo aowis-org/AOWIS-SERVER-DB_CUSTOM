@@ -104,7 +104,7 @@ verified copy under a new directory name. See [operations](docs/operations.md)
 for commands and limitations. The `aowis-native-offline-backup-tests` CTest
 covers multiple projects, branches, active-user refusal and independent restore.
 
-The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
+The binary repository format is not yet frozen for the first public release. A frozen pre-release pack/bundle fixture protects historical readability in CTest; see [format compatibility](docs/format-compatibility.md). Back up important repositories separately; online backup, physical-controller power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
 
 ## Offline repository synchronization
 
@@ -174,6 +174,7 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [Portable sync](docs/offline-repository-synchronization.md) | Full and incremental bundles |
 | [Benchmarks](docs/benchmark-plan.md) | Reproducible workloads and measurement methodology |
 | [Engineering findings](docs/engineering-findings.md) | Measured storage and replication behavior, design tradeoffs and limitations |
+| [Format compatibility](docs/format-compatibility.md) | Frozen pre-release pack/bundle fixtures and upgrade policy |
 | [Durability qualification](docs/durability-qualification.md) | SIGKILL, ENOSPC, optional QEMU VM power-cut and HTTP soak |
 
 `AOWIS-SERVER-MODEL` is the external model-definition submodule; its

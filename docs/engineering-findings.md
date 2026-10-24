@@ -149,6 +149,23 @@ suites** passed on October 24, 2026 alongside the successful QEMU drill. These f
 and workload*, not guaranteed throughput/latency under arbitrary contention.
 Longer soaks and realistic hardware/slow-client workloads remain necessary.
 
+## Historical format regression baseline
+
+An October 24, 2026 **frozen native pack** is retained with the actual
+published branch references, original revision SHA-256 identities, a complete
+bundle at an early revision, an incremental bundle and two full branch
+bundles. Unlike a producer/consumer test against the same binary, the
+regression uses immutable bytes emitted by an earlier build; it requires
+later binaries to rebuild the derived index, recover historical values,
+import historical transfers, preserve revision identities and reject a
+corrupted bundle. This protects a concrete pre-release compatibility
+baseline, not every legacy storage implementation or a public long-term
+format guarantee. See [format compatibility](format-compatibility.md).
+
+The operator subsequently reported **41/41 Debug and Release CTest tests
+passing**, and the QEMU evidence checker validated all eight ext4/XFS cuts.
+Both are a later baseline than the earlier 40-test run.
+
 ## What these results do not prove
 
 The work does not yet establish durability after physical power loss, formal

@@ -20,7 +20,7 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 24, 2026, **40/40 CTest
+and a whole-service offline restore drill. On October 24, 2026, **41/41 CTest
 suites passed in both Debug and Release**, and an opt-in 300-second HTTP
 soak passed (7,516 imports and 7,516 exports). Separately, an **actual QEMU/KVM
 Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
@@ -67,6 +67,9 @@ certification; see [engineering findings](engineering-findings.md).
   interleavings. No known critical integrity regression may remain open.
 - Define supported platforms/filesystems and explicitly freeze the pack,
   sidecar and portable bundle compatibility policy before a stable release.
+  A frozen pre-release pack and bundle reference fixture now protects basic
+  read/import compatibility across builds; see
+  [format compatibility](format-compatibility.md).
 - Publish a measurable resource envelope, backup/restore procedure, version
   migration guide and operational troubleshooting guide. Validate field
   deployment/upgrade on disposable representative datasets.

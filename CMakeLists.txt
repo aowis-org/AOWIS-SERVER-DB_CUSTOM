@@ -57,6 +57,17 @@ add_executable(aowis-native-model-benchmark benchmarks/model_network_benchmark.c
 target_link_libraries(aowis-native-model-benchmark PRIVATE aowis-native-store)
 
 if(BUILD_TESTING)
+    # Frozen pre-release bytes built by a previous native engine, not generated
+    # by the executable under test. Reopen the historical pack and import its
+    # full and incremental bundles before changing stored format encodings.
+    add_executable(aowis-native-format-compatibility-tests
+        tests/native_format_compatibility_tests.cpp)
+    target_link_libraries(aowis-native-format-compatibility-tests PRIVATE aowis-native-store)
+    add_test(NAME aowis-native-format-compatibility-tests
+        COMMAND aowis-native-format-compatibility-tests
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/pack-20261024")
+    set_tests_properties(aowis-native-format-compatibility-tests PROPERTIES
+        LABELS "aowis;compatibility" TIMEOUT 90)
     add_executable(aowis-native-transfer-staging-budget-tests
         tests/native_transfer_staging_budget_tests.cpp)
     target_include_directories(aowis-native-transfer-staging-budget-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -443,4 +454,20 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
     message(STATUS "Native multi-project HTTP server enabled (cpp-httplib)")
 else()
     message(STATUS "Native multi-project HTTP server disabled by configuration")
+endif()
+
+# Keep the aggregate test build in sync with registered CTest executables.
+# compile_linux_tests.sh builds this target before invoking CTest; an omitted
+# dependency would otherwise leave a registered test as "Not Run". The explicit
+# dependencies above still cover helper executables invoked by script tests.
+if(BUILD_TESTING)
+    get_property(AOWIS_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
+    foreach(AOWIS_REGISTERED_TEST IN LISTS AOWIS_REGISTERED_TESTS)
+        if(TARGET "${AOWIS_REGISTERED_TEST}")
+            get_target_property(AOWIS_TEST_TARGET_TYPE "${AOWIS_REGISTERED_TEST}" TYPE)
+            if(AOWIS_TEST_TARGET_TYPE STREQUAL "EXECUTABLE")
+                add_dependencies(aowis-db-tests "${AOWIS_REGISTERED_TEST}")
+            endif()
+        endif()
+    endforeach()
 endif()

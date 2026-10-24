@@ -59,7 +59,7 @@ portable bundle before upgrading, then import into a new pack repository.
 - Repository operations coordinate using POSIX locks. Commits preflight references and optimistic expected-head checks under the same lock as branch publication.
 - Newly encoded immutable objects are appended, flushed with `fsync`, and only then does the engine atomically publish a synced branch ref. An interrupted commit may leave unreachable objects but should not expose an incompletely flushed revision through a published ref on supported filesystems.
 - Offline compaction retains **all** objects reachable from every branch's revision ancestry (including merge parents and both Merkle indexes). The replacement generation is synchronized before the active-generation pointer is published. If compaction fails after switching this pointer, the in-memory repository handle is invalidated and must be reopened before any further commit; continuing to write the old pack is prohibited.
-- Compaction requires exclusive lifetime access; do not compact a live service repository. Deterministic process-crash and simulated write-failure recovery tests cover the pack and offline backup/restore; device-level power-loss validation and online maintenance remain outstanding; coordinated offline backup/restore is implemented.
+- Compaction requires exclusive lifetime access; do not compact a live service repository. Deterministic process-crash and simulated write-failure recovery tests cover the pack and offline backup/restore. An operator-run QEMU/KVM drill passed four guest-cache-loss cuts each on ext4 and XFS; physical-controller power-loss qualification and online maintenance remain outstanding. Coordinated offline backup/restore is implemented.
 
 ## Concurrency and physical limits
 
@@ -76,4 +76,4 @@ Portable `.aowbundle` files contain a complete reachable branch graph or a delta
 - `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
 - Implemented `aowis-server-db` HTTP route handlers — thin REST adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
 
-The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [roadmap](roadmap.md).
+The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [format compatibility policy](format-compatibility.md) and [roadmap](roadmap.md).
