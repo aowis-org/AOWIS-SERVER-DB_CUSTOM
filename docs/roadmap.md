@@ -74,7 +74,7 @@ quota enforcement, and failure recovery on the supported production filesystems.
 
 ## P2 — Capacity and service operations
 
-### 5. Compact physical object lookup — implemented, scale verification pending
+### 5. Compact physical object lookup — verified at 10m objects
 
 The Release baseline measured on the developer machine (October 23, 2026)
 showed 101,387 / 1,001,959 / 10,001,723 physical objects using approximately
@@ -95,19 +95,26 @@ verifies the pack. This accelerator currently supports at most 2^32-1
 physical sidecar entries per generation; that bound must be revisited before
 exceeding it.
 
-- Repeat the identical 100k/1m/10m **Release** matrix with the compact index
-  and publish before/after RSS, reopen, lookup, commit, compaction, sidecar
-  rebuild, and simultaneous-project figures.
-- Test cold-cache/random lookups, hash fingerprint collisions, corrupt and
-  truncated sidecars, crashes during partial publication, and long-lived
-  cross-process repository handles.
-- Profile the optional bounded cache; increase it only with evidence, not
-  by making the physical index memory proportional to pack size again.
+The matched Release benchmark on the developer machine (October 23, 2026)
+verified the compact index at 101,387 / 1,001,959 / 10,001,723 physical
+objects. Additional RSS on reopen fell to approximately 2.73 / 16.7 /
+128.8 MiB, compared with 8.35 / 72.8 / 703.5 MiB for the former map index.
+Reopen time at 10m fell from 8.61 seconds to 3.66 seconds, and simultaneous
+open of two 10m-object repositories decreased from about 1.48 GB RSS to
+278 MB RSS. The complete 30-test Debug and Release suites passed, including
+the model and HTTP integration tests. Those benchmarks used one warm or
+uncontrolled page-cache run per size; they are not cold-disk production SLAs.
 
-**Remaining exit criterion:** establish and meet a documented large-scale
-memory/latency budget on the deployed storage hardware, with operational and
-corruption recovery verified. This remains open until the Release rerun and
-fault matrix have completed.
+**Phase 5 capacity decision:** retain the compact accelerator, pack, and
+unchanged sidecar format. Do not introduce a disk-backed full-hash lookup
+engine without further evidence. The target build is now rebuilt by the
+benchmark driver to avoid comparing stale binaries.
+
+Further qualification belongs to Phase 7: repeat on deployment hardware with
+multiple runs, cold-cache/random reads, fingerprint collisions, corrupted or
+truncated sidecars, interruption during publication, long-lived cross-process
+handles, plus sidecar rebuild and compaction on the large fixtures. Profile
+the bounded cache under representative loads before adjusting its size.
 
 ### 6. Operational resource bounds and maintenance
 

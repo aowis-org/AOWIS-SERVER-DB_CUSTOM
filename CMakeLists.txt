@@ -62,6 +62,11 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_native_index.py"
             --binary "$<TARGET_FILE:aowis-native-index-scaling-benchmark>" --smoke)
     set_tests_properties(aowis-native-index-scaling-smoke PROPERTIES LABELS "aowis")
+    add_test(NAME aowis-native-index-benchmark-build-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/index_benchmark_build_tests.py"
+            --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_native_index.py")
+    set_tests_properties(aowis-native-index-benchmark-build-tests PROPERTIES LABELS "aowis")
     # Packaging must include the working-tree files of every Git submodule,
     # including recursive submodules. The test creates disposable Git repos.
     find_program(AOWIS_TEST_GIT_EXECUTABLE git)

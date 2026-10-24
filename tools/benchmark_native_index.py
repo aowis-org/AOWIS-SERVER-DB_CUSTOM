@@ -14,6 +14,45 @@ import time
 from pathlib import Path
 
 
+def rebuild_selected_release_benchmark(binary):
+    """Build the *selected* benchmark target, never a different build tree.
+
+    This avoids silently benchmarking a stale build-linux-tests-release binary
+    after somebody rebuilt only build-linux (or vice versa).
+    """
+    if binary.name != "aowis-native-index-scaling-benchmark":
+        raise RuntimeError(f"unexpected physical-index benchmark executable: {binary.name}")
+    build_dir = binary.parent
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.is_file():
+        raise RuntimeError(f"{build_dir} is not a configured CMake build directory; "
+                           "configure a Release build before benchmarking")
+    values = {}
+    for line in cache.read_text(encoding="utf-8").splitlines():
+        if line.startswith("//") or line.startswith("#") or "=" not in line:
+            continue
+        name_type, value = line.split("=", 1)
+        if ":" in name_type:
+            name, _kind = name_type.split(":", 1)
+            values[name] = value
+    project = Path(__file__).resolve().parent.parent
+    source = values.get("CMAKE_HOME_DIRECTORY", "")
+    if not source or Path(source).resolve() != project:
+        raise RuntimeError(f"{build_dir} was not configured from this source tree: {source!r}")
+    if values.get("CMAKE_BUILD_TYPE") != "Release":
+        raise RuntimeError(f"{build_dir} is not configured as Release "
+                           f"(found {values.get('CMAKE_BUILD_TYPE')!r}); "
+                           "benchmark the Release build directory")
+    command = ["cmake", "--build", str(build_dir), "--target", binary.name]
+    print(f"Checking selected Release benchmark in {build_dir}", file=sys.stderr, flush=True)
+    try:
+        subprocess.run(command, check=True, stdout=sys.stderr, stderr=sys.stderr)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"could not rebuild the selected benchmark: {error}") from error
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError(f"benchmark executable missing after build: {binary}")
+
+
 def parse_metrics(output):
     result = {}
     for line in output.splitlines():
@@ -207,6 +246,9 @@ def main():
                         help="independent complete fixture/phase repetitions")
     parser.add_argument("--smoke", action="store_true",
                         help="quick fixture and invariants test instead of capacity run")
+    parser.add_argument("--no-build", action="store_true",
+                        help="explicitly skip automatic Release target rebuilding "
+                             "(only for comparing previously built binaries)")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, handle_termination)
     if args.smoke:
@@ -217,7 +259,12 @@ def main():
     if not 1 <= args.batch <= args.keys <= 1000000 or args.reads <= 0 or \
             args.write_rounds <= 0 or not 0 <= args.multi_projects <= 8 or not 1 <= args.repeats <= 50:
         parser.error("invalid keys/batch/reads/write-rounds/multi-projects")
-    binary = args.binary.resolve(strict=True)
+    binary = args.binary.expanduser().absolute()
+    # CTest builds the smoke-test executable before running it; invoking Ninja
+    # recursively from CTest would be unnecessary and can compete with tests.
+    if not args.smoke and not args.no_build:
+        rebuild_selected_release_benchmark(binary)
+    binary = binary.resolve(strict=True)
     if not binary.is_file():
         parser.error("benchmark binary is not a file")
     if args.work_root is not None and not args.work_root.is_dir():

@@ -64,17 +64,27 @@ production guarantees.
 
 `aowis-native-index-scaling-benchmark` and `tools/benchmark_native_index.py`
 measure the **existing** SHA-256-to-pack-location index. They do not
-silently swap in a second storage engine. Use the optimized Release binary:
+silently swap in a second storage engine. Use the optimized Release binary.
+The driver **automatically rebuilds the exact Release target supplied in
+`--binary`** before generating fixtures; it rejects Debug or foreign CMake
+build trees. `./compile_linux.sh` builds `build-linux`, **not**
+`build-linux-tests-release`. To do an explicit clean Release test build first,
+run `./compile_linux_tests.sh --release`. The example below uses `build-linux`
+so it also works after `./compile_linux.sh`:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-index-capacity.XXXXXXXX)"
 python3 tools/benchmark_native_index.py \
-  --binary ./build-linux-tests-release/aowis-native-index-scaling-benchmark \
+  --binary ./build-linux/aowis-native-index-scaling-benchmark \
   --sizes 100000,1000000,10000000 \
   --keys 4096 --batch 1024 --reads 1000 --write-rounds 5 \
   --multi-projects 2 --work-root "$run_root" \
   --output "$run_root/index-capacity.csv"
 ```
+
+For deliberately comparing already-built historical binaries, `--no-build`
+skips the automatic rebuild; use it only when that is intentional. Smoke tests
+run as part of CTest and do not invoke a nested CMake build.
 
 For a quick validation of the benchmark itself, run
 `ctest --test-dir build-linux-tests-release -R aowis-native-index-scaling-smoke

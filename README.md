@@ -53,6 +53,8 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 ./git_submodule_init.sh          # on initial checkout, if the Model submodule is not initialized
 ./compile_linux_tests.sh --both # Debug and Release CTest suites
 ./compile_linux.sh              # optimized Release binaries and benchmarks
+# tools/benchmark_native_index.py rebuilds the exact Release target named by --binary.
+# build-linux and build-linux-tests-release are distinct; do not mix their paths.
 ```
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
