@@ -33,6 +33,47 @@ A successful verification is necessary but not sufficient proof of a fully
 recoverable backup. Periodically perform full restore drills using an isolated
 service instance and compare expected heads.
 
+### Verified offline backup and restore utility
+
+`tools/offline_backup.py` provides a **cold**, whole-service backup/restore
+workflow for Linux. Stop the server and every direct-library user first. It
+refuses a live catalogue or any independently open repository using the
+existing lifetime locks; a filesystem snapshot is **not** created online.
+Always choose a new, absent destination directory, on a filesystem with enough
+space for the full root plus verification temporary files:
+
+```bash
+./compile_linux.sh
+python3 tools/offline_backup.py backup /path/to/aowis-db-data /backup/new-snapshot \
+  --verify-binary ./build-linux/aowis-native-verify
+python3 tools/offline_backup.py restore /backup/new-snapshot /path/to/new-aowis-db-data \
+  --verify-binary ./build-linux/aowis-native-verify
+python3 tools/offline_backup.py verify /path/to/new-aowis-db-data \
+  --verify-binary ./build-linux/aowis-native-verify
+```
+
+The utility locks the catalogue and **all** repository lifetime locks, copies
+the complete storage root to a private sibling directory, compares project
+metadata and every published branch head, verifies each copied repository with
+`aowis-native-verify --full`, synchronizes files/directories, and atomically
+publishes the destination directory with **no overwrite**. It refuses symbolic
+links and nonregular entries in the source tree; inspect such entries rather
+than blindly following them. `verify` likewise verifies an isolated private
+copy while holding source locks, rather than trying to open an exclusively
+locked source repository. An interrupted run may leave a hidden
+`.aowis-offline-copy-*` staging directory. Only final destinations that
+were successfully published should be treated as backups; clean old staging
+folders after ensuring no operation is running.
+
+The restore destination is a **new** root, not a merge with live data. Before
+switching your service over, compare the expected project IDs and branch heads,
+check representative hydraulic reads, and keep the original intact until the
+restored service has been validated. Verification covers native physical and
+logical consistency, **not** domain-level hydraulic semantics. Backup staging
+requires free space and is subject to normal OS filesystem limits, not the
+native engine's scratch budget. This is not an incremental or online backup
+solution and does not replace a separate physically isolated backup policy.
+
 ## Full disk or scratch exhaustion
 
 - HTTP 503 `staging_busy` means the **configured aggregate HTTP transfer

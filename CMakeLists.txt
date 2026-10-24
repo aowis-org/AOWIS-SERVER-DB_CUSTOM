@@ -117,6 +117,16 @@ if(BUILD_TESTING)
     add_test(NAME aowis-native-project-service-tests COMMAND aowis-native-project-service-tests)
     set_tests_properties(aowis-native-project-service-tests PROPERTIES LABELS "aowis")
     find_package(Threads REQUIRED)
+    # Full-service cold backup/restore drill, including independent repository locks.
+    add_executable(aowis-native-offline-backup-tests tests/native_offline_backup_tests.cpp)
+    target_link_libraries(aowis-native-offline-backup-tests PRIVATE aowis-native-project-service)
+    add_dependencies(aowis-native-offline-backup-tests aowis-native-verify)
+    add_test(NAME aowis-native-offline-backup-tests
+        COMMAND aowis-native-offline-backup-tests
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/offline_backup.py"
+            "$<TARGET_FILE:aowis-native-verify>")
+    set_tests_properties(aowis-native-offline-backup-tests PROPERTIES LABELS "aowis")
     add_executable(aowis-native-project-concurrency-tests tests/project_concurrency_tests.cpp)
     target_link_libraries(aowis-native-project-concurrency-tests PRIVATE aowis-native-project-service Threads::Threads)
     add_test(NAME aowis-native-project-concurrency-tests COMMAND aowis-native-project-concurrency-tests)
@@ -212,7 +222,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-db-tests DEPENDS aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

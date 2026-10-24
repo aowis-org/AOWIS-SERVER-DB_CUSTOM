@@ -97,6 +97,13 @@ Each repository uses an append-only content pack and rebuildable index. Each mod
 
 `aowis-native-verify` now performs complete **native storage** verification by default: physical objects, published branch/revision ancestry, canonical Merkle trees, and exact model-to-reverse-reference consistency. The optional `--physical` mode checks only physical stored objects. Bundle imports reuse the same logical validator, rejecting malformed history before publication. This does not yet check application-specific hydraulic semantics. See [repository verification](docs/repository-verification.md). Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md).
 
+For whole-service **offline** backups and verified restores, use
+`tools/offline_backup.py` with a freshly built `aowis-native-verify`. The
+utility refuses active server/repository handles and publishes only a complete
+verified copy under a new directory name. See [operations](docs/operations.md)
+for commands and limitations. The `aowis-native-offline-backup-tests` CTest
+covers multiple projects, branches, active-user refusal and independent restore.
+
 The binary repository format is not yet frozen for the first public release. Back up important repositories separately; online backup, power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
 
 ## Offline repository synchronization

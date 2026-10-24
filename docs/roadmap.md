@@ -168,8 +168,13 @@ Still required:
   in addition to the native internal scratch and HTTP transfer admission
   budgets and the
   existing per-project pending-operation limits.
-- Provide a coordinated backup/recovery procedure with explicit snapshot
-  consistency, verification after restore, and managed offline compaction.
+- Extend coordinated cold backup/restore qualification beyond the new
+  `tools/offline_backup.py` tool and `aowis-native-offline-backup-tests`:
+  larger multi-project roots, cross-volume replication and disaster drills.
+  The current workflow holds catalogue and per-repository lifetime locks,
+  verifies all copied repositories, preserves published head identities and
+  atomically publishes a new destination without replacing existing data.
+  Online filesystem snapshots and managed offline compaction are still future work.
   Project delete/rename and online maintenance remain optional follow-on API
   work, subject to actual product needs.
 - Write operator runbooks for full disks, recovery-tail evidence, unexpected
