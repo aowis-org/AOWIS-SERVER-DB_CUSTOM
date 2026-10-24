@@ -183,6 +183,21 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/offline_backup.py"
             "$<TARGET_FILE:aowis-native-verify>")
     set_tests_properties(aowis-native-offline-backup-tests PROPERTIES LABELS "aowis")
+    # Complete offline server-root move/upgrade: frozen earlier-build packs,
+    # divergent branches, multi-megabyte current data and a second restore
+    # after writing under the newer executable.
+    add_executable(aowis-native-upgrade-restore-tests
+        tests/native_upgrade_restore_tests.cpp)
+    target_link_libraries(aowis-native-upgrade-restore-tests PRIVATE aowis-native-project-service)
+    add_dependencies(aowis-native-upgrade-restore-tests aowis-native-verify)
+    add_test(NAME aowis-native-upgrade-restore-tests
+        COMMAND aowis-native-upgrade-restore-tests
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/offline_backup.py"
+            "$<TARGET_FILE:aowis-native-verify>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/pack-20261024")
+    set_tests_properties(aowis-native-upgrade-restore-tests PROPERTIES
+        LABELS "aowis;compatibility" TIMEOUT 180)
     add_executable(aowis-native-project-concurrency-tests tests/project_concurrency_tests.cpp)
     target_link_libraries(aowis-native-project-concurrency-tests PRIVATE aowis-native-project-service Threads::Threads)
     add_test(NAME aowis-native-project-concurrency-tests COMMAND aowis-native-project-concurrency-tests)

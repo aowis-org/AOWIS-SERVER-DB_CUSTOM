@@ -74,6 +74,40 @@ requires free space and is subject to normal OS filesystem limits, not the
 native engine's scratch budget. This is not an incremental or online backup
 solution and does not replace a separate physically isolated backup policy.
 
+## Upgrading or relocating a complete service root
+
+An engine upgrade is a **cold, whole-root** operation, not an in-place rewrite
+of pack objects. For a new executable or a change of host/filesystem:
+
+1. Stop the HTTP service and every direct C++ user. Record the current binary
+   version, project catalogue (IDs and names), **all branch heads**, and a few
+   representative historical reads. Take a verified offline backup with
+   `tools/offline_backup.py`; store it separately from the live root.
+2. Restore that backup into a **new, absent directory** using the prospective
+   build's `aowis-native-verify`. This verifies its ability to read the old
+   persisted bytes; never try an upgrade on the sole source copy.
+3. Point a disposable instance of the prospective build at the restored root.
+   Check project identities, branch names, revision ancestry, model payloads
+   and historical reads, not merely that the service starts. Ensure all
+   repository handles close before an offline verification or backup command.
+4. Make a representative new commit on the restored root, reopen it and verify
+   historical reads again. Back up and restore **that newly written state** to
+   another new directory to confirm the new format remains recoverable.
+5. Only after validation, switch the service to the new root, retaining the
+   original untouched until a rollback window has expired. A rollback to an
+   older executable is **not** guaranteed to read commits made by a newer
+   executable; restore the original verified backup rather than pointing an
+   older binary at a root modified by the newer version.
+
+The `aowis-native-upgrade-restore-tests` CTest automates an isolated version of
+this drill with four projects, two immutable earlier-build pack specimens,
+divergent branches, more than 1 MiB of current-format model values, sidecar
+reconstruction and a second post-write backup/restore. It checks all project
+IDs, branch histories and payloads. The test demonstrates *this* historical
+format is readable by the present build; it does not exercise a separately
+running old binary, an actual filesystem migration, online upgrades or an
+unbounded scale of projects.
+
 ## Full disk or scratch exhaustion
 
 - HTTP 503 `staging_busy` means the **configured aggregate HTTP transfer

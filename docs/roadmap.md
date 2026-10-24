@@ -20,7 +20,7 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 24, 2026, **41/41 CTest
+and a whole-service offline restore drill. On October 24, 2026, **42/42 CTest
 suites passed in both Debug and Release**, and an opt-in 300-second HTTP
 soak passed (7,516 imports and 7,516 exports). Separately, an **actual QEMU/KVM
 Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
@@ -54,9 +54,10 @@ certification; see [engineering findings](engineering-findings.md).
   limits; profile disk space, wall time and cancellation behavior. The
   incremental path still collects a sorted in-memory set for emitted delta
   hashes; bound it if measurements show an actual need.
-- Extend offline backup/restore drills to larger multi-project roots and
-  storage migrations; online snapshots and online compaction are not yet
-  implemented. Define retention, restore and orphan-scratch cleanup policy.
+- Extend the existing historical-format, four-project cold-upgrade/restore
+  drill to larger representative service roots and actual cross-host/storage
+  migrations. Online snapshots and online compaction are not implemented.
+  Define retention, restore and orphan-scratch cleanup policy.
 - Evaluate optional administrative project deletion/renaming, preview-only
   hydraulic merges and network enumeration only when demanded by clients.
 
@@ -67,8 +68,8 @@ certification; see [engineering findings](engineering-findings.md).
   interleavings. No known critical integrity regression may remain open.
 - Define supported platforms/filesystems and explicitly freeze the pack,
   sidecar and portable bundle compatibility policy before a stable release.
-  A frozen pre-release pack and bundle reference fixture now protects basic
-  read/import compatibility across builds; see
+  Frozen pre-release pack/bundle fixtures and a multi-project restore/upgrade
+  drill protect historical read/import and new-write compatibility; see
   [format compatibility](format-compatibility.md).
 - Publish a measurable resource envelope, backup/restore procedure, version
   migration guide and operational troubleshooting guide. Validate field

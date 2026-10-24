@@ -162,9 +162,23 @@ corrupted bundle. This protects a concrete pre-release compatibility
 baseline, not every legacy storage implementation or a public long-term
 format guarantee. See [format compatibility](format-compatibility.md).
 
-The operator subsequently reported **41/41 Debug and Release CTest tests
-passing**, and the QEMU evidence checker validated all eight ext4/XFS cuts.
-Both are a later baseline than the earlier 40-test run.
+The operator subsequently reported **42/42 Debug and Release CTest tests
+passing**, including the frozen-format regression, and the QEMU evidence
+checker validated all eight ext4/XFS cuts. These are later baselines than the
+earlier 40-test run.
+
+## Service-root restore and format upgrade qualification
+
+The regression harness also has a four-project offline upgrade/restore drill:
+it installs two frozen earlier-build pack repositories under current catalogue
+identities, leaves their derived indexes absent, and mixes them with two
+independently written repositories (one with over 1 MiB of user data). It
+performs verified offline backup, independent restore, checks project IDs,
+branch histories and payloads, writes into a restored historical pack, then
+performs a second verified backup and restore. The original pre-upgrade root
+is not rewritten by this test. This guards real migration workflows against
+cross-project omissions; it is **not** evidence that an older executable can
+read new writes or that all historic experimental formats are supported.
 
 ## What these results do not prove
 

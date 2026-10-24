@@ -103,6 +103,9 @@ utility refuses active server/repository handles and publishes only a complete
 verified copy under a new directory name. See [operations](docs/operations.md)
 for commands and limitations. The `aowis-native-offline-backup-tests` CTest
 covers multiple projects, branches, active-user refusal and independent restore.
+The `aowis-native-upgrade-restore-tests` drill additionally checks a complete
+cold relocation containing frozen historical packs, divergent branches and
+post-upgrade writes, including a second backup/restore cycle.
 
 The binary repository format is not yet frozen for the first public release. A frozen pre-release pack/bundle fixture protects historical readability in CTest; see [format compatibility](docs/format-compatibility.md). Back up important repositories separately; online backup, physical-controller power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
 

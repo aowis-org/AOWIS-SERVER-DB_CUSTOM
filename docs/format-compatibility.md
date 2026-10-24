@@ -56,6 +56,25 @@ ctest --test-dir build-linux-tests-release \
 The test runs as part of normal Debug/Release CTest. It needs neither Qt,
 Docker nor QEMU and does not contact any remote service.
 
+## Whole-service upgrade and restoration drill
+
+The `aowis-native-upgrade-restore-tests` regression composes the frozen
+repository fixture with the actual multi-project catalogue and offline
+backup/restore utility. Two out of four service projects contain unmodified
+older-build pack bytes (with the derived object index omitted); the other
+projects have independently edited branches, including more than 1 MiB of
+current-format data. The test creates a cold backup without mutating the
+original index, verifies the copied index was rebuilt, restores to a new root
+and compares **every project identity, branch head, first-parent history and
+branch payload**. It also checks historic reads, writes a new revision into a
+restored historical pack and repeats backup/restore after that write.
+
+This is a reproducible compatibility and deployment-regression gate, not a
+promise of format downgrade, transparent online migration or preservation of
+application-level model semantics. The source reference bytes remain fixed;
+operator migration still requires a separately verified backup and a planned
+rollback window (see [operations](operations.md)).
+
 ## Upgrades and format changes
 
 1. **Back up** and independently verify important service roots before
