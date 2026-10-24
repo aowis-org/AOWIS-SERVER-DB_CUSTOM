@@ -115,11 +115,26 @@ internal native scratch have separate budgets; see [operations](operations.md).
   multi-project root, independently verifies its repositories and publishes
   a new backup directory atomically. Online backup is not implemented.
 
-The Docker-assisted QEMU tool runs **actual QEMU** and kills whole VMs to lose
-guest RAM while preserving disposable ext4/XFS disk images. Merely passing
-the QEMU-worker CTest does **not** execute the VM drill. Even a passed VM drill
-cannot establish behavior of a real SSD/controller when host power disappears.
-See [durability qualification](durability-qualification.md).
+**QEMU guest-cache-loss evidence (October 24, 2026):** A Debian 12 Linux
+cloud guest running under QEMU/KVM with disposable virtio data disks completed
+**four abrupt whole-VM kills on ext4 and four on XFS**. After each cut, the
+same disk was remounted and the production native repository was fully
+verified in a new process. Every acknowledged branch revision survived. In
+three of four rounds on each filesystem, one additional complete but
+unacknowledged revision was recovered; this is permitted because publication
+can precede the client's acknowledgement. Both filesystems finished at
+sequence **7**, and each independently reported `result: passed`. The operator's
+JSON report was preserved outside the ephemeral VM and contains per-round
+revision hashes. The run used guest-cache loss (`qemu-system-x86_64` killed by
+`SIGKILL`, virtual disks with `cache=none`), **not power loss to the host SSD or
+controller**. Results are specific to the observed guest, filesystem and write
+schedule; a four-round run is not exhaustive crash-interleaving coverage.
+
+Merely passing the QEMU-worker CTest does **not** execute the VM drill. The
+optional offline evidence checker verifies the report's consistency and can
+record hashes of supplied CTest and HTTP-soak logs; it does not execute any
+workload or authenticate the operator's evidence. See [durability
+qualification](durability-qualification.md).
 
 ## Service concurrency: observed load
 
@@ -129,7 +144,8 @@ Linux Release test on October 24, 2026 completed a five-minute soak over
 **three projects**, with **7,516 successful imports and 7,516 exports**, zero
 admission-limit 503 responses, and **12 ms worst health request latency**
 reported by the harness. The full **38/38 Debug and Release CTest suites**
-passed on that source snapshot. These figures describe *that configuration
+passed on that soak-test source snapshot; subsequent **40/40 Debug and Release
+suites** passed on October 24, 2026 alongside the successful QEMU drill. These figures describe *that configuration
 and workload*, not guaranteed throughput/latency under arbitrary contention.
 Longer soaks and realistic hardware/slow-client workloads remain necessary.
 

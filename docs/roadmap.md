@@ -20,16 +20,20 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On the October 24, 2026 developer
-snapshot, **38/38 CTest suites passed in Debug and Release**, and an opt-in
-300-second HTTP soak passed. The QEMU-free worker smoke test is among these
-38; **the actual QEMU ext4/XFS drill has not yet been reported as run**.
+and a whole-service offline restore drill. On October 24, 2026, **40/40 CTest
+suites passed in both Debug and Release**, and an opt-in 300-second HTTP
+soak passed (7,516 imports and 7,516 exports). Separately, an **actual QEMU/KVM
+Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
+full repository verification and no acknowledged commit lost. These are
+operator-reported measurements, not automatic CI or hardware-level durability
+certification; see [engineering findings](engineering-findings.md).
 
 ## Durability and failure qualification
 
-- Execute [`qualify_vm_powercut_docker.sh`](durability-qualification.md) on
-  disposable ext4 and XFS virtual disks, with repeated acknowledged and
-  in-flight commits. Archive guest/kernel/QEMU versions and JSON reports.
+- Repeat the now-proven QEMU ext4/XFS guest-cache-loss drill with many more
+  rounds, wider commit timings, new guest/kernel/QEMU versions, and automated
+  retention of machine, disk-cache and JSON evidence. Four rounds per
+  filesystem establish a useful initial result, not exhaustive coverage.
 - Repeat on deployment filesystems, hardware and storage stacks. VM-kill
   tests do not simulate loss of the host/controller's volatile cache; document
   exactly which guarantees are supported by the target filesystem and device.

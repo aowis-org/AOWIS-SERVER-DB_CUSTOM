@@ -5,6 +5,62 @@ normal unit tests. They do not modify the AOWIS native pack/bundle formats.
 The VM drill runs the production native library, not the fault-injected library.
 Never point the tools at real repositories or physical host disks.
 
+## Observed qualification baseline
+
+On October 24, 2026, the developer reported a successful **real QEMU/KVM**
+Debian 12 guest-cache-loss drill: four VM terminations on **ext4**, four on
+**XFS**, full verification and continued writes after each reboot, final
+repository sequence 7 on both filesystems, and zero acknowledged commits
+lost. Three rounds per filesystem recovered a fully published additional
+unacknowledged revision. The same source snapshot passed **40/40 Debug and
+40/40 Release CTest suites**. An earlier five-minute real-process HTTP soak
+reported 7,516 imports and 7,516 exports across three projects, zero 503
+admission responses and 12 ms worst health latency. These are measurements
+from specific runs, not long-term SLOs, hardware guarantees or a release
+certificate.
+
+### Check and retain qualification evidence
+
+The QEMU wrapper retains a machine-readable result as
+`build-vm-powercut/run-*/report.json`. The optional
+`tools/qualification_evidence.py` **does not execute tests**: it checks that
+both ext4 and XFS contain at least four consecutively numbered successful
+power-cut rounds, all recoveries preserve acknowledgements, recovered heads
+match acknowledged heads where required, and final sequences match the last
+recovery. It can also check combined Debug/Release CTest output and an HTTP
+soak summary, and record the SHA-256 of each evidence file. Save new run
+outputs explicitly:
+
+```bash
+mkdir -p build-qualification
+set -o pipefail
+./compile_linux_tests.sh --both 2>&1 | tee build-qualification/ctest.log
+./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
+  --soak-seconds 300 ./build-linux-tests-release/aowis-server-db \
+  2>&1 | tee build-qualification/http-soak.log
+./qualify_vm_powercut_docker.sh --rounds 4 --filesystems ext4 xfs
+```
+
+Then choose the **actual** latest saved QEMU `report.json` path (the runner
+prints it) and generate a new, non-overwriting evidence summary:
+
+```bash
+python3 tools/qualification_evidence.py \
+  --qemu-report build-vm-powercut/run-REPLACE_WITH_ACTUAL_RUN/report.json \
+  --ctest-log build-qualification/ctest.log \
+  --soak-log build-qualification/http-soak.log \
+  --require-all --output build-qualification/evidence.json
+```
+
+If only a VM report is available, omit the other inputs and `--require-all`;
+the summary explicitly identifies them as `not_supplied`. Higher thresholds
+can be set using `--min-rounds`, `--min-tests` and `--min-soak-seconds`.
+Preserve the **original input logs and JSON report** with the summary. File
+hashes detect later modifications when compared with the summary, but are
+not signed provenance or proof that the tests really executed on a claimed
+machine. Do not interpret `validated_report` as a production release or
+hardware durability certification.
+
 ## One-command Docker workflow (recommended)
 
 The top-level `qualify_vm_powercut_docker.sh` is a containerized **launcher for QEMU**, not a replacement for QEMU. Docker supplies the guest-compatible build tools, QEMU binaries and cloud-image provisioning. The actual durability operation still boots a full Linux guest and abruptly kills the entire QEMU process. **Only a working

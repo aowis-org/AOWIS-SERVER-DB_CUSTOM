@@ -128,6 +128,13 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_powercut_runner_tests.py")
     set_tests_properties(aowis-native-vm-powercut-runner-tests PROPERTIES
         LABELS "aowis;durability" TIMEOUT 30)
+    # Offline evidence checker for QEMU, CTest and HTTP-soak qualification
+    # reports; cannot itself exercise a VM or a production filesystem.
+    add_test(NAME aowis-native-qualification-evidence-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/qualification_evidence_tests.py")
+    set_tests_properties(aowis-native-qualification-evidence-tests PROPERTIES
+        LABELS "aowis;durability" TIMEOUT 30)
     # Standalone production-library worker for optional, externally orchestrated
     # QEMU power-cut qualification. Not registered in default CTest: it needs a
     # separately provisioned guest OS and disposable virtual disk.

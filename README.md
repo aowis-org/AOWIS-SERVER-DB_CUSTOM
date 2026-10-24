@@ -185,7 +185,9 @@ limits.
 
 The short Debug/Release suites include genuine disk-full and process-restart
 cases as well as an HTTP real-process stress test; the VM-worker **smoke** is
-not a QEMU run. The longer drills are opt-in:
+not a QEMU run. A separate real QEMU/KVM drill has passed four ext4 and four
+XFS whole-VM cuts with acknowledged-history recovery; it remains an opt-in
+durability drill, not a default CTest. The longer drills are opt-in:
 
 ```bash
 # QEMU ext4/XFS guest power-cut test (Docker provisions QEMU and Debian guest):
@@ -200,5 +202,7 @@ not a QEMU run. The longer drills are opt-in:
 Docker uses host networking by default to avoid Docker bridge DNS failures;
 the actual durability drill still runs QEMU and kills the entire VM. The
 procedure, expected evidence and hardware-level caveats are documented in
-[durability qualification](docs/durability-qualification.md). Historical
+[durability qualification](docs/durability-qualification.md). Saved QEMU,
+CTest and HTTP-soak evidence can be consistency-checked and catalogued with
+`tools/qualification_evidence.py` (see the durability runbook). Historical
 storage and replication comparisons are in [engineering findings](docs/engineering-findings.md).
