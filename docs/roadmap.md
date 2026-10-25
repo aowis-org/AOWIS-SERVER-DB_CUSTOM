@@ -20,9 +20,11 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 24, 2026, **43/43 CTest
-suites passed in both Debug and Release**, and an opt-in 300-second HTTP
-soak passed (7,516 imports and 7,516 exports). Separately, an **actual QEMU/KVM
+and a whole-service offline restore drill. On October 25, 2026, **44/44 CTest
+suites passed in both Debug and Release**. Two repeated 300-second Linux HTTP
+resource soaks passed with 7,505 and 7,459 imports respectively (the same
+number of exports), 0 admission 503s, stable ~28.1 MiB peak server RSS,
+and 37 peak server file descriptors. Separately, an **actual QEMU/KVM
 Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
 full repository verification and no acknowledged commit lost. These are
 operator-reported measurements, not automatic CI or hardware-level durability
@@ -45,9 +47,10 @@ certification; see [engineering findings](engineering-findings.md).
 ## Scalability and operations
 
 - Run longer, repeated mixed-read/write/merge/replication soaks on realistic
-  project sizes. The Linux HTTP resource sampler records RSS, CPU and open
-  descriptors during the existing three-project soak; it still needs measured
-  target-machine runs. Also monitor pack/index growth, scratch usage,
+  project sizes. Two 300-second, same-binary HTTP resource baselines now exist;
+  extend to at least one hour with early/late RSS trend analysis, and to
+  representative hydraulic model workloads. Also monitor pack/index growth,
+  scratch usage,
   per-project fairness, queue saturation and latency under slow clients.
 - Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,
   including sidecar regeneration and compaction. Re-evaluate the compact

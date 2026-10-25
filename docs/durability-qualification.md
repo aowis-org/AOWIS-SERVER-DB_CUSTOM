@@ -308,6 +308,37 @@ fails, is interrupted, or the server cannot be observed. Optional
 `--max-server-rss-mib N` applies an **operator-selected** memory ceiling to
 that run; no universal ceiling is baked into the database or the tests.
 
+Review one or more **completed** run directories without executing another
+soak:
+
+```bash
+python3 tools/analyze_http_resource_runs.py \
+  build-qualification/http-resources-kdp3qcyi \
+  build-qualification/http-resources-dtjr8g4m
+# Optional machine-readable derived evidence:
+python3 tools/analyze_http_resource_runs.py \
+  build-qualification/http-resources-kdp3qcyi \
+  build-qualification/http-resources-dtjr8g4m \
+  --output-json build-qualification/http-resource-baseline-analysis.json
+```
+
+The analyzer validates the original JSON statistics against `samples.csv`
+and the `soak.log` SHA-256 before comparing runs. It reports normalized
+transfers/s, peak RSS/FDs, CPU time expressed as average logical-core
+**equivalents**, and central-window server RSS medians (samples in 10–25%
+and 75–90% of the run). It clearly marks differences in run duration,
+host/kernel, or executable hashes as not fully comparable. It **does not**
+control CPU contention or prove a memory leak from normal retained-history
+and allocator growth. The original evidence files are never modified.
+
+The first two five-minute runs on the operator's eight-CPU Linux system passed
+with 7,505 and 7,459 imports/exports each, a 37-descriptor peak, zero 503s
+and approximately 28.1 MiB peak sampled server RSS in both. See
+[engineering findings](engineering-findings.md) for the full measured numbers.
+A one-hour run (`--seconds 3600 --interval-ms 1000`) is the next useful
+qualification; avoid heavy competing CPU/disk work for a clean baseline,
+then separately test intentional contention.
+
 The short Python CTest named `aowis-native-http-resource-monitor-tests`
 checks process discovery, sample recording, success parsing, and rejection of
 misleading success text without a server. It uses a synthetic *process tree*,

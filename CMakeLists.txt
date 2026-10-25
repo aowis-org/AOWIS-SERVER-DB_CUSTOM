@@ -83,6 +83,13 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_http_resources_tests.py")
         set_tests_properties(aowis-native-http-resource-monitor-tests PROPERTIES
             LABELS "aowis;http-stress;qualification" TIMEOUT 30)
+        # Offline analysis of saved resource reports. This does not start a
+        # server or assert a universal throughput/memory threshold.
+        add_test(NAME aowis-native-http-resource-analysis-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/http_resource_run_analysis_tests.py")
+        set_tests_properties(aowis-native-http-resource-analysis-tests PROPERTIES
+            LABELS "aowis;http-stress;qualification" TIMEOUT 30)
     endif()
     add_test(NAME aowis-native-index-scaling-smoke
         COMMAND "${Python3_EXECUTABLE}"

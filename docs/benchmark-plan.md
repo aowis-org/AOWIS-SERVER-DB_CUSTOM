@@ -142,10 +142,16 @@ soak through `tools/qualify_http_resources.py` rather than scraping PID values
 from a separately launched server. It measures the same six-client/three-project
 workload, saves a raw observation CSV, an immutable-per-run JSON summary and
 the original soak log under a fresh `build-qualification/http-resources-*`
-directory. Run several durations, e.g. 300, 3600 and 21600 seconds, with
-comparable machine, kernel and fixture conditions. See
-[durability qualification](durability-qualification.md) for the command line
-and interpretation limits.
+directory. Two same-binary, 300-second operator runs now form a measured
+baseline: 50.03 and 49.73 combined transfers/s; approximately 28.1 MiB peak
+sampled server RSS in both, with 37 peak open descriptors and zero admission
+503s. This is short-run evidence, not a resource guarantee. Run longer
+periods, e.g. 3600 and 21600 seconds, with comparable host and fixture
+conditions. Use `tools/analyze_http_resource_runs.py` to validate saved
+JSON/CSV/log evidence and compare throughput and central-window RSS medians
+without presuming linear memory growth. See
+[durability qualification](durability-qualification.md) for commands and
+interpretation limits.
 
 The existing fixture exercises multi-MiB bundle transfers and increasing
 branch counts. It is **not** a replacement for representative hydraulic

@@ -143,11 +143,10 @@ with independent projects rather than a global operation mutex. A developer
 Linux Release test on October 24, 2026 completed a five-minute soak over
 **three projects**, with **7,516 successful imports and 7,516 exports**, zero
 admission-limit 503 responses, and **12 ms worst health request latency**
-reported by the harness. The full **38/38 Debug and Release CTest suites**
-passed on that soak-test source snapshot; subsequent **40/40 Debug and Release
-suites** passed on October 24, 2026 alongside the successful QEMU drill. These figures describe *that configuration
-and workload*, not guaranteed throughput/latency under arbitrary contention.
-Longer soaks and realistic hardware/slow-client workloads remain necessary.
+reported by the harness. The most recent operator-run suite passed **44/44 tests in Debug and Release**.
+These figures describe the tested workload, not guaranteed throughput/latency
+under arbitrary contention. Longer soaks and realistic hardware/slow-client
+workloads remain necessary.
 
 ## Historical format regression baseline
 
@@ -162,10 +161,9 @@ corrupted bundle. This protects a concrete pre-release compatibility
 baseline, not every legacy storage implementation or a public long-term
 format guarantee. See [format compatibility](format-compatibility.md).
 
-The operator subsequently reported **42/42 Debug and Release CTest tests
-passing**, including the frozen-format regression, and the QEMU evidence
-checker validated all eight ext4/XFS cuts. These are later baselines than the
-earlier 40-test run.
+The frozen-format regression passes as part of the **44/44 Debug and Release**
+operator-run suite. The QEMU evidence checker independently validates the
+structure of the operator's eight ext4/XFS cut reports.
 
 ## Service-root restore and format upgrade qualification
 
@@ -188,17 +186,51 @@ all-node corruption repair, supported long-term on-disk format compatibility,
 or any authentication/security boundary for the HTTP service. The complete
 list of qualification gates is in the [roadmap](roadmap.md).
 
-## Latest compatibility release test baseline
+## Measured five-minute Linux HTTP resource envelope
 
-On October 24, 2026, the operator reported **43/43 tests passing** for the
-four-project offline upgrade/restore regression's source snapshot. The
-regression combines old-format pack bytes, index regeneration, independently
-restored project catalogues, current-format data, a new write into a restored
-historical pack and a second backup/restore cycle. This is evidence for that
-migration workflow, not for universal cross-version or cross-platform support.
+On October 25, 2026, the operator ran the **same Release server and workload
+binaries twice** on an x86_64, eight-logical-CPU Linux host (kernel
+`7.2.6-arch2-1`). Each run exercised six clients and three projects for
+300 seconds. The exact binary SHA-256 values and complete run reports are
+retained in the operator's `build-qualification` directories; report values
+were supplied to this qualification record:
 
-An opt-in Linux resource sampler is now available for the existing sustained
-HTTP workload. **No production RSS/CPU/file-descriptor measurements have
-been supplied yet**; such measurements must come from actual runs with the
-reported host/kernel/binary information and cannot be inferred from the
-7,516-import five-minute soak result.
+| Observation | Run A | Run B |
+|---|---:|---:|
+| Successful bundle imports | 7,505 | 7,459 |
+| Successful bundle exports | 7,505 | 7,459 |
+| Combined transfers/s | 50.03 | 49.73 |
+| Admission 503 | 0 | 0 |
+| Worst reported health latency | 4 ms | 3 ms |
+| Server initial RSS | 27,500 KiB | 27,688 KiB |
+| Server final RSS | 28,188 KiB | 28,384 KiB |
+| Peak sampled server RSS | 28,752 KiB | 28,736 KiB |
+| Peak server file descriptors | 37 | 37 |
+| Peak server threads | 10 | 10 |
+| Server CPU time (user + system) | 914.96 s | 909.89 s |
+
+The two runs' combined transfer rates differ by about **0.6%**. First-to-last
+server RSS changed by just **688 KiB** and **696 KiB**, respectively; peak
+sampled RSS was approximately **28.1 MiB** in both. CPU consumption is about
+**3.0 logical cores on average** during each 300-second run, not 915 seconds
+of elapsed time and not a host-wide utilization measurement. The sampling
+interval was 500 ms; the server was observed for approximately 299.8 seconds.
+The unchanged descriptor peak, small short-run RSS change, zero admission
+503s and reproducible transfer rate are positive **short-duration** evidence.
+
+These two reports **do not establish absence of memory leaks** over hours,
+quantify retained revision-history growth, capture host contention, or set a
+production memory/CPU/latency guarantee. Five-minute CPU load, page cache,
+disk and background workloads were not independently controlled. A separate
+read-only report analyzer (`tools/analyze_http_resource_runs.py`) checks source
+reports against their per-process CSV and saved log, and compares central
+10–25% versus 75–90% server-RSS medians. It reports changes descriptively,
+without inventing a leakage threshold. The first one-hour run and further
+representative datasets are still outstanding.
+
+## Current test baseline
+
+The operator reported **44/44 CTest tests passing in both Debug and Release**
+following the Linux resource-monitor race fix. This includes the four-project
+historical-format upgrade/restore drill and the offline resource-monitor
+regression. The eight-cut QEMU/KVM ext4/XFS drill was run separately from CTest.
