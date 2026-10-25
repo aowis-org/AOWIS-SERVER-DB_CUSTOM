@@ -24,7 +24,11 @@ and a whole-service offline restore drill. On October 25, 2026, **44/44 CTest
 suites passed in both Debug and Release**. Two repeated 300-second Linux HTTP
 resource soaks passed with 7,505 and 7,459 imports respectively (the same
 number of exports), 0 admission 503s, stable ~28.1 MiB peak server RSS,
-and 37 peak server file descriptors. Separately, an **actual QEMU/KVM
+and 37 peak server file descriptors. A 3,600-second run also completed
+67,747 imports and 67,747 exports, zero HTTP 503s, a 35.4 MiB sampled
+server-RSS peak and 36 peak descriptors. Its 37.64 combined transfers/s
+was below the two five-minute runs (~49.9/s), without within-run throughput
+checkpoints to determine the cause. Separately, an **actual QEMU/KVM
 Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
 full repository verification and no acknowledged commit lost. These are
 operator-reported measurements, not automatic CI or hardware-level durability
@@ -47,9 +51,13 @@ certification; see [engineering findings](engineering-findings.md).
 ## Scalability and operations
 
 - Run longer, repeated mixed-read/write/merge/replication soaks on realistic
-  project sizes. Two 300-second, same-binary HTTP resource baselines now exist;
-  extend to at least one hour with early/late RSS trend analysis, and to
-  representative hydraulic model workloads. Also monitor pack/index growth,
+  project sizes. Two 300-second and one 3,600-second same-binary HTTP resource
+  baselines now exist; a later 900-second run also completed 25,493
+  import/export pairs with no 503 responses and 56.65 combined transfers/s.
+  Quantify **within-run throughput by minute** and
+  identify whether the lower hour-long average is caused by accumulating
+  branches, I/O, caching or host contention before proposing optimizations.
+  Repeat on representative hydraulic model workloads. Also monitor pack/index growth,
   scratch usage,
   per-project fairness, queue saturation and latency under slow clients.
 - Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,

@@ -3,6 +3,7 @@
 #include <httplib.h>
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -292,9 +293,12 @@ void tightBudget(unsigned short port, const std::string& a, const std::string& b
                      "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 3000000\r\n\r\n" +
                      fixture.substr(0, 4096));
         bool refused = false;
-        const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + 5s;
+        unsigned attempts = 0;
+        std::size_t sent = 4096;
+        const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + 12s;
         while (std::chrono::steady_clock::now() < deadline) {
             const HttpResponse result = request(port, "GET", bRoot + "main/bundle");
+            ++attempts;
             if (result.status == 503) {
                 require(result.retry == "1" && result.body.find("staging_busy") != std::string::npos,
                         "missing structured global staging rejection");
@@ -302,9 +306,18 @@ void tightBudget(unsigned short port, const std::string& a, const std::string& b
                 break;
             }
             require(result.status == 200, "unexpected status before staging contention");
-            std::this_thread::sleep_for(30ms);
+            // A partial HTTP body must remain in progress until the competing
+            // project observes a real global-budget rejection. Trickle more
+            // bytes to prevent idle-read timeouts on slower/scheduled hosts;
+            // never finish the declared 3,000,000-byte upload.
+            const std::size_t chunk = std::min<std::size_t>(256, fixture.size() - sent);
+            require(chunk > 0, "stalled upload fixture exhausted");
+            stalled.send(fixture.substr(sent, chunk));
+            sent += chunk;
+            std::this_thread::sleep_for(35ms);
         }
-        require(refused, "stalled upload did not saturate cross-project transfer budget");
+        require(refused, "stalled upload did not saturate cross-project transfer budget after " +
+                         std::to_string(attempts) + " competing exports");
         const auto begin = std::chrono::steady_clock::now();
         health(port);
         require(std::chrono::steady_clock::now() - begin < 2s,
@@ -447,8 +460,12 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
         ServerProcess server(executable, serviceRoot, log, port, 32);
         for (const char* name : {"soak-alpha", "soak-beta", "soak-gamma"})
             projectIds.push_back(project(port, name));
-        const std::chrono::steady_clock::time_point end =
-            std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        const std::chrono::steady_clock::time_point end = started + std::chrono::seconds(seconds);
+        // Short smoke runs exercise this exact reporting path without
+        // imposing a one-minute delay on CTest; normal soaks log once/minute.
+        const unsigned progressIntervalSeconds = seconds < 60U ? 1U : 60U;
+        unsigned nextProgressSeconds = progressIntervalSeconds;
         std::latch start(6);
         std::vector<std::thread> clients;
         for (unsigned worker = 0; worker < 6U; ++worker) {
@@ -503,7 +520,7 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
             });
         }
         while (!failed && std::chrono::steady_clock::now() < end) {
-            const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+            const std::chrono::steady_clock::time_point probeStarted = std::chrono::steady_clock::now();
             try {
                 health(port);
             } catch (const std::exception& error) {
@@ -513,8 +530,26 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
             }
             const unsigned long delay = static_cast<unsigned long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started).count());
+                    std::chrono::steady_clock::now() - probeStarted).count());
             worstHealthMs = std::max(worstHealthMs, delay);
+            // Periodic counters reveal whether the growing branch catalogue
+            // changes throughput. Recording them does not add HTTP operations.
+            // The final completion line remains backward-compatible.
+            const unsigned elapsedSeconds = static_cast<unsigned>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - started).count());
+            if (elapsedSeconds >= nextProgressSeconds && elapsedSeconds < seconds) {
+                // Read completed exports first: imports are published before
+                // their corresponding exports, even across six clients.
+                const unsigned exported = completedExports.load();
+                const unsigned imported = completedImports.load();
+                std::cout << "Sustained HTTP soak progress: elapsed_s=" << elapsedSeconds
+                          << " imports=" << imported
+                          << " exports=" << exported
+                          << " admission_503=" << busyResponses.load() << std::endl;
+                nextProgressSeconds = (elapsedSeconds / progressIntervalSeconds + 1U) *
+                    progressIntervalSeconds;
+            }
             std::this_thread::sleep_for(250ms);
         }
         for (std::thread& thread : clients) thread.join();

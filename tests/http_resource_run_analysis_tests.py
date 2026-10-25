@@ -20,10 +20,16 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def fixture(base, name, imports, executable="a" * 64):
+def fixture(base, name, imports, executable="a" * 64, progress=True):
     folder = base / name
     folder.mkdir()
-    (folder / "soak.log").write_text("a preserved workload log\n", encoding="utf-8")
+    log = "a preserved workload log\n"
+    if progress:
+        log += (f"Sustained HTTP soak progress: elapsed_s=60 imports={imports // 2} "
+                f"exports={imports // 2} admission_503=0\n")
+    log += (f"Sustained HTTP soak passed: duration_s=120 imports={imports} "
+            f"exports={imports} admission_503=0 worst_health_ms=4 projects=3\n")
+    (folder / "soak.log").write_text(log, encoding="utf-8")
     fieldnames = ["elapsed_ms", "role", "pid", "rss_kib", "high_water_kib",
                   "threads", "fds", "cpu_seconds"]
     server = []
@@ -81,6 +87,53 @@ def run_test():
         require(entry["server_avg_cpu_cores"] == 3.0, "CPU-core equivalents incorrect")
         require(entry["operations_per_second"] == 100.0, "transfer normalization incorrect")
         require(entry["server_peak_fds"] == 37, "descriptor summary incorrect")
+        require(len(entry["throughput_phases"]) == 2,
+                "missing completed throughput intervals")
+        require(entry["throughput_phases"][0]["transfers_per_second"] == 100.0 and
+                entry["throughput_phases"][1]["transfers_per_second"] == 100.0,
+                "progress rate calculation incorrect")
+        require(sum(item["imports"] for item in entry["throughput_phases"]) == 6000 and
+                sum(item["exports"] for item in entry["throughput_phases"]) == 6000,
+                "throughput checkpoint counts do not reconcile with summary")
+        old = fixture(base, "old-no-progress", 6000, progress=False)
+        require(analyzer.read_run(old)["throughput_phases"] is None,
+                "legacy report without progress must remain valid")
+        malformed = fixture(base, "malformed-progress", 6000)
+        text = (malformed / "soak.log").read_text()
+        (malformed / "soak.log").write_text(text.replace("elapsed_s=60", "elapsed_s=120"))
+        report = json.loads((malformed / "report.json").read_text())
+        report["log_sha256"] = checksum(malformed / "soak.log")
+        (malformed / "report.json").write_text(json.dumps(report))
+        try:
+            analyzer.read_run(malformed)
+        except analyzer.AnalysisError:
+            pass
+        else:
+            raise AssertionError("out-of-range progress accepted")
+        inconsistent = fixture(base, "inconsistent-progress", 6000)
+        text = (inconsistent / "soak.log").read_text()
+        (inconsistent / "soak.log").write_text(text.replace("imports=3000", "imports=8000"))
+        report = json.loads((inconsistent / "report.json").read_text())
+        report["log_sha256"] = checksum(inconsistent / "soak.log")
+        (inconsistent / "report.json").write_text(json.dumps(report))
+        try:
+            analyzer.read_run(inconsistent)
+        except analyzer.AnalysisError:
+            pass
+        else:
+            raise AssertionError("progress greater than final count accepted")
+        forged = fixture(base, "forged-final", 6000)
+        text = (forged / "soak.log").read_text()
+        (forged / "soak.log").write_text(text.replace("imports=6000", "imports=7000"))
+        report = json.loads((forged / "report.json").read_text())
+        report["log_sha256"] = checksum(forged / "soak.log")
+        (forged / "report.json").write_text(json.dumps(report))
+        try:
+            analyzer.read_run(forged)
+        except analyzer.AnalysisError:
+            pass
+        else:
+            raise AssertionError("forged completion count accepted")
         different = fixture(base, "changed-binary", 6000, executable="f" * 64)
         require(not analyzer.analyze([first, different])["comparison"][
             "same_duration_host_kernel_and_executables"],

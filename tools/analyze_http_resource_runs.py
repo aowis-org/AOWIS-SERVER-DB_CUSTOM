@@ -9,6 +9,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 from pathlib import Path
 import statistics
 import sys
@@ -16,6 +17,15 @@ import sys
 
 class AnalysisError(ValueError):
     pass
+
+
+PROGRESS = re.compile(
+    r"^Sustained HTTP soak progress: elapsed_s=(\d+) imports=(\d+) "
+    r"exports=(\d+) admission_503=(\d+)$", re.MULTILINE)
+SUMMARY = re.compile(
+    r"^Sustained HTTP soak passed: duration_s=(\d+) imports=(\d+) "
+    r"exports=(\d+) admission_503=(\d+) worst_health_ms=(\d+) "
+    r"projects=(\d+)$", re.MULTILINE)
 
 
 def file_hash(path):
@@ -29,6 +39,55 @@ def file_hash(path):
 def require(condition, reason):
     if not condition:
         raise AnalysisError(reason)
+
+
+def progress_phases(log_text, soak):
+    """Recover independently logged progress, preserving compatibility with old logs.
+
+    Each phase reports completed import/export transfers during its interval.
+    No progress exists in older recordings; overall rate alone cannot locate
+    a slowdown within such a run.
+    """
+    matches = list(PROGRESS.finditer(log_text))
+    written = [line for line in log_text.splitlines()
+               if line.startswith("Sustained HTTP soak progress:")]
+    require(len(matches) == len(written), "malformed soak progress checkpoint")
+    if not matches:
+        return None
+    duration = soak["duration_s"]
+    previous = {"elapsed_s": 0, "imports": 0, "exports": 0, "admission_503": 0}
+    phases = []
+    for match in matches:
+        checkpoint = dict(zip(("elapsed_s", "imports", "exports", "admission_503"),
+                              map(int, match.groups())))
+        require(previous["elapsed_s"] < checkpoint["elapsed_s"] < duration,
+                "nonmonotonic or out-of-range soak progress time")
+        require(checkpoint["imports"] >= previous["imports"] and
+                checkpoint["exports"] >= previous["exports"] and
+                checkpoint["admission_503"] >= previous["admission_503"] and
+                checkpoint["exports"] <= checkpoint["imports"],
+                "nonmonotonic or inconsistent soak progress counters")
+        phases.append(phase(previous, checkpoint))
+        previous = checkpoint
+    completed = {"elapsed_s": duration, "imports": soak["imports"],
+                 "exports": soak["exports"], "admission_503": soak["admission_503"]}
+    require(completed["imports"] >= previous["imports"] and
+            completed["exports"] >= previous["exports"] and
+            completed["admission_503"] >= previous["admission_503"],
+            "soak completion precedes a progress checkpoint")
+    phases.append(phase(previous, completed))
+    return phases
+
+
+def phase(previous, current):
+    elapsed = current["elapsed_s"] - previous["elapsed_s"]
+    require(elapsed > 0, "invalid progress interval")
+    imports = current["imports"] - previous["imports"]
+    exports = current["exports"] - previous["exports"]
+    return {"start_s": previous["elapsed_s"], "end_s": current["elapsed_s"],
+            "imports": imports, "exports": exports,
+            "transfers_per_second": round((imports + exports) / elapsed, 3),
+            "admission_503": current["admission_503"] - previous["admission_503"]}
 
 
 def read_run(argument):
@@ -50,6 +109,14 @@ def read_run(argument):
     log = directory / "soak.log"
     require(file_hash(log) == report["log_sha256"],
             f"soak.log checksum differs from report: {directory}")
+    log_text = log.read_text(encoding="utf-8")
+    final = SUMMARY.findall(log_text)
+    require(len(final) == 1, f"missing or duplicate soak completion line: {log}")
+    observed = tuple(map(int, final[0]))
+    require(observed == (duration, soak["imports"], soak["exports"],
+                         soak["admission_503"], soak["worst_health_ms"], soak["projects"]),
+            f"soak completion differs from report: {log}")
+    phases = progress_phases(log_text, soak)
     csv_path = directory / "samples.csv"
     samples = []
     with csv_path.open(newline="", encoding="utf-8") as source:
@@ -125,6 +192,7 @@ def read_run(argument):
         "host": report["host"],
         "server_sha256": report["executables"]["server"]["sha256"],
         "stress_sha256": report["executables"]["stress"]["sha256"],
+        "throughput_phases": phases,
     }
 
 
@@ -151,6 +219,7 @@ def analyze(arguments):
             "RSS is sampled; retained revision history, caches and allocators can grow normally",
             "Equal kernel and binary hashes do not establish equal disk/cache/background load",
             "Early/late medians describe a run; they are not a memory-leak classification",
+            "Within-run throughput checkpoints cannot explain host contention or storage causes",
         ],
     }
 
@@ -175,6 +244,12 @@ def main(argv=None):
                   f"peak FDs {run['server_peak_fds']}, "
                   f"CPU {run['server_avg_cpu_cores']:.2f} cores, "
                   f"early/late median RSS {run['server_early_late_median_rss_delta_kib']:+g} KiB")
+            if run["throughput_phases"] is None:
+                print("  No within-run throughput checkpoints (older log format).")
+            else:
+                for phase_result in run["throughput_phases"]:
+                    print(f"  {phase_result['start_s']:>5}-{phase_result['end_s']:<5} s: "
+                          f"{phase_result['transfers_per_second']:.2f} transfers/s")
         if len(result["runs"]) > 1:
             print("Comparable duration/host/kernel/binaries: " +
                   ("yes" if result["comparison"]["same_duration_host_kernel_and_executables"]

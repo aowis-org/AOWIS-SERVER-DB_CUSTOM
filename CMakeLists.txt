@@ -478,6 +478,15 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
             COMMAND aowis-native-http-transfer-stress-tests $<TARGET_FILE:aowis-server-db>)
         set_tests_properties(aowis-native-http-transfer-stress-tests PROPERTIES
             LABELS "aowis;http-stress" TIMEOUT 180 RUN_SERIAL TRUE)
+        # Short end-to-end soak guarantees elapsed-time checkpoints really
+        # appear, rather than validating only synthetic progress-log fixtures.
+        add_test(NAME aowis-native-http-soak-progress-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/http_soak_progress_tests.py"
+                "$<TARGET_FILE:aowis-native-http-transfer-stress-tests>"
+                "$<TARGET_FILE:aowis-server-db>")
+        set_tests_properties(aowis-native-http-soak-progress-tests PROPERTIES
+            LABELS "aowis;http-stress;qualification" TIMEOUT 100 RUN_SERIAL TRUE)
         add_dependencies(aowis-db-tests aowis-native-http-transfer-stress-tests)
     endif()
     message(STATUS "Native multi-project HTTP server enabled (cpp-httplib)")

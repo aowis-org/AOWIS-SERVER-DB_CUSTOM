@@ -145,11 +145,19 @@ the original soak log under a fresh `build-qualification/http-resources-*`
 directory. Two same-binary, 300-second operator runs now form a measured
 baseline: 50.03 and 49.73 combined transfers/s; approximately 28.1 MiB peak
 sampled server RSS in both, with 37 peak open descriptors and zero admission
-503s. This is short-run evidence, not a resource guarantee. Run longer
-periods, e.g. 3600 and 21600 seconds, with comparable host and fixture
-conditions. Use `tools/analyze_http_resource_runs.py` to validate saved
-JSON/CSV/log evidence and compare throughput and central-window RSS medians
-without presuming linear memory growth. See
+503s. A subsequent 3,600-second run completed **67,747 imports and
+67,747 exports**, zero admission 503s and a 35.4 MiB sampled RSS peak at
+**37.64 transfers/s**. The lower hour-long average cannot be assigned to
+history-growth cost or external contention without per-minute progress data.
+These are observed workloads, not resource guarantees. Run repeated longer
+periods (e.g. 3600 and 21600 seconds) with comparable host and fixture
+conditions. The stress harness now prints one-minute import/export checkpoints to
+`soak.log` without extra HTTP requests. Use
+`tools/analyze_http_resource_runs.py` to validate saved JSON/CSV/log evidence,
+compare throughput and central-window RSS medians, and report within-run
+minute-by-minute transfer rates when checkpoints are available. Older run
+logs have only total throughput; their per-minute history cannot be inferred.
+Do not presume linear memory growth. See
 [durability qualification](durability-qualification.md) for commands and
 interpretation limits.
 

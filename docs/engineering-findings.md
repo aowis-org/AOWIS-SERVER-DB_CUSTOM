@@ -186,7 +186,7 @@ all-node corruption repair, supported long-term on-disk format compatibility,
 or any authentication/security boundary for the HTTP service. The complete
 list of qualification gates is in the [roadmap](roadmap.md).
 
-## Measured five-minute Linux HTTP resource envelope
+## Measured sustained Linux HTTP resource envelope
 
 On October 25, 2026, the operator ran the **same Release server and workload
 binaries twice** on an x86_64, eight-logical-CPU Linux host (kernel
@@ -225,8 +225,57 @@ disk and background workloads were not independently controlled. A separate
 read-only report analyzer (`tools/analyze_http_resource_runs.py`) checks source
 reports against their per-process CSV and saved log, and compares central
 10–25% versus 75–90% server-RSS medians. It reports changes descriptively,
-without inventing a leakage threshold. The first one-hour run and further
-representative datasets are still outstanding.
+without inventing a leakage threshold.
+
+**One-hour run (October 25–26, 2026):** The same hashed Release server and
+stress executables, the same eight-logical-CPU x86_64 host, and Linux kernel
+`7.2.6-arch2-1` completed a **3,600-second** continuous run with **67,747
+imports and 67,747 exports** (135,494 successful transfers, **37.64/s**),
+**zero admission 503 responses**, and **10 ms** worst health response. The
+server accumulated **10,837.03 CPU seconds**, equivalent to approximately
+**3.01 logical cores** during the 3,598.789-second observed interval. The
+server's first and last sampled RSS were **27,648 KiB** and **28,292 KiB**
+(a **644 KiB** first-to-last increase); its sampled peak was **36,220 KiB**
+(**35.4 MiB**), with 10 peak threads and 36 peak file descriptors. A higher
+intermediate peak followed by lower final RSS is not proof of a leak or of a
+fixed maximum memory footprint. The saved operator evidence is
+`build-qualification/http-resources-qfk67i39/`, with executable and log
+SHA-256 hashes in `report.json`; the samples were taken every 1,000 ms.
+
+Compared with the mean of the two five-minute runs (~49.88 transfers/s),
+the hour-long run averaged **~24.5% fewer transfers/s**. This is a real
+**between-run difference**, but *not* evidence that throughput declined
+within that hour: the earlier stress harness did not record interval
+completion counts. The workload creates an increasing number of uniquely
+named branches throughout its run; its working set differs between hour-long
+and five-minute tests. Host I/O, background work and caching were not
+independently recorded. Future runs print optional one-minute progress
+checkpoints, and the offline report analyzer computes per-interval rates.
+Old run reports remain valid, but cannot reconstruct missing historical
+progress data. The operator also reported playing a YouTube video in Firefox
+throughout the hour-long run, unlike the five-minute baselines. CPU scheduling,
+thermal/power limits and video-decoding activity are plausible confounders;
+none were separately logged. Investigate falling within-run rates, if observed,
+before attributing a cause or changing the storage engine.
+
+**Fifteen-minute run (October 26, 2026):** An independently reported
+**900-second** workload on the same Release server and stress binary completed
+**25,493 imports and 25,493 exports** (50,986 combined, **56.65 transfers/s**),
+with **zero 503 responses** and **5 ms** worst health-request latency. Peak
+server RSS was **30,532 KiB** (~29.8 MiB), versus **27,736 KiB** initially and
+**29,680 KiB** at the last sample. The maximum was **36 file descriptors** and
+**10 threads**; server CPU consumption was **2,750.54 CPU seconds** (~3.06
+logical CPUs averaged over the full run). Evidence was recorded at
+`build-qualification/http-resources-y9bg_t6y/`.
+
+The 15-minute result is higher, not lower, than the five-minute baselines,
+but this does not isolate history-growth effects from host conditions. The
+saved log contains no time-segmented counters, so the rate within the run is
+unknown. Its stress executable SHA-256 equals the earlier runs: the Release
+binary was not rebuilt after a Debug CTest failure interrupted the two-build
+workflow. The current qualification harness computes progress from the whole
+soak's start time, and a real-server smoke test requires checkpoints. Reports
+saved before those counters existed cannot be reconstructed retrospectively.
 
 ## Current test baseline
 

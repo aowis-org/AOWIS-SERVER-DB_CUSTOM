@@ -323,10 +323,19 @@ python3 tools/analyze_http_resource_runs.py \
 ```
 
 The analyzer validates the original JSON statistics against `samples.csv`
-and the `soak.log` SHA-256 before comparing runs. It reports normalized
-transfers/s, peak RSS/FDs, CPU time expressed as average logical-core
-**equivalents**, and central-window server RSS medians (samples in 10–25%
-and 75–90% of the run). It clearly marks differences in run duration,
+and the `soak.log` SHA-256, and independently checks that the log's terminal
+soak counters match the JSON report. It reports normalized transfers/s,
+peak RSS/FDs, CPU time expressed as average logical-core **equivalents**,
+and central-window server RSS medians (samples in 10–25% and 75–90% of the
+run). Current stress-harness builds additionally write one-minute progress lines
+(`elapsed_s`, import/export counts, 503 count) to the original `soak.log`.
+A dedicated six-second CTest smoke verifies that elapsed-time progress is
+actually emitted by a real HTTP server; only short smoke workloads use
+one-second checkpoints. The analyzer validates monotonic progress and shows
+rates for each interval;
+these checkpoints perform no extra HTTP operations and do not affect the
+engine or report schema. Pre-existing runs without checkpoints remain
+compatible but cannot be retrospectively separated into throughput phases. It clearly marks differences in run duration,
 host/kernel, or executable hashes as not fully comparable. It **does not**
 control CPU contention or prove a memory leak from normal retained-history
 and allocator growth. The original evidence files are never modified.
@@ -335,9 +344,15 @@ The first two five-minute runs on the operator's eight-CPU Linux system passed
 with 7,505 and 7,459 imports/exports each, a 37-descriptor peak, zero 503s
 and approximately 28.1 MiB peak sampled server RSS in both. See
 [engineering findings](engineering-findings.md) for the full measured numbers.
-A one-hour run (`--seconds 3600 --interval-ms 1000`) is the next useful
-qualification; avoid heavy competing CPU/disk work for a clean baseline,
-then separately test intentional contention.
+A one-hour run (`--seconds 3600 --interval-ms 1000`) was also completed:
+67,747 imports, 67,747 exports, zero 503s, sampled server-RSS peak 35.4 MiB,
+36 peak descriptors and 10 ms worst health latency. Its ~37.64 transfers/s
+was below the mean ~49.88 transfers/s of the two five-minute runs. That
+historical one-hour log has no interval counters, so the result **does not
+establish a within-run slowdown**. For a repeat run with the updated stress
+executable, inspect the printed minute-by-minute rates before evaluating
+branch-history cost. Avoid heavy competing CPU/disk work for a clean
+baseline, then separately test intentional contention.
 
 The short Python CTest named `aowis-native-http-resource-monitor-tests`
 checks process discovery, sample recording, success parsing, and rejection of
