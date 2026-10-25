@@ -280,9 +280,47 @@ fixture directory and server log for investigation.
 A short developer smoke can use `--soak-seconds 30`. This sustained mode is
 not registered in normal CTest: test duration is controlled explicitly. Its
 reported import/export counts, staging-busy responses and worst health time
-are **measurements**, not promised production SLOs. Run on actual target
-hardware with external RSS/CPU/I/O monitoring and representative network
-conditions before defining production capacity targets.
+are **measurements**, not promised production SLOs.
+
+### Reproducible Linux HTTP resource measurements
+
+Use `tools/qualify_http_resources.py` to run **the same** production HTTP
+soak while sampling the actual child server process and its client harness
+from Linux `/proc`. The executable first creates a disposable multi-megabyte
+bundle, starts a real HTTP server, and uses three independent projects. The
+monitor adds no requests or database operations and never opens a production
+repository. It observes process RSS, high-water memory, file descriptors,
+threads and user+system CPU. One unique run directory contains the raw soak
+log, a per-process sample CSV and a machine-readable JSON report with
+kernel/machine information and SHA-256 hashes of the executable files:
+
+```bash
+python3 tools/qualify_http_resources.py --seconds 300
+# One-hour run, sampled every second:
+python3 tools/qualify_http_resources.py --seconds 3600 --interval-ms 1000
+```
+
+By default these use the compiled test and server executables in
+`build-linux-tests-release` and create fresh `build-qualification/http-resources-*`
+subdirectories. Override `--stress-binary`, `--server-binary` and
+`--output-root` when needed. The monitor retains evidence if the workload
+fails, is interrupted, or the server cannot be observed. Optional
+`--max-server-rss-mib N` applies an **operator-selected** memory ceiling to
+that run; no universal ceiling is baked into the database or the tests.
+
+The short Python CTest named `aowis-native-http-resource-monitor-tests`
+checks process discovery, sample recording, success parsing, and rejection of
+misleading success text without a server. It uses a synthetic *process tree*,
+not QEMU or a live HTTP service. The production HTTP soak remains opt-in.
+
+RSS naturally grows with retained branch history and physical index/cache
+working sets; growth alone is not evidence of a leak. CPU totals cover the
+monitored server and harness processes only. `/proc` measurements are
+sampling observations, not precise peak allocation or hardware counters.
+Use repeated workloads with the same duration, dataset, host, kernel and
+storage stack before defining a resource envelope. Include disk-space,
+I/O and latency measurements under representative workloads separately;
+this sampler does not establish those guarantees.
 
 It is not a full replication conflict/fuzz test, does not emulate a failing
 physical device, and does not replace a real power-loss drill. Additional

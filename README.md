@@ -6,6 +6,16 @@ This repository contains the **native storage engine**, canonical hydraulic-mode
 
 > **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
+## Planned GUI integration gaps
+
+The GUI-first Projects/version-explorer design requires additional project and
+branch lifecycle endpoints, network enumeration, revision metadata and mutable
+annotations, graph/DAG paging, tag/reference management, optimistic metadata
+updates, audit, search and safe conflict UX. **These are proposals, not implemented
+HTTP capabilities.** See the detailed [GUI integration requirements and server
+backlog](docs/gui-integration-requirements.md). The current OpenAPI remains the
+implemented API contract.
+
 ## System overview
 
 ```text
@@ -201,6 +211,9 @@ durability drill, not a default CTest. The longer drills are opt-in:
 # Five-minute real-process HTTP mixed import/export soak:
 ./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
   --soak-seconds 300 ./build-linux-tests-release/aowis-server-db
+
+# Same soak with Linux RSS/CPU/FD evidence in a new run directory:
+python3 tools/qualify_http_resources.py --seconds 300
 ```
 
 Docker uses host networking by default to avoid Docker bridge DNS failures;

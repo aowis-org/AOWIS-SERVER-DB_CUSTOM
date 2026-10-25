@@ -187,3 +187,18 @@ linearizability, production latency SLOs, large-scale cold-cache throughput,
 all-node corruption repair, supported long-term on-disk format compatibility,
 or any authentication/security boundary for the HTTP service. The complete
 list of qualification gates is in the [roadmap](roadmap.md).
+
+## Latest compatibility release test baseline
+
+On October 24, 2026, the operator reported **43/43 tests passing** for the
+four-project offline upgrade/restore regression's source snapshot. The
+regression combines old-format pack bytes, index regeneration, independently
+restored project catalogues, current-format data, a new write into a restored
+historical pack and a second backup/restore cycle. This is evidence for that
+migration workflow, not for universal cross-version or cross-platform support.
+
+An opt-in Linux resource sampler is now available for the existing sustained
+HTTP workload. **No production RSS/CPU/file-descriptor measurements have
+been supplied yet**; such measurements must come from actual runs with the
+reported host/kernel/binary information and cannot be inferred from the
+7,516-import five-minute soak result.

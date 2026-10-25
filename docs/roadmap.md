@@ -20,7 +20,7 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 24, 2026, **42/42 CTest
+and a whole-service offline restore drill. On October 24, 2026, **43/43 CTest
 suites passed in both Debug and Release**, and an opt-in 300-second HTTP
 soak passed (7,516 imports and 7,516 exports). Separately, an **actual QEMU/KVM
 Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
@@ -45,8 +45,10 @@ certification; see [engineering findings](engineering-findings.md).
 ## Scalability and operations
 
 - Run longer, repeated mixed-read/write/merge/replication soaks on realistic
-  project sizes. Monitor RSS, CPU, pack/index growth, scratch usage, per-project
-  fairness, queue saturation and latency under slow clients.
+  project sizes. The Linux HTTP resource sampler records RSS, CPU and open
+  descriptors during the existing three-project soak; it still needs measured
+  target-machine runs. Also monitor pack/index growth, scratch usage,
+  per-project fairness, queue saturation and latency under slow clients.
 - Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,
   including sidecar regeneration and compaction. Re-evaluate the compact
   lookup only if representative regressions justify it.
@@ -79,3 +81,10 @@ certification; see [engineering findings](engineering-findings.md).
 
 A new feature or major storage rewrite is **not** implied by this roadmap.
 Prefer reproducible evidence and direct changes to the single native engine.
+
+## GUI integration contract (2026-10-25)
+
+See [GUI integration requirements](gui-integration-requirements.md) for the
+proposed project/branch CRUD, network discovery, immutable commit metadata,
+mutable annotations and labels, graph paging, dry-run merges, security and
+concurrency work. This is a design backlog, not implemented functionality.

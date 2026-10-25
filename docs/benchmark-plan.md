@@ -134,3 +134,21 @@ memory but is not an isolated allocator measurement. Record the actual
 
 **Retain the compact sidecar-backed index** unless reproducible benchmarks establish a regression or stronger alternative. The before/after evidence and assumptions are recorded in [engineering findings](engineering-findings.md). Any future changes must preserve pack integrity and publication guarantees. This benchmark does not yet qualify cold-cache reads, sustained
 production mixed workloads, or network-service contention.
+
+## Sustained HTTP resource envelope
+
+For repeatable Linux process measurements, run the existing real HTTP bundle
+soak through `tools/qualify_http_resources.py` rather than scraping PID values
+from a separately launched server. It measures the same six-client/three-project
+workload, saves a raw observation CSV, an immutable-per-run JSON summary and
+the original soak log under a fresh `build-qualification/http-resources-*`
+directory. Run several durations, e.g. 300, 3600 and 21600 seconds, with
+comparable machine, kernel and fixture conditions. See
+[durability qualification](durability-qualification.md) for the command line
+and interpretation limits.
+
+The existing fixture exercises multi-MiB bundle transfers and increasing
+branch counts. It is **not** a replacement for representative hydraulic
+model reads/writes, large object deltas, high-divergence merges, disk I/O
+profiling or real-world client latency. Record those separately before
+publishing a deployment resource envelope.

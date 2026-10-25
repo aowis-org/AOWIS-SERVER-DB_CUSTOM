@@ -77,6 +77,13 @@ if(BUILD_TESTING)
         COMMAND aowis-native-transfer-staging-budget-tests)
     set_tests_properties(aowis-native-transfer-staging-budget-tests PROPERTIES LABELS "aowis")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME aowis-native-http-resource-monitor-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_http_resources_tests.py")
+        set_tests_properties(aowis-native-http-resource-monitor-tests PROPERTIES
+            LABELS "aowis;http-stress;qualification" TIMEOUT 30)
+    endif()
     add_test(NAME aowis-native-index-scaling-smoke
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_native_index.py"
