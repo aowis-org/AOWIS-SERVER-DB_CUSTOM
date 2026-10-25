@@ -3,6 +3,7 @@
 /build-*/
 /build-linux/
 /build-linux-*/
+/build-vm-powercut/
 /CMakeFiles/
 /CMakeCache.txt
 /Testing/
