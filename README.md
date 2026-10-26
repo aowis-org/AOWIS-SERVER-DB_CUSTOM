@@ -72,11 +72,11 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 
 The build script checks configuration, full build, the HTTP-server target and the executable before launching it. A failed or interrupted build will never fall back to the server left by a previous build. Use `--build-only` for CI, backup procedures and workflows that must not start a database process.
 
-The default server data root (`aowis-dvmdb-data/`) is runtime state, **not source code**. Never commit its `catalogue.lock` or project files; the data root is ignored and excluded from source ZIPs. If a lock was already committed, untrack it with `git rm --cached -- aowis-dvmdb-data/catalogue.lock` (this preserves the live file), then commit that index change. Do not delete the lock of a running database.
+The default **unconfigured** Linux server data root is `$XDG_DATA_HOME/aowis-dvmdb/`, normally `~/.local/share/aowis-dvmdb/`, **outside the source checkout**. `catalogue.lock` is runtime data inside that root, not a configuration file. Explicit `--data-root` and `[storage] root=` override this default. An existing `./aowis-dvmdb-data/` blocks an unconfigured launch to prevent silently opening an empty store; supply the old root explicitly or perform a stopped-server, verified backup/restore migration. Do not delete the lock of a running database. The old checkout-local directory remains ignored by Git and excluded from source ZIPs.
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
-`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata, generated/ignored files, or the live `aowis-dvmdb-data/` root (even if mistakenly tracked). Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-dvmdb-zip-submodule-tests`.
+`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata, generated/ignored files, or a legacy checkout-local `aowis-dvmdb-data/` root (even if mistakenly tracked). Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-dvmdb-zip-submodule-tests`.
 
 ### AOWIS DVMDB project and patch convention
 
@@ -127,7 +127,7 @@ repository.createBranch("main");
 
 Engine failures, including hydraulic load failures, are `aowis::dvmdb::StorageError` exceptions (see `include/aowis/dvmdb/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
 
-The project catalogue is also available as `AOWIS::DvmdbProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-dvmdb` (binds to 127.0.0.1:8755, project storage `./aowis-dvmdb-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
+The project catalogue is also available as `AOWIS::DvmdbProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-dvmdb` (binds to 127.0.0.1:8755, project storage normally at `~/.local/share/aowis-dvmdb`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
 
 For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).
 

@@ -497,6 +497,16 @@ if(AOWIS_DVMDB_WITH_HTTP_SERVER)
         add_executable(aowis-dvmdb-http-tests tests/native_http_tests.cpp)
         target_link_libraries(aowis-dvmdb-http-tests PRIVATE aowis-dvmdb-http)
         add_dependencies(aowis-dvmdb-http-tests aowis-server-dvmdb)
+        # Real-server validation of the XDG user-data default, CLI/INI
+        # overrides and refusal to overlook an existing working-tree store.
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME aowis-dvmdb-default-data-root-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/server_default_data_root_tests.py"
+                    --server "$<TARGET_FILE:aowis-server-dvmdb>")
+            set_tests_properties(aowis-dvmdb-default-data-root-tests PROPERTIES
+                LABELS "aowis;qualification" TIMEOUT 75)
+        endif()
         add_test(NAME aowis-dvmdb-http-tests COMMAND aowis-dvmdb-http-tests
             $<TARGET_FILE:aowis-server-dvmdb>)
         set_tests_properties(aowis-dvmdb-http-tests PROPERTIES LABELS "aowis")

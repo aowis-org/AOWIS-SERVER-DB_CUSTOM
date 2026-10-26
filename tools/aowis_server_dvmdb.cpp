@@ -5,7 +5,10 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QSettings>
+#include <QStandardPaths>
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -140,8 +143,32 @@ int main(int argc, char** argv) {
             settings.value("server/worker_threads", 8).toString();
         const QString pendingValue = parser.isSet(pending) ? parser.value(pending) :
             settings.value("server/max_pending_per_project", "").toString();
+        // Without an explicit root, use the platform's user-data location,
+        // never the source checkout or a relative working-directory path.
+        const bool configuredRoot = parser.isSet(dataRoot) || settings.contains("storage/root");
+        QString defaultRoot;
+        if (!configuredRoot) {
+            const QString location = QStandardPaths::writableLocation(
+                QStandardPaths::GenericDataLocation);
+            if (location.isEmpty() || !QDir::isAbsolutePath(location)) {
+                std::cerr << "Unable to determine a user data directory; set --data-root or "
+                          << "[storage] root explicitly\n";
+                return 2;
+            }
+            // An old default may already contain live projects. Never silently
+            // start a different empty database when the default location changes.
+            const QFileInfo oldRoot(QStringLiteral("aowis-dvmdb-data"));
+            if (oldRoot.exists() || oldRoot.isSymLink()) {
+                std::cerr << "Existing ./aowis-dvmdb-data found; refusing to switch "
+                          << "to the new user-data default silently. Use "
+                          << "--data-root ./aowis-dvmdb-data or configure [storage] "
+                          << "root explicitly; see docs/native-database-service.md\n";
+                return 2;
+            }
+            defaultRoot = QDir(location).filePath(QStringLiteral("aowis-dvmdb"));
+        }
         const QString rootValue = parser.isSet(dataRoot) ? parser.value(dataRoot) :
-            settings.value("storage/root", "./aowis-dvmdb-data").toString();
+            settings.value("storage/root", defaultRoot).toString();
         const QString logPath = parser.isSet(logFile) ? parser.value(logFile) :
             settings.value("logging/file", "").toString();
 

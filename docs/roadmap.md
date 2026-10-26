@@ -21,7 +21,7 @@ AOWIS-wide security design, not to be improvised here.
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
 and a whole-service offline restore drill. On October 26, 2026, after the
-AOWIS-SERVER-DVMDB C++/HTTP naming cleanup, **49/49 CTest tests passed
+AOWIS-SERVER-DVMDB C++/HTTP naming cleanup, **51/51 CTest tests passed
 in both Debug and Release** on an operator's clean Linux rebuild. The
 standalone Release server also built successfully. Two 300-second Linux
 HTTP resource soaks and the earlier uninstrumented

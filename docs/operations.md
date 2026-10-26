@@ -7,6 +7,18 @@ derived object index, published branch references, recovery evidence and tmp).
 Never copy only the active pack: a repository snapshot also needs all matching
 reference files and generation markers.
 
+On Linux, an **unconfigured development server** keeps its data under
+`$XDG_DATA_HOME/aowis-dvmdb/` (normally `~/.local/share/aowis-dvmdb/`), not
+inside the source checkout. The production `deploy/aowis-server-dvmdb.ini`
+still specifies `/var/lib/aowis-dvmdb`. Existing checkout-local
+`./aowis-dvmdb-data/` roots are **not moved automatically**. If that old root
+exists, an unconfigured startup refuses to proceed. Specify
+`--data-root ./aowis-dvmdb-data` to continue using it, or stop every writer,
+back up and restore the whole service root to a new verified location before
+restarting. `catalogue.lock` belongs inside the storage root because it
+coordinates all server processes sharing that root, irrespective of their
+configuration files. It must not be relocated to `/etc`.
+
 ## Coordinated backup and restore
 
 1. Stop the **database server and all direct-library users** of the storage
