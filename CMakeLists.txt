@@ -101,6 +101,12 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/index_benchmark_build_tests.py"
             --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_native_index.py")
     set_tests_properties(aowis-native-index-benchmark-build-tests PROPERTIES LABELS "aowis")
+    # Offline runner tests: no Qt or hydraulic executable is needed here.
+    add_test(NAME aowis-native-hydraulic-workload-driver-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydraulic_workload_driver_tests.py")
+    set_tests_properties(aowis-native-hydraulic-workload-driver-tests PROPERTIES
+        LABELS "aowis;qualification" TIMEOUT 30)
     # Packaging must include the working-tree files of every Git submodule,
     # including recursive submodules. The test creates disposable Git repos.
     find_program(AOWIS_TEST_GIT_EXECUTABLE git)
@@ -396,7 +402,18 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
             benchmarks/hydraulic_edit_benchmark.cpp)
         target_link_libraries(aowis-native-hydraulic-edit-benchmark PRIVATE aowis-native-hydraulic)
         if(BUILD_TESTING)
-            add_dependencies(aowis-db-tests aowis-native-hydraulic-edit-benchmark)
+            add_dependencies(aowis-db-tests aowis-native-hydraulic-edit-benchmark aowis-native-verify)
+            # Genuine canonical hydraulic model operations and a fresh-process
+            # full verification. Each invocation creates its own disposable root.
+            add_test(NAME aowis-native-hydraulic-workload-smoke
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/qualify_hydraulic_workload.py"
+                    --binary "$<TARGET_FILE:aowis-native-hydraulic-edit-benchmark>"
+                    --verifier "$<TARGET_FILE:aowis-native-verify>"
+                    --pipes 12 --edits 2 --topology-edits 2 --repeats 1
+                    --results-root "${CMAKE_CURRENT_BINARY_DIR}/hydraulic-qualification")
+            set_tests_properties(aowis-native-hydraulic-workload-smoke PROPERTIES
+                LABELS "aowis;qualification;hydraulic" TIMEOUT 120)
         endif()
         if(BUILD_TESTING)
             add_executable(aowis-native-model-codec-tests tests/v5_codec_tests.cpp)

@@ -427,3 +427,18 @@ following the HTTP stress-progress and stalled-transfer fixes. This includes
 the four-project historical-format upgrade/restore drill and the offline
 resource-monitor regression. The eight-cut QEMU/KVM ext4/XFS drill was run
 separately from CTest.
+
+## Canonical hydraulic workload qualification boundary
+
+The existing hydraulic edit benchmark models canonical AOWIS network
+serialization and entity validation. A repeated qualification runner now
+measures targeted/complete reads, divergent-branch diff, validated hydraulic
+merge and physical pack/sidecar growth; it also independently reopens and
+fully verifies each disposable repository. See [benchmark plan](benchmark-plan.md).
+
+**No cross-size hydraulic timing or pack-growth measurements have yet been
+supplied for this new procedure.** Its CTest smoke is correctness coverage,
+not a measured Release performance baseline. Unlike the branch-heavy HTTP
+bundle soak, it exercises real canonical model payloads, but the generated
+chain topology, edit distribution and absence of concurrent clients still
+limit what can be inferred about production hydraulic networks.

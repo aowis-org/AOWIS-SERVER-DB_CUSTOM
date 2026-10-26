@@ -53,9 +53,12 @@ certification; see [engineering findings](engineering-findings.md).
 
 ## Scalability and operations
 
-- Qualify **representative hydraulic model** edit/read/merge/diff operations
-  with realistic revision histories, large network records and concurrent
-  clients. The synthetic six-client/three-project bundle workload has passed
+- Run the new **canonical hydraulic model workload qualification** at
+  several pipe counts and preserve measured edit/read/diff/merge, pack/index
+  growth and fresh-process verification reports. The small CTest smoke and
+  deterministic chain fixture are not production-scale evidence; extend the
+  workload with realistic network topology, deep revision histories and
+  concurrent clients. The synthetic six-client/three-project bundle workload has passed
   an instrumented one-hour, >221K-transfer run with stable quarter-hour
   throughput after the branch-lookup fix; a further identical branch-growth
   soak is not the highest-priority evidence gap. Track actual pack/index

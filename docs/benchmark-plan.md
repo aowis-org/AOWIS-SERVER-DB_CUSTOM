@@ -204,3 +204,50 @@ branch counts. It is **not** a replacement for representative hydraulic
 model reads/writes, large object deltas, high-divergence merges, disk I/O
 profiling or real-world client latency. Record those separately before
 publishing a deployment resource envelope.
+
+## Representative canonical hydraulic workload qualification
+
+The existing `aowis-native-hydraulic-edit-benchmark` uses **real serialized
+NetworkHydraulic objects**, not the synthetic model-record topology benchmark.
+It now also measures indexed pipe reads, complete network reconstruction,
+divergent-branch diff, a validated two-parent hydraulic field merge, and
+pack/index growth from initial import to completion. It verifies that
+nonconflicting fields survive merging and that an immutable pre-merge revision
+can still be read. See [hydraulic merging](native-hydraulic-merging.md) for
+conflict semantics.
+
+Build the actual **Release** targets and run repeated independent fixtures:
+
+```bash
+cmake --build build-linux-tests-release --target \
+  aowis-native-hydraulic-edit-benchmark aowis-native-verify --parallel
+python3 tools/qualify_hydraulic_workload.py \
+  --binary ./build-linux-tests-release/aowis-native-hydraulic-edit-benchmark \
+  --verifier ./build-linux-tests-release/aowis-native-verify \
+  --pipes 10000 --edits 20 --topology-edits 3 --repeats 3
+```
+
+The runner saves a unique `build-qualification/hydraulic-workload-*/report.json`
+and the original benchmark and verifier logs. Every repetition uses a brand-new
+repository, verifies its **complete native repository integrity from a new
+process**, and checks that reported physical pack/index sizes match on-disk
+bytes. Each executable's SHA-256 is recorded. By default it removes
+**only its freshly created disposable repository directories** on success;
+use `--keep-fixtures` when investigating a particular case. A failed run
+retains the fixture and diagnostics. Do not run against actual project data.
+
+The result field `fresh_process_reopen_full_verify_ms` measures **process
+startup + repository reopening + full logical/physical verification** together,
+not pure open latency. The OS page cache is not cleared, so it must **not** be
+called a cold-cache disk benchmark. Internal `full_network_read_ms` is a
+separate warm in-process canonical reconstruction. Pack and index growth
+includes all tested operations, including revision/branch overhead. Every
+iteration's raw metrics remain available in `report.json`; no absolute latency
+or memory threshold is implied by this fixture. It is a linear chain of pipes
+with representative entity types and deterministic edits—not a field-derived
+real water network or a concurrent GUI session. Run with several network sizes
+and actual project fixtures before claiming deployment representativeness.
+
+The normal Qt-enabled CTest suite includes a small end-to-end hydraulic
+workload smoke and an additional Qt-free, offline runner-contract regression.
+The smoke only verifies semantic correctness, never a performance SLA.

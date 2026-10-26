@@ -105,6 +105,8 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point importStart = std::chrono::steady_clock::now();
         hydraulic::saveHydraulicNetwork(repository, "main", network);
         const double importMs = elapsedMs(importStart);
+        const std::uint64_t importPackBytes = repository.packSize();
+        const std::uint64_t importIndexBytes = std::filesystem::file_size(directory / "objects.idx");
 
         HydraulicLinkPipe edited = network.links_pipes[0];
         const std::chrono::steady_clock::time_point scalarStart = std::chrono::steady_clock::now();
@@ -308,6 +310,80 @@ int main(int argc, char** argv) {
         const double dependentDeleteMs = elapsedMs(dependentDeleteStart);
         if (!dependencyStats.indexedMembershipFastPath || dependencyStats.validatedEntities != 3)
             throw std::runtime_error("expected indexed demand/control deletion");
+        // Representative model reads: a bounded, indexed entity lookup and
+        // a complete reconstruction are separate operations with different
+        // complexity. Never mix either cost into the edit-path timings.
+        constexpr int readSamples = 100;
+        const std::chrono::steady_clock::time_point targetedStart =
+            std::chrono::steady_clock::now();
+        for (int sample = 0; sample < readSamples; ++sample) {
+            const std::optional<hydraulic::HydraulicEntity> entity =
+                hydraulic::loadHydraulicEntity(repository, "main", network.uuid,
+                    network.links_pipes[sample % pipeCount].uuid);
+            if (!entity || !std::holds_alternative<HydraulicLinkPipe>(*entity))
+                throw std::runtime_error("targeted canonical pipe read failed");
+        }
+        const double targetedMs = elapsedMs(targetedStart);
+        const std::chrono::steady_clock::time_point fullReadStart =
+            std::chrono::steady_clock::now();
+        const std::optional<NetworkHydraulic> reconstructed =
+            hydraulic::loadHydraulicNetwork(repository, "main", network.uuid);
+        const double fullReadMs = elapsedMs(fullReadStart);
+        if (!reconstructed || reconstructed->links_pipes.size() != pipeCount ||
+            reconstructed->nodes_junctions.size() != pipeCount + 1)
+            throw std::runtime_error("full canonical network reconstruction failed");
+
+        // Two branches change DIFFERENT fields of the same existing pipe.
+        // Validate the real hydraulic three-way merger, not the generic
+        // object-level conflict resolver. The immutable baseline must survive.
+        repository.createBranch("baseline", "main");
+        repository.createBranch("feature", "main");
+        const native::Hash baselineId = repository.head("baseline").id;
+        HydraulicLinkPipe targetPipe = edited;
+        HydraulicLinkPipe featurePipe = edited;
+        targetPipe.diameter_mm += 2.0;
+        featurePipe.length_calculated_m += 10.0;
+        hydraulic::editHydraulicNetwork(repository, "main", network.uuid,
+            {{targetPipe.uuid, hydraulic::HydraulicEntity{targetPipe}}});
+        hydraulic::editHydraulicNetwork(repository, "feature", network.uuid,
+            {{featurePipe.uuid, hydraulic::HydraulicEntity{featurePipe}}});
+        const std::chrono::steady_clock::time_point diffStart =
+            std::chrono::steady_clock::now();
+        const std::vector<native::Difference> differences =
+            repository.diff("main", "feature");
+        const double diffMs = elapsedMs(diffStart);
+        if (differences.empty())
+            throw std::runtime_error("divergent hydraulic branches unexpectedly have no diff");
+        const std::chrono::steady_clock::time_point mergeStart =
+            std::chrono::steady_clock::now();
+        const native::MergeResult merged =
+            hydraulic::mergeHydraulicBranches(repository, "main", "feature");
+        const double mergeMs = elapsedMs(mergeStart);
+        if (merged.status != native::MergeStatus::Merged ||
+            merged.revision.parents.size() != 2)
+            throw std::runtime_error("expected a canonical two-parent hydraulic merge");
+        const std::optional<hydraulic::HydraulicEntity> mergedPipe =
+            hydraulic::loadHydraulicEntity(repository, "main", network.uuid, edited.uuid);
+        if (!mergedPipe || !std::holds_alternative<HydraulicLinkPipe>(*mergedPipe))
+            throw std::runtime_error("merged canonical pipe is missing");
+        const HydraulicLinkPipe& finalPipe = std::get<HydraulicLinkPipe>(*mergedPipe);
+        if (finalPipe.diameter_mm != targetPipe.diameter_mm ||
+            finalPipe.length_calculated_m != featurePipe.length_calculated_m)
+            throw std::runtime_error("hydraulic merge lost a nonconflicting field");
+        const std::optional<hydraulic::HydraulicEntity> historicalPipe =
+            hydraulic::loadHydraulicEntityAtRevision(
+                repository, baselineId, network.uuid, edited.uuid);
+        if (!historicalPipe || !std::holds_alternative<HydraulicLinkPipe>(*historicalPipe) ||
+            std::get<HydraulicLinkPipe>(*historicalPipe).diameter_mm != edited.diameter_mm ||
+            std::get<HydraulicLinkPipe>(*historicalPipe).length_calculated_m !=
+                edited.length_calculated_m)
+            throw std::runtime_error("merged revision mutated the historical model");
+        const std::uint64_t finalPackBytes = repository.packSize();
+        const std::uint64_t finalIndexBytes =
+            std::filesystem::file_size(directory / "objects.idx");
+        const std::uint64_t finalObjectCount = repository.objectCount();
+        if (finalPackBytes < importPackBytes || finalIndexBytes < importIndexBytes)
+            throw std::runtime_error("append-only pack or index unexpectedly shrank");
         repository.verifyPack();
         const std::optional<native::ModelRecord> networkRoot = repository.getModel(
             "main", hydraulic::keyFromUuid(network.uuid));
@@ -336,6 +412,20 @@ int main(int argc, char** argv) {
                   << "indexed_dependent_update_batch_ms=" << dependentUpdateMs << '\n'
                   << "indexed_dependent_delete_batch_ms=" << dependentDeleteMs << '\n'
                   << "network_membership_chunk_count=" << networkRoot->references.size() << '\n'
+                  << "targeted_read_samples=" << readSamples << '\n'
+                  << "targeted_read_mean_ms=" << targetedMs / readSamples << '\n'
+                  << "full_network_read_ms=" << fullReadMs << '\n'
+                  << "divergent_diff_ms=" << diffMs << '\n'
+                  << "divergent_diff_entities=" << differences.size() << '\n'
+                  << "canonical_merge_ms=" << mergeMs << '\n'
+                  << "merge_parents=" << merged.revision.parents.size() << '\n'
+                  << "pack_bytes_after_import=" << importPackBytes << '\n'
+                  << "pack_bytes_final=" << finalPackBytes << '\n'
+                  << "pack_growth_bytes=" << finalPackBytes - importPackBytes << '\n'
+                  << "index_bytes_after_import=" << importIndexBytes << '\n'
+                  << "index_bytes_final=" << finalIndexBytes << '\n'
+                  << "index_growth_bytes=" << finalIndexBytes - importIndexBytes << '\n'
+                  << "physical_objects_final=" << finalObjectCount << '\n'
                   << "peak_rss_kib=" << peakRssKiB << '\n';
         return 0;
     } catch (const std::exception& error) {

@@ -1,4 +1,4 @@
-# AOWIS Versioned Model Database
+# AOWIS Distributed Versioned Model Database
 
 **AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
