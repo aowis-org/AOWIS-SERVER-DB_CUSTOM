@@ -43,7 +43,7 @@ Always choose a new, absent destination directory, on a filesystem with enough
 space for the full root plus verification temporary files:
 
 ```bash
-./compile_linux.sh
+./compile_linux.sh --build-only
 python3 tools/offline_backup.py backup /path/to/aowis-dvmdb-data /backup/new-snapshot \
   --verify-binary ./build-linux/aowis-dvmdb-verify
 python3 tools/offline_backup.py restore /backup/new-snapshot /path/to/new-aowis-dvmdb-data \

@@ -49,6 +49,7 @@ def assert_members(archive: Path, project_name: str) -> None:
     }
     excluded = {
         ".env",
+        "aowis-dvmdb-data/catalogue.lock",
         "external/AOWIS-SERVER-MODEL/.env",
         "external/AOWIS-SERVER-MODEL/secret.key",
         "external/AOWIS-SERVER-MODEL/ignored.o",
@@ -98,6 +99,9 @@ def main() -> None:
         init_repo(project)
         write(project / "src/root.cpp", "root\n")
         write(project / ".env", "do not package\n")
+        # This file is deliberately tracked to catch a real-world mistake:
+        # git ls-files includes runtime files even after adding .gitignore.
+        write(project / "aowis-dvmdb-data/catalogue.lock", "runtime lock\n")
         write(project / ".gitignore", "ignored-build/\n")
         (project / "tools").mkdir()
         shutil.copy2(args.script, project / "tools/zip_dvmdb.sh")

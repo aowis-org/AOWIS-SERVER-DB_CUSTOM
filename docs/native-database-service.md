@@ -7,11 +7,13 @@
 With Qt6 Core installed (Qt Network/HttpServer are not needed), run:
 
 ```bash
-./compile_linux.sh
+./compile_linux.sh --build-only
 ./compile_linux_tests.sh --both
 ```
 
 `AOWIS_DVMDB_WITH_HTTP_SERVER=ON` builds the executable and HTTP integration tests (the default when the model codec is enabled). A native-only build uses `-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF -DAOWIS_DVMDB_WITH_HTTP_SERVER=OFF`.
+
+The normal `./compile_linux.sh` command builds and **starts** the server only after all build steps succeed; `--build-only` does not start any process.
 
 ## Run
 

@@ -41,6 +41,10 @@ def main() -> None:
         (project / "legacy_tree").mkdir()
         (project / "legacy_tree" / "obsolete.txt").write_text("old\n", encoding="utf-8")
         # Even mistakenly tracked bytecode must not leak into source snapshots.
+        # Tracked runtime state must never be published inside source ZIPs.
+        runtime_lock = project / "aowis-dvmdb-data" / "catalogue.lock"
+        runtime_lock.parent.mkdir()
+        runtime_lock.write_bytes(b"\0runtime lock fixture")
         python_cache = project / "tools" / "__pycache__"
         python_cache.mkdir()
         (python_cache / "worker.cpython-314.pyc").write_bytes(b"\0\x01test-bytecode")
@@ -65,6 +69,8 @@ def main() -> None:
         with zipfile.ZipFile(output) as archive:
             assert not any("__pycache__" in name or name.endswith(".pyc")
                            for name in archive.namelist()), "source archive contains Python bytecode"
+            assert not any("/aowis-dvmdb-data/" in name for name in archive.namelist()), (
+                "source archive contains runtime database files")
 
         prefix = "AOWIS-SERVER-DVMDB/"
         old_name = directory / ("aowis-" + "db-custom-rejected.zip")

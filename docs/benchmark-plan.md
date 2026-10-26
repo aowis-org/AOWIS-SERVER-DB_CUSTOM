@@ -67,10 +67,10 @@ measure the **existing** SHA-256-to-pack-location index. They do not
 silently swap in a second storage engine. Use the optimized Release binary.
 The driver **automatically rebuilds the exact Release target supplied in
 `--binary`** before generating fixtures; it rejects Debug or foreign CMake
-build trees. `./compile_linux.sh` builds `build-linux`, **not**
+build trees. `./compile_linux.sh --build-only` builds `build-linux`, **not**
 `build-linux-tests-release`. To do an explicit clean Release test build first,
 run `./compile_linux_tests.sh --release`. The example below uses `build-linux`
-so it also works after `./compile_linux.sh`:
+so it also works after `./compile_linux.sh --build-only`:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-index-capacity.XXXXXXXX)"

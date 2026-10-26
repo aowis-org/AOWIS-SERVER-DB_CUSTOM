@@ -78,6 +78,14 @@ if(BUILD_TESTING)
     set_tests_properties(aowis-dvmdb-transfer-staging-budget-tests PROPERTIES LABELS "aowis")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME aowis-dvmdb-build-launch-guard-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/compile_linux_guard_tests.py"
+                --script "${CMAKE_CURRENT_SOURCE_DIR}/compile_linux.sh")
+        set_tests_properties(aowis-dvmdb-build-launch-guard-tests PROPERTIES
+            LABELS "aowis;qualification" TIMEOUT 30)
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME aowis-dvmdb-http-resource-monitor-tests
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_http_resources_tests.py")

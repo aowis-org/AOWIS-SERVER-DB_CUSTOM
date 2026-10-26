@@ -64,14 +64,19 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 ```bash
 ./git_submodule_init.sh          # on initial checkout, if the Model submodule is not initialized
 ./compile_linux_tests.sh --both # Debug and Release CTest suites
-./compile_linux.sh              # optimized Release binaries and benchmarks
+./compile_linux.sh              # build Release and start server, only if every build stage succeeds
+./compile_linux.sh --build-only # build Release binaries and benchmarks, without starting server
 # tools/benchmark_native_index.py rebuilds the exact Release target named by --binary.
 # build-linux and build-linux-tests-release are distinct; do not mix their paths.
 ```
 
+The build script checks configuration, full build, the HTTP-server target and the executable before launching it. A failed or interrupted build will never fall back to the server left by a previous build. Use `--build-only` for CI, backup procedures and workflows that must not start a database process.
+
+The default server data root (`aowis-dvmdb-data/`) is runtime state, **not source code**. Never commit its `catalogue.lock` or project files; the data root is ignored and excluded from source ZIPs. If a lock was already committed, untrack it with `git rm --cached -- aowis-dvmdb-data/catalogue.lock` (this preserves the live file), then commit that index change. Do not delete the lock of a running database.
+
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
-`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata or generated/ignored files. Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-dvmdb-zip-submodule-tests`.
+`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata, generated/ignored files, or the live `aowis-dvmdb-data/` root (even if mistakenly tracked). Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-dvmdb-zip-submodule-tests`.
 
 ### AOWIS DVMDB project and patch convention
 

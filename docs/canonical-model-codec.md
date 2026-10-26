@@ -15,7 +15,7 @@ The binary payload has an internal, explicit serialization version and determini
 ```bash
 ./git_submodule_init.sh
 ./compile_linux_tests.sh --both
-./compile_linux.sh
+./compile_linux.sh --build-only
 ```
 
 The CMake option `AOWIS_DVMDB_WITH_MODEL_CODEC=OFF` allows building only the raw store. With Qt6 Core installed and the Model submodule available, the build provides `AOWIS::DvmdbModelCodec` and `AOWIS::DvmdbHydraulic` and runs model round-trip tests.
