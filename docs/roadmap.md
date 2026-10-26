@@ -20,7 +20,7 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 25, 2026, **44/44 CTest
+and a whole-service offline restore drill. On October 26, 2026, **46/46 CTest
 suites passed in both Debug and Release**. Two repeated 300-second Linux HTTP
 resource soaks passed with 7,505 and 7,459 imports respectively (the same
 number of exports), 0 admission 503s, stable ~28.1 MiB peak server RSS,
@@ -52,11 +52,15 @@ certification; see [engineering findings](engineering-findings.md).
 
 - Run longer, repeated mixed-read/write/merge/replication soaks on realistic
   project sizes. Two 300-second and one 3,600-second same-binary HTTP resource
-  baselines now exist; a later 900-second run also completed 25,493
-  import/export pairs with no 503 responses and 56.65 combined transfers/s.
-  Quantify **within-run throughput by minute** and
-  identify whether the lower hour-long average is caused by accumulating
-  branches, I/O, caching or host contention before proposing optimizations.
+  baselines now exist; the first 900-second run completed 25,493
+  import/export pairs without checkpoint data (56.65 combined transfers/s).
+  A later **instrumented** 900-second run completed 24,363 pairs with no
+  503 responses, but transfer rate fell from **63.3/s** in the first minute
+  to **41.8/s** in the final minute. A code-level scan of all branch refs for
+  single-branch HTTP reads was identified and replaced with targeted lookups.
+  **Repeat that exact workload under comparable conditions**, inspect phase
+  rates and distinguish any remaining history-growth cost, I/O, caching or
+  host contention before proposing more changes.
   Repeat on representative hydraulic model workloads. Also monitor pack/index growth,
   scratch usage,
   per-project fairness, queue saturation and latency under slow clients.

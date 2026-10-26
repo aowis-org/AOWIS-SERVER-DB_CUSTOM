@@ -147,8 +147,14 @@ baseline: 50.03 and 49.73 combined transfers/s; approximately 28.1 MiB peak
 sampled server RSS in both, with 37 peak open descriptors and zero admission
 503s. A subsequent 3,600-second run completed **67,747 imports and
 67,747 exports**, zero admission 503s and a 35.4 MiB sampled RSS peak at
-**37.64 transfers/s**. The lower hour-long average cannot be assigned to
+**37.64 transfers/s**. The lower hour-long average could not be assigned to
 history-growth cost or external contention without per-minute progress data.
+A later 900-second run **with** checkpoints exhibited a 63.28/s to 41.75/s
+first-to-last-minute decline as branch refs accumulated. This exposed a
+single-branch lookup path that scanned the whole branch catalogue, now
+replaced with direct regular-file checks; collect a fresh instrumented run
+before assessing its impact. The saved pre-change progress evidence remains
+useful for comparison.
 These are observed workloads, not resource guarantees. Run repeated longer
 periods (e.g. 3600 and 21600 seconds) with comparable host and fixture
 conditions. The stress harness now prints one-minute import/export checkpoints to

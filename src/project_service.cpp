@@ -377,11 +377,9 @@ Revision ProjectService::createBranch(std::string_view projectId, std::string_vi
     Revision created;
     // Check and creation form one operation of this project.
     withRepository(projectId, [&](Repository& repository) {
-        const std::vector<std::string> branches = repository.listBranches();
-        if (std::find(branches.begin(), branches.end(), std::string(name)) != branches.end()) {
+        if (repository.hasBranch(name))
             throw ProjectError(ProjectErrorKind::Conflict, "branch already exists");
-        }
-        if (fromBranch && std::find(branches.begin(), branches.end(), *fromBranch) == branches.end())
+        if (fromBranch && !repository.hasBranch(*fromBranch))
             throw ProjectError(ProjectErrorKind::NotFound, "source branch not found");
         created = translated<Revision>([&]() {
             if (fromRevision) repository.createBranchAtRevision(name, *fromBranch, *fromRevision);
@@ -398,8 +396,7 @@ Revision ProjectService::head(std::string_view projectId, std::string_view branc
     const std::shared_ptr<Project> found = findProject(projectId);
     return translated<Revision>([&]() {
         const std::shared_ptr<Repository> repository = openRepository(*found);
-        const std::vector<std::string> branches = repository->listBranches();
-        if (std::find(branches.begin(), branches.end(), branch) == branches.end())
+        if (!repository->hasBranch(branch))
             throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
         return repository->head(branch);
     });
@@ -412,8 +409,7 @@ std::vector<Revision> ProjectService::history(std::string_view projectId,
     const std::shared_ptr<Project> found = findProject(projectId);
     return translated<std::vector<Revision>>([&]() {
         const std::shared_ptr<Repository> repository = openRepository(*found);
-        const std::vector<std::string> branches = repository->listBranches();
-        if (std::find(branches.begin(), branches.end(), branch) == branches.end())
+        if (!repository->hasBranch(branch))
             throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
         return repository->history(branch, maxCount, after);
     });

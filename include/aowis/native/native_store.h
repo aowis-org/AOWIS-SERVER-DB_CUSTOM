@@ -238,6 +238,9 @@ public:
 
     void createBranch(std::string_view name, std::optional<std::string_view> from = std::nullopt);
     Revision head(std::string_view branch);
+    // A single validated branch-file lookup, independent of how many other
+    // branches are present. A symlink or a non-regular ref is never a branch.
+    bool hasBranch(std::string_view branch);
     // Sorted branch names, independent of authorization. Filter at the service boundary.
     std::vector<std::string> listBranches();
     // Immutable history: newest first along the first-parent chain. `after`

@@ -2663,6 +2663,17 @@ void Repository::createBranch(std::string_view name, std::optional<std::string_v
     publishRef(name, initial, true);
 }
 
+bool Repository::hasBranch(std::string_view branch) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    checkBranch(branch);
+    const std::filesystem::path path = this->directory_ / "refs" / "heads" / std::string(branch);
+    struct stat metadata{};
+    if (::lstat(path.c_str(), &metadata) == 0) return S_ISREG(metadata.st_mode);
+    if (errno == ENOENT) return false;
+    throwSystemError("stat branch reference");
+}
+
 std::vector<std::string> Repository::listBranches() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);

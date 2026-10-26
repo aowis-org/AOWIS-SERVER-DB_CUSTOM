@@ -165,6 +165,54 @@ void exerciseBackend() {
     require(failed, "corrupt catalogue should fail startup");
 }
 
+// A growing branch catalogue must not make a single-branch request depend on
+// enumerating every other ref. Use real, immutable ref files to build the
+// directory without spending thousands of fsyncs creating test-only branches.
+void exerciseLargeBranchCatalogue() {
+    TemporaryRoot root;
+    ProjectService service(root.directory);
+    const aowis::native::ProjectInfo project = service.createProject("Branch scaling");
+    const aowis::native::Hash mainHead = service.head(project.id, "main").id;
+    const std::filesystem::path heads = root.directory / "projects" / project.id /
+                                        "repository" / "refs" / "heads";
+    constexpr unsigned branchCount = 4096;
+    for (unsigned number = 0; number < branchCount; ++number) {
+        const std::string branch = "bulk_" + std::to_string(number);
+        std::filesystem::copy_file(heads / "main", heads / branch);
+    }
+    require(service.listBranches(project.id).size() == branchCount + 1U,
+            "large branch catalogue is missing entries");
+    for (const unsigned number : {0U, 1024U, 2048U, 4095U}) {
+        const std::string branch = "bulk_" + std::to_string(number);
+        require(service.head(project.id, branch).id == mainHead,
+                "targeted branch read changed revision");
+        require(service.history(project.id, branch, 1).at(0).id == mainHead,
+                "targeted branch history changed revision");
+    }
+    service.createBranch(project.id, "new_from_bulk", "bulk_2048");
+    require(service.head(project.id, "new_from_bulk").id == mainHead,
+            "fork from large branch catalogue lost head");
+    expectError([&] { service.head(project.id, "absent"); }, ProjectErrorKind::NotFound);
+    expectError([&] { service.history(project.id, "absent", 1); }, ProjectErrorKind::NotFound);
+    expectError([&] { service.createBranch(project.id, "missing_parent", "absent"); },
+                ProjectErrorKind::NotFound);
+    expectError([&] { service.createBranch(project.id, "bulk_2048"); },
+                ProjectErrorKind::Conflict);
+
+    // Directory enumeration ignored unsafe branch refs before the targeted
+    // lookup change. Preserve that boundary and do not follow symlinks.
+    std::filesystem::create_symlink("main", heads / "symlink_ref");
+    std::filesystem::create_directory(heads / "directory_ref");
+    require(service.listBranches(project.id).size() == branchCount + 2U,
+            "unsafe branch refs were included in enumeration");
+    for (const char* branch : {"symlink_ref", "directory_ref"}) {
+        expectError([&] { service.head(project.id, branch); }, ProjectErrorKind::NotFound);
+        expectError([&] { service.history(project.id, branch, 1); }, ProjectErrorKind::NotFound);
+        expectError([&] { service.createBranch(project.id, "unsafe_source", branch); },
+                    ProjectErrorKind::NotFound);
+    }
+}
+
 void exerciseUnsafeCatalogue() {
     TemporaryRoot root;
     const std::filesystem::path directory = root.directory / "projects";
@@ -181,6 +229,7 @@ int main() {
     try {
         exerciseBackend();
         exerciseUnsafeCatalogue();
+        exerciseLargeBranchCatalogue();
         std::cout << "Project catalogue and lifecycle tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -237,8 +237,7 @@ QJsonObject projectJson(const ProjectInfo& project) {
 
 void requireBranch(Repository& repository, const std::string& branch) {
     requireInput(ProjectService::validBranchName(branch), "invalid branch name");
-    const std::vector<std::string> branches = repository.listBranches();
-    if (std::find(branches.begin(), branches.end(), branch) == branches.end())
+    if (!repository.hasBranch(branch))
         throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
 }
 

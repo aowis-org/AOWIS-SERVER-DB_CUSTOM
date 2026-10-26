@@ -277,9 +277,47 @@ workflow. The current qualification harness computes progress from the whole
 soak's start time, and a real-server smoke test requires checkpoints. Reports
 saved before those counters existed cannot be reconstructed retrospectively.
 
+## Growing-branch HTTP soak: measured decline and targeted lookup fix
+
+**900-second instrumented run (October 26, 2026):** After both Debug and
+Release passed **46/46 CTest tests**, the operator ran the six-client/three-project
+HTTP soak on an Intel i5-8365U Linux host. It completed **24,363 imports and
+24,363 exports** (48,726 transfers, **54.14/s** overall) with **zero admission
+503s** and **11 ms** worst health latency. The Release server's SHA-256 was
+`04155f8e46ce16721515f76df75fbce28e9d8316bbc37058bd0447bccbba6536`;
+its stress-client SHA-256 was
+`86b32795e5c276f8d875349d7b291c7c7663e68a4ba34a16237fb4c8037586b8`.
+Server RSS sampled at 28,424 KiB initially, 28,080 KiB finally, and a
+29,580 KiB peak (~28.9 MiB); peak file descriptors were 37, peak threads 10,
+and CPU consumed 2,725.56 seconds. Evidence:
+`build-qualification/http-resources-ha2jc118/` (operator-local path).
+
+The first 60-second interval completed **3,797 transfers** (**63.28/s**), but
+the last completed 60-second interval (840–900 s) completed **2,505**
+(**41.75/s**): approximately **34% lower throughput** within the same run.
+Intermediate checkpoints decreased broadly with branch count. This is stronger
+evidence than comparing runs with different desktop activity, but the root
+cause cannot be established by counts alone.
+
+**Code-level scaling issue discovered:** branch-specific HTTP reads previously
+called `Repository::listBranches()` and searched the resulting vector merely
+to establish whether one branch existed. `ProjectService::head()`,
+`ProjectService::history()`, `ProjectService::createBranch()` and the HTTP
+bundle-export/branch-scope guard all used this pattern. As the soak creates a
+new ref for every successful import, each such lookup enumerated and sorted an
+increasing number of ref files. The targeted replacement checks a single
+regular ref with `lstat` under the existing repository lock; explicit branch
+listing still performs the full enumeration. Symlinks/non-regular refs remain
+unrecognized. A 4,096-ref regression exercises branch reads, history, forks,
+missing references and unsafe refs. **No post-change soak result exists yet:**
+repeat the instrumented 900-second run and compare per-minute rates before
+claiming an actual performance improvement. This change does not alter the
+pack, index, bundle or durability protocol.
+
 ## Current test baseline
 
-The operator reported **44/44 CTest tests passing in both Debug and Release**
-following the Linux resource-monitor race fix. This includes the four-project
-historical-format upgrade/restore drill and the offline resource-monitor
-regression. The eight-cut QEMU/KVM ext4/XFS drill was run separately from CTest.
+The operator reported **46/46 CTest tests passing in both Debug and Release**
+following the HTTP stress-progress and stalled-transfer fixes. This includes
+the four-project historical-format upgrade/restore drill and the offline
+resource-monitor regression. The eight-cut QEMU/KVM ext4/XFS drill was run
+separately from CTest.
