@@ -332,11 +332,15 @@ run). Current stress-harness builds additionally write one-minute progress lines
 A dedicated six-second CTest smoke verifies that elapsed-time progress is
 actually emitted by a real HTTP server; only short smoke workloads use
 one-second checkpoints. The analyzer validates monotonic progress and shows
-rates for each interval;
+rates for each interval plus four time-weighted equal-duration throughput
+quarters. These window averages do not assume checkpoint times coincide with
+quarter boundaries. The first/last interval and first/last quarter changes
+are descriptive, not a fixed performance pass/fail threshold;
 these checkpoints perform no extra HTTP operations and do not affect the
 engine or report schema. Pre-existing runs without checkpoints remain
-compatible but cannot be retrospectively separated into throughput phases. It clearly marks differences in run duration,
-host/kernel, or executable hashes as not fully comparable. It **does not**
+compatible but cannot be retrospectively separated into throughput phases.
+It clearly marks differences in run duration, host/kernel or executable
+hashes as not fully comparable. It **does not**
 control CPU contention or prove a memory leak from normal retained-history
 and allocator growth. The original evidence files are never modified.
 
@@ -353,6 +357,24 @@ establish a within-run slowdown**. For a repeat run with the updated stress
 executable, inspect the printed minute-by-minute rates before evaluating
 branch-history cost. Avoid heavy competing CPU/disk work for a clean
 baseline, then separately test intentional contention.
+
+A later optimized and instrumented hour-long run completed **110,733
+imports and 110,733 exports**, no 503s, a **28.0 MiB** sampled peak RSS,
+37 peak descriptors and a 10 ms worst health latency. The four quarter-hour
+rates were **62.01 / 58.70 / 61.56 / 63.81 transfers/s**; this run had no
+persistent throughput decline as branches accumulated. The operator's saved
+evidence can be analyzed with:
+
+```bash
+python3 tools/analyze_http_resource_runs.py \
+  build-qualification/http-resources-lqle9235
+```
+
+The earlier hour-long run used other executables and has no interval records,
+so its 37.64/s average cannot be assigned to a specific stage of the hour.
+The two runs were not controlled for background machine load; the post-change
+61.52/s does not define a portable throughput SLA. See
+[engineering findings](engineering-findings.md) for full details.
 
 The short Python CTest named `aowis-native-http-resource-monitor-tests`
 checks process discovery, sample recording, success parsing, and rejection of

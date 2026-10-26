@@ -158,14 +158,26 @@ previously. Its first/last-minute rates were 64.82/s and 63.10/s. The before
 and after reports have different executable hashes and were not instrumented
 for background host load, so this is useful evidence, not a controlled
 portable speedup estimate. The saved before/after reports remain useful.
-These are observed workloads, not resource guarantees. Run repeated longer
-periods (e.g. 3600 and 21600 seconds) with comparable host and fixture
-conditions. The stress harness now prints one-minute import/export checkpoints to
-`soak.log` without extra HTTP requests. Use
+The subsequently completed **optimized 3,600-second** run retained the same
+Release executable hashes as the post-change 900-second run: 110,733
+imports and exports each (221,466 transfers, **61.52/s**), **zero 503s**,
+28.0 MiB peak sampled server RSS and 10 ms worst health latency. Quarter-hour
+throughput averages were **62.01 / 58.70 / 61.56 / 63.81 transfers/s**,
+showing no sustained decline with the growing branch catalogue. This run
+used different binaries from the previous uninstrumented 3,600-second run,
+and does not establish a portable 63.5% causal speedup claim. Detailed
+figures and caveats are retained in [engineering findings](engineering-findings.md).
+
+These are observed workloads, not resource guarantees. Run additional longer
+periods (e.g. 21600 seconds) only if relevant to deployment workloads, and
+prioritize representative hydraulic model traffic, actual disk use and cold
+reopening on target hardware. The stress harness now prints one-minute
+import/export checkpoints to `soak.log` without extra HTTP requests. Use
 `tools/analyze_http_resource_runs.py` to validate saved JSON/CSV/log evidence,
 compare throughput and central-window RSS medians, and report within-run
-minute-by-minute transfer rates and first-to-last interval changes when
-checkpoints are available. The analysis explicitly distinguishes same-binary
+minute-by-minute transfer rates, first-to-last interval changes and
+four time-weighted quarter-run throughput averages when checkpoints are
+available. The analysis explicitly distinguishes same-binary
 repeats from ordered cross-build comparisons, and reports ordered overall
 throughput change without implying causal attribution. For example, on the
 operator's Linux machine with the original run directories still present:
@@ -174,6 +186,10 @@ operator's Linux machine with the original run directories still present:
 python3 tools/analyze_http_resource_runs.py \
   build-qualification/http-resources-ha2jc118 \
   build-qualification/http-resources-m5po2jr0
+
+# A longer same-binary trend on the optimized build:
+python3 tools/analyze_http_resource_runs.py \
+  build-qualification/http-resources-lqle9235
 ```
 
 Older run logs have only total throughput; their per-minute history cannot

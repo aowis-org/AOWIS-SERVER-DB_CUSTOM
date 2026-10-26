@@ -21,15 +21,18 @@ AOWIS-wide security design, not to be improvised here.
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
 and a whole-service offline restore drill. On October 26, 2026, **46/46 CTest
-suites passed in both Debug and Release**. Two repeated 300-second Linux HTTP
-resource soaks passed with 7,505 and 7,459 imports respectively (the same
-number of exports), 0 admission 503s, stable ~28.1 MiB peak server RSS,
-and 37 peak server file descriptors. A 3,600-second run also completed
-67,747 imports and 67,747 exports, zero HTTP 503s, a 35.4 MiB sampled
-server-RSS peak and 36 peak descriptors. Its 37.64 combined transfers/s
-was below the two five-minute runs (~49.9/s), without within-run throughput
-checkpoints to determine the cause. Separately, an **actual QEMU/KVM
-Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
+suites passed in both Debug and Release**. Two 300-second Linux HTTP resource soaks and the earlier uninstrumented
+3,600-second run established initial resource evidence. Following removal
+of full catalogue scans for single-branch lookups, an **instrumented
+3,600-second** run completed **110,733 imports and 110,733 exports**,
+**61.52 transfers/s** overall, zero admission 503s, a **28.0 MiB**
+sampled RSS peak, 37 peak descriptors and 10 ms worst health latency.
+The four 15-minute interval averages were **62.01, 58.70, 61.56 and
+63.81 transfers/s**. The optimized run did not exhibit sustained throughput
+loss as more than 110,000 branches accumulated. It used a different binary
+from the previous one-hour run and does not establish a portable throughput
+SLA or a representative model-workload envelope. Separately, an **actual
+QEMU/KVM Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
 full repository verification and no acknowledged commit lost. These are
 operator-reported measurements, not automatic CI or hardware-level durability
 certification; see [engineering findings](engineering-findings.md).
@@ -50,24 +53,15 @@ certification; see [engineering findings](engineering-findings.md).
 
 ## Scalability and operations
 
-- Run longer, repeated mixed-read/write/merge/replication soaks on realistic
-  project sizes. Two 300-second and one 3,600-second same-binary HTTP resource
-  baselines now exist; the first 900-second run completed 25,493
-  import/export pairs without checkpoint data (56.65 combined transfers/s).
-  An instrumented 900-second run completed 24,363 import/export pairs
-  with no 503s, but slowed from 63.28/s in its first minute to 41.75/s in
-  the last. A directory-wide scan for single-branch lookups was replaced with
-  direct regular-ref checks. The **post-change** 900-second run completed
-  **28,675 import/export pairs**, **17.7% more transfers overall**, with
-  64.82/s first-minute and 63.10/s last-minute throughput, 28.1 MiB peak
-  server RSS, and zero 503s. The same host/kernel was reported but server
-  and stress hashes differ, and system-load controls were not recorded.
-  **Do not optimize further based only on the previous decline.** Instead,
-  repeat a one-hour instrumented run with the improved binary under mostly
-  idle conditions, then run representative hydraulic model workloads and
-  monitor pack/index growth,
-  scratch usage,
-  per-project fairness, queue saturation and latency under slow clients.
+- Qualify **representative hydraulic model** edit/read/merge/diff operations
+  with realistic revision histories, large network records and concurrent
+  clients. The synthetic six-client/three-project bundle workload has passed
+  an instrumented one-hour, >221K-transfer run with stable quarter-hour
+  throughput after the branch-lookup fix; a further identical branch-growth
+  soak is not the highest-priority evidence gap. Track actual pack/index
+  size, scratch and disk I/O, per-project fairness, queue saturation and
+  slow-client latency. Repeat the longer run on production storage stacks or
+  other hardware if a deployment envelope requires it.
 - Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,
   including sidecar regeneration and compaction. Re-evaluate the compact
   lookup only if representative regressions justify it.

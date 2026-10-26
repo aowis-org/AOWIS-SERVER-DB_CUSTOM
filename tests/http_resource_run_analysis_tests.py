@@ -89,6 +89,11 @@ def run_test():
         require(entry["server_peak_fds"] == 37, "descriptor summary incorrect")
         require(entry["first_last_phase_change_percent"] == 0.0,
                 "flat synthetic throughput should have no phase drift")
+        require(len(entry["throughput_quarters"]) == 4 and
+                all(item["transfers_per_second"] == 100.0
+                    for item in entry["throughput_quarters"]) and
+                entry["first_last_quarter_change_percent"] == 0.0,
+                "flat run must have equal quarter-average throughput")
         require(len(entry["throughput_phases"]) == 2,
                 "missing completed throughput intervals")
         require(entry["throughput_phases"][0]["transfers_per_second"] == 100.0 and
@@ -99,6 +104,8 @@ def run_test():
                 "throughput checkpoint counts do not reconcile with summary")
         old = fixture(base, "old-no-progress", 6000, progress=False)
         require(analyzer.read_run(old)["throughput_phases"] is None and
+                analyzer.read_run(old)["throughput_quarters"] is None and
+                analyzer.read_run(old)["first_last_quarter_change_percent"] is None and
                 analyzer.read_run(old)["first_last_phase_change_percent"] is None,
                 "legacy report without progress must remain valid")
         require(analysis["comparison"]["same_duration_and_host"] and
@@ -114,8 +121,21 @@ def run_test():
         slowed_report = json.loads((slowed / "report.json").read_text())
         slowed_report["log_sha256"] = checksum(log_file)
         (slowed / "report.json").write_text(json.dumps(slowed_report))
-        require(analyzer.read_run(slowed)["first_last_phase_change_percent"] == -50.0,
-                "early/late interval slowdown calculated incorrectly")
+        require(analyzer.read_run(slowed)["first_last_phase_change_percent"] == -50.0 and
+                analyzer.read_run(slowed)["first_last_quarter_change_percent"] == -50.0,
+                "early/late slowdown calculated incorrectly")
+        # Check partial-interval weighting: a checkpoint at 50 seconds crosses
+        # the 30-second quarter boundary; raw checkpoint average is incorrect.
+        nonuniform = [
+            {"start_s": 0, "end_s": 50, "imports": 1000, "exports": 1000},
+            {"start_s": 50, "end_s": 120, "imports": 3500, "exports": 3500},
+        ]
+        quarters = analyzer.quarter_throughput(nonuniform, 120)
+        require([item["transfers_per_second"] for item in quarters] ==
+                [40.0, 60.0, 100.0, 100.0],
+                "partial checkpoint intervals were not time-weighted")
+        require(analyzer.quarter_throughput(None, 120) is None,
+                "historical uninstrumented runs must not get fabricated quarters")
         malformed = fixture(base, "malformed-progress", 6000)
         text = (malformed / "soak.log").read_text()
         (malformed / "soak.log").write_text(text.replace("elapsed_s=60", "elapsed_s=120"))

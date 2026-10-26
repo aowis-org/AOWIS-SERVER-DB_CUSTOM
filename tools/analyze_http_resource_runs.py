@@ -90,6 +90,34 @@ def phase(previous, current):
             "admission_503": current["admission_503"] - previous["admission_503"]}
 
 
+def quarter_throughput(phases, duration):
+    """Average transfer rates in four equal elapsed-time quarters.
+
+    Progress samples can have nonuniform spacing. Assign each interval's
+    completed transfers proportionally to its overlap with a quarter; this
+    assumes a uniform rate *within* a logged interval, not across the run.
+    """
+    if phases is None:
+        return None
+    require(duration > 0 and phases and phases[0]["start_s"] == 0 and
+            phases[-1]["end_s"] == duration,
+            "throughput phases do not cover the complete run")
+    output = []
+    for index in range(4):
+        begin = duration * index / 4
+        end = duration * (index + 1) / 4
+        estimated = 0.0
+        for item in phases:
+            overlap = max(0.0, min(end, item["end_s"]) -
+                          max(begin, item["start_s"]))
+            if overlap > 0:
+                estimated += ((item["imports"] + item["exports"]) * overlap /
+                              (item["end_s"] - item["start_s"]))
+        output.append({"quarter": index + 1, "start_s": begin, "end_s": end,
+                       "transfers_per_second": round(estimated / (end - begin), 3)})
+    return output
+
+
 def read_run(argument):
     directory = argument if argument.is_dir() else argument.parent
     report_path = directory / "report.json"
@@ -174,6 +202,12 @@ def read_run(argument):
     # This is a descriptive first/last interval comparison, not a slope fit.
     # Runs without saved checkpoints cannot supply an interval trend.
     phase_change = None
+    quarters = quarter_throughput(phases, duration)
+    quarter_change = None
+    if quarters is not None and quarters[0]["transfers_per_second"] > 0:
+        quarter_change = round(100 * (
+            quarters[-1]["transfers_per_second"] /
+            quarters[0]["transfers_per_second"] - 1), 3)
     if phases is not None and len(phases) >= 2:
         first_rate = phases[0]["transfers_per_second"]
         last_rate = phases[-1]["transfers_per_second"]
@@ -202,6 +236,8 @@ def read_run(argument):
         "stress_sha256": report["executables"]["stress"]["sha256"],
         "throughput_phases": phases,
         "first_last_phase_change_percent": phase_change,
+        "throughput_quarters": quarters,
+        "first_last_quarter_change_percent": quarter_change,
     }
 
 
@@ -242,6 +278,8 @@ def analyze(arguments):
             "Within-run throughput checkpoints cannot explain host contention or storage causes",
             "Cross-build improvements are associations, not controlled causal attribution",
             "First/last interval change is not a monotonicity or statistical trend test",
+            "Quarter rates estimate uniform activity within each checkpoint interval; "
+            "they are descriptive, not a performance SLA",
         ],
     }
 
@@ -275,6 +313,14 @@ def main(argv=None):
                 if run["first_last_phase_change_percent"] is not None:
                     print("  First-to-last interval change: " +
                           f"{run['first_last_phase_change_percent']:+.2f}%")
+                if run["throughput_quarters"] is not None:
+                    rates = ", ".join(
+                        f"Q{quarter['quarter']}={quarter['transfers_per_second']:.2f}/s"
+                        for quarter in run["throughput_quarters"])
+                    print("  Quarter-average throughput: " + rates)
+                    if run["first_last_quarter_change_percent"] is not None:
+                        print("  First-to-last quarter change: " +
+                              f"{run['first_last_quarter_change_percent']:+.2f}%")
         if len(result["runs"]) > 1:
             print("Comparable duration/host/kernel/binaries: " +
                   ("yes" if result["comparison"]["same_duration_host_kernel_and_executables"]

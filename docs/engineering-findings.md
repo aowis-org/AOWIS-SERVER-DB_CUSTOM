@@ -349,6 +349,77 @@ SLA. The branch-lookup improvement should be retained unless a regression
 provides contrary evidence; longer same-build runs and representative model
 workloads remain to be qualified.
 
+## One-hour growing-branch qualification after direct lookups (October 26, 2026)
+
+The operator completed the requested **3,600-second** six-client,
+three-project HTTP stress campaign on the optimized Release server (same
+executables as the post-change 900-second run). It reported **110,733
+successful imports and 110,733 exports**: **221,466 total transfers**,
+**61.52/s** average, **zero admission HTTP 503s**, and **10 ms** worst health
+response. The native HTTP soak checks the published heads as it runs and
+reopens the repository after server shutdown to verify branch heads and that
+successful imports match the retained branch count. The run therefore also
+exercised a growing branch catalogue with more than 110,000 imported heads
+across three projects, not only HTTP request counters.
+
+The Release executable SHA-256 values are
+`ffd42d37edb64fd5ead567d50480159bf7f89902b93f8cba5de973f317208261`
+(server) and
+`6a756d8230f25c01578f5a94089ba0ea2ab5b1c2f60ccbe9bf59fbb942176c83`
+(stress). Environment: x86_64 Linux `7.2.6-arch2-1`, Intel i5-8365U,
+8 logical CPUs. Evidence retained locally as
+`build-qualification/http-resources-lqle9235/`; the original JSON report
+records the workload SHA-256, server identity and the soak-log SHA-256.
+These are operator-supplied measurements, not measurements recreated from
+raw CSV within CI.
+
+| Observation | Earlier 1-hour run | Direct-lookup 1-hour run |
+|---|---:|---:|
+| Imports and exports (each) | 67,747 | 110,733 |
+| Combined transfers/s | 37.64 | 61.52 |
+| Admission HTTP 503 | 0 | 0 |
+| Worst health latency | 10 ms | 10 ms |
+| Peak sampled server RSS | 36,220 KiB (35.4 MiB) | 28,628 KiB (28.0 MiB) |
+| Initial / final sampled server RSS | 27,648 / 28,292 KiB | 28,068 / 27,944 KiB |
+| Peak server file descriptors | 36 | 37 |
+| Peak server threads | 10 | 10 |
+| Server CPU time | 10,837.03 s | 10,830.11 s |
+
+The optimized run achieved **63.5% more transfers** in the same duration,
+while the sampled RSS ended **124 KiB below** its first observed sample.
+The peak is a sampled operating-system RSS value, **not** a maximum memory
+allocation or deployment SLA. CPU consumption was ~3.01 logical-core
+seconds per elapsed second, which is not a measurement of systemwide CPU
+usage.
+
+Unlike the earlier one-hour run, this run recorded **60 throughput phases**.
+The first minute completed **3,428 transfers** (57.13/s), and the final
+minute **3,482** (58.03/s). Quarter-hour aggregate rates were:
+
+| Elapsed time | Combined transfers/s |
+|---|---:|
+| 0–15 minutes | 62.01 |
+| 15–30 minutes | 58.70 |
+| 30–45 minutes | 61.56 |
+| 45–60 minutes | 63.81 |
+
+There is **no sustained within-run downward trend** in this hour-long
+branch-growth fixture. The quarter-level view is more representative than
+isolated first/last minute samples, and the analyzer now derives this view
+from saved progress checkpoints (time-weighting boundaries if necessary).
+The earlier one-hour run had no progress checkpoints, so no historical
+first/last-quarter comparison can be reconstructed.
+
+The two one-hour reports have different server and stress executable hashes;
+moreover, the operator previously reported Firefox/YouTube activity during
+the earlier run, and host load was not independently measured. This is
+strong supporting evidence that the direct single-branch lookup removed an
+important scaling cost, **not** a controlled causal 63.5% speedup guarantee.
+This workload continuously creates branches from repeated transfers; it
+is not a representative hydraulic-model edit/merge workload, a storage
+capacity study, or a test of authentication on untrusted networks. Those
+are separate release qualification tasks.
+
 ## Current test baseline
 
 The operator reported **46/46 CTest tests passing in both Debug and Release**
