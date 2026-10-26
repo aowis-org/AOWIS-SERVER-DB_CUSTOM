@@ -56,12 +56,16 @@ certification; see [engineering findings](engineering-findings.md).
 
 ## Scalability and operations
 
-- Extend the **canonical hydraulic model workload qualification** from its
-  completed three-repeat, 10,000-pipe baseline to several pipe counts and preserve measured edit/read/diff/merge, pack/index
-  growth and fresh-process verification reports. The small CTest smoke and
-  deterministic chain fixture are not production-scale evidence; extend the
-  workload with realistic network topology, deep revision histories and
-  concurrent clients. The synthetic six-client/three-project bundle workload has passed
+- The canonical hydraulic workload has now passed three operator-run
+  repetitions each at **10K, 50K and 100K pipes**. Reconstruction, validated
+  merge, fresh-process verification and pack size grew roughly proportionally
+  to pipe count in this generated chain fixture (see engineering findings).
+  The remaining work is to compare the saved full evidence (same-binary
+  verification, indexed edit/targeted-read/diff latencies, index size and
+  peak RSS), define application latency budgets, and extend the workload with
+  realistic network topology, deep revision histories and concurrent clients.
+  The small CTest smoke and deterministic chain fixture are not
+  production-scale evidence. The synthetic six-client/three-project bundle workload has passed
   an instrumented one-hour, >221K-transfer run with stable quarter-hour
   throughput after the branch-lookup fix; a further identical branch-growth
   soak is not the highest-priority evidence gap. Track actual pack/index

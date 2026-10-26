@@ -12,3 +12,6 @@ cmake -S "$project_dir" -B "$project_dir/build-linux" -G Ninja \
     -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build "$project_dir/build-linux" --parallel
 printf 'AOWIS native storage library and Release benchmark built in build-linux.\n'
+
+./build-linux/aowis-server-dvmdb
+

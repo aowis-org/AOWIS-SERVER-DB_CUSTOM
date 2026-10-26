@@ -446,11 +446,38 @@ The **median full-network read** was **1,085.58 ms** (range 953.38–1,297.88 ms
 (1,099.12–1,158.29 ms). Every run reported **12.86 MiB** final pack size
 and independent full verification passed. These are operator-reported
 warm/uncontrolled-OS-cache measurements, not pure open times or cold-cache
-results. The renamed executables have new hashes and report identifiers;
-repeat the 10K baseline using current DVMDB Release binaries before comparing
-to 50K/100K runs. **No cross-size hydraulic measurements have yet been
-supplied.** The small CTest smoke is correctness coverage,
-not production-scale evidence. Unlike the branch-heavy HTTP
-bundle soak, it exercises real canonical model payloads, but the generated
-chain topology, edit distribution and absence of concurrent clients still
-limit what can be inferred about production hydraulic networks.
+results. The renamed executables have new hashes and report identifiers; the
+operator subsequently repeated the 10K baseline and ran the 50K/100K series
+with DVMDB-native Release executables, as recorded below.
+
+**DVMDB hydraulic network size series (operator, October 26, 2026):**
+With the renamed Release benchmark, the operator then completed **three
+independent successful runs at each of 10K, 50K and 100K pipes**, using
+20 scalar edits and three topology edits per repository:
+
+| Pipes | Median full-network reconstruction | Median validated merge | Median new-process full verification | Final pack per run |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1,033.85 ms | 1,877.05 ms | 1,357.37 ms | 12.86 MiB |
+| 50,000 | 5,843.52 ms | 11,492.34 ms | 7,065.88 ms | 62.88 MiB |
+| 100,000 | 11,251.48 ms | 20,336.20 ms | 12,729.78 ms | 125.34 MiB |
+
+Relative to the 10K run, a 10-fold larger network required **10.88x** the
+reconstruction time, **10.83x** the merge time and **9.38x** the separate-process
+full-verification time; final pack size was **9.75x** as large. These results
+are broadly proportional to pipe count in this synthetic workload. They do
+**not** prove a complexity bound or exclude other workload-specific scaling
+issues. Timings are three-run medians; OS cache, host contention and filesystem
+I/O were not controlled. The operator supplied summary timings rather than the
+complete per-run JSON/CSV and executable hashes in this exchange, so the
+cross-size analyzer's executable-identity and detailed evidence checks remain
+to be run on the saved result directories.
+
+The current full-network read (~11.25 seconds) and merged-revision operation
+(~20.34 seconds) at 100K pipes are **whole-network operations**, not indexed
+single-entity read or scalar edit latencies. Before changing the storage
+engine, examine the separately recorded targeted-read, indexed-edit, diff,
+index-growth and peak-RSS metrics and establish an application latency
+budget. The small CTest smoke is correctness coverage, not production-scale
+evidence. Unlike the branch-heavy HTTP bundle soak, this exercises real
+canonical model payloads, but its chain topology, deterministic edit pattern
+and lack of concurrent clients still limit production representativeness.

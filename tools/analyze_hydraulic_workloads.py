@@ -147,8 +147,23 @@ def analyze(paths):
     base = summaries[0]
     for row in summaries:
         row["pipe_ratio"] = round(row["pipes"] / base["pipes"], 4)
-        row["network_read_ratio"] = round(row["network_read_ms"] / base["network_read_ms"], 4) if base["network_read_ms"] else None
-        row["merge_ratio"] = round(row["merge_ms"] / base["merge_ms"], 4) if base["merge_ms"] else None
+        # Ratios compare like-for-like independent repositories, not isolated
+        # storage-engine microbenchmarks. Zero-time measurements have no valid
+        # proportional ratio; keep them blank in CSV instead of dividing by 0.
+        for field in ("network_read_ms", "merge_ms", "reopen_verify_ms",
+                      "pack_mib", "index_mib", "targeted_read_ms",
+                      "scalar_edit_ms", "topology_edit_ms", "diff_ms"):
+            denominator = base[field]
+            ratio_key = {
+                "network_read_ms": "network_read_ratio",
+                "merge_ms": "merge_ratio",
+                "reopen_verify_ms": "reopen_verify_ratio",
+            }.get(field, field + "_ratio")
+            row[ratio_key] = round(row[field] / denominator, 4) if denominator else None
+        row["network_read_ms_per_1000_pipes"] = round(
+            row["network_read_ms"] * 1000 / row["pipes"], 5)
+        row["merge_ms_per_1000_pipes"] = round(
+            row["merge_ms"] * 1000 / row["pipes"], 5)
     return summaries
 
 
@@ -184,7 +199,26 @@ def main():
                   f"{row['pack_mib']:9.2f} {row['pack_bytes_per_pipe'] / 1024:10.2f} "
                   f"{row['network_read_ms']:8.2f} {row['merge_ms']:9.2f} "
                   f"{row['reopen_verify_ms']:10.2f} {row['peak_rss_mib']:13.2f}")
-        print("Comparison uses identical benchmark/verifier SHA-256 and edit settings.")
+        print("Indexed operation medians (milliseconds; separate from full reconstruction):")
+        print("pipes    scalar_edit   topology_edit  targeted_read  divergent_diff")
+        for row in rows:
+            print(f"{row['pipes']:7d} {row['scalar_edit_ms']:12.3f} "
+                  f"{row['topology_edit_ms']:14.3f} "
+                  f"{row['targeted_read_ms']:14.3f} {row['diff_ms']:15.2f}")
+        if len(rows) > 1:
+            print(f"Growth relative to {rows[0]['pipes']} pipes (median ratios):")
+            print("pipes   pipes_x   read_x  merge_x  verify_x   pack_x  index_x  read_ms/1k  merge_ms/1k")
+            for row in rows:
+                def fmt_ratio(name):
+                    value = row[name]
+                    return f"{value:7.2f}" if value is not None else "    n/a"
+                print(f"{row['pipes']:7d} {row['pipe_ratio']:8.2f} "
+                      f"{fmt_ratio('network_read_ratio')} {fmt_ratio('merge_ratio')} "
+                      f"{fmt_ratio('reopen_verify_ratio')} {fmt_ratio('pack_mib_ratio')} "
+                      f"{fmt_ratio('index_mib_ratio')} "
+                      f"{row['network_read_ms_per_1000_pipes']:11.2f} "
+                      f"{row['merge_ms_per_1000_pipes']:12.2f}")
+        print("Comparison requires identical benchmark/verifier SHA-256 and edit settings.")
         print("Read/merge timings use an uncontrolled OS cache; verify includes new process startup and full integrity scan.")
         if arguments.csv is not None:
             export_csv(arguments.csv, rows)

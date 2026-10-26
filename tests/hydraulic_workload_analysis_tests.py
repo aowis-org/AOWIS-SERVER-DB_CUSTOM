@@ -80,13 +80,24 @@ def run_test():
                 "median read time incorrect")
         require(rows[0]["pack_bytes_per_pipe"] == 1350,
                 "pack bytes per pipe incorrect")
+        require(rows[1]["reopen_verify_ratio"] > 4.0 and
+                rows[1]["pack_mib_ratio"] == 5.0 and
+                rows[1]["network_read_ms_per_1000_pipes"] == 100.4 and
+                rows[0]["targeted_read_ms_ratio"] == 1.0,
+                "extended size-scaling ratios are incorrect")
         csv_path = root / "summary.csv"
         result = cli(large, small, "--csv", csv_path)
         require(result.returncode == 0, "successful CLI comparison failed: " + result.stderr)
+        require("Indexed operation medians" in result.stdout and
+                "Growth relative to 1000 pipes" in result.stdout and
+                "targeted_read" in result.stdout,
+                "indexed-work and normalized-growth summaries missing from CLI")
         with csv_path.open(newline="") as stream:
             data = list(csv.DictReader(stream))
         require(len(data) == 2 and data[0]["pipes"] == "1000" and
-                data[1]["merge_ratio"] != "", "missing or incorrect CSV output")
+                data[1]["merge_ratio"] != "" and
+                data[1]["reopen_verify_ratio"] != "" and
+                data[1]["pack_mib_ratio"] != "", "missing or incorrect CSV output")
         different = create_report(root, 9000, benchmark_sha="e" * 64)
         result = cli(small, different)
         require(result.returncode != 0 and "different benchmark/verifier" in result.stderr,

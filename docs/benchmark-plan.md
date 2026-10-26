@@ -243,6 +243,25 @@ python3 tools/analyze_hydraulic_workloads.py \
   --csv build-qualification/hydraulic-size-comparison.csv
 ```
 
+For the successful operator-reported October 26, 2026 series, the saved
+local directories can be compared without re-running the benchmarks:
+
+```bash
+python3 tools/analyze_hydraulic_workloads.py \
+  build-qualification/hydraulic-workload-f18bsyo0 \
+  build-qualification/hydraulic-workload-7kem6w99 \
+  build-qualification/hydraulic-workload-nvqj2qod \
+  --csv build-qualification/hydraulic-size-comparison.csv
+```
+
+This also prints the **indexed scalar/topology edit**, **targeted-read** and
+**divergent-diff** medians, plus ratios and milliseconds per 1,000 pipes for
+whole-network operations. These distinctions matter: a 100K-pipe full
+reconstruction or merge is not a proxy for the latency of an indexed edit.
+The comparison will refuse different benchmark or verifier hashes, inconsistent
+edit settings and missing raw evidence; without the saved per-run files, only
+the operator-supplied aggregate timings can be assessed.
+
 Replace the placeholders with the actual output directory names. The comparison
 requires matching benchmark/verifier SHA-256 hashes and edit counts; because
 its executable identity changed during the DVMDB API rename, do **not** mix
