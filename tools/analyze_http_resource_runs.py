@@ -171,6 +171,14 @@ def read_run(argument):
     require(early and late, f"insufficient samples in early/late windows: {csv_path}")
     early_median = statistics.median(early)
     late_median = statistics.median(late)
+    # This is a descriptive first/last interval comparison, not a slope fit.
+    # Runs without saved checkpoints cannot supply an interval trend.
+    phase_change = None
+    if phases is not None and len(phases) >= 2:
+        first_rate = phases[0]["transfers_per_second"]
+        last_rate = phases[-1]["transfers_per_second"]
+        require(first_rate > 0, "first progress interval contains no completed transfers")
+        phase_change = round(100 * (last_rate / first_rate - 1), 3)
     return {
         "directory": str(directory.resolve()),
         "report_sha256": file_hash(report_path),
@@ -193,21 +201,33 @@ def read_run(argument):
         "server_sha256": report["executables"]["server"]["sha256"],
         "stress_sha256": report["executables"]["stress"]["sha256"],
         "throughput_phases": phases,
+        "first_last_phase_change_percent": phase_change,
     }
 
 
 def analyze(arguments):
     runs = [read_run(path) for path in arguments]
     baseline = runs[0]
-    compatible = all(
-        (run["duration_s"], run["host"], run["server_sha256"],
-         run["stress_sha256"]) ==
-        (baseline["duration_s"], baseline["host"], baseline["server_sha256"],
-         baseline["stress_sha256"]) for run in runs[1:])
+    same_host_duration = all(
+        (run["duration_s"], run["host"]) ==
+        (baseline["duration_s"], baseline["host"]) for run in runs[1:])
+    same_server = all(run["server_sha256"] == baseline["server_sha256"]
+                      for run in runs[1:])
+    same_harness = all(run["stress_sha256"] == baseline["stress_sha256"]
+                       for run in runs[1:])
+    compatible = same_host_duration and same_server and same_harness
+    first_to_last = None
+    if len(runs) >= 2:
+        first_to_last = round(100 * (
+            runs[-1]["operations_per_second"] / baseline["operations_per_second"] - 1), 3)
     return {
         "kind": "aowis-native-http-resource-run-analysis", "version": 1,
         "comparison": {
             "same_duration_host_kernel_and_executables": compatible,
+            "same_duration_and_host": same_host_duration,
+            "same_server_executable": same_server,
+            "same_stress_executable": same_harness,
+            "first_to_last_overall_throughput_change_percent": first_to_last,
             "throughput_range_percent_of_mean":
                 round(100 * (max(run["operations_per_second"] for run in runs) -
                              min(run["operations_per_second"] for run in runs)) /
@@ -220,6 +240,8 @@ def analyze(arguments):
             "Equal kernel and binary hashes do not establish equal disk/cache/background load",
             "Early/late medians describe a run; they are not a memory-leak classification",
             "Within-run throughput checkpoints cannot explain host contention or storage causes",
+            "Cross-build improvements are associations, not controlled causal attribution",
+            "First/last interval change is not a monotonicity or statistical trend test",
         ],
     }
 
@@ -250,12 +272,27 @@ def main(argv=None):
                 for phase_result in run["throughput_phases"]:
                     print(f"  {phase_result['start_s']:>5}-{phase_result['end_s']:<5} s: "
                           f"{phase_result['transfers_per_second']:.2f} transfers/s")
+                if run["first_last_phase_change_percent"] is not None:
+                    print("  First-to-last interval change: " +
+                          f"{run['first_last_phase_change_percent']:+.2f}%")
         if len(result["runs"]) > 1:
             print("Comparable duration/host/kernel/binaries: " +
                   ("yes" if result["comparison"]["same_duration_host_kernel_and_executables"]
                    else "NO (compare trends descriptively only)"))
+            comparison = result["comparison"]
+            print("Same duration and host: " +
+                  ("yes" if comparison["same_duration_and_host"] else "NO"))
+            print("Same server executable: " +
+                  ("yes" if comparison["same_server_executable"] else "NO"))
+            print("Same stress executable: " +
+                  ("yes" if comparison["same_stress_executable"] else "NO"))
+            print("First-to-last overall rate change (ordered runs): " +
+                  f"{comparison['first_to_last_overall_throughput_change_percent']:+.2f}%")
             print("Throughput spread: " +
-                  f"{result['comparison']['throughput_range_percent_of_mean']:.2f}% of mean")
+                  f"{comparison['throughput_range_percent_of_mean']:.2f}% of mean")
+            if not comparison["same_duration_host_kernel_and_executables"]:
+                print("  Descriptive comparison only: runs differ in host, duration "
+                      "or binaries; external load was not controlled.")
         return 0
     except (AnalysisError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"HTTP resource analysis FAILED: {error}", file=sys.stderr)

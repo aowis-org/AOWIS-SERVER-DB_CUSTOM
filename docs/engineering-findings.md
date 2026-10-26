@@ -309,10 +309,45 @@ increasing number of ref files. The targeted replacement checks a single
 regular ref with `lstat` under the existing repository lock; explicit branch
 listing still performs the full enumeration. Symlinks/non-regular refs remain
 unrecognized. A 4,096-ref regression exercises branch reads, history, forks,
-missing references and unsafe refs. **No post-change soak result exists yet:**
-repeat the instrumented 900-second run and compare per-minute rates before
-claiming an actual performance improvement. This change does not alter the
-pack, index, bundle or durability protocol.
+missing references and unsafe refs. This change does not alter the pack,
+index, bundle or durability protocol.
+
+**Measured post-change comparison (October 26, 2026):** The operator ran the
+same 900-second, six-client/three-project workload after rebuilding the Release
+server and stress executable, on the same reported x86_64 Linux host/kernel.
+The following outcomes are taken from saved operator-reported `report.json`
+and one-minute `soak.log` contents, not independent execution by CI:
+
+| Observation | Before direct branch lookup | After direct branch lookup |
+|---|---:|---:|
+| Successful imports | 24,363 | 28,675 |
+| Successful exports | 24,363 | 28,675 |
+| Combined transfers per second | 54.14 | 63.72 |
+| First 60-second interval | 63.28/s | 64.82/s |
+| Last 60-second interval | 41.75/s | 63.10/s |
+| First-to-last interval change | -34.03% | -2.65% |
+| Peak sampled server RSS | 28.89 MiB | 28.10 MiB |
+| Peak server file descriptors | 37 | 37 |
+| Worst health latency | 11 ms | 4 ms |
+| Admission HTTP 503 | 0 | 0 |
+| Server CPU seconds | 2,725.56 | 2,717.12 |
+
+Overall throughput increased **17.7%**, and the late-run decline was much
+smaller. Rates vary from minute to minute; the first/last statistic does not
+mean each intermediate minute remained flat. The post-change run began at
+28,492 KiB RSS, ended at 27,912 KiB, peaked at 28,772 KiB, and retained a
+maximum of 10 threads. Its original evidence directory is
+`build-qualification/http-resources-m5po2jr0/`, with SHA-256 of the server
+`ffd42d37edb64fd5ead567d50480159bf7f89902b93f8cba5de973f317208261`
+and of the workload
+`6a756d8230f25c01578f5a94089ba0ea2ab5b1c2f60ccbe9bf59fbb942176c83`.
+The previous server and workload hashes differ: this is a **cross-build**
+comparison. Although it corroborates the identified directory-scan bottleneck,
+background activity, temperature, page cache and fixture timing were not
+controlled. Do not report 17.7% as a portable causal speedup or throughput
+SLA. The branch-lookup improvement should be retained unless a regression
+provides contrary evidence; longer same-build runs and representative model
+workloads remain to be qualified.
 
 ## Current test baseline
 

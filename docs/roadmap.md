@@ -54,14 +54,18 @@ certification; see [engineering findings](engineering-findings.md).
   project sizes. Two 300-second and one 3,600-second same-binary HTTP resource
   baselines now exist; the first 900-second run completed 25,493
   import/export pairs without checkpoint data (56.65 combined transfers/s).
-  A later **instrumented** 900-second run completed 24,363 pairs with no
-  503 responses, but transfer rate fell from **63.3/s** in the first minute
-  to **41.8/s** in the final minute. A code-level scan of all branch refs for
-  single-branch HTTP reads was identified and replaced with targeted lookups.
-  **Repeat that exact workload under comparable conditions**, inspect phase
-  rates and distinguish any remaining history-growth cost, I/O, caching or
-  host contention before proposing more changes.
-  Repeat on representative hydraulic model workloads. Also monitor pack/index growth,
+  An instrumented 900-second run completed 24,363 import/export pairs
+  with no 503s, but slowed from 63.28/s in its first minute to 41.75/s in
+  the last. A directory-wide scan for single-branch lookups was replaced with
+  direct regular-ref checks. The **post-change** 900-second run completed
+  **28,675 import/export pairs**, **17.7% more transfers overall**, with
+  64.82/s first-minute and 63.10/s last-minute throughput, 28.1 MiB peak
+  server RSS, and zero 503s. The same host/kernel was reported but server
+  and stress hashes differ, and system-load controls were not recorded.
+  **Do not optimize further based only on the previous decline.** Instead,
+  repeat a one-hour instrumented run with the improved binary under mostly
+  idle conditions, then run representative hydraulic model workloads and
+  monitor pack/index growth,
   scratch usage,
   per-project fairness, queue saturation and latency under slow clients.
 - Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,

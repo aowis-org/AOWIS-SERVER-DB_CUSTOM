@@ -87,6 +87,8 @@ def run_test():
         require(entry["server_avg_cpu_cores"] == 3.0, "CPU-core equivalents incorrect")
         require(entry["operations_per_second"] == 100.0, "transfer normalization incorrect")
         require(entry["server_peak_fds"] == 37, "descriptor summary incorrect")
+        require(entry["first_last_phase_change_percent"] == 0.0,
+                "flat synthetic throughput should have no phase drift")
         require(len(entry["throughput_phases"]) == 2,
                 "missing completed throughput intervals")
         require(entry["throughput_phases"][0]["transfers_per_second"] == 100.0 and
@@ -96,8 +98,24 @@ def run_test():
                 sum(item["exports"] for item in entry["throughput_phases"]) == 6000,
                 "throughput checkpoint counts do not reconcile with summary")
         old = fixture(base, "old-no-progress", 6000, progress=False)
-        require(analyzer.read_run(old)["throughput_phases"] is None,
+        require(analyzer.read_run(old)["throughput_phases"] is None and
+                analyzer.read_run(old)["first_last_phase_change_percent"] is None,
                 "legacy report without progress must remain valid")
+        require(analysis["comparison"]["same_duration_and_host"] and
+                analysis["comparison"]["same_server_executable"] and
+                analysis["comparison"]["same_stress_executable"],
+                "same-binary repeat comparison classification incorrect")
+        require(analysis["comparison"]["first_to_last_overall_throughput_change_percent"] == -0.5,
+                "ordered overall throughput percentage incorrect")
+        slowed = fixture(base, "slowed-phase", 6000)
+        log_file = slowed / "soak.log"
+        log_file.write_text(log_file.read_text().replace("imports=3000", "imports=4000")
+                            .replace("exports=3000", "exports=4000"))
+        slowed_report = json.loads((slowed / "report.json").read_text())
+        slowed_report["log_sha256"] = checksum(log_file)
+        (slowed / "report.json").write_text(json.dumps(slowed_report))
+        require(analyzer.read_run(slowed)["first_last_phase_change_percent"] == -50.0,
+                "early/late interval slowdown calculated incorrectly")
         malformed = fixture(base, "malformed-progress", 6000)
         text = (malformed / "soak.log").read_text()
         (malformed / "soak.log").write_text(text.replace("elapsed_s=60", "elapsed_s=120"))
@@ -135,9 +153,19 @@ def run_test():
         else:
             raise AssertionError("forged completion count accepted")
         different = fixture(base, "changed-binary", 6000, executable="f" * 64)
-        require(not analyzer.analyze([first, different])["comparison"][
-            "same_duration_host_kernel_and_executables"],
-            "different binary must never be marked fully comparable")
+        cross_build = analyzer.analyze([first, different])["comparison"]
+        require(not cross_build["same_duration_host_kernel_and_executables"] and
+                cross_build["same_duration_and_host"] and
+                not cross_build["same_server_executable"] and
+                cross_build["same_stress_executable"],
+                "different server binary must be labeled as cross-build comparison")
+        other_harness = fixture(base, "different-harness", 6000)
+        other_report_path = other_harness / "report.json"
+        other_report = json.loads(other_report_path.read_text())
+        other_report["executables"]["stress"]["sha256"] = "c" * 64
+        other_report_path.write_text(json.dumps(other_report))
+        require(not analyzer.analyze([first, other_harness])["comparison"][
+            "same_stress_executable"], "different stress binary misidentified")
         # A summary that no longer matches the measurements must be rejected.
         bad = fixture(base, "tampered-sample", 6000)
         with (bad / "samples.csv").open("a", encoding="utf-8") as output:

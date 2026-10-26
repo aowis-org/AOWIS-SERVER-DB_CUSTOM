@@ -151,18 +151,34 @@ sampled server RSS in both, with 37 peak open descriptors and zero admission
 history-growth cost or external contention without per-minute progress data.
 A later 900-second run **with** checkpoints exhibited a 63.28/s to 41.75/s
 first-to-last-minute decline as branch refs accumulated. This exposed a
-single-branch lookup path that scanned the whole branch catalogue, now
-replaced with direct regular-file checks; collect a fresh instrumented run
-before assessing its impact. The saved pre-change progress evidence remains
-useful for comparison.
+single-branch lookup path that scanned the entire branch catalogue. After
+switching to direct regular-ref lookups, another 900-second run completed
+28,675 import/export pairs, at 63.72 combined transfers/s versus 54.14/s
+previously. Its first/last-minute rates were 64.82/s and 63.10/s. The before
+and after reports have different executable hashes and were not instrumented
+for background host load, so this is useful evidence, not a controlled
+portable speedup estimate. The saved before/after reports remain useful.
 These are observed workloads, not resource guarantees. Run repeated longer
 periods (e.g. 3600 and 21600 seconds) with comparable host and fixture
 conditions. The stress harness now prints one-minute import/export checkpoints to
 `soak.log` without extra HTTP requests. Use
 `tools/analyze_http_resource_runs.py` to validate saved JSON/CSV/log evidence,
 compare throughput and central-window RSS medians, and report within-run
-minute-by-minute transfer rates when checkpoints are available. Older run
-logs have only total throughput; their per-minute history cannot be inferred.
+minute-by-minute transfer rates and first-to-last interval changes when
+checkpoints are available. The analysis explicitly distinguishes same-binary
+repeats from ordered cross-build comparisons, and reports ordered overall
+throughput change without implying causal attribution. For example, on the
+operator's Linux machine with the original run directories still present:
+
+```bash
+python3 tools/analyze_http_resource_runs.py \
+  build-qualification/http-resources-ha2jc118 \
+  build-qualification/http-resources-m5po2jr0
+```
+
+Older run logs have only total throughput; their per-minute history cannot
+be inferred. Keep original run directories because their raw CSV, JSON and
+soak log evidence are required by the analysis tool.
 Do not presume linear memory growth. See
 [durability qualification](durability-qualification.md) for commands and
 interpretation limits.
