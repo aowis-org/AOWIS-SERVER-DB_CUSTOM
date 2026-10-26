@@ -107,6 +107,11 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydraulic_workload_driver_tests.py")
     set_tests_properties(aowis-dvmdb-hydraulic-workload-driver-tests PROPERTIES
         LABELS "aowis;qualification" TIMEOUT 30)
+    add_test(NAME aowis-dvmdb-hydraulic-workload-analysis-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydraulic_workload_analysis_tests.py")
+    set_tests_properties(aowis-dvmdb-hydraulic-workload-analysis-tests PROPERTIES
+        LABELS "aowis;qualification" TIMEOUT 30)
     # Packaging must include the working-tree files of every Git submodule,
     # including recursive submodules. The test creates disposable Git repos.
     find_program(AOWIS_TEST_GIT_EXECUTABLE git)

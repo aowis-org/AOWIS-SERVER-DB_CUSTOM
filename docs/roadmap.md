@@ -20,8 +20,11 @@ AOWIS-wide security design, not to be improvised here.
 
 Existing tests include process crash/restart, native fault injection, a
 private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 26, 2026, **46/46 CTest
-suites passed in both Debug and Release**. Two 300-second Linux HTTP resource soaks and the earlier uninstrumented
+and a whole-service offline restore drill. On October 26, 2026, after the
+AOWIS-SERVER-DVMDB C++/HTTP naming cleanup, **49/49 CTest tests passed
+in both Debug and Release** on an operator's clean Linux rebuild. The
+standalone Release server also built successfully. Two 300-second Linux
+HTTP resource soaks and the earlier uninstrumented
 3,600-second run established initial resource evidence. Following removal
 of full catalogue scans for single-branch lookups, an **instrumented
 3,600-second** run completed **110,733 imports and 110,733 exports**,
@@ -53,8 +56,8 @@ certification; see [engineering findings](engineering-findings.md).
 
 ## Scalability and operations
 
-- Run the new **canonical hydraulic model workload qualification** at
-  several pipe counts and preserve measured edit/read/diff/merge, pack/index
+- Extend the **canonical hydraulic model workload qualification** from its
+  completed three-repeat, 10,000-pipe baseline to several pipe counts and preserve measured edit/read/diff/merge, pack/index
   growth and fresh-process verification reports. The small CTest smoke and
   deterministic chain fixture are not production-scale evidence; extend the
   workload with realistic network topology, deep revision histories and

@@ -422,8 +422,10 @@ are separate release qualification tasks.
 
 ## Current test baseline
 
-The operator reported **46/46 CTest tests passing in both Debug and Release**
-following the HTTP stress-progress and stalled-transfer fixes. This includes
+On October 26, 2026 the operator clean-rebuilt the renamed
+**AOWIS-SERVER-DVMDB** project and reported **49/49 CTest tests passing
+in both Debug and Release**. The standalone optimized Release server also
+built successfully. This includes
 the four-project historical-format upgrade/restore drill and the offline
 resource-monitor regression. The eight-cut QEMU/KVM ext4/XFS drill was run
 separately from CTest.
@@ -436,9 +438,19 @@ measures targeted/complete reads, divergent-branch diff, validated hydraulic
 merge and physical pack/sidecar growth; it also independently reopens and
 fully verifies each disposable repository. See [benchmark plan](benchmark-plan.md).
 
-**No cross-size hydraulic timing or pack-growth measurements have yet been
-supplied for this new procedure.** Its CTest smoke is correctness coverage,
-not a measured Release performance baseline. Unlike the branch-heavy HTTP
+The operator completed three independent **10,000-pipe** Release runs
+(20 scalar edits, 3 topology edits) before the public DVMDB API rename.
+The **median full-network read** was **1,085.58 ms** (range 953.38–1,297.88 ms),
+**median canonical merge** **1,738.38 ms** (1,714.26–2,083.17 ms), and
+**median fresh-process full verification** **1,132.82 ms**
+(1,099.12–1,158.29 ms). Every run reported **12.86 MiB** final pack size
+and independent full verification passed. These are operator-reported
+warm/uncontrolled-OS-cache measurements, not pure open times or cold-cache
+results. The renamed executables have new hashes and report identifiers;
+repeat the 10K baseline using current DVMDB Release binaries before comparing
+to 50K/100K runs. **No cross-size hydraulic measurements have yet been
+supplied.** The small CTest smoke is correctness coverage,
+not production-scale evidence. Unlike the branch-heavy HTTP
 bundle soak, it exercises real canonical model payloads, but the generated
 chain topology, edit distribution and absence of concurrent clients still
 limit what can be inferred about production hydraulic networks.

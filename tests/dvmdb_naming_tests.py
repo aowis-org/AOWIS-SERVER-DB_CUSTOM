@@ -40,6 +40,10 @@ def main() -> None:
         (project / "obsolete.txt").write_text("old\n", encoding="utf-8")
         (project / "legacy_tree").mkdir()
         (project / "legacy_tree" / "obsolete.txt").write_text("old\n", encoding="utf-8")
+        # Even mistakenly tracked bytecode must not leak into source snapshots.
+        python_cache = project / "tools" / "__pycache__"
+        python_cache.mkdir()
+        (python_cache / "worker.cpython-314.pyc").write_bytes(b"\0\x01test-bytecode")
         run("git", "init", "-q", str(project))
         run("git", "-C", str(project), "add", "-A")
 
@@ -58,6 +62,9 @@ def main() -> None:
             assert all(item.startswith("AOWIS-SERVER-DVMDB/")
                        for item in archive.namelist()), "incorrect ZIP root"
         assert output.is_file()
+        with zipfile.ZipFile(output) as archive:
+            assert not any("__pycache__" in name or name.endswith(".pyc")
+                           for name in archive.namelist()), "source archive contains Python bytecode"
 
         prefix = "AOWIS-SERVER-DVMDB/"
         old_name = directory / ("aowis-" + "db-custom-rejected.zip")

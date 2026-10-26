@@ -227,6 +227,28 @@ python3 tools/qualify_hydraulic_workload.py \
   --pipes 10000 --edits 20 --topology-edits 3 --repeats 3
 ```
 
+To compare multiple DVMDB-native Release runs, use the offline analyzer:
+
+```bash
+python3 tools/qualify_hydraulic_workload.py \
+  --pipes 10000 --edits 20 --topology-edits 3 --repeats 3
+python3 tools/qualify_hydraulic_workload.py \
+  --pipes 50000 --edits 20 --topology-edits 3 --repeats 3
+python3 tools/qualify_hydraulic_workload.py \
+  --pipes 100000 --edits 20 --topology-edits 3 --repeats 3
+python3 tools/analyze_hydraulic_workloads.py \
+  build-qualification/hydraulic-workload-<10k-run> \
+  build-qualification/hydraulic-workload-<50k-run> \
+  build-qualification/hydraulic-workload-<100k-run> \
+  --csv build-qualification/hydraulic-size-comparison.csv
+```
+
+Replace the placeholders with the actual output directory names. The comparison
+requires matching benchmark/verifier SHA-256 hashes and edit counts; because
+its executable identity changed during the DVMDB API rename, do **not** mix
+pre-rename 10K evidence with fresh DVMDB runs. Each benchmark run has a fresh
+disposable repository and removes its own fixtures on success.
+
 The runner saves a unique `build-qualification/hydraulic-workload-*/report.json`
 and the original benchmark and verifier logs. Every repetition uses a brand-new
 repository, verifies its **complete native repository integrity from a new

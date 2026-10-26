@@ -61,7 +61,7 @@ collect_worktree() {
 
         # Never package private environment files or key material by accident.
         case "/$project_path" in
-            */.env|*/.env.*|*.pem|*.key|*.p12|*.pfx) continue ;;
+            */.env|*/.env.*|*.pem|*.key|*.p12|*.pfx|*/__pycache__/*|*.pyc|*.pyo) continue ;;
         esac
         if [[ "$project_path" == *$'\n'* ]]; then
             printf 'Error: filenames containing newlines cannot be archived.\n' >&2
