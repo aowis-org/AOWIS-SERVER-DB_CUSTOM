@@ -89,6 +89,9 @@ int main(int argc, char** argv) {
         network.nodes_reservoirs.append(physicalReservoir);
         HydraulicNodeTank physicalTank;
         physicalTank.uuid = uuid(6000001);
+        physicalTank.water_level_minimum_m = 1.0;
+        physicalTank.water_level_initial_m = 3.0;
+        physicalTank.water_level_maximum_m = 10.0;
         network.nodes_tanks.append(physicalTank);
         HydraulicLinkPump physicalPump;
         physicalPump.uuid = uuid(6000002);
@@ -209,7 +212,10 @@ int main(int argc, char** argv) {
         hydraulic::HydraulicEditDiagnostics physicalStats;
         for (int i = 0; i < scalarEdits; ++i) {
             physicalReservoir.hydraulic_head_m += 1.0;
-            physicalTank.water_level_initial_m += 0.25;
+            // Always remain within the tank's declared physical limits, even
+            // for long edit sequences. Each iteration still changes the level.
+            physicalTank.water_level_initial_m =
+                3.0 + 0.25 * static_cast<double>((i % 24) + 1);
             physicalPump.initial_speed_ratio += 0.01;
             physicalValve.setting_pressure_head_m += 0.25;
             hydraulic::editHydraulicNetwork(repository, "main", network.uuid,

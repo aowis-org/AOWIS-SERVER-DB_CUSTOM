@@ -89,7 +89,12 @@ def execute(args, log_path, timeout):
     log_path.write_text("COMMAND: " + " ".join(str(arg) for arg in args) + "\n"
                         + "STDOUT:\n" + result.stdout + "\nSTDERR:\n" + result.stderr)
     if result.returncode:
-        raise RuntimeError(f"command failed ({result.returncode}): {args[0]}; see {log_path}")
+        # Keep the full diagnostic in the retained log, but expose the cause
+        # directly through CTest instead of requiring a second manual lookup.
+        details = (result.stderr.strip() or result.stdout.strip()).replace("\n", " | ")
+        if details:
+            details = "; output: " + details[:1200]
+        raise RuntimeError(f"command failed ({result.returncode}): {args[0]}{details}; see {log_path}")
     return result.stdout, (time.monotonic() - start) * 1000.0
 
 

@@ -38,22 +38,37 @@ def hash_file(path):
 
 
 def status_fields(pid):
+    # /proc/<pid>/status, /proc/<pid>/statm and /proc/<pid>/fd are not a
+    # snapshot. During exec/exit a task can still report R/S while VmRSS is
+    # absent. Retry that short transition, then distinguish a disappearing
+    # address space from missing metrics on a genuinely live process.
     values = {}
     state = None
-    for line in Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines():
-        name, delimiter, text = line.partition(":")
-        if delimiter and name == "State":
-            state = text.strip().split()[0]
-        if delimiter and name in ("VmRSS", "VmHWM", "Threads"):
-            values[name] = int(text.strip().split()[0])
-    # A child may become a zombie between poll() and reading /proc. Linux
-    # omits VmRSS for zombies; skip that transient sample rather than
-    # treating normal process exit as a failed qualification.
-    if state in ("Z", "X", "x"):
-        raise FileNotFoundError(f"PID {pid} exited while sampling")
-    if "VmRSS" not in values or "Threads" not in values:
-        raise QualificationError(f"missing memory or thread metrics for PID {pid}")
-    return values
+    for attempt in range(2):
+        values = {}
+        state = None
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines():
+            name, delimiter, text = line.partition(":")
+            if delimiter and name == "State":
+                state = text.strip().split()[0]
+            if delimiter and name in ("VmRSS", "VmHWM", "Threads"):
+                values[name] = int(text.strip().split()[0])
+        if state in ("Z", "X", "x"):
+            raise FileNotFoundError(f"PID {pid} exited while sampling")
+        if "VmRSS" in values and "Threads" in values:
+            return values
+        if attempt == 0:
+            time.sleep(0.002)
+
+    # A process in the last stages of exit (or an early exec transition) can
+    # have no mm even before its state becomes Z. Linux statm reports 0/0 in
+    # that case. This is an *absent sample*, never a successful measurement.
+    # In particular, a live process with mapped memory and missing fields
+    # still fails qualification rather than having its error hidden.
+    statm = Path(f"/proc/{pid}/statm").read_text(encoding="ascii").split()
+    if len(statm) >= 2 and int(statm[0]) == 0 and int(statm[1]) == 0:
+        raise FileNotFoundError(f"PID {pid} has no address space while sampling")
+    raise QualificationError(f"missing memory or thread metrics for PID {pid}")
 
 
 def cpu_seconds(pid):
@@ -68,6 +83,9 @@ def process_metrics(pid):
     values = status_fields(pid)
     try:
         descriptors = sum(1 for _ in Path(f"/proc/{pid}/fd").iterdir())
+    except FileNotFoundError:
+        # Process disappeared between reading status and enumerating its fds.
+        raise
     except OSError as error:
         raise QualificationError(f"cannot inspect descriptor count of PID {pid}: {error}") from error
     return {

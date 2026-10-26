@@ -89,6 +89,12 @@ def run_test():
         bad = run_driver(binpath, verify, results)
         require(bad.returncode != 0 and "canonical merge" in bad.stderr,
                 "non-two-parent merge was incorrectly accepted")
+        fake_executable(binpath, "import sys\nprint('fixture edit rejected', file=sys.stderr)\nsys.exit(1)\n")
+        failed_benchmark = run_driver(binpath, verify, results)
+        require(failed_benchmark.returncode != 0 and
+                "fixture edit rejected" in failed_benchmark.stderr and
+                "benchmark-01.log" in failed_benchmark.stderr,
+                "benchmark failure did not include retained log and underlying reason")
         fake_executable(binpath, BENCHMARK)
         fake_executable(verify, "import sys\nprint('not verified')\n")
         invalid = run_driver(binpath, verify, results)

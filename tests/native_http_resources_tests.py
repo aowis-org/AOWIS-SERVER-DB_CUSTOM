@@ -18,10 +18,19 @@ def require(condition, message):
 
 
 def run_test():
+    def mock_proc_read(status, statm="0 0 0 0 0 0 0"):
+        def read(path, encoding=None):
+            if str(path).endswith("/status"):
+                return status
+            if str(path).endswith("/statm"):
+                return statm
+            raise AssertionError(f"unexpected procfs read: {path}")
+        return read
+
     specification = importlib.util.spec_from_file_location("aowis_resource_monitor", MONITOR)
     monitor = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(monitor)
-    with mock.patch.object(Path, "read_text", return_value=(
+    with mock.patch.object(Path, "read_text", mock_proc_read(
             "Name:\tsleep\nState:\tZ (zombie)\nThreads:\t1\n")):
         try:
             monitor.status_fields(12345)
@@ -29,14 +38,46 @@ def run_test():
             pass  # Exited processes are expected sampling races.
         else:
             raise AssertionError("zombie process was treated as a valid RSS sample")
-    with mock.patch.object(Path, "read_text", return_value=(
-            "Name:\tsleep\nState:\tS (sleeping)\nThreads:\t1\n")):
+    with mock.patch.object(Path, "read_text", mock_proc_read(
+            "Name:\tsleep\nState:\tS (sleeping)\nThreads:\t1\n", "101 11 0 0 0 0 0")):
         try:
             monitor.status_fields(12345)
         except monitor.QualificationError:
             pass  # Missing RSS of a live process remains a hard error.
         else:
             raise AssertionError("missing live-process RSS was incorrectly ignored")
+
+    # Just before becoming a zombie a task can still report running, but
+    # its mm is already absent. Such a sample must be skipped, not counted.
+    transitional = "Name:\tsleep\nState:\tR (running)\nThreads:\t1\n"
+    with mock.patch.object(Path, "read_text", mock_proc_read(transitional)):
+        try:
+            monitor.status_fields(12345)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("exiting process without mm was treated as live")
+
+    # A live task with mapped pages and missing VmRSS remains a hard error.
+    with mock.patch.object(Path, "read_text", mock_proc_read(
+            transitional, "101 11 0 0 0 0 0")):
+        try:
+            monitor.status_fields(12345)
+        except monitor.QualificationError:
+            pass
+        else:
+            raise AssertionError("live task with missing RSS was ignored")
+
+    # A process may exit after the valid status sample but before /proc/fd.
+    with mock.patch.object(monitor, "status_fields", return_value={
+            "VmRSS": 100, "VmHWM": 100, "Threads": 1}):
+        with mock.patch.object(Path, "iterdir", side_effect=FileNotFoundError):
+            try:
+                monitor.process_metrics(12345)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("disappearing fd directory was not skipped")
 
     with tempfile.TemporaryDirectory(prefix="aowis-http-resource-monitor-") as work:
         path = Path(work)
