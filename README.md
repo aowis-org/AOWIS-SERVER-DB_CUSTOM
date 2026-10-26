@@ -11,13 +11,13 @@ This repository contains the **native storage engine**, canonical hydraulic-mode
 ## GUI integration status
 
 The GUI can already discover projects, branches and limited first-parent
-revision history from this server, create projects and branches, and aggregate
+first-parent revision history from this server, create projects and branches, and aggregate
 several checked databases in its navigator. A separate standalone build
 can use DVMDB directly as a C++ library. **The GUI does not yet check out
 hydraulic networks or save network revisions**, even though some underlying
 DVMDB read/write API operations already exist.
 
-Project/branch rename/delete, network enumeration, full revision-DAG paging,
+Project/branch rename/delete, network enumeration, GUI adoption of full revision-DAG paging,
 editable annotations, authentication and release-tag workflows remain
 unimplemented contracts. See the [GUI contract and remaining gaps](docs/gui-integration-requirements.md) and the GUI's
 `docs/dvmdb-integration-roadmap.md`. The
@@ -58,7 +58,7 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
 | Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
 | Replication | Portable full/incremental `.aowbundle` exchange, SHA-256, object graph, canonical Merkle trie and model-reference index verification, fast-forward-only import, divergence protection |
-| Service | HTTP/TCP service (vendored cpp-httplib, worker thread pool) with durable multi-project catalogue, project create/list/read, branches, heads, history and revision metadata |
+| Service | HTTP/TCP service (vendored cpp-httplib, worker thread pool) with durable multi-project catalogue, project create/list/read, branches, heads, first-parent history, complete paged revision-DAG discovery and immutable revision metadata |
 | Administrative access policy | Provisional UUID-based users/groups/roles/grants library and local CLI, **not currently enforced by any service** |
 
 These are engineering capabilities, **not a production-readiness claim**. See [limitations and roadmap](docs/roadmap.md).

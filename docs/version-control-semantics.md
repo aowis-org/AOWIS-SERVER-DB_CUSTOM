@@ -191,33 +191,39 @@ immutable revision metadata, including both merge parents.
 current GUI combines bounded first-parent pages and therefore must not claim
 to show every reachable revision in a complex merge DAG.
 
-**Missing — next integration milestone:** a transport-neutral **full-DAG
-enumeration API** in the native repository/service, then an equivalent HTTP
-adapter, followed by GUI integration. A future route might be
-`GET /dvmdb/v1/projects/{id}/revision-graph`; **this is a design example,
-not an implemented route and must not enter OpenAPI until implemented**.
+**Implemented in DVMDB, not yet wired into the GUI:**
+`Repository::revisionGraph(maxCount, cursor)` and
+`ProjectService::revisionGraph(projectId, maxCount, cursor)`, exposed through
+`GET /dvmdb/v1/projects/{id}/revision-graph?limit=&cursor=`. The initial
+call captures one branch-name → HEAD snapshot under a repository lock. Each
+page traverses **both** merge parents, returns each reachable revision once
+within that project and reports `complete` / `nextCursor`. Pagination pins
+original heads even after branch advances. HTTP cursors are signed,
+project-specific, and expire on service restart. The traversal order is a
+stable DFS, not a timestamp or global topological sort. The GUI still needs
+migration from its existing first-parent catalogue reader.
 
-### Required behavior of the new graph reader
+### Implemented graph-reader contract and remaining acceptance work
 
-1. Capture a **consistent set of branch names and HEAD hashes** for one
+1. **Implemented:** capture a **consistent set of branch names and HEAD hashes** for one
    project at one logical observation point. No mixed-time per-branch lists.
    Decide what happens if branches change during a multi-page query (pinned
    head-set/token preferred).
-2. Traverse **both** ordered parent links of every reachable revision from
+2. **Implemented:** traverse **both** ordered parent links of every reachable revision from
    those pinned heads, deduplicating immutable hashes **within a project**.
    Include branch-name → HEAD mappings in the result, even when heads coincide.
-3. Return bounded pages with a stable, resumable traversal cursor and an
+3. **Implemented:** return bounded pages with a stable, resumable traversal cursor and an
    explicit `complete`/frontier indicator. Show parent IDs even if a parent
    has not yet been loaded; GUI must not invent an edge endpoint or falsely
    mark the graph complete.
-4. Define deterministic traversal order, bounds, cancellation, stale/expired
+4. **Partly implemented:** deterministic traversal order, bounds, cancellation, stale/expired
    cursor behavior, failure handling and resource budgets. Different project
    scopes must not be merged merely because hashes match (e.g., identical
    empty roots). Native and HTTP results must obey the **same** contract.
-5. Preserve existing first-parent `history` behavior for its current callers;
+5. **Implemented:** preserve existing first-parent `history` behavior for its current callers;
    introduce full-DAG reading separately, not by silently changing history
    pagination semantics.
-6. Include regression coverage for deep history, historical forks, two-parent
+6. **Partly implemented:** include regression coverage for deep history, historical forks, two-parent
    merges, shared HEADs, branches whose HEADs are non-leaf revisions,
    concurrent HEAD advances, paging/frontiers, cancelled loads and complete
    deduplication.

@@ -117,15 +117,17 @@ shows histories reachable from **all** HEADs. A HEAD is not necessarily a
 leaf; the GUI's selected revision or eventual working-copy base is separate.
 No branch creation-event or branch-parent object is currently persisted.
 
-**Highest priority: full-DAG graph discovery.** Current native/HTTP `history`
-is first-parent only. Add a consistent branch-name/HEAD snapshot and bounded
-all-parent revision enumeration to Repository/ProjectService, expose the same
-contract in REST, and integrate both into the GUI with explicit pagination/
-frontier state. The graph must deduplicate shared revisions, preserve both
-merge parents, and not present a partial first-parent history as complete.
-This work needs no underlying revision-format redesign. See the detailed
-[graph acceptance contract](version-control-semantics.md#5-current-read-surface-and-missing-full-graph-contract)
-and [GUI integration requirements](gui-integration-requirements.md).
+**P0 backend implemented: full-DAG graph discovery.** Native
+`Repository`/`ProjectService` and REST now provide a coherent snapshot of all
+branch HEADs and bounded, deduplicated all-parent revision enumeration,
+without changing storage format. See [native revision history](native-revision-history.md)
+and the [live OpenAPI route](dvmdb-http-api.yaml). The first implementation
+uses stateless DFS replay and has documented traversal limits; indexed scalable
+pagination is a later optimization. **Next P0 task:** wire the GUI's embedded
+and REST readers to these pages and preserve partial/full graph state in the
+renderer. The old `history` endpoint remains intentionally first-parent.
+See the [graph acceptance contract](version-control-semantics.md#5-current-read-surface-and-missing-full-graph-contract)
+and [GUI requirements](gui-integration-requirements.md).
 
 **Deferred by product decision: working-copy checkout and saving.** Network
 listing, revision-pinned checkout, dirty editor sessions and expected-HEAD

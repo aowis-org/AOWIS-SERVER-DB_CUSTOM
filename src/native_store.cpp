@@ -2748,6 +2748,86 @@ std::vector<Revision> Repository::history(std::string_view branch, std::size_t m
     return result;
 }
 
+RevisionGraphPage Repository::revisionGraph(std::size_t maxCount,
+                                                std::optional<RevisionGraphCursor> cursor) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    // A deliberate work budget protects the HTTP worker (and the native GUI)
+    // from unbounded traversal. Exceeding it is explicit, never a truncated DAG.
+    constexpr std::size_t maxRevisions = 250000;
+    constexpr std::size_t maxBranches = 1024;
+    require(Err::InvalidInput, maxCount >= 1 && maxCount <= 1000,
+            "graph page size must be between 1 and 1000");
+
+    RevisionGraphPage page;
+    std::size_t skip = 0;
+    if (cursor) {
+        require(Err::InvalidInput, cursor->heads.size() <= maxBranches &&
+                cursor->skip <= maxRevisions, "invalid graph cursor bounds");
+        skip = cursor->skip;
+        page.heads = std::move(cursor->heads);
+        std::string previous;
+        for (const RevisionGraphHead& head : page.heads) {
+            checkBranch(head.name);
+            require(Err::InvalidInput, !isZero(head.revision) &&
+                    (previous.empty() || previous < head.name), "invalid graph cursor heads");
+            previous = head.name;
+        }
+    } else {
+        const std::filesystem::path headsDirectory = this->directory_ / "refs" / "heads";
+        for (const std::filesystem::directory_entry& entry :
+             std::filesystem::directory_iterator(headsDirectory)) {
+            if (entry.is_symlink() || !entry.is_regular_file()) continue;
+            const std::string name = entry.path().filename().string();
+            try { checkBranch(name); }
+            catch (const StorageError&) { continue; }
+            page.heads.push_back({name, {}});
+            require(Err::LimitExceeded, page.heads.size() <= maxBranches,
+                    "graph exceeds branch snapshot limit");
+        }
+        std::sort(page.heads.begin(), page.heads.end(),
+                  [](const RevisionGraphHead& a, const RevisionGraphHead& b) {
+                      return a.name < b.name;
+                  });
+        for (RevisionGraphHead& head : page.heads) head.revision = branchHead(head.name);
+    }
+
+    // Deterministic iterative DFS, walking *both* merge parents. Process the
+    // branch refs in sorted order and parents in stored order. Replaying the
+    // immutable snapshot until skip reconstructs the visited set across pages,
+    // so a shared ancestor is returned exactly once without server sessions.
+    // Order is stable DFS, not a global topological sort between roots.
+    std::vector<Hash> pending;
+    pending.reserve(page.heads.size());
+    for (auto it = page.heads.rbegin(); it != page.heads.rend(); ++it)
+        pending.push_back(it->revision);
+    std::set<Hash> seen;
+    std::size_t visited = 0;
+    while (!pending.empty()) {
+        const Hash id = pending.back();
+        pending.pop_back();
+        if (!seen.insert(id).second) continue;
+        require(Err::LimitExceeded, visited < maxRevisions,
+                "graph exceeds revision traversal budget");
+        // A stored HEAD set remains valid after normal branch advances,
+        // because revision objects are immutable. Offline compaction can
+        // invalidate an old cursor; such reads fail rather than lie.
+        const Revision item = readRevision(id);
+        for (auto it = item.parents.rbegin(); it != item.parents.rend(); ++it)
+            pending.push_back(*it);
+        if (visited++ < skip) continue;
+        if (page.revisions.size() == maxCount) {
+            page.next = RevisionGraphCursor{page.heads, skip + maxCount};
+            break;
+        }
+        page.revisions.push_back(item);
+    }
+    require(Err::InvalidInput, !cursor || visited > skip,
+            "graph cursor is beyond the captured history");
+    return page;
+}
+
 bool Repository::revisionOnBranch(std::string_view branch, const Hash& revisionId) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);

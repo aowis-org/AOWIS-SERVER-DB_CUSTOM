@@ -415,6 +415,15 @@ std::vector<Revision> ProjectService::history(std::string_view projectId,
     });
 }
 
+RevisionGraphPage ProjectService::revisionGraph(std::string_view projectId,
+                                                    std::size_t maxCount,
+                                                    std::optional<RevisionGraphCursor> cursor) {
+    const std::shared_ptr<Project> found = findProject(projectId);
+    return translated<RevisionGraphPage>([&]() {
+        return openRepository(*found)->revisionGraph(maxCount, std::move(cursor));
+    });
+}
+
 Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
     const std::shared_ptr<Project> found = findProject(projectId);
     return translated<Revision>([&]() { return openRepository(*found)->revision(id); });

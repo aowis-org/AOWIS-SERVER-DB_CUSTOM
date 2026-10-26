@@ -80,6 +80,8 @@ public:
                                   std::size_t maxCount,
                                   std::optional<Hash> after = std::nullopt);
     Revision revision(std::string_view projectId, const Hash& id);
+    RevisionGraphPage revisionGraph(std::string_view projectId, std::size_t maxCount = 100,
+                                    std::optional<RevisionGraphCursor> cursor = std::nullopt);
 
     // Execute a scoped operation with this project's repository and its
     // operation mutex held (other projects are not blocked). Callbacks must

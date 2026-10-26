@@ -196,6 +196,25 @@ struct Revision {
     std::vector<Hash> parents;
 };
 
+// Consistent, stateless all-parent graph pagination. A cursor pins the sorted
+// branch names and their HEAD hashes at the first request; subsequent pages
+// never re-read moving refs. The cursor is a native value, not an HTTP token.
+struct RevisionGraphHead {
+    std::string name;
+    Hash revision{};
+};
+
+struct RevisionGraphCursor {
+    std::vector<RevisionGraphHead> heads;
+    std::size_t skip = 0; // unique revisions already emitted, from newest first
+};
+
+struct RevisionGraphPage {
+    std::vector<RevisionGraphHead> heads;
+    std::vector<Revision> revisions;
+    std::optional<RevisionGraphCursor> next;
+};
+
 struct MergeResult {
     MergeStatus status = MergeStatus::UpToDate;
     Hash base{};
@@ -251,6 +270,11 @@ public:
     // Lookup by immutable SHA-256 revision identity, including older revisions.
     // These low-level APIs do not implement authorization or branch scoping.
     Revision revision(const Hash& revisionId);
+    // All revisions reachable through either parent of the captured branch
+    // HEAD set. Deterministic DFS; pages never mix HEAD snapshots.
+    // No on-disk state is changed. Limit: 1..1000 revisions per page.
+    RevisionGraphPage revisionGraph(std::size_t maxCount = 100,
+                                    std::optional<RevisionGraphCursor> cursor = std::nullopt);
     // Create a new branch from any ancestor (including merge parents) of
     // sourceBranch, without changing sourceBranch or writing a new revision.
     void createBranchAtRevision(std::string_view name, std::string_view sourceBranch,

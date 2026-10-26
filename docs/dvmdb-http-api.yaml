@@ -204,6 +204,45 @@ paths:
                     type: array
                     items: {$ref: '#/components/schemas/Revision'}
         '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/{projectId}/revision-graph:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    get:
+      operationId: getRevisionGraph
+      description: |
+        Enumerate the union of immutable revision ancestry reachable from ALL
+        branch HEADs captured atomically within one project. Both merge parents
+        are traversed, with every revision returned once across pages. The
+        deterministic traversal is depth-first, not a global time/topological
+        sort; clients arrange revisions using their parent IDs. HEAD mappings
+        are repeated unchanged on each page. A cursor pins the original HEAD
+        set even if branches advance. Signed, project-scoped continuation tokens
+        become invalid after server restart; restart pagination with no cursor.
+        Native and HTTP readers share the same 1..1000 page bound, 1024-branch
+        snapshot bound, and 250000-revision replay/traversal budget. Excessive
+        graphs return 413 limit_exceeded, never a falsely complete page.
+        Replay from immutable pinned HEADs bounds server state, but late pages
+        cost O(revisions already traversed) rather than O(page size). Cursor
+        tokens can be long with very many branches; a reverse proxy may impose
+        a smaller URI limit. Existing first-parent /history is unchanged.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+        - name: cursor
+          in: query
+          required: false
+          schema: {type: string, description: Opaque signed graph continuation token}
+      responses:
+        '200':
+          description: One page from a consistent immutable revision graph snapshot
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RevisionGraphPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {description: Branch or revision traversal budget exceeded (limit_exceeded)}
   /projects/{projectId}/revisions/{revisionHash}:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
@@ -413,6 +452,30 @@ components:
         status: {type: string, enum: [created, fast_forward, up_to_date]}
         head: {$ref: '#/components/schemas/RevisionHash'}
         objectsImported: {type: integer, minimum: 0}
+    RevisionGraphPage:
+      type: object
+      required: [heads, revisions, complete, nextCursor]
+      properties:
+        heads:
+          type: array
+          description: Sorted branch HEAD snapshot, identical on each page
+          items:
+            type: object
+            required: [branch, revision]
+            properties:
+              branch: {type: string}
+              revision: {$ref: '#/components/schemas/RevisionHash'}
+        revisions:
+          type: array
+          description: Deduplicated immutable revisions, deterministic DFS order
+          maxItems: 1000
+          items: {$ref: '#/components/schemas/Revision'}
+        complete: {type: boolean, description: True when no further revisions remain}
+        nextCursor:
+          oneOf:
+            - {type: string}
+            - {type: 'null'}
+          description: Null exactly when complete is true
     RevisionHash: {type: string, pattern: '^[a-f0-9]{64}$'}
     Project:
       type: object

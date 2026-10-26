@@ -14,6 +14,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QMessageAuthenticationCode>
+#include <QRandomGenerator>
+#include <QCryptographicHash>
 #include <QString>
 #include <QStringList>
 #include <QUuid>
@@ -219,6 +222,84 @@ QString hashString(const Hash& hash) {
 
 QJsonValue optionalHashJson(const std::optional<Hash>& hash) {
     return hash ? QJsonValue(hashString(*hash)) : QJsonValue(QJsonValue::Null);
+}
+
+// A page token is authenticated, not merely encoded: callers cannot forge a
+// snapshot rooted at an arbitrary immutable object. A new server process has
+// a new key, so tokens issued before a restart must be reacquired.
+const QByteArray& graphTokenKey() {
+    static const QByteArray key = [] {
+        QByteArray result(32, '\0');
+        for (int i = 0; i < 32; i += 4) {
+            const quint32 word = QRandomGenerator::system()->generate();
+            for (int j = 0; j < 4; ++j)
+                result[i + j] = static_cast<char>(word >> (8 * j));
+        }
+        return result;
+    }();
+    return key;
+}
+
+QByteArray graphSignature(const QByteArray& payload) {
+    return QMessageAuthenticationCode::hash(payload, graphTokenKey(), QCryptographicHash::Sha256);
+}
+
+QString graphToken(const RevisionGraphCursor& cursor, const std::string& projectId) {
+    QJsonArray heads;
+    for (const RevisionGraphHead& head : cursor.heads)
+        heads.append(QJsonArray{QString::fromStdString(head.name), hashString(head.revision)});
+    const QByteArray payload = QJsonDocument(QJsonObject{
+        {"v", 1}, {"project", QString::fromStdString(projectId)},
+        {"skip", static_cast<qint64>(cursor.skip)}, {"heads", heads}
+    }).toJson(QJsonDocument::Compact);
+    const QByteArray bytes = payload + graphSignature(payload);
+    return QString::fromLatin1(bytes.toBase64(QByteArray::Base64UrlEncoding |
+                                               QByteArray::OmitTrailingEquals));
+}
+
+RevisionGraphCursor readGraphToken(const std::string& encoded,
+                                   const std::string& projectId) {
+    requireInput(!encoded.empty() && encoded.size() <= 140000,
+                 "invalid revision graph cursor size");
+    for (const char ch : encoded)
+        requireInput((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                     (ch >= '0' && ch <= '9') || ch == '-' || ch == '_',
+                     "invalid revision graph cursor characters");
+    const QByteArray bytes = QByteArray::fromBase64(QByteArray::fromStdString(encoded),
+                                                    QByteArray::Base64UrlEncoding);
+    requireInput(bytes.size() > 32, "invalid revision graph cursor");
+    const QByteArray payload = bytes.left(bytes.size() - 32);
+    const QByteArray signature = bytes.right(32);
+    const QByteArray expected = graphSignature(payload);
+    unsigned difference = 0;
+    for (int i = 0; i < 32; ++i)
+        difference |= static_cast<unsigned char>(signature[i] ^ expected[i]);
+    requireInput(difference == 0, "revision graph cursor expired or invalid");
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(payload, &error);
+    requireInput(error.error == QJsonParseError::NoError && document.isObject(),
+                 "invalid revision graph cursor body");
+    const QJsonObject object = document.object();
+    requireInput(object.size() == 4 && object.value("v").toInt() == 1 &&
+                 object.value("project").toString().toStdString() == projectId &&
+                 object.value("heads").isArray() && object.value("skip").isDouble(),
+                 "invalid revision graph cursor fields");
+    const double skip = object.value("skip").toDouble();
+    requireInput(skip >= 1 && skip <= 250000 && skip == static_cast<double>(static_cast<std::size_t>(skip)),
+                 "invalid revision graph cursor offset");
+    RevisionGraphCursor cursor;
+    cursor.skip = static_cast<std::size_t>(skip);
+    const QJsonArray items = object.value("heads").toArray();
+    requireInput(items.size() <= 1024, "too many revision graph heads");
+    for (const QJsonValue& item : items) {
+        requireInput(item.isArray(), "invalid revision graph cursor head");
+        const QJsonArray pair = item.toArray();
+        requireInput(pair.size() == 2 && pair.at(0).isString() && pair.at(1).isString(),
+                     "invalid revision graph cursor head");
+        cursor.heads.push_back({pair.at(0).toString().toStdString(),
+                                parseHash(pair.at(1).toString().toStdString())});
+    }
+    return cursor;
 }
 
 QJsonObject revisionJson(const Revision& revision) {
@@ -892,6 +973,36 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                                             pathParam(request, "branch"), limit, after))
                 revisions.append(revisionJson(revision));
             return Reply{200, QJsonObject{{"revisions", revisions}}};
+        });
+    });
+    // The graph endpoint is independent of first-parent branch history. Each
+    // response carries the pinned branch HEAD set. Subsequent pages replay
+    // only immutable ancestry of those exact HEADs.
+    server.Get("/dvmdb/v1/projects/:id/revision-graph",
+               [&service](const httplib::Request& request, httplib::Response& response) {
+        guarded(response, [&]() {
+            std::size_t limit = 100;
+            if (const std::optional<std::string> text = queryValue(request, "limit")) {
+                bool ok = false;
+                const unsigned value = QString::fromStdString(*text).toUInt(&ok);
+                requireInput(ok && value >= 1 && value <= 1000, "invalid graph limit");
+                limit = value;
+            }
+            std::optional<RevisionGraphCursor> cursor;
+            if (const std::optional<std::string> text = queryValue(request, "cursor"))
+                cursor = readGraphToken(*text, pathParam(request, "id"));
+            const RevisionGraphPage page = service.revisionGraph(pathParam(request, "id"),
+                                                                  limit, std::move(cursor));
+            QJsonArray heads;
+            for (const RevisionGraphHead& head : page.heads)
+                heads.append(QJsonObject{{"branch", QString::fromStdString(head.name)},
+                                         {"revision", hashString(head.revision)}});
+            QJsonArray revisions;
+            for (const Revision& item : page.revisions) revisions.append(revisionJson(item));
+            return Reply{200, QJsonObject{{"heads", heads}, {"revisions", revisions},
+                                          {"complete", !page.next.has_value()},
+                                          {"nextCursor", page.next ? QJsonValue(graphToken(*page.next, pathParam(request, "id")))
+                                                                   : QJsonValue(QJsonValue::Null)}}};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/revisions/:hash",

@@ -29,6 +29,7 @@
 #include <memory>
 #include <netinet/in.h>
 #include <optional>
+#include <set>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
@@ -1356,6 +1357,88 @@ void exerciseTransferStagingBudget() {
           "abandoned upload published an incomplete branch");
 }
 
+// A separate full-DAG protocol test keeps the ordinary CRUD fixture intact.
+void exerciseRevisionGraphHttp() {
+    TemporaryRoot root;
+    aowis::dvmdb::ProjectService service(root.root());
+    const std::string id = service.createProject("Graph API").id;
+    const std::string other = service.createProject("Other graph").id;
+    aowis::dvmdb::Hash initial{};
+    aowis::dvmdb::Hash merged{};
+    service.withRepository(id, [&](aowis::dvmdb::Repository& repository) {
+        initial = repository.head("main").id;
+        repository.commit("main", {{aowis::dvmdb::Key{1}, aowis::dvmdb::Bytes{1}}});
+        repository.createBranch("feature", "main");
+        repository.createBranch("alias", "feature");
+        repository.commit("main", {{aowis::dvmdb::Key{2}, aowis::dvmdb::Bytes{2}}});
+        repository.commit("feature", {{aowis::dvmdb::Key{3}, aowis::dvmdb::Bytes{3}}});
+        const aowis::dvmdb::MergeResult result = repository.mergeBranches("main", "feature");
+        check(result.status == aowis::dvmdb::MergeStatus::Merged &&
+              result.revision.parents.size() == 2, "HTTP graph test merge fixture failed");
+        merged = result.revision.id;
+    });
+    TestServer server(service, aowis::dvmdb::BundleLimits{1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL});
+    Client client(server.port());
+    const QString path = "/dvmdb/v1/projects/" + QString::fromStdString(id) + "/revision-graph";
+    check(client.call("GET", path + "?limit=0").status == 400,
+          "graph route accepted zero limit");
+    check(client.call("GET", path + "?limit=1001").status == 400,
+          "graph route accepted oversized page");
+    check(client.call("GET", path + "?cursor=bogus").status == 400,
+          "graph route accepted invalid cursor");
+    const Response first = client.call("GET", path + "?limit=1");
+    check(first.status == 200 && !first.json.value("complete").toBool() &&
+          first.json.value("heads").toArray().size() == 3 &&
+          first.json.value("revisions").toArray().size() == 1 &&
+          first.json.value("nextCursor").isString(), "graph initial response malformed");
+    const QString initialCursor = first.json.value("nextCursor").toString();
+    check(client.call("GET", "/dvmdb/v1/projects/" + QString::fromStdString(other) +
+                      "/revision-graph?cursor=" + initialCursor).status == 400,
+          "signed cursor could be replayed into another project");
+    QString tampered = initialCursor;
+    tampered[3] = tampered.at(3) == QChar('a') ? QChar('b') : QChar('a');
+    check(client.call("GET", path + "?cursor=" + tampered).status == 400,
+          "tampered graph cursor accepted");
+    // Commit after the snapshot was pinned; old pages must still describe
+    // the original graph, while a new request shows the advanced main head.
+    aowis::dvmdb::Hash later{};
+    service.withRepository(id, [&](aowis::dvmdb::Repository& repository) {
+        later = repository.commit("main", {{aowis::dvmdb::Key{4}, aowis::dvmdb::Bytes{4}}}).id;
+    });
+    std::set<QString> seen;
+    auto record = [&](const Response& response) {
+        check(response.status == 200 && response.json.value("heads").toArray().size() == 3,
+              "graph paging response malformed");
+        const QJsonArray heads = response.json.value("heads").toArray();
+        check(heads.at(2).toObject().value("revision").toString() ==
+              QString::fromStdString(aowis::dvmdb::toHex(merged)),
+              "graph HEAD snapshot changed after concurrent commit");
+        const QJsonArray revisions = response.json.value("revisions").toArray();
+        check(revisions.size() == 1, "graph page size incorrect");
+        const QString hash = revisions.at(0).toObject().value("id").toString();
+        check(seen.insert(hash).second, "duplicate graph revision across HTTP pages");
+    };
+    record(first);
+    QString cursor = initialCursor;
+    for (int i = 0; !cursor.isEmpty(); ++i) {
+        check(i < 20, "HTTP revision graph cursor loop");
+        const Response response = client.call("GET", path + "?limit=1&cursor=" + cursor);
+        record(response);
+        cursor = response.json.value("nextCursor").toString();
+        check(response.json.value("complete").toBool() == cursor.isEmpty(),
+              "graph completeness flag disagrees with cursor");
+    }
+    check(seen.size() == 5 && seen.contains(QString::fromStdString(aowis::dvmdb::toHex(initial))) &&
+          !seen.contains(QString::fromStdString(aowis::dvmdb::toHex(later))),
+          "HTTP graph omitted ancestry or leaked a later revision");
+    const Response updated = client.call("GET", path);
+    check(updated.status == 200 && updated.json.value("complete").toBool() &&
+          updated.json.value("revisions").toArray().size() == 6 &&
+          updated.json.value("heads").toArray().at(2).toObject().value("revision").toString() ==
+              QString::fromStdString(aowis::dvmdb::toHex(later)),
+          "fresh HTTP graph missing advanced branch tip");
+}
+
 // Starts the real executable, probes /dvmdb/v1/health on 127.0.0.1, optionally
 // runs `whileRunning`, then stops it with SIGTERM. A process that exits on
 // its own is reported with its exit code.
@@ -1476,6 +1559,7 @@ int main(int argc, char** argv) {
     try {
         check(argc == 2, "expected path to aowis-server-dvmdb executable");
         exercise();
+        exerciseRevisionGraphHttp();
         exerciseConcurrency();
         exerciseTransferStagingBudget();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));

@@ -35,39 +35,37 @@ TLS; a list-networks-in-project endpoint; immutable commit author/message/
 timestamp records; revision annotations and rich project/branch metadata;
 a single consistent, paginated full-DAG API.
 
-## P0 — complete multi-branch history graph (next milestone)
+## P0 — wire the implemented native and REST revision graph into GUI
 
-Current `history(branch, maxCount, after)` follows **only the first parent**;
-requesting each branch independently and merging the responses does not
-promise a full graph. We have agreed that the GUI should display **every
-revision reachable from all branch HEADs of every visible project**, with
-both merge parents and one revision card per immutable revision identity per
-project. Each branch carries its own `HEAD` marker; HEAD is not necessarily a
-global graph leaf. See [the graph contract](version-control-semantics.md#5-current-read-surface-and-missing-full-graph-contract).
+DVMDB now implements `Repository::revisionGraph`,
+`ProjectService::revisionGraph` and the REST `GET .../revision-graph`
+endpoint. These return the coherent snapshot and complete all-parent
+ancestry required by the agreed GUI semantics, independently of the existing
+first-parent history API. The actual **GUI has not yet adopted it**; it still
+combines bounded first-parent histories. That remains the integration gap.
 
-Implement in this order:
+Required GUI work, in order:
 
-1. **Native repository graph reader:** capture a coherent branch-name → HEAD
-   map and traverse all ordered parents. Deduplicate revision IDs within the
-   project. Expose bounded pages, stable cursors or a pinned head-set token,
-   frontier/missing-parent indicators and an explicit complete flag; define
-   how concurrent branch moves, expiry and cancellation behave.
-2. **ProjectService equivalent:** hold the appropriate project scope and
-   serialize only where necessary for a coherent snapshot. Avoid treating
-   independent read calls as one atomic snapshot without an explicit pin.
-3. **REST equivalent:** implement a bounded HTTP resource with the same model,
-   response limits and errors as native. Add OpenAPI **only with working code**.
-   `GET /dvmdb/v1/projects/{id}/revision-graph` is a suggested route name,
-   **not a deployed endpoint**.
-4. **GUI adapter:** both embedded and REST consume identical project/branch/
-   revision graph data. Preserve server/project namespaces (different
-   projects can have identical revision hashes). Indicate partial/paged data
-   rather than rendering a seemingly complete but truncated graph.
-5. **Regression/acceptance:** one linear branch; two refs sharing HEAD;
-   historical branch fork; non-leaf branch HEAD; divergent branches and
-   two-parent merge; fast-forward; many projects/sources with overlapping
-   hashes; deterministic paging; branch advancement mid-load; cancellation
-   and resource bounds. Add real native and loopback HTTP contract tests.
+1. Replace per-branch history fetching with paginated graph enumeration for
+   both native and REST profiles. Always load `heads`, `revisions`, `complete`
+   and `nextCursor`, not just rendered revision cards.
+2. Deduplicate within a project, preserving distinct project/server identities
+   even when identical hashes exist in separate repositories. Show all branch
+   HEAD references, including shared and non-leaf HEADs.
+3. Display incomplete states and pending parent frontiers without fabricating
+   revisions, and refresh by starting a **new** pinned snapshot (never splice
+   new HEADs into an in-flight cursor).
+4. Exercise deep histories, branch advances mid-page, merges, cancellation,
+   stale/restarted HTTP cursors, multi-server identity, and graph camera/selection
+   stability. Avoid presenting a partial graph as complete.
+
+**Backend v1 limits:** deterministic DFS replay per page (cost proportional to
+already-read prefix), pages of 1..1000, 1024 captured branches and 250000
+traversed revisions maximum. Signed REST cursors are scoped to one project
+and become invalid after server restart. These are deliberate, documented
+budgets; a more scalable streaming/indexed walker may be needed for very
+large projects. See [native history](native-revision-history.md) and
+[OpenAPI](dvmdb-http-api.yaml).
 
 A Git-style visualization is compatible with branch refs: **no persisted
 branch-creation node is required**. A clickable branch reference decoration

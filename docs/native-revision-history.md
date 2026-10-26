@@ -19,11 +19,32 @@ Every native revision is identified by SHA-256 and stores the immutable model Me
 - `diffRevisions(before, after)` compares two immutable UUID-to-hash states using Merkle pruning, reporting additions, modifications and deletions.
 
 First-parent pagination is a browsing view, not the full merge DAG.
-The GUI requirement is to show the union of histories reachable from **all**
-branch heads, traversing both parents and deduplicating revisions within each
-project. DVMDB does **not yet expose a single snapshot-consistent, paginated
-full-DAG reader** in either native `ProjectService` or HTTP; this is the next
-integration milestone, not an available endpoint. Use both parents for merge ancestry and reachability. When a branch advances during UI browsing, clients should hold the selected revision ID and use historical reads for a consistent view.
+The separate `Repository::revisionGraph(maxCount, cursor)` and
+`ProjectService::revisionGraph(projectId, maxCount, cursor)` expose the union
+of all revisions reachable from every branch HEAD, following **both** merge
+parents. The first request captures the sorted branch-name → HEAD set under
+one repository/process lock; subsequent pages replay exactly that immutable
+snapshot even if HEADs move. Results deduplicate hashes within the project.
+
+A `RevisionGraphPage` contains `heads`, `revisions`, and an optional `next`
+`RevisionGraphCursor` (`heads` + count of unique revisions already emitted).
+No `next` means complete. A page contains 1..1000 revisions except for a
+complete smaller/empty graph. Traversal follows a stable DFS, not a global
+chronological/topological order. Do not infer commit timestamps or branch
+origin events. Parents not yet present in the client's page cache are
+normal **frontier edges**, not missing data. Graph display must wait for or
+indicate the remaining pages. A new request without a cursor sees the current
+HEADs. The API does not mutate storage.
+
+Graph paging is stateless: each later page replays the pinned ancestry from
+the start and skips already emitted unique hashes. This costs O(prefix length)
+per page; it avoids server session retention but is not optimal for very large
+repositories. A single call has a 1,024-branch and 250,000-revision traversal
+budget and fails with a clear limit error rather than returning an incorrect
+partial graph. The REST continuation token is authenticated and project-bound;
+server restart invalidates it (re-fetch the first page). These budgets and
+large URL tokens are candidates for a future bounded streaming or persistent
+index design, not a reason to pretend this first API is infinitely scalable.
 
 ## Branch creation from history
 

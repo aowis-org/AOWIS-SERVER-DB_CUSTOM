@@ -22,17 +22,20 @@ branches. `history` is currently **first-parent only**, while an immutable
 revision response carries both merge parents. Neither branch labels nor
 GUI-side server cards are additional revision-DAG objects.
 
-The next proposed read feature is a **snapshot-consistent, paginated
-full-revision DAG** with all branch heads, both parents and explicit
-incomplete-page indicators; no such REST route exists yet. If accepted, a
-candidate path is `GET /dvmdb/v1/projects/{projectId}/revision-graph`, to be
-added to OpenAPI **only once implemented and tested**. Its shape and cursor
-contract are specified as requirements in the semantics document, not as an
-unimplemented live wire schema.
+**Implemented full-DAG read:** `GET /dvmdb/v1/projects/{projectId}/revision-graph`
+returns a coherent branch-name → HEAD snapshot and pages of all revisions
+reachable through either parent, deduplicated per project. A signed,
+project-scoped cursor pins the HEAD snapshot across calls even if branches
+advance. `complete` and `nextCursor` mark partial pages explicitly. Traversal
+order is deterministic DFS, not chronological order; use parent IDs to lay
+out the GUI graph. The existing first-parent `history` remains unchanged.
+See the [OpenAPI contract](dvmdb-http-api.yaml) for the limits and cursor
+behavior. **The current GUI still consumes first-parent history**; upgrading
+its native and REST readers is the next integration step.
 
 ## Implemented and planned routes
 
-The table lists implemented routes plus one explicitly marked proposed network-enumeration route. The proposed full-graph endpoint appears only in the design text, not as live API. The machine-readable OpenAPI specification documents actual operations. The `/dvmdb/v1` prefix versions the HTTP interface, **not the model serialization format**.
+The table lists implemented routes plus one explicitly marked proposed network-enumeration route. The machine-readable OpenAPI specification documents actual operations. The `/dvmdb/v1` prefix versions the HTTP interface, **not the model serialization format**.
 
 | Operation | Method and route |
 |---|---|
@@ -43,6 +46,7 @@ The table lists implemented routes plus one explicitly marked proposed network-e
 | List project branches | `GET /dvmdb/v1/projects/{projectId}/branches` |
 | Create/fork branch | `POST /dvmdb/v1/projects/{projectId}/branches` |
 | Read branch head | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/head` |
+| Browse complete project revision graph | `GET /dvmdb/v1/projects/{projectId}/revision-graph?limit=&cursor=` |
 | Browse branch history | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/history` |
 | Inspect immutable revision | `GET /dvmdb/v1/projects/{projectId}/revisions/{revisionHash}` |
 | Compare revisions | `GET /dvmdb/v1/projects/{projectId}/diff?from={hash}&to={hash}` (implemented) |
