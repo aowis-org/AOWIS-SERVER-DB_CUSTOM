@@ -1,8 +1,10 @@
 # AOWIS Distributed Versioned Model Database
 
+**Repository:** https://github.com/aowis-org/AOWIS-SERVER-DVMDB
+
 **AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
-This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-db` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
+This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-dvmdb` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
 
 > **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
@@ -23,7 +25,7 @@ AOWIS GUI / other AOWIS services / remote clients
                       |
                 REST over HTTP
                       |
-                 aowis-server-db
+                 aowis-server-dvmdb
           configurable TCP address + port
           multiple projects / repositories
                       |
@@ -69,7 +71,36 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
-`./tools/zip_db.sh` creates `../db_custom.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata or generated/ignored files. Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-native-zip-submodule-tests`.
+`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata or generated/ignored files. Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-native-zip-submodule-tests`.
+
+### DVMDB rename and patch convention
+
+The Git repository, top-level source directory, CMake project, server executable,
+service packaging and project snapshot now use **DVMDB**:
+
+```bash
+./tools/zip_dvmdb.sh       # ../dvmdb.zip, containing AOWIS-SERVER-DVMDB/
+./tools/zip_db.sh          # supported compatibility entrypoint, same output
+./tools/apply_patch.sh ~/Downloads/aowis-dvmdb-example.zip
+```
+
+Patch ZIPs must begin with `aowis-dvmdb-`, and each archive entry must begin
+with `AOWIS-SERVER-DVMDB/`. The one-time rename patch is exceptionally named
+`aowis-db-custom-rename-project-to-dvmdb.zip` so it can be applied by the
+*previous* `apply_patch.sh`, which only knows the old prefix. After applying
+it, use DVMDB patch names exclusively. Old `db_custom.zip` snapshots are not
+automatically deleted from the parent directory.
+
+**Existing deployments:** the new executable name and default data directory
+are naming changes, **not** a storage-format migration. Never start a fresh
+empty root and assume it contains your old projects. Before a rollout stop all
+writers, take a verified offline backup, and explicitly point the new service
+at the existing data root or use a verified cold restore into the new root.
+When using the new systemd unit, ensure its service account, state directory,
+INI and sandbox write paths agree with the selected root. The API routes,
+canonical model identities, bundle extension and persistent pack bytes do not
+change. See [operations](docs/operations.md) for backup and restore rules.
+
 
 When `AOWIS_NATIVE_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. The project catalogue and HTTP route integration suites are included when their dependencies are enabled.
 
@@ -91,7 +122,7 @@ repository.createBranch("main");
 
 Engine failures, including hydraulic load failures, are `aowis::native::StorageError` exceptions (see `include/aowis/native/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
 
-The project catalogue is also available as `AOWIS::NativeProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-db` (binds to 127.0.0.1:8755, project storage `./aowis-db-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/db-http-api.yaml) documents implemented routes.
+The project catalogue is also available as `AOWIS::NativeProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-dvmdb` (binds to 127.0.0.1:8755, project storage `./aowis-dvmdb-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
 
 For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).
 
@@ -137,7 +168,7 @@ A subsequent bundle can contain only objects missing relative to a shared base r
 Every benchmark creates its own repository. Supply a **nonexistent child directory** inside a fresh random temporary parent; never reuse the same repository path for a second run.
 
 ```bash
-run_root="$(mktemp -d /tmp/aowis-db-custom-bench.XXXXXXXX)"
+run_root="$(mktemp -d /tmp/aowis-dvmdb-bench.XXXXXXXX)"
 ./build-linux/aowis-native-hydraulic-edit-benchmark \
   "$run_root/repository" 100000 20 3
 ```
@@ -160,14 +191,14 @@ device-level and deployment-filesystem qualification remain outstanding.
 
 The chosen server design is:
 
-- **`aowis-server-db`**, built on the vendored **cpp-httplib** with a worker thread pool, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
+- **`aowis-server-dvmdb`**, built on the vendored **cpp-httplib** with a worker thread pool, listening on a configurable TCP bind address and port using **HTTP (not HTTPS yet)**.
 - **Multiple projects**, each identified by UUID and owning an independent native versioned repository, managed by one process. Clients never supply server filesystem paths as project identifiers.
 - Implemented versioned REST resources for projects, branches and revision metadata, with JSON responses. Hydraulic networks/entities, merges/conflicts and bounded binary full/incremental synchronization are available.
 - Revision-pinned hydraulic network/entity/membership reads (including historical APIs) and optimistic revision-head checks for mutations, preventing mixed snapshots and silent concurrent overwrites.
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
 - File-based synchronization and direct native C++ library access remain supported alongside the HTTP project service.
 
-The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /api/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for incremental download); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/db-http-api.yaml) and the [roadmap](docs/roadmap.md).
+The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /api/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for incremental download); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/dvmdb-http-api.yaml) and the [roadmap](docs/roadmap.md).
 
 ## Documentation
 
@@ -210,7 +241,7 @@ durability drill, not a default CTest. The longer drills are opt-in:
 
 # Five-minute real-process HTTP mixed import/export soak:
 ./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
-  --soak-seconds 300 ./build-linux-tests-release/aowis-server-db
+  --soak-seconds 300 ./build-linux-tests-release/aowis-server-dvmdb
 
 # Same soak with Linux RSS/CPU/FD evidence in a new run directory:
 python3 tools/qualify_http_resources.py --seconds 300

@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN); // a closed client socket must not kill the server
 
     QCoreApplication app(argc, argv);
-    app.setApplicationName(QStringLiteral("aowis-server-db"));
+    app.setApplicationName(QStringLiteral("aowis-server-dvmdb"));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("AOWIS multi-project native database HTTP service"));
@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
 
     try {
         QSettings settings(parser.isSet(config) ? parser.value(config) :
-                           QStringLiteral("aowis-server-db.ini"), QSettings::IniFormat);
+                           QStringLiteral("aowis-server-dvmdb.ini"), QSettings::IniFormat);
         const QString bindValue = parser.isSet(bind) ? parser.value(bind) :
             settings.value("server/bind", "127.0.0.1").toString();
         const QString portValue = parser.isSet(port) ? parser.value(port) :
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
         const QString pendingValue = parser.isSet(pending) ? parser.value(pending) :
             settings.value("server/max_pending_per_project", "").toString();
         const QString rootValue = parser.isSet(dataRoot) ? parser.value(dataRoot) :
-            settings.value("storage/root", "./aowis-db-data").toString();
+            settings.value("storage/root", "./aowis-dvmdb-data").toString();
         const QString logPath = parser.isSet(logFile) ? parser.value(logFile) :
             settings.value("logging/file", "").toString();
 

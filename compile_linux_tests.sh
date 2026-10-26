@@ -16,7 +16,7 @@ run_suite() {
         arguments+=("-DCMAKE_BUILD_TYPE=$build_type")
     fi
     cmake "${arguments[@]}"
-    cmake --build "$build_dir" --target aowis-db-tests --parallel
+    cmake --build "$build_dir" --target aowis-dvmdb-tests --parallel
     local registered
     registered="$(ctest --test-dir "$build_dir" -N -L '^aowis$')"
     if ! grep -Eq 'Total Tests: [1-9][0-9]*' <<< "$registered"; then

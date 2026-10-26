@@ -1,10 +1,10 @@
 # AOWIS database REST API — design and implemented interface
 
-**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-db` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](db-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and end-to-end zero-staging streaming bundles remain planned; bounded file-staged, chunk-transferred full/incremental bundles are implemented.
+**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-dvmdb` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](dvmdb-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and end-to-end zero-staging streaming bundles remain planned; bounded file-staged, chunk-transferred full/incremental bundles are implemented.
 
 ## Goals and deployment
 
-- One `aowis-server-db` process serves **multiple independent AOWIS projects**. A project has a stable UUID, descriptive metadata and one native repository with its own branch/revision history.
+- One `aowis-server-dvmdb` process serves **multiple independent AOWIS projects**. A project has a stable UUID, descriptive metadata and one native repository with its own branch/revision history.
 - Expose **RESTful HTTP over TCP**, with a configurable listen address and port. Use the vendored, pinned **cpp-httplib** (decision 2026-10-23: QHttpServer cannot bound requests before Qt 6.11 and buffers whole bodies) and the existing Qt/C++ model types internally. Do not develop another HTTP parser.
 - **HTTP only, no TLS/HTTPS in this implementation.** Authentication, authorization, sessions, keys and identities are intentionally **not implemented or enforced** in the initial REST service. These will be defined by a future AOWIS-wide security system, not separately for database storage.
 - The native database and hydraulic APIs remain usable directly as libraries by AOWIS standalone and in-process services. REST is an adapter, not a second storage implementation.
@@ -55,7 +55,7 @@ An implemented incremental export supplies a known base revision as a `base` que
 - Persist a server-side **project catalogue** mapping UUIDs to administrator-controlled repository directories. The project catalogue uses durable UUID-named directories with atomic project publication and tested restart recovery.
 - Decide and document repository-handle lifetime, concurrent request handling, graceful shutdown and safe offline maintenance. Never promise online compaction before it is implemented.
 - Use configuration for bind address, port, project data root and logging; align with other AOWIS servers' conventions rather than invent per-request filesystem routing.
-- Maintain the [OpenAPI specification](db-http-api.yaml) alongside implemented endpoints and test them over real local TCP.
+- Maintain the [OpenAPI specification](dvmdb-http-api.yaml) alongside implemented endpoints and test them over real local TCP.
 - Keep a storage-agnostic native C++ façade so embedding the database in the AOWIS standalone build does not require TCP/HTTP.
 
 ## Deferred security
@@ -66,4 +66,4 @@ An AOWIS-wide security design will later specify identity/session lifecycle, tru
 
 ## Remaining interface work
 
-The implemented surface is specified in [OpenAPI](db-http-api.yaml) and exercised by HTTP integration tests. Preview-only merges, network enumeration and optional deeper transfer streaming are possible extensions, not promised existing endpoints. Remaining release qualification is tracked in the [roadmap](roadmap.md).
+The implemented surface is specified in [OpenAPI](dvmdb-http-api.yaml) and exercised by HTTP integration tests. Preview-only merges, network enumeration and optional deeper transfer streaming are possible extensions, not promised existing endpoints. Remaining release qualification is tracked in the [roadmap](roadmap.md).

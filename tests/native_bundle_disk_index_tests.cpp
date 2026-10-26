@@ -34,7 +34,7 @@ void check(bool condition, std::string_view message) {
 class TemporaryRoot {
 public:
     TemporaryRoot() {
-        char pattern[] = "/tmp/aowis-db-bundle-disk-index-XXXXXX";
+        char pattern[] = "/tmp/aowis-dvmdb-bundle-disk-index-XXXXXX";
         const char* result = ::mkdtemp(pattern);
         check(result != nullptr, "create unique test directory");
         this->directory_ = result;

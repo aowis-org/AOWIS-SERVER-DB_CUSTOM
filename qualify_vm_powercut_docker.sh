@@ -21,7 +21,7 @@ only when available; otherwise QEMU uses much slower software emulation.
 No host disks are attached. All guest data disks are freshly created files.
 
 Environment:
-  AOWIS_VM_DOCKER_IMAGE   Docker image tag (default: aowis-db-powercut:debian12)
+  AOWIS_VM_DOCKER_IMAGE   Docker image tag (default: aowis-dvmdb-powercut:debian12)
   AOWIS_VM_CACHE          Cached cloud image and compiled worker
   AOWIS_VM_RESULTS        Logs and disposable VM workspaces
   AOWIS_DOCKER            Docker executable (default: docker)
@@ -33,7 +33,7 @@ case "${1:-}" in
     --help|-h) usage; exit 0 ;;
 esac
 
-image="${AOWIS_VM_DOCKER_IMAGE:-aowis-db-powercut:debian12}"
+image="${AOWIS_VM_DOCKER_IMAGE:-aowis-dvmdb-powercut:debian12}"
 # Host networking avoids Docker bridge DNS failures during apt and during
 # Debian guest-image downloads and guest cloud-init package installation.
 # It affects Docker's networking only: the workload still runs inside QEMU.
@@ -65,7 +65,7 @@ if [[ "${1:-}" == --prepare ]]; then
     exit 0
 fi
 
-cache_dir="${AOWIS_VM_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/aowis-db-powercut}"
+cache_dir="${AOWIS_VM_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/aowis-dvmdb-powercut}"
 result_dir="${AOWIS_VM_RESULTS:-$project_dir/build-vm-powercut}"
 mkdir -p -- "$cache_dir" "$result_dir"
 cache_dir="$(cd -- "$cache_dir" && pwd -P)"

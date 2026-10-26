@@ -53,17 +53,17 @@ main() {
         exit 0
     fi
     if [[ $# -ne 1 ]]; then
-        printf 'Usage: %s /path/to/aowis-db-custom-<description>.zip | --finish\n' "${0##*/}" >&2
+        printf 'Usage: %s /path/to/aowis-dvmdb-<description>.zip | --finish\n' "${0##*/}" >&2
         exit 2
     fi
 
     # Prevent cross-repository patch mixups. This repository accepts only patch
-    # archives specifically named for AOWIS-SERVER-DB_CUSTOM. Validate the archive
+    # archives specifically named for AOWIS-SERVER-DVMDB. Validate the archive
     # basename, not its directory, before accessing or extracting any content.
     patch_name="$(basename -- "$1")"
-    if [[ "$patch_name" != aowis-db-custom-*.zip ||
-          "$patch_name" == aowis-db-custom-.zip ]]; then
-        printf 'Refusing patch %s: expected aowis-db-custom-<description>.zip\n' "$patch_name" >&2
+    if [[ "$patch_name" != aowis-dvmdb-*.zip ||
+          "$patch_name" == aowis-dvmdb-.zip ]]; then
+        printf 'Refusing patch %s: expected aowis-dvmdb-<description>.zip\n' "$patch_name" >&2
         exit 1
     fi
 
@@ -91,9 +91,9 @@ main() {
     apply_deletions
     printf 'Applied %s with current file and directory timestamps.\n' "$patch"
 
-    # Refresh the project snapshot (db_custom.zip next to the repository) so
+    # Refresh the project snapshot (dvmdb.zip next to the repository) so
     # the applied state can be shared for review without a separate step.
-    if ! "$script_dir/zip_db.sh"; then
+    if ! "$script_dir/zip_dvmdb.sh"; then
         printf 'Patch applied, but creating the project snapshot failed.\n' >&2
         exit 1
     fi

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(AOWIS_Server_DB_Custom VERSION 0.1.0 LANGUAGES CXX)
+project(AOWIS_Server_DVMDB VERSION 0.1.0 LANGUAGES CXX)
 
 include(CTest)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
@@ -115,8 +115,17 @@ if(BUILD_TESTING)
         add_test(NAME aowis-native-zip-submodule-tests
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/zip_submodule_tests.py"
-                --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/zip_db.sh")
+                --script "${CMAKE_CURRENT_SOURCE_DIR}/tools/zip_dvmdb.sh")
         set_tests_properties(aowis-native-zip-submodule-tests PROPERTIES LABELS "aowis")
+        # A renamed checkout must accept only DVMDB-rooted DVMDB-named patches,
+        # generate dvmdb.zip and still support the legacy zip_db.sh entrypoint.
+        add_test(NAME aowis-native-dvmdb-naming-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/dvmdb_naming_tests.py"
+                --apply-script "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch.sh"
+                --zip-script "${CMAKE_CURRENT_SOURCE_DIR}/tools/zip_dvmdb.sh"
+                --legacy-zip-script "${CMAKE_CURRENT_SOURCE_DIR}/tools/zip_db.sh")
+        set_tests_properties(aowis-native-dvmdb-naming-tests PROPERTIES LABELS "aowis;compatibility")
     endif()
     add_test(NAME aowis-native-replication-benchmark-smoke
         COMMAND "${Python3_EXECUTABLE}"
@@ -324,7 +333,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-native-store-tests PRIVATE aowis-native-store)
     add_test(NAME aowis-native-store-tests COMMAND aowis-native-store-tests)
     set_tests_properties(aowis-native-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-db-tests DEPENDS aowis-native-vm-powercut-worker aowis-native-sigkill-restart-tests aowis-native-physical-enospc-tests aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
+    add_custom_target(aowis-dvmdb-tests DEPENDS aowis-native-vm-powercut-worker aowis-native-sigkill-restart-tests aowis-native-physical-enospc-tests aowis-native-offline-backup-tests aowis-native-transfer-staging-budget-tests aowis-native-index-scaling-benchmark aowis-native-pack-operational-stress-tests aowis-native-bundle-import-profile-tests aowis-native-replication-scaling-benchmark aowis-native-bundle-revision-marks-tests aowis-native-bundle-disk-index-tests aowis-native-merge-ancestry-tests aowis-native-bundle-limit-tests aowis-native-project-service-tests aowis-native-project-concurrency-tests aowis-native-recovery-tests aowis-native-scratch-tests aowis-native-error-kind-tests aowis-native-repository-verify-tests aowis-native-model-import-integrity-tests aowis-native-merkle-integrity-tests aowis-native-store-tests aowis-native-diff-scope-tests aowis-native-incremental-sync-tests aowis-native-sync-tests aowis-native-sync-cli-tests aowis-native-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.
@@ -402,7 +411,7 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
             benchmarks/hydraulic_edit_benchmark.cpp)
         target_link_libraries(aowis-native-hydraulic-edit-benchmark PRIVATE aowis-native-hydraulic)
         if(BUILD_TESTING)
-            add_dependencies(aowis-db-tests aowis-native-hydraulic-edit-benchmark aowis-native-verify)
+            add_dependencies(aowis-dvmdb-tests aowis-native-hydraulic-edit-benchmark aowis-native-verify)
             # Genuine canonical hydraulic model operations and a fresh-process
             # full verification. Each invocation creates its own disposable root.
             add_test(NAME aowis-native-hydraulic-workload-smoke
@@ -434,7 +443,7 @@ if(AOWIS_NATIVE_WITH_MODEL_CODEC)
                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_model_codec_tests.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}")
             set_tests_properties(aowis-native-model-codec-check-tests PROPERTIES LABELS "aowis")
-            add_dependencies(aowis-db-tests aowis-native-model-codec-tests aowis-native-hydraulic-network-tests
+            add_dependencies(aowis-dvmdb-tests aowis-native-model-codec-tests aowis-native-hydraulic-network-tests
                 aowis-native-model-value-rules-tests)
         endif()
         message(STATUS "Native model serializer and hydraulic persistence enabled")
@@ -470,29 +479,29 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
         target_compile_definitions(aowis-native-http PUBLIC AOWIS_HTTP_WITH_HYDRAULIC=1)
     endif()
 
-    add_executable(aowis-server-db tools/aowis_server_db.cpp)
-    target_link_libraries(aowis-server-db PRIVATE aowis-native-http)
+    add_executable(aowis-server-dvmdb tools/aowis_server_dvmdb.cpp)
+    target_link_libraries(aowis-server-dvmdb PRIVATE aowis-native-http)
     if(BUILD_TESTING)
         add_executable(aowis-native-http-tests tests/native_http_tests.cpp)
         target_link_libraries(aowis-native-http-tests PRIVATE aowis-native-http)
-        add_dependencies(aowis-native-http-tests aowis-server-db)
+        add_dependencies(aowis-native-http-tests aowis-server-dvmdb)
         add_test(NAME aowis-native-http-tests COMMAND aowis-native-http-tests
-            $<TARGET_FILE:aowis-server-db>)
+            $<TARGET_FILE:aowis-server-dvmdb>)
         set_tests_properties(aowis-native-http-tests PROPERTIES LABELS "aowis")
-        add_dependencies(aowis-db-tests aowis-native-http-tests)
+        add_dependencies(aowis-dvmdb-tests aowis-native-http-tests)
         # Separate real-process transfer/admission stress: independent of Qt
         # test helpers, but runs against the production HTTP executable.
         add_executable(aowis-native-http-transfer-stress-tests
             tests/native_http_transfer_stress_tests.cpp)
         target_link_libraries(aowis-native-http-transfer-stress-tests PRIVATE
             aowis-native-store aowis-cpp-httplib)
-        add_dependencies(aowis-native-http-transfer-stress-tests aowis-server-db)
+        add_dependencies(aowis-native-http-transfer-stress-tests aowis-server-dvmdb)
         add_test(NAME aowis-native-http-stress-fixture-tests
             COMMAND aowis-native-http-transfer-stress-tests --fixture-only)
         set_tests_properties(aowis-native-http-stress-fixture-tests PROPERTIES
             LABELS "aowis;http-stress" TIMEOUT 45)
         add_test(NAME aowis-native-http-transfer-stress-tests
-            COMMAND aowis-native-http-transfer-stress-tests $<TARGET_FILE:aowis-server-db>)
+            COMMAND aowis-native-http-transfer-stress-tests $<TARGET_FILE:aowis-server-dvmdb>)
         set_tests_properties(aowis-native-http-transfer-stress-tests PROPERTIES
             LABELS "aowis;http-stress" TIMEOUT 180 RUN_SERIAL TRUE)
         # Short end-to-end soak guarantees elapsed-time checkpoints really
@@ -501,10 +510,10 @@ if(AOWIS_NATIVE_WITH_HTTP_SERVER)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/http_soak_progress_tests.py"
                 "$<TARGET_FILE:aowis-native-http-transfer-stress-tests>"
-                "$<TARGET_FILE:aowis-server-db>")
+                "$<TARGET_FILE:aowis-server-dvmdb>")
         set_tests_properties(aowis-native-http-soak-progress-tests PROPERTIES
             LABELS "aowis;http-stress;qualification" TIMEOUT 100 RUN_SERIAL TRUE)
-        add_dependencies(aowis-db-tests aowis-native-http-transfer-stress-tests)
+        add_dependencies(aowis-dvmdb-tests aowis-native-http-transfer-stress-tests)
     endif()
     message(STATUS "Native multi-project HTTP server enabled (cpp-httplib)")
 else()
@@ -521,7 +530,7 @@ if(BUILD_TESTING)
         if(TARGET "${AOWIS_REGISTERED_TEST}")
             get_target_property(AOWIS_TEST_TARGET_TYPE "${AOWIS_REGISTERED_TEST}" TYPE)
             if(AOWIS_TEST_TARGET_TYPE STREQUAL "EXECUTABLE")
-                add_dependencies(aowis-db-tests "${AOWIS_REGISTERED_TEST}")
+                add_dependencies(aowis-dvmdb-tests "${AOWIS_REGISTERED_TEST}")
             endif()
         endif()
     endforeach()

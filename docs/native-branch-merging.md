@@ -23,4 +23,4 @@ Generic reference existence is **not** sufficient for hydraulic integrity. A pip
 
 ## Boundaries
 
-No implicit overwrite policy resolves conflicts. Complex semantic conflicts, incompatible membership order and arbitrary multi-object topology may still require explicit review; recursive ancestry does not silently resolve conflicting edits. The implemented HTTP merge endpoint uses hydraulic-aware validation; see [service API](native-database-service.md) and [OpenAPI](db-http-api.yaml).
+No implicit overwrite policy resolves conflicts. Complex semantic conflicts, incompatible membership order and arbitrary multi-object topology may still require explicit review; recursive ancestry does not silently resolve conflicting edits. The implemented HTTP merge endpoint uses hydraulic-aware validation; see [service API](native-database-service.md) and [OpenAPI](dvmdb-http-api.yaml).

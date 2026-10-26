@@ -1,6 +1,6 @@
 # Repository and bundle format compatibility
 
-AOWIS-SERVER-DB_CUSTOM has **one native pack storage implementation** and
+AOWIS-SERVER-DVMDB has **one native pack storage implementation** and
 portable, content-addressed `.aowbundle` synchronization. Pack files are the
 local authoritative object storage; `objects.idx` is a derived sidecar and can
 be rebuilt. Bundles transport immutable logical history independently of

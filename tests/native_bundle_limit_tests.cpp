@@ -45,7 +45,7 @@ void rejectsLimit(Callable operation) {
 class TemporaryRoot {
 public:
     TemporaryRoot() {
-        char path[] = "/tmp/aowis-db-bundle-limits-XXXXXX";
+        char path[] = "/tmp/aowis-dvmdb-bundle-limits-XXXXXX";
         const char* created = ::mkdtemp(path);
         check(created != nullptr, "temporary directory creation failed");
         this->root_ = created;

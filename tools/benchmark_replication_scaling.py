@@ -42,8 +42,8 @@ def scratch_bytes(pid):
         try:
             target = os.readlink(entry)
             if not any(name in target for name in (
-                    "aowis-db-bundle-index-", "aowis-db-bundle-marks-",
-                    "aowis-db-tree-summaries-", "aowis-db-reference-edges-")):
+                    "aowis-dvmdb-bundle-index-", "aowis-dvmdb-bundle-marks-",
+                    "aowis-dvmdb-tree-summaries-", "aowis-dvmdb-reference-edges-")):
                 continue
             info = entry.stat()
             identity = (info.st_dev, info.st_ino)
@@ -296,7 +296,7 @@ def main():
     with contextlib.ExitStack() as resources:
         if args.mode == "all":
             fixtures_root = Path(resources.enter_context(
-                tempfile.TemporaryDirectory(prefix="aowis-db-custom-replication-",
+                tempfile.TemporaryDirectory(prefix="aowis-dvmdb-replication-",
                                             dir=args.work_root)))
             prepare_fixtures(binary, fixtures_root, args, kinds, backends)
         else:
@@ -308,7 +308,7 @@ def main():
                 return
             load_fixtures(fixtures_root, args, kinds, backends)
         destination_root = Path(resources.enter_context(
-            tempfile.TemporaryDirectory(prefix="aowis-db-custom-replication-imports-",
+            tempfile.TemporaryDirectory(prefix="aowis-dvmdb-replication-imports-",
                                         dir=args.work_root)))
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)

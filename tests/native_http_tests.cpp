@@ -46,7 +46,7 @@ void check(bool ok, const char* message) {
 class TemporaryRoot {
 public:
     TemporaryRoot() {
-        char name[] = "/tmp/aowis-db-http-XXXXXX";
+        char name[] = "/tmp/aowis-dvmdb-http-XXXXXX";
         char* result = ::mkdtemp(name);
         check(result != nullptr, "mkdtemp failed");
         this->root_ = result;
@@ -1472,7 +1472,7 @@ void exerciseExecutable(const QString& executable) {
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     try {
-        check(argc == 2, "expected path to aowis-server-db executable");
+        check(argc == 2, "expected path to aowis-server-dvmdb executable");
         exercise();
         exerciseConcurrency();
         exerciseTransferStagingBudget();

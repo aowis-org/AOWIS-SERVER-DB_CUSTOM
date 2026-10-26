@@ -51,7 +51,7 @@ T item(int ordinal) {
 
 std::filesystem::path tempDir() {
     std::string pattern = (std::filesystem::temp_directory_path() /
-                           "aowis-db-custom-network-test-XXXXXXXX").string();
+                           "aowis-dvmdb-network-test-XXXXXXXX").string();
     std::vector<char> writable(pattern.begin(), pattern.end());
     writable.push_back('\0');
     char* result = ::mkdtemp(writable.data());

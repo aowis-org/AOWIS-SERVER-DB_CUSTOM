@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--script", required=True, type=Path)
     parser.add_argument("--binary", required=True, type=Path)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="aowis-db-custom-benchmark-phases-") as temp:
+    with tempfile.TemporaryDirectory(prefix="aowis-dvmdb-benchmark-phases-") as temp:
         root = Path(temp)
         fixtures = root / "fixtures"
         results = root / "results.csv"

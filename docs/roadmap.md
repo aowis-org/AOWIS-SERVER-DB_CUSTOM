@@ -8,7 +8,7 @@ are preserved in [engineering findings](engineering-findings.md).
 
 ## Current baseline
 
-AOWIS-SERVER-DB_CUSTOM is one native C++ versioned model database using a
+AOWIS-SERVER-DVMDB is one native C++ versioned model database using a
 content-addressed pack, durable branch references, Merkle indexes, distributed
 full/incremental bundles and recursive merge bases. Canonical hydraulic
 persistence/validation and the multi-project HTTP service are implemented.

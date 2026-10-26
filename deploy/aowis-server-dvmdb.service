@@ -4,15 +4,15 @@ After=network.target
 
 [Service]
 Type=simple
-User=aowis-db
-Group=aowis-db
-# /var/lib/aowis-db, created with the right owner; matches [storage] root.
-StateDirectory=aowis-db
+User=aowis-dvmdb
+Group=aowis-dvmdb
+# /var/lib/aowis-dvmdb, created with the right owner; matches [storage] root.
+StateDirectory=aowis-dvmdb
 StateDirectoryMode=0700
-# /var/log/aowis-db for an optional [logging] file=; journald is the default.
-LogsDirectory=aowis-db
-# Install deploy/aowis-server-db.ini as /etc/aowis/aowis-server-db.ini.
-ExecStart=/usr/local/bin/aowis-server-db --config /etc/aowis/aowis-server-db.ini
+# /var/log/aowis-dvmdb for an optional [logging] file=; journald is the default.
+LogsDirectory=aowis-dvmdb
+# Install deploy/aowis-server-dvmdb.ini as /etc/aowis/aowis-server-dvmdb.ini.
+ExecStart=/usr/local/bin/aowis-server-dvmdb --config /etc/aowis/aowis-server-dvmdb.ini
 Restart=on-failure
 RestartSec=2
 # SIGTERM closes the listener; running requests finish first.
@@ -22,7 +22,7 @@ TimeoutStopSec=60
 # Hardening: the service writes only its state directory.
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/aowis-db
+ReadWritePaths=/var/lib/aowis-dvmdb
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

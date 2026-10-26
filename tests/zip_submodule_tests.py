@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regression test for recursive, self-contained zip_db.sh exports."""
+"""End-to-end regression test for recursive, self-contained zip_dvmdb.sh exports."""
 
 import argparse
 from pathlib import Path
@@ -75,7 +75,7 @@ def main() -> None:
         nested = root / "nested-source"
         model = root / "model-source"
         extra = root / "extra-source"
-        project = root / "AOWIS-SERVER-DB_CUSTOM"
+        project = root / "AOWIS-SERVER-DVMDB"
 
         init_repo(nested)
         write(nested / "include/nested.h", "nested source\n")
@@ -100,7 +100,7 @@ def main() -> None:
         write(project / ".env", "do not package\n")
         write(project / ".gitignore", "ignored-build/\n")
         (project / "tools").mkdir()
-        shutil.copy2(args.script, project / "tools/zip_db.sh")
+        shutil.copy2(args.script, project / "tools/zip_dvmdb.sh")
         add_submodule(project, model, "external/AOWIS-SERVER-MODEL")
         add_submodule(project, extra, "external/EXTRA")
         commit(project)
@@ -114,15 +114,15 @@ def main() -> None:
         write(checkout / "deps/nested/fresh.txt", "nested untracked\n")
         write(project / "docs/untracked.txt", "new project file\n")
 
-        archive = root / "db_custom.zip"
-        run("bash", str(project / "tools/zip_db.sh"))
+        archive = root / "dvmdb.zip"
+        run("bash", str(project / "tools/zip_dvmdb.sh"))
         assert_members(archive, project.name)
         valid_archive = archive.read_bytes()
 
         # Removing a nested checkout must make the script fail *without*
         # overwriting the previous successfully generated archive.
         shutil.rmtree(checkout / "deps/nested")
-        failure = subprocess.run(["bash", str(project / "tools/zip_db.sh")],
+        failure = subprocess.run(["bash", str(project / "tools/zip_dvmdb.sh")],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert failure.returncode != 0, "uninitialized nested submodule was silently skipped"
         assert "not initialized" in failure.stderr, failure.stderr

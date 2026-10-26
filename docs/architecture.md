@@ -8,7 +8,7 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 2. **Domain persistence:** the hydraulic adapter validates `NetworkHydraulic`, persists network metadata, up to 256 ordered UUIDs per membership chunk, and one independently addressed record per top-level entity.
 3. **Logical object store:** content-addressed immutable values, compressed 16-way UUID Merkle trie, persistent reverse-reference index, revision DAG and named branch refs.
 4. **Physical store:** append-only content-addressed object pack with a derived/rebuildable index.
-5. **Service boundary:** `aowis-server-db` uses the vendored cpp-httplib over HTTP/TCP (worker thread pool) with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Implemented HTTP routes cover catalogue, branches, immutable revisions and diffs, canonical hydraulic reads/edits/merges, and bounded full/incremental bundle transfers.
+5. **Service boundary:** `aowis-server-dvmdb` uses the vendored cpp-httplib over HTTP/TCP (worker thread pool) with a durable UUID-based multi-project catalogue. Native storage/model APIs and the Qt-free project-service library remain directly callable from C++; the HTTP adapters never change stored model identities. Implemented HTTP routes cover catalogue, branches, immutable revisions and diffs, canonical hydraulic reads/edits/merges, and bounded full/incremental bundle transfers.
 
 ## Logical identities and history
 
@@ -74,6 +74,6 @@ Portable `.aowbundle` files contain a complete reachable branch graph or a delta
 - `aowis::native::Repository` — low-level storage, history, compaction, bundles and generic merges.
 - `aowis::native::ModelCodec<T>` — typed serialization.
 - `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
-- Implemented `aowis-server-db` HTTP route handlers — thin REST adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
+- Implemented `aowis-server-dvmdb` HTTP route handlers — thin REST adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
 
 The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [format compatibility policy](format-compatibility.md) and [roadmap](roadmap.md).

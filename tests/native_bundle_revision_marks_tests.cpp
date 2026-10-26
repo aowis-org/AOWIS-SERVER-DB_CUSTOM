@@ -36,7 +36,7 @@ class TemporaryDirectory {
 public:
     TemporaryDirectory() {
         const std::filesystem::path base =
-            std::filesystem::temp_directory_path() / "aowis-db-revision-marks-XXXXXX";
+            std::filesystem::temp_directory_path() / "aowis-dvmdb-revision-marks-XXXXXX";
         std::string pattern = base.string();
         check(::mkdtemp(pattern.data()) != nullptr, "create unique test directory");
         this->directory_ = pattern;

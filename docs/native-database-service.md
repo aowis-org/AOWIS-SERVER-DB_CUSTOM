@@ -1,6 +1,6 @@
 # Native database HTTP/TCP service
 
-`aowis-server-db` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::NativeProjectService` and `AOWIS::NativeHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
+`aowis-server-dvmdb` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::NativeProjectService` and `AOWIS::NativeHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
 
 ## Build
 
@@ -16,12 +16,24 @@ With Qt6 Core installed (Qt Network/HttpServer are not needed), run:
 ## Run
 
 ```bash
-./build-linux/aowis-server-db --config ./deploy/aowis-server-db.ini
+./build-linux/aowis-server-dvmdb --config ./deploy/aowis-server-dvmdb.ini
 # Or override the INI settings:
-./build-linux/aowis-server-db --bind 127.0.0.1 --port 8755 --data-root ./db-data
+./build-linux/aowis-server-dvmdb --bind 127.0.0.1 --port 8755 --data-root ./db-data
 ```
 
-`QSettings` reads `server/bind`, `server/port`, `storage/root` and optional `logging/file` from an INI file. Defaults if absent: `127.0.0.1`, `8755`, `./aowis-db-data`; errors go to stderr when no log file is configured. `--log-file` (or `logging/file` in INI) appends C++ service diagnostics to a file, which must be writable by the service account. Log rotation is the administrator's responsibility. Explicit CLI arguments override INI values. Paths are relative to the server process's working directory unless absolute. The example INI and systemd unit in `deploy/` use `/var/lib/aowis-db`. Create the `aowis-db` service account, install the binary as `/usr/local/bin/aowis-server-db` and the INI as `/etc/aowis/aowis-server-db.ini`. The unit is sandboxed: read-only system (`ProtectSystem=strict`), writable only `/var/lib/aowis-db` (state) and `/var/log/aowis-db` (an optional `[logging] file=`), private `/tmp`, no home directories, no capabilities and a `@system-service` system-call filter (`systemd-analyze security` exposure 1.7). Run `--help` for supported CLI options.
+`QSettings` reads `server/bind`, `server/port`, `storage/root` and optional `logging/file` from an INI file. Defaults if absent: `127.0.0.1`, `8755`, `./aowis-dvmdb-data`; errors go to stderr when no log file is configured. `--log-file` (or `logging/file` in INI) appends C++ service diagnostics to a file, which must be writable by the service account. Log rotation is the administrator's responsibility. Explicit CLI arguments override INI values. Paths are relative to the server process's working directory unless absolute. The example INI and systemd unit in `deploy/` use `/var/lib/aowis-dvmdb`. Create the `aowis-dvmdb` service account, install the binary as `/usr/local/bin/aowis-server-dvmdb` and the INI as `/etc/aowis/aowis-server-dvmdb.ini`. The unit is sandboxed: read-only system (`ProtectSystem=strict`), writable only `/var/lib/aowis-dvmdb` (state) and `/var/log/aowis-dvmdb` (an optional `[logging] file=`), private `/tmp`, no home directories, no capabilities and a `@system-service` system-call filter (`systemd-analyze security` exposure 1.7). Run `--help` for supported CLI options.
+
+**Upgrading an existing service:** The old binary, INI and systemd filenames,
+Unix account and example `/var/lib/` and `/var/log/` paths were renamed to
+`aowis-server-dvmdb` and `aowis-dvmdb`. The service does **not** move an
+existing catalogue automatically. Stop all old service processes and back up
+their data before changing service units. Either restore to the new root with
+`tools/offline_backup.py` and verify the restored projects, or explicitly
+configure `[storage] root=` / `--data-root` to the existing location and
+allow that location in the systemd sandbox. Do not delete an old data root
+until the new service has been verified against expected project IDs, branch
+heads and representative historical reads. No HTTP API or physical pack
+format IDs were renamed.
 
 The service listens on plain HTTP, **without TLS, authentication or authorization**. Expose it only on deliberately trusted networks. A cross-AOWIS security design is planned separately. Health: `GET /api/v1/health`; readiness: `GET /api/v1/ready`.
 
@@ -37,7 +49,7 @@ If a disk error occurs immediately after catalogue publication, the service fail
 
 ## Current HTTP operations
 
-See the machine-readable [OpenAPI contract](db-http-api.yaml) for request/response schemas and exact paths. The available endpoints are:
+See the machine-readable [OpenAPI contract](dvmdb-http-api.yaml) for request/response schemas and exact paths. The available endpoints are:
 
 | Method | Path | Result |
 |---|---|---|
@@ -91,7 +103,7 @@ JSON payloads are limited to 8 MiB for network saves and entity edits (256 KiB f
 - **Workers:** requests run on `[server] worker_threads` worker threads (default 8, range 1–256, CLI `--worker-threads`). At most 16 further connections per worker are queued; more are closed. One project may occupy at most `max_pending_per_project` of them (see Concurrency).
 - **Error bodies:** all rejections, including protocol-level ones, carry the usual JSON error body.
 
-TLS and access control are not built in; terminate TLS in a reverse proxy, see `deploy/nginx-aowis-server-db.conf`.
+TLS and access control are not built in; terminate TLS in a reverse proxy, see `deploy/nginx-aowis-server-dvmdb.conf`.
 
 **Branch-scoped revisions.** `?revision=` on `/branches/{branch}/...` routes must name the branch head or one of its ancestors (including merged second parents); any other revision of the project returns 404 `not_found`. Use project-level `/revisions/{id}` and `/diff` for revisions independent of a branch. Large network retrievals currently encode the full result in memory; paginated/streaming alternatives are part of the subsequent resource-hardening stage.
 

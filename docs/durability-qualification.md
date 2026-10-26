@@ -36,7 +36,7 @@ mkdir -p build-qualification
 set -o pipefail
 ./compile_linux_tests.sh --both 2>&1 | tee build-qualification/ctest.log
 ./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
-  --soak-seconds 300 ./build-linux-tests-release/aowis-server-db \
+  --soak-seconds 300 ./build-linux-tests-release/aowis-server-dvmdb \
   2>&1 | tee build-qualification/http-soak.log
 ./qualify_vm_powercut_docker.sh --rounds 4 --filesystems ext4 xfs
 ```
@@ -119,7 +119,7 @@ successful VM drill. The explicit bridge option is primarily useful on hosts
 whose Docker bridge DNS is already functional.
 
 The official Debian cloud image and compiled worker are cached in
-`~/.cache/aowis-db-powercut/`. Logs and the JSON qualification reports are
+`~/.cache/aowis-dvmdb-powercut/`. Logs and the JSON qualification reports are
 saved under `build-vm-powercut/run-*/`. First execution requires internet
 access both to build the container/download the guest image and for the guest
 to install ext4/XFS utilities using Debian package repositories. Subsequent
@@ -274,7 +274,7 @@ fixture directory and server log for investigation.
 ```bash
 ./compile_linux_tests.sh --both
 ./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
-  --soak-seconds 3600 ./build-linux-tests-release/aowis-server-db
+  --soak-seconds 3600 ./build-linux-tests-release/aowis-server-dvmdb
 ```
 
 A short developer smoke can use `--soak-seconds 30`. This sustained mode is

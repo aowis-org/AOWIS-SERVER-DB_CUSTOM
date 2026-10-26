@@ -269,7 +269,7 @@ def main(argv=None):
     parser.add_argument("--stress-binary", type=Path,
                         default=Path("build-linux-tests-release/aowis-native-http-transfer-stress-tests"))
     parser.add_argument("--server-binary", type=Path,
-                        default=Path("build-linux-tests-release/aowis-server-db"))
+                        default=Path("build-linux-tests-release/aowis-server-dvmdb"))
     parser.add_argument("--output-root", type=Path, default=Path("build-qualification"))
     parser.add_argument("--interval-ms", type=int, default=500)
     parser.add_argument("--max-server-rss-mib", type=int)

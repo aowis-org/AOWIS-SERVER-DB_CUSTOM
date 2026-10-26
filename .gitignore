@@ -21,6 +21,8 @@
 *.autosave
 # Local benchmark databases and generated archives
 /native-benchmark-data/
+/dvmdb.zip
+# Ignore a leftover snapshot from before the repository rename.
 /db_custom.zip
 
 # Transient archive deletion manifest (consumed by apply_patch.sh)

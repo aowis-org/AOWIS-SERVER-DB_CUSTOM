@@ -4,7 +4,7 @@
 implemented HTTP/database behavior.** The AOWIS-SERVER-GUI Projects workspace
 is being developed as an in-memory prototype first. This document is the
 backlog/contract for a later storage-integration phase. See the **existing**
-`docs/db-http-api.yaml`, `docs/native-revision-history.md`,
+`docs/dvmdb-http-api.yaml`, `docs/native-revision-history.md`,
 `docs/native-database-service.md`, and `docs/native-hydraulic-network.md` for
 implemented behavior; do not publish speculative paths into the live OpenAPI.
 

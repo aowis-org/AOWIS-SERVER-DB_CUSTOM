@@ -30,7 +30,7 @@ void rejected(F&& function, const char* reason) {
 struct TemporaryDirectory {
     TemporaryDirectory() {
         std::string pattern = (std::filesystem::temp_directory_path() /
-                               "aowis-db-custom-access-XXXXXXXX").string();
+                               "aowis-dvmdb-access-XXXXXXXX").string();
         std::vector<char> buffer(pattern.begin(), pattern.end()); buffer.push_back('\0');
         char* result = ::mkdtemp(buffer.data());
         expect(result != nullptr, "cannot allocate test directory");

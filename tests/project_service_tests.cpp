@@ -25,7 +25,7 @@ void require(bool condition, const std::string& message) {
 struct TemporaryRoot {
     std::filesystem::path directory;
     TemporaryRoot() {
-        char pattern[] = "/tmp/aowis-db-projects-XXXXXX";
+        char pattern[] = "/tmp/aowis-dvmdb-projects-XXXXXX";
         char* directoryName = ::mkdtemp(pattern);
         require(directoryName != nullptr, "mkdtemp failed");
         this->directory = directoryName;
