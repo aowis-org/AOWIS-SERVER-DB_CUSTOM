@@ -497,8 +497,8 @@ if(AOWIS_DVMDB_WITH_HTTP_SERVER)
         add_executable(aowis-dvmdb-http-tests tests/native_http_tests.cpp)
         target_link_libraries(aowis-dvmdb-http-tests PRIVATE aowis-dvmdb-http)
         add_dependencies(aowis-dvmdb-http-tests aowis-server-dvmdb)
-        # Real-server validation of the XDG user-data default, CLI/INI
-        # overrides and refusal to overlook an existing working-tree store.
+        # Real-server validation of HTTP readiness, the XDG default,
+        # automatic legacy-root reuse and explicit CLI/INI overrides.
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_test(NAME aowis-dvmdb-default-data-root-tests
                 COMMAND "${Python3_EXECUTABLE}"

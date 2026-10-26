@@ -7,17 +7,48 @@ derived object index, published branch references, recovery evidence and tmp).
 Never copy only the active pack: a repository snapshot also needs all matching
 reference files and generation markers.
 
-On Linux, an **unconfigured development server** keeps its data under
-`$XDG_DATA_HOME/aowis-dvmdb/` (normally `~/.local/share/aowis-dvmdb/`), not
-inside the source checkout. The production `deploy/aowis-server-dvmdb.ini`
-still specifies `/var/lib/aowis-dvmdb`. Existing checkout-local
-`./aowis-dvmdb-data/` roots are **not moved automatically**. If that old root
-exists, an unconfigured startup refuses to proceed. Specify
-`--data-root ./aowis-dvmdb-data` to continue using it, or stop every writer,
-back up and restore the whole service root to a new verified location before
-restarting. `catalogue.lock` belongs inside the storage root because it
-coordinates all server processes sharing that root, irrespective of their
+On Linux, an **unconfigured development server** reuses an existing
+`./aowis-dvmdb-data/` checkout-local root; otherwise it uses
+`$XDG_DATA_HOME/aowis-dvmdb/` (normally `~/.local/share/aowis-dvmdb/`).
+The production `deploy/aowis-server-dvmdb.ini` still specifies
+`/var/lib/aowis-dvmdb`. Existing roots are **not moved automatically**.
+If both checkout-local and user-data roots exist, the checkout-local root
+wins, and startup reports the path in use; use `--data-root` or
+`[storage] root=` to select another. For a permanent relocation, stop every
+writer, back up and restore the whole service root to a new verified location
+before restarting. `catalogue.lock` belongs inside the storage root because
+it coordinates all server processes sharing that root, irrespective of their
 configuration files. It must not be relocated to `/etc`.
+
+## Identify the active root before maintenance
+
+`./compile_linux.sh` starts the HTTP process in the foreground after a
+successful Release build. The default listener is `127.0.0.1:8755`. Before
+backing up, relocating or investigating missing projects, **read the storage
+root printed by that process** and confirm the HTTP catalogue:
+
+```bash
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/ready
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/projects
+```
+
+The first command checks catalogue readiness; the second lists the projects
+of **the root actually opened by the running process**. It does not look for
+repositories elsewhere. A healthy, empty catalogue may simply mean you
+selected the wrong root, not that your projects were erased.
+
+For development startup without an explicit root, priority goes to an
+existing `./aowis-dvmdb-data` (relative to the server's working directory),
+then the per-user directory. A configured INI `storage/root` overrides both;
+`--data-root` overrides the INI. The bundled `deploy/` INI explicitly uses
+`/var/lib/aowis-dvmdb`, not the per-user root.
+
+Before changing paths, stop the HTTP server **and any standalone application
+or other process using the same native root**. Different DVMDB storage roots
+are independent databases; pointing multiple processes at one root is not a
+synchronization mechanism. Never delete a live `catalogue.lock`, manually
+combine catalogue directories, or replace a running repository pack. Use
+the verified offline backup/restore procedure below.
 
 ## Coordinated backup and restore
 

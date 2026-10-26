@@ -8,15 +8,21 @@ This repository contains the **native storage engine**, canonical hydraulic-mode
 
 > **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
-## Planned GUI integration gaps
+## GUI integration status
 
-The GUI-first Projects/version-explorer design requires additional project and
-branch lifecycle endpoints, network enumeration, revision metadata and mutable
-annotations, graph/DAG paging, tag/reference management, optimistic metadata
-updates, audit, search and safe conflict UX. **These are proposals, not implemented
-HTTP capabilities.** See the detailed [GUI integration requirements and server
-backlog](docs/gui-integration-requirements.md). The current OpenAPI remains the
-implemented API contract.
+The GUI can already discover projects, branches and limited first-parent
+revision history from this server, create projects and branches, and aggregate
+several checked databases in its navigator. A separate standalone build
+can use DVMDB directly as a C++ library. **The GUI does not yet check out
+hydraulic networks or save network revisions**, even though some underlying
+DVMDB read/write API operations already exist.
+
+Project/branch rename/delete, network enumeration, full revision-DAG paging,
+editable annotations, authentication and release-tag workflows remain
+unimplemented contracts. See the [GUI contract and remaining gaps](docs/gui-integration-requirements.md) and the GUI's
+`docs/dvmdb-integration-roadmap.md`. The
+[OpenAPI definition](docs/dvmdb-http-api.yaml) describes implemented server
+routes, not proposed GUI capabilities.
 
 ## System overview
 
@@ -57,6 +63,36 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 
 These are engineering capabilities, **not a production-readiness claim**. See [limitations and roadmap](docs/roadmap.md).
 
+## Fastest way to start the HTTP server
+
+From the DVMDB checkout, run:
+
+```bash
+./compile_linux.sh
+```
+
+This builds and **starts** the HTTP service in the foreground. Leave that
+terminal running; press Ctrl+C to stop it. It binds to `127.0.0.1:8755` by
+default. In a second terminal:
+
+```bash
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/ready
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/projects
+```
+
+Readiness returns `{"status":"ready"}`; an empty new catalogue returns
+`{"projects":[]}`. The storage-root selection is deliberate: an existing
+`./aowis-dvmdb-data` is reused, otherwise the per-user data location is
+selected. No flag is required merely because an old data directory exists.
+The selected path is printed at startup; it is **not migrated**. Explicit
+`--data-root` or INI configuration wins. Do not point a standalone
+embedded-library instance and the HTTP daemon at the same live root.
+
+See the [HTTP service runbook](docs/native-database-service.md) for
+configuration and [operations](docs/operations.md) for backups and recovery.
+The service currently has **no TLS, authentication or authorization**:
+keep the listener on a trusted local/development network.
+
 ## Build and tests
 
 Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries and a POSIX filesystem with `flock`, `fsync`, `rename`, `pread` and `pwrite`. Qt6 Core and the pinned `AOWIS-SERVER-MODEL` submodule are required for typed model serialization and hydraulic persistence; the HTTP executable uses the vendored cpp-httplib header (`external/cpp-httplib`) and Qt6 Core only; the generic byte store can build without Qt.
@@ -72,7 +108,7 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 
 The build script checks configuration, full build, the HTTP-server target and the executable before launching it. A failed or interrupted build will never fall back to the server left by a previous build. Use `--build-only` for CI, backup procedures and workflows that must not start a database process.
 
-The default **unconfigured** Linux server data root is `$XDG_DATA_HOME/aowis-dvmdb/`, normally `~/.local/share/aowis-dvmdb/`, **outside the source checkout**. `catalogue.lock` is runtime data inside that root, not a configuration file. Explicit `--data-root` and `[storage] root=` override this default. An existing `./aowis-dvmdb-data/` blocks an unconfigured launch to prevent silently opening an empty store; supply the old root explicitly or perform a stopped-server, verified backup/restore migration. Do not delete the lock of a running database. The old checkout-local directory remains ignored by Git and excluded from source ZIPs.
+An **unconfigured** Linux server reuses `./aowis-dvmdb-data/` if that legacy root already exists, so an existing checkout can start the HTTP service without extra flags. Otherwise, it uses `$XDG_DATA_HOME/aowis-dvmdb/` (normally `~/.local/share/aowis-dvmdb/`) outside the source checkout. If both roots exist, the legacy root takes precedence and the server prints which path it selected; no data is copied or merged. Explicit `--data-root` and `[storage] root=` override automatic selection. `catalogue.lock` is runtime data inside the selected root, not a configuration file; do not delete a live lock. The old checkout-local directory remains ignored by Git and excluded from source ZIPs.
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
@@ -127,7 +163,7 @@ repository.createBranch("main");
 
 Engine failures, including hydraulic load failures, are `aowis::dvmdb::StorageError` exceptions (see `include/aowis/dvmdb/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
 
-The project catalogue is also available as `AOWIS::DvmdbProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-dvmdb` (binds to 127.0.0.1:8755, project storage normally at `~/.local/share/aowis-dvmdb`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
+The project catalogue is also available through the `AOWIS::DvmdbProjectService` CMake target (`aowis::dvmdb::ProjectService` in C++) without a Qt dependency. Running `./build-linux/aowis-server-dvmdb` directly listens on `127.0.0.1:8755` by default; the active storage root is selected using CLI/INI, an existing working-directory legacy root, or the per-user default **in that order**. See [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
 
 For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).
 
@@ -213,7 +249,9 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [Architecture](docs/architecture.md) | Logical storage, physical formats, durability and limits |
 | [REST API design](docs/rest-api-design.md) | Agreed service boundaries, proposed resources and wire contracts |
 | [Roadmap](docs/roadmap.md) | Remaining implementation work |
-| [Database service](docs/native-database-service.md) | Implemented multi-project HTTP service, configuration, catalogue and endpoints |
+| [Database service](docs/native-database-service.md) | HTTP quickstart, storage-root precedence, configuration, health and endpoints |
+| [GUI integration contract](docs/gui-integration-requirements.md) | Implemented GUI-facing primitives and remaining backend gaps |
+| [OpenAPI](docs/dvmdb-http-api.yaml) | Actual implemented HTTP route/schema contract |
 | [Operations](docs/operations.md) | Coordinated backups, restore verification, disk-full response and maintenance |
 | [Hydraulic model](docs/native-hydraulic-network.md) | Persistence, entity queries, indexed editing, validation |
 | [Canonical serialization](docs/canonical-model-codec.md) | Model codec/schema contract |

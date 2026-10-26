@@ -1,14 +1,21 @@
 # Planned GUI integration contract — project, branch and revision management
 
-**Status (2026-10-25): requirements only; nothing described here is a claim of
-implemented HTTP/database behavior.** The AOWIS-SERVER-GUI Projects workspace
-is being developed as an in-memory prototype first. This document is the
-backlog/contract for a later storage-integration phase. See the **existing**
-`docs/dvmdb-http-api.yaml`, `docs/native-revision-history.md`,
-`docs/native-database-service.md`, and `docs/native-hydraulic-network.md` for
-implemented behavior; do not publish speculative paths into the live OpenAPI.
+**Status (2026-10-26): remaining server/API requirements, not an inventory of
+everything the GUI can do.** The GUI now uses the implemented REST and native
+service APIs to enumerate projects, branches and limited first-parent revision
+history, and to create projects and branches (including a fork from a selected
+revision). It also monitors multiple REST databases automatically and filters
+their visibility. Its separate in-memory preview remains a demonstration;
+GUI checkout, hydraulic revision saving and general lifecycle CRUD are
+**not** implemented. See the GUI's `docs/dvmdb-integration-roadmap.md` and
+`docs/dvmdb-quickstart.md`.
 
-## Existing primitives that the GUI can eventually use
+Use the **existing** [OpenAPI](dvmdb-http-api.yaml),
+[native service](native-database-service.md) and
+[revision history](native-revision-history.md) for implemented behavior.
+Do not publish speculative paths into the live OpenAPI.
+
+## Implemented primitives and current GUI use
 
 - `GET/POST /projects`; `GET /projects/{projectId}`; list/create branches;
   branch heads, first-parent paginated history, immutable revision lookup;
@@ -123,14 +130,19 @@ implemented behavior; do not publish speculative paths into the live OpenAPI.
 
 ## Accepted GUI behavioral contract
 
-Opening a branch pins and loads HEAD; local edits mark the model dirty; save
-creates a new immutable revision against an exact expected HEAD; historical
-snapshots open read-only; switching away from unsaved changes prompts Save /
-Discard / Cancel; concurrent updates never destroy local edits; merges are a
-reviewable explicit process. Revision annotations can be edited independently
-of the immutable model, and the UI clearly distinguishes branch context from
-revision selection. These behaviors are **not** implemented by the current
-GUI-only prototype.
+**Target behavior, not currently implemented as a complete GUI editing
+session:** opening a branch pins its HEAD and network snapshot; local edits
+mark the working model dirty; saving creates a new immutable revision against
+the exact expected HEAD; historical snapshots open read-only; switching
+away from unsaved edits offers Save / Discard / Cancel; conflicts preserve
+the working copy; merges are explicit, reviewable operations. Revision
+annotations are separate from immutable model data.
+
+**Already implemented in the GUI:** project/branch discovery, read-only
+revision-history browsing (limited first-parent pages), project creation,
+branch creation/fork-from-revision, multi-source visibility, automatic remote
+health monitoring and catalogue refresh. Do not confuse these with network
+checkout, Save-to-DVMDB, rename/delete or full DAG traversal.
 
 ## Suggested implementation order
 

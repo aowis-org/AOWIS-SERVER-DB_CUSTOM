@@ -2,6 +2,8 @@
 """Start the real DVMDB HTTP server and check data-root precedence and safety."""
 
 import argparse
+import http.client
+import json
 import os
 from pathlib import Path
 import socket
@@ -37,11 +39,16 @@ def run_server(server: Path, cwd: Path, environment: dict[str, str],
                     f"server exited during startup ({process.returncode}): "
                     f"{output.decode(errors='replace')} {errors.decode(errors='replace')}")
             if (expected_root / "catalogue.lock").exists() and (expected_root / "projects").is_dir():
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.3)
                 try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    connection.request("GET", "/dvmdb/v1/ready")
+                    response = connection.getresponse()
+                    if response.status == 200 and json.loads(response.read()).get("status") == "ready":
                         return
-                except OSError:
+                except (OSError, ValueError):
                     pass
+                finally:
+                    connection.close()
             time.sleep(0.05)
         raise AssertionError(f"server did not start with expected storage root {expected_root}")
     finally:
@@ -78,23 +85,35 @@ def run_test(server: Path) -> None:
                 "default server unexpectedly created a working-directory data root")
         run_server(server, cwd, environment, default_root)
 
-        # Refuse to quietly use a *different* empty database when a previous
-        # default is present in the current working directory.
+        # A preexisting checkout-local database also works on the very first
+        # launch, without creating a separate user-data root.
+        legacy_only_cwd = base / "legacy-only-working-directory"
+        legacy_only_cwd.mkdir()
+        legacy_only_root = legacy_only_cwd / "aowis-dvmdb-data"
+        legacy_only_root.mkdir()
+        legacy_only_env = dict(environment)
+        legacy_only_env["XDG_DATA_HOME"] = str(base / "legacy-only-xdg")
+        run_server(server, legacy_only_cwd, legacy_only_env, legacy_only_root)
+        require(not (base / "legacy-only-xdg" / "aowis-dvmdb").exists(),
+                "legacy-only startup silently created another database")
+
+        # A checkout-local database must be reused automatically. Even if the
+        # XDG default already exists, the legacy root wins rather than hiding
+        # old projects or refusing to start the HTTP service.
         legacy_root = cwd / "aowis-dvmdb-data"
         legacy_root.mkdir()
         marker = legacy_root / "do-not-overwrite"
         marker.write_text("persisted-test-data", encoding="utf-8")
-        result = subprocess.run(
-            [str(server), "--bind", "127.0.0.1", "--port", str(unused_local_port())],
-            cwd=str(cwd), env=environment, capture_output=True, text=True, timeout=8)
-        require(result.returncode == 2 and "Existing ./aowis-dvmdb-data" in result.stderr,
-                f"legacy data root did not trigger migration guard: "
-                f"exit={result.returncode} stderr={result.stderr!r}")
+        user_marker = default_root / "user-data-marker"
+        user_marker.write_text("separate-user-data", encoding="utf-8")
+        run_server(server, cwd, environment, legacy_root)
+        run_server(server, cwd, environment, legacy_root)
         require(marker.read_text(encoding="utf-8") == "persisted-test-data",
-                "legacy data was changed by default startup")
+                "legacy data was changed by automatic startup")
+        require(user_marker.read_text(encoding="utf-8") == "separate-user-data",
+                "existing user-data root was changed when legacy root was selected")
 
-        # CLI and INI overrides must bypass the new default and may explicitly
-        # point at an existing legacy database root.
+        # CLI and INI overrides must bypass automatic legacy-root selection.
         run_server(server, cwd, environment, legacy_root,
                    ["--data-root", str(legacy_root)])
         ini_root = base / "configured-root"
@@ -110,7 +129,7 @@ def run_test(server: Path) -> None:
         require(marker.read_text(encoding="utf-8") == "persisted-test-data",
                 "legacy data changed after explicit root tests")
 
-    print("DVMDB per-user default, legacy guard, INI and CLI overrides passed")
+    print("DVMDB HTTP startup, automatic legacy root, INI and CLI overrides passed")
 
 
 if __name__ == "__main__":

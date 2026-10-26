@@ -1,6 +1,6 @@
 # Native database HTTP/TCP service
 
-`aowis-server-dvmdb` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::DvmdbProjectService` and `AOWIS::DvmdbHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
+`aowis-server-dvmdb` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue and native storage are callable directly from C++ (for example through `aowis::dvmdb::ProjectService` and `aowis::dvmdb::hydraulic`). CMake consumers link the `AOWIS::DvmdbProjectService` and `AOWIS::DvmdbHydraulic` targets; no network connection is required. The underlying native storage engine remains Qt-free.
 
 ## Build
 
@@ -15,15 +15,74 @@ With Qt6 Core installed (Qt Network/HttpServer are not needed), run:
 
 The normal `./compile_linux.sh` command builds and **starts** the server only after all build steps succeed; `--build-only` does not start any process.
 
-## Run
+## Run and verify
+
+For **development**, the normal path is simply:
 
 ```bash
-./build-linux/aowis-server-dvmdb --config ./deploy/aowis-server-dvmdb.ini
-# Or override the INI settings:
-./build-linux/aowis-server-dvmdb --bind 127.0.0.1 --port 8755 --data-root ./db-data
+./compile_linux.sh
 ```
 
-`QSettings` reads `server/bind`, `server/port`, `storage/root` and optional `logging/file` from an INI file. Defaults if absent: `127.0.0.1`, `8755`, and Qt's `QStandardPaths::GenericDataLocation` followed by `/aowis-dvmdb` (normally `$XDG_DATA_HOME/aowis-dvmdb`, or `~/.local/share/aowis-dvmdb` on Linux). This data root is independent of the working directory. If a checkout-local `./aowis-dvmdb-data` still exists and no root was explicitly configured, the server **refuses startup**, to avoid silently presenting a fresh, empty project catalogue. To continue using existing data, pass `--data-root ./aowis-dvmdb-data` or configure `[storage] root=`; to relocate it, stop all writers, take a verified offline backup, restore to the new location and verify before switching. Do **not** delete or copy an active `catalogue.lock` while the service is running. The lock stays in the storage root, not the configuration directory.
+This builds the Release executable and starts it in the foreground with the
+default configuration. To stop it, press Ctrl+C. To build without starting,
+run `./compile_linux.sh --build-only`.
+
+From a **second terminal**, verify HTTP (a successful compilation alone
+does not mean a server is listening):
+
+```bash
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/health
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/ready
+curl -fsS http://127.0.0.1:8755/dvmdb/v1/projects
+```
+
+These return `{"status":"ok"}`, `{"status":"ready"}` and an object
+containing a `projects` array respectively. A new catalogue has
+`{"projects":[]}`. `health` means the process responds; `ready` additionally
+checks the project catalogue. GUI availability probes use the project-list
+response and validate its JSON shape, not just the TCP socket.
+
+To run the binary directly with an **explicit root**, or to use the
+production-oriented example INI:
+
+```bash
+./build-linux/aowis-server-dvmdb --bind 127.0.0.1 --port 8755 --data-root ./db-data
+./build-linux/aowis-server-dvmdb --config ./deploy/aowis-server-dvmdb.ini
+```
+
+**Important:** the example INI specifies `/var/lib/aowis-dvmdb`. This is
+**not** the default development data directory. It requires suitable
+permissions and is intended for an installed service; use it only when that
+root is the one you intend to operate.
+
+`QSettings` reads `server/bind`, `server/port`, `storage/root` and optional
+`logging/file` from an INI file. Default bind/port: `127.0.0.1:8755`.
+The selected storage root follows this precedence:
+
+| Priority | Condition | Selected root |
+|---|---|---|
+| 1 | `--data-root` explicitly supplied | CLI directory |
+| 2 | `[storage] root=` present in the selected/default INI | INI directory |
+| 3 | `./aowis-dvmdb-data` already exists | Existing legacy directory, resolved from the **process working directory** |
+| 4 | None of the above | Qt `QStandardPaths::GenericDataLocation` + `/aowis-dvmdb` (normally `$XDG_DATA_HOME/aowis-dvmdb`, otherwise `~/.local/share/aowis-dvmdb` on Linux) |
+
+`./compile_linux.sh` changes to the repository root before launching the
+binary, so its legacy-directory check is relative to that checkout. Running
+the binary directly from a different working directory changes that check.
+An existing legacy entry is selected even if it is malformed, rather than
+silently creating an apparently empty database elsewhere. The process
+prints the selected storage root. When both legacy and user-data roots exist,
+the legacy one wins and the other is reported, **not merged**. Explicit
+paths always win. No data is copied, deleted or migrated during startup.
+
+To relocate storage, stop **all** writers (including embedded-library users),
+take a verified whole-root offline backup, restore to the new location and
+verify before changing the configured path. Do **not** delete an active
+`catalogue.lock` to try to bypass a lock error; the file belongs inside the
+storage root and coordinates access.
+
+For an existing root you want to select without relying on working directory,
+use `--data-root /absolute/path` (or an absolute INI value).
 
 Errors go to stderr when no log file is configured. `--log-file` (or `logging/file` in INI) appends C++ service diagnostics to a file, which must be writable by the service account. Log rotation is the administrator's responsibility. Explicit CLI arguments override INI values. **Explicit** relative paths are relative to the server process's working directory unless absolute. The example INI and systemd unit in `deploy/` still use `/var/lib/aowis-dvmdb`. Create the `aowis-dvmdb` service account, install the binary as `/usr/local/bin/aowis-server-dvmdb` and the INI as `/etc/aowis/aowis-server-dvmdb.ini`. The unit is sandboxed: read-only system (`ProtectSystem=strict`), writable only `/var/lib/aowis-dvmdb` (state) and `/var/log/aowis-dvmdb` (an optional `[logging] file=`), private `/tmp`, no home directories, no capabilities and a `@system-service` system-call filter (`systemd-analyze security` exposure 1.7). Run `--help` for supported CLI options.
 
@@ -40,6 +99,22 @@ heads and representative historical reads. No HTTP API or physical pack
 format IDs were renamed.
 
 The service listens on plain HTTP, **without TLS, authentication or authorization**. Expose it only on deliberately trusted networks. A cross-AOWIS security design is planned separately. Health: `GET /dvmdb/v1/health`; readiness: `GET /dvmdb/v1/ready`.
+
+## Startup failures and operator checks
+
+| Symptom | Check / action |
+|---|---|
+| `curl` reports connection refused | Did `./compile_linux.sh` stay running after printing its startup messages? Is another process already using port `8755`? Check the listening address and the terminal's error output. |
+| `GET /health` succeeds but `GET /ready` fails | The process is running but the catalogue is unavailable. Inspect service diagnostics and storage permissions; do not create an unrelated empty root as a workaround. |
+| Unexpected empty `projects` list | Compare the **printed storage root** with the root holding your existing `projects/` directory. Look for an explicit INI or CLI override, and remember that direct execution uses the caller's working directory. |
+| Cannot open/lock catalogue | Stop all competing server and embedded-library users, then investigate permissions and stale processes. Do not remove a lock file belonging to a live process. |
+| `400` or `404` from GUI / `curl` | Use the `/dvmdb/v1` prefix exactly once. Test `/ready` and `/projects` directly, then verify the GUI profile URL. |
+| GUI marks service offline despite HTTP `200` | The response must be a valid DVMDB projects catalogue (`{"projects":[...]}`); a proxy landing page or wrong server is not a valid health response. |
+| Connection times out from another machine | Default bind is loopback only. The daemon does not provide TLS or access control; do **not** simply bind it to the public Internet. |
+
+Read [operations](operations.md) before backup, data relocation, live lock
+recovery or restore. For the GUI's automated polling, profile visibility
+and supported operations, see its `docs/dvmdb-quickstart.md`.
 
 ## Project catalogue and lifecycle
 

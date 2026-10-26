@@ -143,29 +143,40 @@ int main(int argc, char** argv) {
             settings.value("server/worker_threads", 8).toString();
         const QString pendingValue = parser.isSet(pending) ? parser.value(pending) :
             settings.value("server/max_pending_per_project", "").toString();
-        // Without an explicit root, use the platform's user-data location,
-        // never the source checkout or a relative working-directory path.
+        // Keep existing checkout-local databases usable without requiring a
+        // command-line override.  Only fresh, unconfigured installations use
+        // the user-data default.  Explicit CLI/INI roots always win.
         const bool configuredRoot = parser.isSet(dataRoot) || settings.contains("storage/root");
         QString defaultRoot;
         if (!configuredRoot) {
-            const QString location = QStandardPaths::writableLocation(
-                QStandardPaths::GenericDataLocation);
-            if (location.isEmpty() || !QDir::isAbsolutePath(location)) {
-                std::cerr << "Unable to determine a user data directory; set --data-root or "
-                          << "[storage] root explicitly\n";
-                return 2;
-            }
-            // An old default may already contain live projects. Never silently
-            // start a different empty database when the default location changes.
             const QFileInfo oldRoot(QStringLiteral("aowis-dvmdb-data"));
             if (oldRoot.exists() || oldRoot.isSymLink()) {
-                std::cerr << "Existing ./aowis-dvmdb-data found; refusing to switch "
-                          << "to the new user-data default silently. Use "
-                          << "--data-root ./aowis-dvmdb-data or configure [storage] "
-                          << "root explicitly; see docs/native-database-service.md\n";
-                return 2;
+                // Use even a symlink or non-directory here: the project service
+                // will report an invalid root rather than silently creating a
+                // different (apparently empty) database elsewhere.
+                defaultRoot = oldRoot.absoluteFilePath();
+                std::cerr << "Using existing DVMDB storage root: "
+                          << defaultRoot.toStdString() << '\n';
+                const QString location = QStandardPaths::writableLocation(
+                    QStandardPaths::GenericDataLocation);
+                if (!location.isEmpty() && QDir::isAbsolutePath(location)) {
+                    const QString otherRoot = QDir(location).filePath(QStringLiteral("aowis-dvmdb"));
+                    if (QFileInfo::exists(otherRoot)) {
+                        std::cerr << "User-data storage also exists at "
+                                  << otherRoot.toStdString() << " (not selected). "
+                                  << "Use --data-root to select it explicitly.\n";
+                    }
+                }
+            } else {
+                const QString location = QStandardPaths::writableLocation(
+                    QStandardPaths::GenericDataLocation);
+                if (location.isEmpty() || !QDir::isAbsolutePath(location)) {
+                    std::cerr << "Unable to determine a user data directory; set --data-root or "
+                              << "[storage] root explicitly\n";
+                    return 2;
+                }
+                defaultRoot = QDir(location).filePath(QStringLiteral("aowis-dvmdb"));
             }
-            defaultRoot = QDir(location).filePath(QStringLiteral("aowis-dvmdb"));
         }
         const QString rootValue = parser.isSet(dataRoot) ? parser.value(dataRoot) :
             settings.value("storage/root", defaultRoot).toString();
@@ -230,6 +241,8 @@ int main(int argc, char** argv) {
         // Default: errors go to stderr/journald. Optional file logging
         // redirects the C++ service diagnostics, restoring stderr on exit.
         ScopedErrorLog errorLog(logPath);
+        std::cout << "DVMDB storage root: "
+                  << QDir(rootValue).absolutePath().toStdString() << std::endl;
         aowis::dvmdb::setInternalScratchLimit(
             static_cast<std::uint64_t>(internalScratch) * 1024ULL * 1024ULL);
         aowis::dvmdb::ProjectService service(rootValue.toStdString(), pendingLimit);
