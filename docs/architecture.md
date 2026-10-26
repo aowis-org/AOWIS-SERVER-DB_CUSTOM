@@ -38,7 +38,7 @@ repository/
 
 Object records use an `AOBJ` header and typed canonical bytes. Index entries contain object hash, physical offset/length and a CRC32 checksum. The index is derived: on damage or absence it can be rebuilt from the authoritative pack. A normal reopen checks index structure but does **not** hash every object; payload reads and explicit verification check SHA-256. Corrupted complete pack records are rejected. A torn pack tail is repaired on open: if the first invalid record (short, zero-filled, or a full-length body whose SHA-256 does not match) is followed by no valid record up to EOF, and every published branch head is still present before it, the region is unpublished by construction. It is copied to `recovered-pack-tails/` (fsynced), then truncated, and `Repository::recoveredPackTailBytes()` reports the amount. An invalid record followed by a valid one, or damage reaching a published head, is mid-pack corruption and fails closed without modifying the pack. A torn region whose payload happens to contain a complete, valid embedded pack record is also refused (fail-closed direction).
 
-`aowis-native-verify` performs physical verification of all stored objects and, by default, traverses every published branch's complete history to validate Merkle structure, typed native records and exact reverse-reference consistency. `--physical` limits verification to physical storage only. The same immutable logical verifier is used during bundle import and on-disk audits. Application-specific hydraulic semantic validation is outside this native storage check; see [repository verification](repository-verification.md). CRC32 is an accidental-corruption check for index entries, **not a signature or authentication mechanism**.
+`aowis-dvmdb-verify` performs physical verification of all stored objects and, by default, traverses every published branch's complete history to validate Merkle structure, typed native records and exact reverse-reference consistency. `--physical` limits verification to physical storage only. The same immutable logical verifier is used during bundle import and on-disk audits. Application-specific hydraulic semantic validation is outside this native storage check; see [repository verification](repository-verification.md). CRC32 is an accidental-corruption check for index entries, **not a signature or authentication mechanism**.
 
 ## Physical storage
 
@@ -71,9 +71,9 @@ Portable `.aowbundle` files contain a complete reachable branch graph or a delta
 
 ## API ownership
 
-- `aowis::native::Repository` — low-level storage, history, compaction, bundles and generic merges.
-- `aowis::native::ModelCodec<T>` — typed serialization.
-- `aowis::native::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
-- Implemented `aowis-server-dvmdb` HTTP route handlers — thin REST adapters calling `AOWIS::NativeProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
+- `aowis::dvmdb::Repository` — low-level storage, history, compaction, bundles and generic merges.
+- `aowis::dvmdb::ModelCodec<T>` — typed serialization.
+- `aowis::dvmdb::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
+- Implemented `aowis-server-dvmdb` HTTP route handlers — thin REST adapters calling `AOWIS::DvmdbProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
 
 The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [format compatibility policy](format-compatibility.md) and [roadmap](roadmap.md).

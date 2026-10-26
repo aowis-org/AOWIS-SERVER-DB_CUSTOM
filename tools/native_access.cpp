@@ -1,4 +1,4 @@
-#include "aowis/native/access_policy.h"
+#include "aowis/dvmdb/access_policy.h"
 
 #include <algorithm>
 #include <exception>
@@ -7,7 +7,7 @@
 #include <string>
 
 namespace {
-using namespace aowis::native;
+using namespace aowis::dvmdb;
 
 void require(bool condition, const char* error) {
     if (!condition) throw std::runtime_error(error);
@@ -15,21 +15,21 @@ void require(bool condition, const char* error) {
 
 void usage() {
     std::cerr <<
-        "Usage: aowis-native-access bootstrap REPOSITORY UNIX_ACCOUNT\n"
-        "       aowis-native-access add-user REPOSITORY UNIX_ACCOUNT\n"
-        "       aowis-native-access add-group REPOSITORY NAME\n"
-        "       aowis-native-access add-role REPOSITORY NAME\n"
-        "       aowis-native-access add-permission REPOSITORY read|write BRANCH|*\n"
-        "       aowis-native-access bind-user-role REPOSITORY USER_UUID ROLE_UUID\n"
-        "       aowis-native-access bind-user-group REPOSITORY USER_UUID GROUP_UUID\n"
-        "       aowis-native-access bind-group-role REPOSITORY GROUP_UUID ROLE_UUID\n"
-        "       aowis-native-access bind-role-permission REPOSITORY ROLE_UUID PERMISSION_UUID\n"
-        "       aowis-native-access unbind-user-role REPOSITORY USER_UUID ROLE_UUID\n"
-        "       aowis-native-access unbind-user-group REPOSITORY USER_UUID GROUP_UUID\n"
-        "       aowis-native-access unbind-group-role REPOSITORY GROUP_UUID ROLE_UUID\n"
-        "       aowis-native-access unbind-role-permission REPOSITORY ROLE_UUID PERMISSION_UUID\n"
-        "       aowis-native-access enable-user|disable-user REPOSITORY USER_UUID\n"
-        "       aowis-native-access list REPOSITORY\n";
+        "Usage: aowis-dvmdb-access bootstrap REPOSITORY UNIX_ACCOUNT\n"
+        "       aowis-dvmdb-access add-user REPOSITORY UNIX_ACCOUNT\n"
+        "       aowis-dvmdb-access add-group REPOSITORY NAME\n"
+        "       aowis-dvmdb-access add-role REPOSITORY NAME\n"
+        "       aowis-dvmdb-access add-permission REPOSITORY read|write BRANCH|*\n"
+        "       aowis-dvmdb-access bind-user-role REPOSITORY USER_UUID ROLE_UUID\n"
+        "       aowis-dvmdb-access bind-user-group REPOSITORY USER_UUID GROUP_UUID\n"
+        "       aowis-dvmdb-access bind-group-role REPOSITORY GROUP_UUID ROLE_UUID\n"
+        "       aowis-dvmdb-access bind-role-permission REPOSITORY ROLE_UUID PERMISSION_UUID\n"
+        "       aowis-dvmdb-access unbind-user-role REPOSITORY USER_UUID ROLE_UUID\n"
+        "       aowis-dvmdb-access unbind-user-group REPOSITORY USER_UUID GROUP_UUID\n"
+        "       aowis-dvmdb-access unbind-group-role REPOSITORY GROUP_UUID ROLE_UUID\n"
+        "       aowis-dvmdb-access unbind-role-permission REPOSITORY ROLE_UUID PERMISSION_UUID\n"
+        "       aowis-dvmdb-access enable-user|disable-user REPOSITORY USER_UUID\n"
+        "       aowis-dvmdb-access list REPOSITORY\n";
 }
 
 template <typename T>

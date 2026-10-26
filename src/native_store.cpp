@@ -1,5 +1,5 @@
-#include "aowis/native/native_store.h"
-#include "aowis/native/storage_error.h"
+#include "aowis/dvmdb/native_store.h"
+#include "aowis/dvmdb/storage_error.h"
 #include "native_test_faults.h"
 
 #include <openssl/evp.h>
@@ -27,7 +27,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 namespace {
 
 constexpr std::array<std::uint8_t, 8> bundleMagic{
@@ -1827,7 +1827,7 @@ void Repository::prepareScratchDirectory() {
 }
 
 ScratchFile Repository::createScratchFile() {
-    return ScratchFile(aowis::native::createScratchFile(this->scratch_, "client"));
+    return ScratchFile(aowis::dvmdb::createScratchFile(this->scratch_, "client"));
 }
 
 const std::filesystem::path& Repository::scratchDirectory() const noexcept {
@@ -4414,4 +4414,4 @@ CompactionStats Repository::compact() {
     return stats;
 }
 
-}  // namespace aowis::native
+}  // namespace aowis::dvmdb

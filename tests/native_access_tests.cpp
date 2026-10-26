@@ -1,4 +1,4 @@
-#include "aowis/native/access_policy.h"
+#include "aowis/dvmdb/access_policy.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace {
-using namespace aowis::native;
+using namespace aowis::dvmdb;
 
 void expect(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);

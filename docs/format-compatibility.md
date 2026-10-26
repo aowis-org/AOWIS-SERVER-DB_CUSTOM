@@ -50,7 +50,7 @@ Run it independently:
 
 ```bash
 ctest --test-dir build-linux-tests-release \
-  -R '^aowis-native-format-compatibility-tests$' --output-on-failure
+  -R '^aowis-dvmdb-format-compatibility-tests$' --output-on-failure
 ```
 
 The test runs as part of normal Debug/Release CTest. It needs neither Qt,
@@ -58,7 +58,7 @@ Docker nor QEMU and does not contact any remote service.
 
 ## Whole-service upgrade and restoration drill
 
-The `aowis-native-upgrade-restore-tests` regression composes the frozen
+The `aowis-dvmdb-upgrade-restore-tests` regression composes the frozen
 repository fixture with the actual multi-project catalogue and offline
 backup/restore utility. Two out of four service projects contain unmodified
 older-build pack bytes (with the derived object index omitted); the other
@@ -100,3 +100,10 @@ A stable release still requires a published, explicit support matrix for pack,
 sidecar, bundles, model-codec schema and minimum reader/writer versions. The
 reference fixtures establish a concrete regression baseline; they are **not**
 a substitute for that policy.
+
+## AOWIS project-name independence
+
+The DVMDB product rename does not replace the platform's AOWIS pack, index,
+model type or bundle markers. These bytes define persisted object identities,
+not the name of a build target. See [DVMDB rename/migration](dvmdb-rename-migration.md)
+for the intentionally breaking C++ namespace and HTTP route changes.

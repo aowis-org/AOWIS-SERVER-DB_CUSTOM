@@ -3,8 +3,8 @@
 // Hydraulic entity bridge for the native-owned model serializer.
 // This header is not included by native_store.h: the core storage engine
 // has no Qt dependency.
-#include "aowis/native/native_store.h"
-#include <aowis/native/model_codec.h>
+#include "aowis/dvmdb/native_store.h"
+#include <aowis/dvmdb/model_codec.h>
 
 #include <QByteArray>
 #include <QString>
@@ -13,7 +13,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace aowis::native::hydraulic {
+namespace aowis::dvmdb::hydraulic {
 
 // These local storage-kind values follow the native model-record contract, not
 // a finalized global entity catalog. Payloads use ModelCodec<T>.
@@ -33,4 +33,4 @@ std::optional<HydraulicLinkPipe> readPipe(Repository& store,
                                           std::string_view branch, const Key& key,
                                           QString* error = nullptr);
 
-}  // namespace aowis::native::hydraulic
+}  // namespace aowis::dvmdb::hydraulic

@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -13,9 +13,9 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Repository;
 
 void expect(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
@@ -24,7 +24,7 @@ void expect(bool condition, const char* reason) {
 struct TemporaryDirectory {
     TemporaryDirectory() {
         std::string name = (std::filesystem::temp_directory_path() /
-                            "aowis-native-sync-cli-XXXXXXXX").string();
+                            "aowis-dvmdb-sync-cli-XXXXXXXX").string();
         std::vector<char> buffer(name.begin(), name.end());
         buffer.push_back('\0');
         const char* created = ::mkdtemp(buffer.data());
@@ -64,9 +64,9 @@ void exercise(const std::filesystem::path& cli) {
     const std::filesystem::path destinationPath = temp.path / "destination";
     const std::filesystem::path bundle = temp.path / "full.aowbundle";
     const std::filesystem::path delta = temp.path / "incremental.aowbundle";
-    aowis::native::Hash base{};
-    aowis::native::Hash tip{};
-    aowis::native::Key key{};
+    aowis::dvmdb::Hash base{};
+    aowis::dvmdb::Hash tip{};
+    aowis::dvmdb::Key key{};
     key[0] = 73;
     {
         Repository source(sourcePath);
@@ -87,7 +87,7 @@ void exercise(const std::filesystem::path& cli) {
         tip = source.commit("main", {{key, Bytes{9, 8, 7}}}).id;
     }
     expect(run(cli, {"export-incremental", sourcePath.string(), "main",
-                     aowis::native::toHex(base), delta.string()}) == 0,
+                     aowis::dvmdb::toHex(base), delta.string()}) == 0,
            "offline incremental export failed");
     expect(run(cli, {"import", destinationPath.string(),
                      delta.string(), "incoming"}) == 0,

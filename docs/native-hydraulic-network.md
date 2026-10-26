@@ -1,8 +1,8 @@
 # Hydraulic network persistence and indexed editing
 
-`aowis::native::hydraulic` stores complete `NetworkHydraulic` objects using this repository's canonical `ModelCodec<T>` and native reference validator. It can be called directly from C++ without a database service or HTTP.
+`aowis::dvmdb::hydraulic` stores complete `NetworkHydraulic` objects using this repository's canonical `ModelCodec<T>` and native reference validator. It can be called directly from C++ without a database service or HTTP.
 
-Public API: `include/aowis/native/hydraulic_network_persistence.h`.
+Public API: `include/aowis/dvmdb/hydraulic_network_persistence.h`.
 
 ## Model structure and storage
 
@@ -22,19 +22,19 @@ The **18 top-level collections** are: pipe materials; time patterns; tank volume
 ## Complete network operations
 
 ```cpp
-#include <aowis/native/hydraulic_network_persistence.h>
+#include <aowis/dvmdb/hydraulic_network_persistence.h>
 
 // repository and NetworkHydraulic network are already initialized.
-const aowis::native::Revision revision =
-    aowis::native::hydraulic::saveHydraulicNetwork(repository, "main", network);
+const aowis::dvmdb::Revision revision =
+    aowis::dvmdb::hydraulic::saveHydraulicNetwork(repository, "main", network);
 
 // nullopt: no such network. Failures throw StorageError with their kind.
 const std::optional<NetworkHydraulic> loaded =
-    aowis::native::hydraulic::loadHydraulicNetwork(repository, "main", network.uuid);
+    aowis::dvmdb::hydraulic::loadHydraulicNetwork(repository, "main", network.uuid);
 
 // Explicit, reproducible historical read (does not follow a moving branch).
 const std::optional<NetworkHydraulic> historical =
-    aowis::native::hydraulic::loadHydraulicNetworkAtRevision(
+    aowis::dvmdb::hydraulic::loadHydraulicNetworkAtRevision(
         repository, revision.id, network.uuid);
 ```
 
@@ -43,10 +43,10 @@ const std::optional<NetworkHydraulic> historical =
 ## Indexed entity queries
 
 ```cpp
-const std::optional<aowis::native::hydraulic::HydraulicEntity> pipe =
-    aowis::native::hydraulic::loadHydraulicEntity(repository, "main", networkUuid, pipeUuid);
-const std::optional<QList<QUuid>> pipeIds = aowis::native::hydraulic::listHydraulicEntityIds(
-    repository, "main", networkUuid, aowis::native::hydraulic::HydraulicEntityType::Pipe);
+const std::optional<aowis::dvmdb::hydraulic::HydraulicEntity> pipe =
+    aowis::dvmdb::hydraulic::loadHydraulicEntity(repository, "main", networkUuid, pipeUuid);
+const std::optional<QList<QUuid>> pipeIds = aowis::dvmdb::hydraulic::listHydraulicEntityIds(
+    repository, "main", networkUuid, aowis::dvmdb::hydraulic::HydraulicEntityType::Pipe);
 ```
 
 `loadHydraulicEntity()` uses the reverse-reference membership index to find a single entity without reconstructing the network. It validates the requested record's type and canonical UUID; it does not perform a full network semantic audit on each read. `listHydraulicEntityIds()` returns one selected collection in its original order, without decoding every entity payload. A missing network/member returns `std::nullopt`; a corrupt or inconsistent stored object throws `StorageError(Corruption)`, and I/O or full-disk failures keep their own kind (HTTP 500/507). Branch-oriented queries pin a revision on entry; they never combine records from different branch heads. The corresponding `loadHydraulicEntityAtRevision()` and `listHydraulicEntityIdsAtRevision()` APIs accept an explicit revision hash, so several separate queries can be made against the same historical snapshot. A branch may advance between two *different* branch-oriented calls; clients requiring a consistent multi-call view must obtain the branch head once and pass its revision ID to each call.
@@ -55,11 +55,11 @@ const std::optional<QList<QUuid>> pipeIds = aowis::native::hydraulic::listHydrau
 
 ```cpp
 HydraulicLinkPipe editedPipe = existingPipe; // supplied by the calling application
-const std::vector<aowis::native::hydraulic::HydraulicEntityChange> changes = {
-    {editedPipe.uuid, aowis::native::hydraulic::HydraulicEntity{editedPipe}}
+const std::vector<aowis::dvmdb::hydraulic::HydraulicEntityChange> changes = {
+    {editedPipe.uuid, aowis::dvmdb::hydraulic::HydraulicEntity{editedPipe}}
 };
-aowis::native::hydraulic::HydraulicEditDiagnostics diagnostics;
-const auto revision = aowis::native::hydraulic::editHydraulicNetwork(
+aowis::dvmdb::hydraulic::HydraulicEditDiagnostics diagnostics;
+const auto revision = aowis::dvmdb::hydraulic::editHydraulicNetwork(
     repository, "main", networkUuid, changes, &diagnostics);
 ```
 
@@ -94,4 +94,4 @@ Hydraulic branches should use `mergeHydraulicBranches()` rather than the generic
 
 The serializer, ordered membership and persistent reference-index formats are part of the pack repository format. Indexed entity reads and suitable edits avoid decoding the whole network, while full saves, fallbacks and merged-snapshot validation still work over the whole aggregate. Solver feasibility and arbitrary conflicting membership reorder resolution remain separate work. The REST service also exposes canonical complete-network reads/saves, revision-pinned targeted entity reads, atomic validated edits and semantic merges, reusing this native library. See [REST design](rest-api-design.md) for HTTP request envelopes, size limits and operations still planned.
 
-Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-native-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency.
+Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-dvmdb-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency.

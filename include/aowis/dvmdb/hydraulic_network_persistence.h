@@ -5,7 +5,7 @@
 // Optional Qt/hydraulic persistence adapter for a complete NetworkHydraulic aggregate. The
 // authoritative entity bytes are encoded by the native-owned canonical ModelCodec;
 // ordered network membership is stored as bounded, individually versioned chunks.
-#include "aowis/native/model_codec_adapter.h"
+#include "aowis/dvmdb/model_codec_adapter.h"
 
 #include <QList>
 
@@ -14,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-namespace aowis::native::hydraulic {
+namespace aowis::dvmdb::hydraulic {
 
 inline constexpr std::uint16_t hydraulicNetworkKind = 100;
 
@@ -192,4 +192,4 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
                               HydraulicEditDiagnostics* diagnostics = nullptr,
                               std::optional<Hash> expectedHead = std::nullopt);
 
-} // namespace aowis::native::hydraulic
+} // namespace aowis::dvmdb::hydraulic

@@ -158,7 +158,7 @@ def main(argv=None):
             else:
                 result = check_soak_log(content, args.min_soak_seconds)
             evidence[kind] = {"status": "validated_report", **result}
-        record = {"kind": "aowis-native-qualification-evidence", "version": 1,
+        record = {"kind": "aowis-dvmdb-qualification-evidence", "version": 1,
                   "recorded_utc": datetime.now(timezone.utc).isoformat(),
                   "scope": "Consistency check of supplied reports; not independent execution or hardware certification",
                   "source_sha256": inputs, "evidence": evidence}

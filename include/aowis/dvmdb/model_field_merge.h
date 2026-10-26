@@ -1,5 +1,5 @@
-#ifndef AOWIS_NATIVE_MODEL_FIELD_MERGE_H
-#define AOWIS_NATIVE_MODEL_FIELD_MERGE_H
+#ifndef AOWIS_DVMDB_MODEL_FIELD_MERGE_H
+#define AOWIS_DVMDB_MODEL_FIELD_MERGE_H
 
 #include <optional>
 #include <QByteArray>
@@ -8,7 +8,7 @@
 #include <QStringList>
 #include <QUuid>
 
-namespace aowis::native
+namespace aowis::dvmdb
 {
 // Internal, schema-aware top-level field merge. A nullopt result means that
 // the kind/payload cannot be safely merged and must retain entity-level
@@ -25,5 +25,5 @@ std::optional<ModelFieldMerge> mergeModelFields(const QUuid &object_uuid,
     const QString &kind, const QByteArray &base, const QByteArray &left,
     const QByteArray &right, const QMap<QString, bool> &field_choices = {});
 
-} // namespace aowis::native
-#endif // AOWIS_NATIVE_MODEL_FIELD_MERGE_H
+} // namespace aowis::dvmdb
+#endif // AOWIS_DVMDB_MODEL_FIELD_MERGE_H

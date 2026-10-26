@@ -3,7 +3,7 @@
 // plus the changed trie paths of new revisions; import treats objects that are
 // already stored locally as verified boundaries. Forged bundles that graft
 // local objects into the wrong position must still be rejected.
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -24,21 +24,21 @@
 #include <vector>
 
 namespace {
-using aowis::native::BundleImportProfile;
-using aowis::native::BundleImportResult;
-using aowis::native::BundleImportStatus;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::MergeResult;
-using aowis::native::MergeStatus;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::Revision;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
+using aowis::dvmdb::BundleImportProfile;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::MergeResult;
+using aowis::dvmdb::MergeStatus;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::Revision;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
 
 void expect(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
@@ -48,7 +48,7 @@ struct TestDirectory {
     explicit TestDirectory(std::string_view label) {
         static unsigned counter = 0;
         this->path = std::filesystem::temp_directory_path() /
-            ("aowis-native-incremental-" + std::string(label) + "-" + std::to_string(::getpid()) +
+            ("aowis-dvmdb-incremental-" + std::string(label) + "-" + std::to_string(::getpid()) +
              "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
              "-" + std::to_string(++counter));
         std::filesystem::create_directories(this->path);
@@ -64,7 +64,7 @@ struct TestDirectory {
 Key key(std::uint32_t number) {
     const Bytes seed{static_cast<std::uint8_t>(number >> 24U), static_cast<std::uint8_t>(number >> 16U),
                      static_cast<std::uint8_t>(number >> 8U), static_cast<std::uint8_t>(number), 'k'};
-    const Hash digest = aowis::native::sha256(seed);
+    const Hash digest = aowis::dvmdb::sha256(seed);
     Key result{};
     std::copy_n(digest.begin(), result.size(), result.begin());
     return result;
@@ -156,7 +156,7 @@ Bytes branchObject(std::uint8_t depth, const Key& prefix, const std::map<unsigne
 
 Bytes modelValue(const ModelRecord& record) {
     Bytes bytes{'V'};
-    const Bytes envelope = aowis::native::encodeModelRecord(record);
+    const Bytes envelope = aowis::dvmdb::encodeModelRecord(record);
     bytes.insert(bytes.end(), envelope.begin(), envelope.end());
     return bytes;
 }
@@ -178,7 +178,7 @@ unsigned nibble(const Key& value, unsigned position) {
 void writeBundle(const std::filesystem::path& path, const Hash& tip, const Hash& base,
                  const std::vector<Bytes>& objects) {
     std::map<Hash, Bytes> sorted;
-    for (const Bytes& object : objects) sorted.emplace(aowis::native::sha256(object), object);
+    for (const Bytes& object : objects) sorted.emplace(aowis::dvmdb::sha256(object), object);
     Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C', '2'};
     bundle.insert(bundle.end(), tip.begin(), tip.end());
     appendU64(bundle, sorted.size());
@@ -249,7 +249,7 @@ void testWorkIndependentOfHistory() {
         expect(transfer.result.status == BundleImportStatus::FastForward, "delta import not a fast-forward");
         reads.push_back(transfer.profile.localObjectReads);
         sizes.push_back(transfer.objects);
-        const aowis::native::VerificationReport report = recipient.verifyRepository();
+        const aowis::dvmdb::VerificationReport report = recipient.verifyRepository();
         expect(report.revisions == historyLength + 3U, "verification after delta import incomplete");
     }
     std::cout << "  delta import local reads " << reads[0] << " (50 commits), " << reads[1]
@@ -437,7 +437,7 @@ void expectForgedRejected(const ForgeFixture& fixture, const std::filesystem::pa
                           std::vector<Bytes> objects,
                           StorageErrorKind expected = StorageErrorKind::InvalidInput) {
     objects.push_back(tipRevision);
-    writeBundle(bundle, aowis::native::sha256(tipRevision), base, objects);
+    writeBundle(bundle, aowis::dvmdb::sha256(tipRevision), base, objects);
     Repository recipient(fixture.directory);
     const std::uint64_t before = recipient.objectCount();
     expectKind(expected, label, [&] { (void)recipient.importBranchBundle(bundle, "main"); });
@@ -450,12 +450,12 @@ void testForgedBoundaryGrafts() {
     const ForgeFixture fixture(directory.path);
     const std::filesystem::path bundle = directory.path / "forged.bundle";
     const Revision& b = fixture.b;
-    const Hash referrers = aowis::native::sha256(referrersValue({key(2)}));
+    const Hash referrers = aowis::dvmdb::sha256(referrersValue({key(2)}));
     expect(storedObject(fixture.directory, referrers) == referrersValue({key(2)}),
            "fixture reverse index differs from the expected encoding");
-    const Bytes recordTwoLeaf = leafObject(key(2), aowis::native::sha256(modelValue(
+    const Bytes recordTwoLeaf = leafObject(key(2), aowis::dvmdb::sha256(modelValue(
         ModelRecord{1, {key(1)}, payload(2, 0)})));
-    (void)storedObject(fixture.directory, aowis::native::sha256(recordTwoLeaf));
+    (void)storedObject(fixture.directory, aowis::dvmdb::sha256(recordTwoLeaf));
 
     // A local reverse-index trie (INR1 values) used as a raw content tree.
     expectForgedRejected(fixture, bundle, "local reference trie as raw tree", b.id,
@@ -470,21 +470,21 @@ void testForgedBoundaryGrafts() {
     {
         const Bytes leaf = leafObject(key(7), referrers);
         expectForgedRejected(fixture, bundle, "bundled leaf with local reference value", b.id,
-                             revisionObject(aowis::native::sha256(leaf), Hash{}, true, {b.id}), {leaf});
+                             revisionObject(aowis::dvmdb::sha256(leaf), Hash{}, true, {b.id}), {leaf});
     }
     // A local leaf placed in a slot that does not match its key.
     {
-        const Hash localLeaf = aowis::native::sha256(recordTwoLeaf);
+        const Hash localLeaf = aowis::dvmdb::sha256(recordTwoLeaf);
         const unsigned correct = nibble(key(2), 0);
         const ModelRecord record{1, {}, payload(9, 0)};
         Key other = key(9);
         other[0] = static_cast<std::uint8_t>((((correct + 2U) % 16U) << 4U) | (other[0] & 0x0fU));
         const Bytes otherValue = modelValue(record);
-        const Bytes otherLeaf = leafObject(other, aowis::native::sha256(otherValue));
+        const Bytes otherLeaf = leafObject(other, aowis::dvmdb::sha256(otherValue));
         const Bytes branch = branchObject(0, Key{}, {{(correct + 1U) % 16U, localLeaf},
-                                                     {(correct + 2U) % 16U, aowis::native::sha256(otherLeaf)}});
+                                                     {(correct + 2U) % 16U, aowis::dvmdb::sha256(otherLeaf)}});
         expectForgedRejected(fixture, bundle, "local leaf in the wrong slot", b.id,
-                             revisionObject(aowis::native::sha256(branch), Hash{}, false, {b.id}),
+                             revisionObject(aowis::dvmdb::sha256(branch), Hash{}, false, {b.id}),
                              {branch, otherLeaf, otherValue});
     }
     // A bundled branch whose local child branch is not deeper than itself.
@@ -505,10 +505,10 @@ void testForgedBoundaryGrafts() {
         sibling[depth / 2U] = static_cast<std::uint8_t>(
             (sibling[depth / 2U] & ~(0x0fU << shift)) | (siblingSlot << shift));
         const Bytes value = modelValue(ModelRecord{1, {}, payload(11, 0)});
-        const Bytes leaf = leafObject(sibling, aowis::native::sha256(value));
-        const Bytes branch = branchObject(depth, prefix, {{0U, b.root}, {siblingSlot, aowis::native::sha256(leaf)}});
+        const Bytes leaf = leafObject(sibling, aowis::dvmdb::sha256(value));
+        const Bytes branch = branchObject(depth, prefix, {{0U, b.root}, {siblingSlot, aowis::dvmdb::sha256(leaf)}});
         expectForgedRejected(fixture, bundle, "local branch not deeper than its parent", b.id,
-                             revisionObject(aowis::native::sha256(branch), Hash{}, false, {b.id}),
+                             revisionObject(aowis::dvmdb::sha256(branch), Hash{}, false, {b.id}),
                              {branch, leaf, value});
     }
     // A local tree node or value used as a parent revision.
@@ -522,7 +522,7 @@ void testForgedBoundaryGrafts() {
     // (raw values are any 'V' objects), and the import is complete.
     {
         const Bytes revision = revisionObject(b.root, Hash{}, false, {b.id});
-        writeBundle(bundle, aowis::native::sha256(revision), b.id, {revision});
+        writeBundle(bundle, aowis::dvmdb::sha256(revision), b.id, {revision});
         Repository recipient(fixture.directory);
         const BundleImportResult result = recipient.importBranchBundle(bundle, "main");
         expect(result.status == BundleImportStatus::FastForward && result.objectsImported == 1,
@@ -571,7 +571,7 @@ void testBranchRelations() {
     expect(behind.importBranchBundle(directory.path / "from-a.bundle", "main").head == d,
            "delta from an older held base failed");
     expectKind(StorageErrorKind::Conflict, "export base not an ancestor",
-               [&] { source.exportIncrementalBranchBundle("main", aowis::native::sha256(Bytes{1}),
+               [&] { source.exportIncrementalBranchBundle("main", aowis::dvmdb::sha256(Bytes{1}),
                                                           directory.path / "bad.bundle"); });
 }
 

@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <array>
 #include <fcntl.h>
@@ -18,15 +18,15 @@
 #include <vector>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
 
 void expect(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
@@ -36,7 +36,7 @@ struct TestDirectory {
     explicit TestDirectory(std::string_view label) {
         static unsigned counter = 0;
         this->path = std::filesystem::temp_directory_path() /
-            ("aowis-native-recovery-" + std::string(label) + "-" +
+            ("aowis-dvmdb-recovery-" + std::string(label) + "-" +
              std::to_string(::getpid()) + "-" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
              "-" + std::to_string(++counter));
@@ -94,7 +94,7 @@ void recover(const std::filesystem::path& path,
         expect(data.has_value() && *data == value(11),
                "baseline record corrupted during recovery");
     }
-    const aowis::native::VerificationReport report = repository.verifyRepository();
+    const aowis::dvmdb::VerificationReport report = repository.verifyRepository();
     expect(report.branches == 1 && report.revisions >= 2,
            "full verification failed to inspect recovered history");
     // A recovered repository must remain writable (not merely readable).
@@ -122,8 +122,8 @@ void runFault(std::string_view point, bool crash,
     expect(child >= 0, "fork failed");
     if (child == 0) {
         const std::string selected(point);
-        ::setenv("AOWIS_NATIVE_TEST_FAULT", selected.c_str(), 1);
-        ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
+        ::setenv("AOWIS_DVMDB_TEST_FAULT", selected.c_str(), 1);
+        ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
             Repository repository(directory.path / "repo");
             if (compaction) {
@@ -173,7 +173,7 @@ void runImportFault(std::string_view point, bool crash,
     }
     {
         Repository destination(to);
-        const aowis::native::BundleImportResult imported =
+        const aowis::dvmdb::BundleImportResult imported =
             destination.importBranchBundle(initial, "main");
         expect(imported.head == initialHead, "incorrect initial import");
     }
@@ -181,8 +181,8 @@ void runImportFault(std::string_view point, bool crash,
     expect(child >= 0, "import fork failed");
     if (child == 0) {
         const std::string selected(point);
-        ::setenv("AOWIS_NATIVE_TEST_FAULT", selected.c_str(), 1);
-        ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
+        ::setenv("AOWIS_DVMDB_TEST_FAULT", selected.c_str(), 1);
+        ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
             Repository destination(to);
             (void)destination.importBranchBundle(incremental, "main");
@@ -208,7 +208,7 @@ void runImportFault(std::string_view point, bool crash,
     }
     recovered.verifyRepository();
     if (!afterPublish) {
-        const aowis::native::BundleImportResult retried =
+        const aowis::dvmdb::BundleImportResult retried =
             recovered.importBranchBundle(incremental, "main");
         expect(retried.head != initialHead, "retry did not complete import");
     }
@@ -292,13 +292,13 @@ void testInterruptedCompactionHandle(bool afterSwitch) {
     {
         Repository repository(path);
         const char* point = (afterSwitch ? "compact.pack.after.pointer" : "compact.pack.before.pointer");
-        ::setenv("AOWIS_NATIVE_TEST_FAULT", point, 1);
-        ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
+        ::setenv("AOWIS_DVMDB_TEST_FAULT", point, 1);
+        ::setenv("AOWIS_DVMDB_TEST_ACTION", "error", 1);
         bool failed = false;
         try { (void)repository.compact(); }
         catch (const std::exception&) { failed = true; }
-        ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
-        ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
+        ::unsetenv("AOWIS_DVMDB_TEST_FAULT");
+        ::unsetenv("AOWIS_DVMDB_TEST_ACTION");
         expect(failed, "compaction did not observe injected failure");
         bool writable = true;
         try { repository.commit("main", {Change{key(5), value(55)}}); }
@@ -346,7 +346,7 @@ Bytes garbageRecord(std::uint64_t payloadSize, std::uint8_t fill) {
 }
 
 Bytes validRecord(const Bytes& payload) {
-    const Hash hash = aowis::native::sha256(payload);
+    const Hash hash = aowis::dvmdb::sha256(payload);
     Bytes record{'A', 'O', 'B', 'J', 1};
     record.insert(record.end(), hash.begin(), hash.end());
     appendU64(record, payload.size());
@@ -499,8 +499,8 @@ void crashCompaction(const std::filesystem::path& repo, const char* point) {
     const pid_t child = ::fork();
     expect(child >= 0, "fork failed");
     if (child == 0) {
-        ::setenv("AOWIS_NATIVE_TEST_FAULT", point, 1);
-        ::setenv("AOWIS_NATIVE_TEST_ACTION", "crash", 1);
+        ::setenv("AOWIS_DVMDB_TEST_FAULT", point, 1);
+        ::setenv("AOWIS_DVMDB_TEST_ACTION", "crash", 1);
         try {
             Repository repository(repo);
             (void)repository.compact();
@@ -525,7 +525,7 @@ void testStaleGenerationCleanup() {
     { std::ofstream(repo / "objects.notes") << "unrelated administrator file\n"; }
     {
         Repository repository(repo);
-        const aowis::native::CompactionStats stats = repository.compact();
+        const aowis::dvmdb::CompactionStats stats = repository.compact();
         expect(stats.staleFilesRemoved == 3,
                "expected orphan pack, orphan index and pointer temp to be removed, got " +
                std::to_string(stats.staleFilesRemoved));
@@ -542,7 +542,7 @@ void testStaleGenerationCleanup() {
     {
         Repository repository(repo);
         repository.verifyRepository();
-        const aowis::native::CompactionStats stats = repository.compact();
+        const aowis::dvmdb::CompactionStats stats = repository.compact();
         expect(stats.staleFilesRemoved == 2, "retired generation was not removed");
         repository.commit("main", {Change{key(7), value(77)}});
         repository.verifyRepository();
@@ -562,13 +562,13 @@ void testExportFailureBeforePublish() {
     const std::filesystem::path bundle = directory.path / "main.aowbundle";
     baseline(repo, true);
     Repository repository(repo);
-    ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.before.publish", 1);
-    ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
+    ::setenv("AOWIS_DVMDB_TEST_FAULT", "export.before.publish", 1);
+    ::setenv("AOWIS_DVMDB_TEST_ACTION", "error", 1);
     bool failed = false;
     try { repository.exportBranchBundle("main", bundle); }
     catch (const std::exception&) { failed = true; }
-    ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
-    ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
+    ::unsetenv("AOWIS_DVMDB_TEST_FAULT");
+    ::unsetenv("AOWIS_DVMDB_TEST_ACTION");
     expect(failed, "export did not observe injected failure before publication");
     expect(!std::filesystem::exists(bundle), "failed export left a bundle behind");
     repository.exportBranchBundle("main", bundle);
@@ -593,8 +593,8 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
     const pid_t child = ::fork();
     expect(child >= 0, "partial export fork failed");
     if (child == 0) {
-        ::setenv("AOWIS_NATIVE_TEST_FAULT", "export.partial.object", 1);
-        ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
+        ::setenv("AOWIS_DVMDB_TEST_FAULT", "export.partial.object", 1);
+        ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
             Repository repository(repo);
             if (descriptor) {
@@ -673,9 +673,9 @@ void testAtomicNamedBundlePublication() {
                 expect(child >= 0, "atomic export fork failed");
                 if (child == 0) {
                     const std::string checkpoint(point);
-                    ::setenv("AOWIS_NATIVE_TEST_FAULT", checkpoint.c_str(), 1);
-                    ::setenv("AOWIS_NATIVE_TEST_ACTION", crash ? "crash" : "error", 1);
-                    if (namedFallback) ::setenv("AOWIS_NATIVE_TEST_NAMED_SCRATCH", "1", 1);
+                    ::setenv("AOWIS_DVMDB_TEST_FAULT", checkpoint.c_str(), 1);
+                    ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
+                    if (namedFallback) ::setenv("AOWIS_DVMDB_TEST_NAMED_SCRATCH", "1", 1);
                     try {
                         Repository source(repo);
                         source.exportBranchBundle("main", bundle);

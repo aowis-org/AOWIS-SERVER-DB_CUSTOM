@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <filesystem>
 #include <fstream>
@@ -13,16 +13,16 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::BundleImportStatus;
-using aowis::native::BundleLimits;
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::Repository;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
-using aowis::native::MergeStatus;
-using aowis::native::Change;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::BundleLimits;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
+using aowis::dvmdb::MergeStatus;
+using aowis::dvmdb::Change;
 
 void check(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -298,7 +298,7 @@ void exercise() {
     const std::filesystem::path exactExport = temporary.path() / "bounded.aowbundle";
     source.exportBranchBundle("main", exactExport, exact);
     check(std::filesystem::file_size(exactExport) == length, "bounded export altered bundle bytes");
-    const aowis::native::BundleImportResult imported =
+    const aowis::dvmdb::BundleImportResult imported =
         destination.importBranchBundle(exactExport, "tracking", exact);
     check(imported.status == BundleImportStatus::Created && imported.head == tip,
           "valid bounded transfer rejected");

@@ -19,7 +19,7 @@ The source branch remains unchanged. If a divergent merge succeeds, publication 
 
 ## Domain-specific safety
 
-Generic reference existence is **not** sufficient for hydraulic integrity. A pipe might refer to an existing UUID of the wrong kind, or a demand-point attachment may violate endpoint constraints. Use `aowis::native::hydraulic::mergeHydraulicBranches()` for hydraulic networks. That API can reconcile fields and coordinated membership, and validates the complete resulting network before publication. See [hydraulic merging](native-hydraulic-merging.md).
+Generic reference existence is **not** sufficient for hydraulic integrity. A pipe might refer to an existing UUID of the wrong kind, or a demand-point attachment may violate endpoint constraints. Use `aowis::dvmdb::hydraulic::mergeHydraulicBranches()` for hydraulic networks. That API can reconcile fields and coordinated membership, and validates the complete resulting network before publication. See [hydraulic merging](native-hydraulic-merging.md).
 
 ## Boundaries
 

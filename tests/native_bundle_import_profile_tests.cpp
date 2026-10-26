@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <cmath>
 #include <cstdio>
@@ -12,15 +12,15 @@
 
 namespace {
 
-using aowis::native::BundleImportProfile;
-using aowis::native::BundleImportResult;
-using aowis::native::BundleImportStatus;
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
+using aowis::dvmdb::BundleImportProfile;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
 
 void check(bool condition, std::string_view reason) {
     if (!condition) throw std::runtime_error(std::string(reason));
@@ -30,7 +30,7 @@ class TemporaryRoot {
 public:
     TemporaryRoot() {
         const std::filesystem::path pattern =
-            std::filesystem::temp_directory_path() / "aowis-native-import-profile-XXXXXX";
+            std::filesystem::temp_directory_path() / "aowis-dvmdb-import-profile-XXXXXX";
         std::string writable = pattern.string();
         writable.push_back('\0');
         char* const created = ::mkdtemp(writable.data());

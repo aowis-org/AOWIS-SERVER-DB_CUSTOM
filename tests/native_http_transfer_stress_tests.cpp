@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <httplib.h>
 
@@ -104,17 +104,17 @@ HttpResponse request(unsigned short port, const std::string& method, const std::
 }
 
 std::string project(unsigned short port, const std::string& name) {
-    const HttpResponse reply = request(port, "POST", "/api/v1/projects", "{\"name\":\"" + name + "\"}");
+    const HttpResponse reply = request(port, "POST", "/dvmdb/v1/projects", "{\"name\":\"" + name + "\"}");
     require(reply.status == 201, "unable to create project: " + reply.body);
     return field(reply.body, "id");
 }
 
 std::string prefix(const std::string& projectId) {
-    return "/api/v1/projects/" + projectId + "/branches/";
+    return "/dvmdb/v1/projects/" + projectId + "/branches/";
 }
 
 void health(unsigned short port) {
-    const HttpResponse reply = request(port, "GET", "/api/v1/health");
+    const HttpResponse reply = request(port, "GET", "/dvmdb/v1/health");
     require(reply.status == 200, "server health failed: " + reply.body);
 }
 
@@ -252,7 +252,7 @@ private:
 };
 
 std::string makeBundle(const fs::path& root, std::string& expected) {
-    using namespace aowis::native;
+    using namespace aowis::dvmdb;
     const fs::path sourcePath = root / "source";
     Repository repository(sourcePath);
     repository.createBranch("main");
@@ -561,12 +561,12 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
         require(!server.forcedShutdown(), "soak server needed forced shutdown");
     }
     for (std::size_t index = 0; index < projectIds.size(); ++index) {
-        aowis::native::Repository repository(serviceRoot / "projects" / projectIds[index] / "repository");
+        aowis::dvmdb::Repository repository(serviceRoot / "projects" / projectIds[index] / "repository");
         repository.verifyRepository();
         const std::vector<std::string> branches = repository.listBranches();
         for (const std::string& branch : branches) {
             if (branch == "main") continue;
-            require(aowis::native::toHex(repository.head(branch).id) == expectedHead,
+            require(aowis::dvmdb::toHex(repository.head(branch).id) == expectedHead,
                     "soak branch head wrong on disk after service stop");
             ++completedByProject[index];
         }
@@ -583,8 +583,8 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
 
 int main(int argc, char** argv) {
     if (argc != 2 && argc != 4) {
-        std::cerr << "Usage: aowis-native-http-transfer-stress-tests SERVER_EXECUTABLE|--fixture-only\n"
-                     "       aowis-native-http-transfer-stress-tests --soak-seconds SECONDS SERVER_EXECUTABLE\n";
+        std::cerr << "Usage: aowis-dvmdb-http-transfer-stress-tests SERVER_EXECUTABLE|--fixture-only\n"
+                     "       aowis-dvmdb-http-transfer-stress-tests --soak-seconds SECONDS SERVER_EXECUTABLE\n";
         return 2;
     }
     const bool soak = argc == 4 && std::string_view(argv[1]) == "--soak-seconds";
@@ -601,9 +601,9 @@ int main(int argc, char** argv) {
         const std::string fixture = makeBundle(root.path, head);
         if (std::string(argv[1]) == "--fixture-only") {
             const fs::path path = root.path / "fixture.bundle";
-            aowis::native::Repository recipient(root.path / "fixture-recipient");
-            const aowis::native::BundleImportResult result = recipient.importBranchBundle(path, "received");
-            require(aowis::native::toHex(result.head) == head, "fixture import head mismatch");
+            aowis::dvmdb::Repository recipient(root.path / "fixture-recipient");
+            const aowis::dvmdb::BundleImportResult result = recipient.importBranchBundle(path, "received");
+            require(aowis::dvmdb::toHex(result.head) == head, "fixture import head mismatch");
             require(recipient.verifyRepository().revisions >= 2, "fixture import verification failed");
             std::cout << "HTTP stress fixture verified: " << fixture.size() << " bytes\n";
             return 0;
@@ -641,12 +641,12 @@ int main(int argc, char** argv) {
         }
         for (std::size_t index = 0; index < projects.size(); ++index) {
             const std::string& id = projects[index];
-            aowis::native::Repository repository(serviceRoot / "projects" / id / "repository");
+            aowis::dvmdb::Repository repository(serviceRoot / "projects" / id / "repository");
             require(repository.verifyRepository().revisions >= 2, "post-stress repository verification failed");
             const std::vector<std::string> branches = repository.listBranches();
             require(branches.size() == (index == 2 ? 9U : 10U), "unexpected post-stress branch count");
             for (const std::string& branch : branches) {
-                require(aowis::native::toHex(repository.head(branch).id) ==
+                require(aowis::dvmdb::toHex(repository.head(branch).id) ==
                             (branch == "main" ? emptyHeads[index] : head),
                         "post-stress branch points at an unexpected revision");
             }

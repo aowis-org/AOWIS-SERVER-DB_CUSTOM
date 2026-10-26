@@ -16,10 +16,10 @@ The generic model-record layer stores a canonical model payload without interpre
 
 ## Scope of validation
 
-Normal model commits enforce **UUID existence and reference-index integrity**. Portable model-bundle imports recompute all incoming edges from the canonical model records at each reachable historical revision, verify targets exist, and require an exact match with the separately stored reverse index. These validations run before any imported object is written. A separate comprehensive checker for repositories already on disk remains planned. It does not know whether a reference points to the correct type of hydraulic node or whether a demand-point assignment matches a pipe endpoint. Use `aowis::native::hydraulic` for real hydraulic network editing, validation and merging. Domain-specific relationships and network membership are described in [hydraulic persistence](native-hydraulic-network.md).
+Normal model commits enforce **UUID existence and reference-index integrity**. Portable model-bundle imports recompute all incoming edges from the canonical model records at each reachable historical revision, verify targets exist, and require an exact match with the separately stored reverse index. These validations run before any imported object is written. A separate comprehensive checker for repositories already on disk remains planned. It does not know whether a reference points to the correct type of hydraulic node or whether a demand-point assignment matches a pipe endpoint. Use `aowis::dvmdb::hydraulic` for real hydraulic network editing, validation and merging. Domain-specific relationships and network membership are described in [hydraulic persistence](native-hydraulic-network.md).
 
 ## Synthetic performance tool
 
-`aowis-native-model-benchmark` uses synthetic hydraulic-shaped payloads to isolate model-envelope, reference-index and Merkle costs. It does **not** exercise full ModelCodec or complete hydraulic validation. For real typed junction/pipe data use `aowis-native-hydraulic-model-benchmark`; for network-wide editing use `aowis-native-hydraulic-edit-benchmark`.
+`aowis-dvmdb-model-benchmark` uses synthetic hydraulic-shaped payloads to isolate model-envelope, reference-index and Merkle costs. It does **not** exercise full ModelCodec or complete hydraulic validation. For real typed junction/pipe data use `aowis-dvmdb-hydraulic-model-benchmark`; for network-wide editing use `aowis-dvmdb-hydraulic-edit-benchmark`.
 
 The native record format is not yet frozen for a public release.

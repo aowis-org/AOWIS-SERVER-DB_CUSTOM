@@ -1,6 +1,6 @@
 #pragma once
 
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <filesystem>
 #include <functional>
@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 
 // Authorization is deliberately independent of project/branch revision history:
 // checking out an older model revision must never roll back its access rules.
@@ -79,4 +79,4 @@ Key newAccessUuid();
 std::string accessUuidString(const Key& id);
 Key parseAccessUuid(std::string_view value);
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

@@ -1,4 +1,4 @@
-#include "aowis/native/project_service.h"
+#include "aowis/dvmdb/project_service.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,9 +14,9 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::ProjectService;
-using aowis::native::ProjectError;
-using aowis::native::ProjectErrorKind;
+using aowis::dvmdb::ProjectService;
+using aowis::dvmdb::ProjectError;
+using aowis::dvmdb::ProjectErrorKind;
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -44,12 +44,12 @@ void exerciseBackend() {
     TemporaryRoot root;
     std::string firstId;
     std::string secondId;
-    aowis::native::Hash firstHead{};
+    aowis::dvmdb::Hash firstHead{};
     {
         ProjectService service(root.directory);
         require(service.listProjects().empty(), "new catalogue is not empty");
-        const aowis::native::ProjectInfo first = service.createProject("Engineering Å");
-        const aowis::native::ProjectInfo second = service.createProject("Second project");
+        const aowis::dvmdb::ProjectInfo first = service.createProject("Engineering Å");
+        const aowis::dvmdb::ProjectInfo second = service.createProject("Second project");
         firstId = first.id;
         secondId = second.id;
         require(ProjectService::validProjectId(firstId), "invalid generated UUID");
@@ -64,18 +64,18 @@ void exerciseBackend() {
         require(service.history(firstId, "main", 10, firstHead).empty(), "history cursor should be exclusive");
         require(service.head(secondId, "main").id == firstHead,
                 "initial object identities should be deterministic");
-        const aowis::native::Revision fork = service.createBranch(firstId, "design", "main", firstHead);
+        const aowis::dvmdb::Revision fork = service.createBranch(firstId, "design", "main", firstHead);
         require(fork.id == firstHead, "pinned fork changed revision");
         service.createBranch(firstId, "independent");
         require(service.listBranches(firstId).size() == 3, "missing new branch");
         require(service.listBranches(secondId).size() == 1, "projects are not isolated");
         // The model HTTP adapter's scoped native callback shares the exact
         // project handle and serializes access without exposing its lifetime.
-        aowis::native::Key modelKey{};
+        aowis::dvmdb::Key modelKey{};
         modelKey[0] = 0x91;
-        aowis::native::Hash modelRevision{};
-        service.withRepository(firstId, [&](aowis::native::Repository& repository) {
-            aowis::native::ModelRecord record;
+        aowis::dvmdb::Hash modelRevision{};
+        service.withRepository(firstId, [&](aowis::dvmdb::Repository& repository) {
+            aowis::dvmdb::ModelRecord record;
             record.kind = 31;
             record.payload = {1, 3, 5};
             modelRevision = repository.commitModel("main", {{modelKey, record}}, firstHead).id;
@@ -87,11 +87,11 @@ void exerciseBackend() {
         require(service.head(secondId, "main").id == firstHead,
                 "scoped model commit leaked across project boundaries");
         expectError([&] {
-            service.withRepository("../../wrong", [](aowis::native::Repository&) {});
+            service.withRepository("../../wrong", [](aowis::dvmdb::Repository&) {});
         }, ProjectErrorKind::InvalidInput);
         bool callbackFailure = false;
         try {
-            service.withRepository(firstId, [](aowis::native::Repository&) {
+            service.withRepository(firstId, [](aowis::dvmdb::Repository&) {
                 throw std::runtime_error("intentional callback failure");
             });
         } catch (const std::runtime_error&) { callbackFailure = true; }
@@ -102,7 +102,7 @@ void exerciseBackend() {
         expectError([&]{ service.project("00000000-0000-4000-8000-000000000000"); }, ProjectErrorKind::NotFound);
         expectError([&]{ service.head(firstId, "missing"); }, ProjectErrorKind::NotFound);
         expectError([&]{ service.createBranch(firstId, "fork", "missing"); }, ProjectErrorKind::NotFound);
-        expectError([&]{ service.revision(firstId, aowis::native::sha256(aowis::native::Bytes{1,2,3,4})); }, ProjectErrorKind::NotFound);
+        expectError([&]{ service.revision(firstId, aowis::dvmdb::sha256(aowis::dvmdb::Bytes{1,2,3,4})); }, ProjectErrorKind::NotFound);
         expectError([&]{ service.createProject(""); }, ProjectErrorKind::InvalidInput);
         expectError([&]{ service.createProject("bad\nname"); }, ProjectErrorKind::InvalidInput);
         expectError([&]{ service.createProject(std::string("\xc0\xaf", 2)); },
@@ -131,7 +131,7 @@ void exerciseBackend() {
         std::vector<std::thread> workers;
         for (int worker = 0; worker < 6; ++worker) {
             workers.emplace_back([&, worker] {
-                const aowis::native::ProjectInfo item = service.createProject("thread-" + std::to_string(worker));
+                const aowis::dvmdb::ProjectInfo item = service.createProject("thread-" + std::to_string(worker));
                 require(!item.id.empty(), "concurrent create failed");
                 ++completed;
             });
@@ -171,8 +171,8 @@ void exerciseBackend() {
 void exerciseLargeBranchCatalogue() {
     TemporaryRoot root;
     ProjectService service(root.directory);
-    const aowis::native::ProjectInfo project = service.createProject("Branch scaling");
-    const aowis::native::Hash mainHead = service.head(project.id, "main").id;
+    const aowis::dvmdb::ProjectInfo project = service.createProject("Branch scaling");
+    const aowis::dvmdb::Hash mainHead = service.head(project.id, "main").id;
     const std::filesystem::path heads = root.directory / "projects" / project.id /
                                         "repository" / "refs" / "heads";
     constexpr unsigned branchCount = 4096;

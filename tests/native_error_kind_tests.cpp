@@ -1,7 +1,7 @@
 // Review finding F2: every failure is classified by StorageErrorKind at its
 // source. Callers (HTTP, CLI) must never inspect message text. Linked against
 // the fault-test engine build for deterministic ENOSPC and compaction faults.
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <chrono>
 #include <cerrno>
@@ -19,17 +19,17 @@
 #include <vector>
 
 namespace {
-using aowis::native::BundleLimits;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::Revision;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
+using aowis::dvmdb::BundleLimits;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::Revision;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
 
 void expect(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
@@ -39,7 +39,7 @@ struct TestDirectory {
     explicit TestDirectory(std::string_view label) {
         static unsigned counter = 0;
         this->path = std::filesystem::temp_directory_path() /
-            ("aowis-native-error-kinds-" + std::string(label) + "-" + std::to_string(::getpid()) +
+            ("aowis-dvmdb-error-kinds-" + std::string(label) + "-" + std::to_string(::getpid()) +
              "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
              "-" + std::to_string(++counter));
         std::filesystem::create_directories(this->path);
@@ -104,10 +104,10 @@ void appendU64(Bytes& bytes, std::uint64_t number) {
 }
 
 void testErrnoMapping() {
-    expect(aowis::native::storageErrorKindForErrno(ENOSPC) == StorageErrorKind::ResourceExhausted &&
-           aowis::native::storageErrorKindForErrno(EDQUOT) == StorageErrorKind::ResourceExhausted &&
-           aowis::native::storageErrorKindForErrno(EIO) == StorageErrorKind::Io &&
-           aowis::native::storageErrorKindForErrno(EACCES) == StorageErrorKind::Io,
+    expect(aowis::dvmdb::storageErrorKindForErrno(ENOSPC) == StorageErrorKind::ResourceExhausted &&
+           aowis::dvmdb::storageErrorKindForErrno(EDQUOT) == StorageErrorKind::ResourceExhausted &&
+           aowis::dvmdb::storageErrorKindForErrno(EIO) == StorageErrorKind::Io &&
+           aowis::dvmdb::storageErrorKindForErrno(EACCES) == StorageErrorKind::Io,
            "errno classification");
 }
 
@@ -123,7 +123,7 @@ void testRequestKinds() {
     expectKind(StorageErrorKind::InvalidInput, "invalid branch name",
                [&] { repository.createBranch("../escape"); });
     expectKind(StorageErrorKind::InvalidInput, "malformed revision hex",
-               [&] { (void)aowis::native::fromHex(std::string(64, 'g')); });
+               [&] { (void)aowis::dvmdb::fromHex(std::string(64, 'g')); });
     expectKind(StorageErrorKind::InvalidInput, "duplicate UUID in one commit", [&] {
         repository.commitModel("main", {ModelChange{key(3), ModelRecord{1, {}, value(3)}},
                                         ModelChange{key(3), ModelRecord{1, {}, value(4)}}});
@@ -134,12 +134,12 @@ void testRequestKinds() {
     expectKind(StorageErrorKind::InvalidInput, "delete of a referenced model",
                [&] { repository.commitModel("main", {ModelChange{key(1), std::nullopt}}); });
     expectKind(StorageErrorKind::InvalidInput, "history cursor from elsewhere",
-               [&] { (void)repository.history("main", 10, aowis::native::sha256(value(9))); });
+               [&] { (void)repository.history("main", 10, aowis::dvmdb::sha256(value(9))); });
     expectKind(StorageErrorKind::InvalidInput, "raw commit to a model-indexed branch",
                [&] { repository.commit("main", {Change{key(5), value(5)}}); });
 
     // NotFound, including identities of objects that are not revisions (F10b)
-    const Hash unknown = aowis::native::sha256(Bytes{1, 2, 3});
+    const Hash unknown = aowis::dvmdb::sha256(Bytes{1, 2, 3});
     expectKind(StorageErrorKind::NotFound, "unknown branch", [&] { (void)repository.head("missing"); });
     expectKind(StorageErrorKind::NotFound, "unknown revision", [&] { (void)repository.revision(unknown); });
     expectKind(StorageErrorKind::NotFound, "tree hash used as revision",
@@ -180,7 +180,7 @@ void testImportKinds() {
     // structural verifier reports Corruption, the importer InvalidInput.
     {
         const Bytes payload{'V', 'x'};
-        const Hash hash = aowis::native::sha256(payload);
+        const Hash hash = aowis::dvmdb::sha256(payload);
         Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C', '1'};
         bundle.insert(bundle.end(), hash.begin(), hash.end());
         appendU64(bundle, 1);
@@ -227,18 +227,18 @@ void testImportKinds() {
     {
         Repository target(directory.path / "enospc");
         target.importBranchBundle(directory.path / "base.bundle", "main");
-        ::setenv("AOWIS_NATIVE_TEST_FAULT", "import.after.sync", 1);
-        ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
+        ::setenv("AOWIS_DVMDB_TEST_FAULT", "import.after.sync", 1);
+        ::setenv("AOWIS_DVMDB_TEST_ACTION", "error", 1);
         try {
             expectKind(StorageErrorKind::ResourceExhausted, "ENOSPC during import",
                        [&] { (void)target.importBranchBundle(directory.path / "delta.bundle", "main"); });
         } catch (...) {
-            ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
-            ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
+            ::unsetenv("AOWIS_DVMDB_TEST_FAULT");
+            ::unsetenv("AOWIS_DVMDB_TEST_ACTION");
             throw;
         }
-        ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
-        ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
+        ::unsetenv("AOWIS_DVMDB_TEST_FAULT");
+        ::unsetenv("AOWIS_DVMDB_TEST_ACTION");
     }
 }
 
@@ -266,13 +266,13 @@ void testUnavailableAfterInterruptedCompaction() {
     Repository repository(directory.path / "repo");
     repository.createBranch("main");
     repository.commit("main", {Change{key(1), value(1)}});
-    ::setenv("AOWIS_NATIVE_TEST_FAULT", "compact.pack.after.pointer", 1);
-    ::setenv("AOWIS_NATIVE_TEST_ACTION", "error", 1);
+    ::setenv("AOWIS_DVMDB_TEST_FAULT", "compact.pack.after.pointer", 1);
+    ::setenv("AOWIS_DVMDB_TEST_ACTION", "error", 1);
     bool failed = false;
     try { (void)repository.compact(); }
     catch (const std::exception&) { failed = true; }
-    ::unsetenv("AOWIS_NATIVE_TEST_FAULT");
-    ::unsetenv("AOWIS_NATIVE_TEST_ACTION");
+    ::unsetenv("AOWIS_DVMDB_TEST_FAULT");
+    ::unsetenv("AOWIS_DVMDB_TEST_ACTION");
     expect(failed, "compaction fault not reached");
     expectKind(StorageErrorKind::Unavailable, "handle after interrupted compaction",
                [&] { repository.commit("main", {Change{key(2), value(2)}}); });

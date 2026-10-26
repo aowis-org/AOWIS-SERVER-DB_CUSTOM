@@ -18,14 +18,14 @@ reference files and generation markers.
    entries with symlinks introduced by untrusted users. Keep the original root
    untouched. Where available, snapshot/copy after a filesystem sync.
 3. On a **separate staging copy** of the backup, run full verification for
-   every `projects/<uuid>/repository` with `aowis-native-verify --full PATH`.
+   every `projects/<uuid>/repository` with `aowis-dvmdb-verify --full PATH`.
    Verification may rebuild a derived sidecar or recover an unpublished tail,
    so do not use an immutable evidence copy for this step.
 4. Retain the verified backup separately from live data. Restore only while
    all writers are stopped; preferably restore to a NEW root and configure the
-   server to start from that root, then check `/api/v1/ready` and project list.
+   server to start from that root, then check `/dvmdb/v1/ready` and project list.
    Never combine files from two independently changing repository copies.
-5. After restore, repeat `aowis-native-verify --full` for every repository and
+5. After restore, repeat `aowis-dvmdb-verify --full` for every repository and
    validate expected branch heads and one or more representative model reads.
    Storage verification does not establish hydraulic model semantics.
 
@@ -45,17 +45,17 @@ space for the full root plus verification temporary files:
 ```bash
 ./compile_linux.sh
 python3 tools/offline_backup.py backup /path/to/aowis-dvmdb-data /backup/new-snapshot \
-  --verify-binary ./build-linux/aowis-native-verify
+  --verify-binary ./build-linux/aowis-dvmdb-verify
 python3 tools/offline_backup.py restore /backup/new-snapshot /path/to/new-aowis-dvmdb-data \
-  --verify-binary ./build-linux/aowis-native-verify
+  --verify-binary ./build-linux/aowis-dvmdb-verify
 python3 tools/offline_backup.py verify /path/to/new-aowis-dvmdb-data \
-  --verify-binary ./build-linux/aowis-native-verify
+  --verify-binary ./build-linux/aowis-dvmdb-verify
 ```
 
 The utility locks the catalogue and **all** repository lifetime locks, copies
 the complete storage root to a private sibling directory, compares project
 metadata and every published branch head, verifies each copied repository with
-`aowis-native-verify --full`, synchronizes files/directories, and atomically
+`aowis-dvmdb-verify --full`, synchronizes files/directories, and atomically
 publishes the destination directory with **no overwrite**. It refuses symbolic
 links and nonregular entries in the source tree; inspect such entries rather
 than blindly following them. `verify` likewise verifies an isolated private
@@ -84,7 +84,7 @@ of pack objects. For a new executable or a change of host/filesystem:
    representative historical reads. Take a verified offline backup with
    `tools/offline_backup.py`; store it separately from the live root.
 2. Restore that backup into a **new, absent directory** using the prospective
-   build's `aowis-native-verify`. This verifies its ability to read the old
+   build's `aowis-dvmdb-verify`. This verifies its ability to read the old
    persisted bytes; never try an upgrade on the sole source copy.
 3. Point a disposable instance of the prospective build at the restored root.
    Check project identities, branch names, revision ancestry, model payloads
@@ -99,7 +99,7 @@ of pack objects. For a new executable or a change of host/filesystem:
    executable; restore the original verified backup rather than pointing an
    older binary at a root modified by the newer version.
 
-The `aowis-native-upgrade-restore-tests` CTest automates an isolated version of
+The `aowis-dvmdb-upgrade-restore-tests` CTest automates an isolated version of
 this drill with four projects, two immutable earlier-build pack specimens,
 divergent branches, more than 1 MiB of current-format model values, sidecar
 reconstruction and a second post-write backup/restore. It checks all project
@@ -150,7 +150,7 @@ unbounded scale of projects.
 
 ## Concurrent HTTP transfer qualification
 
-The test `aowis-native-http-transfer-stress-tests` runs the real server on an
+The test `aowis-dvmdb-http-transfer-stress-tests` runs the real server on an
 isolated loopback port with a disposable multi-project root. It first tests
 HTTP transfer staging admission at a one-transfer budget, including an
 incomplete upload and interrupted download, then restarts the server with a
@@ -160,7 +160,7 @@ It verifies the repositories after stopping the server. Run it through CTest:
 
 ```bash
 ./compile_linux_tests.sh --both
-ctest --test-dir build-linux-tests-release -R '^aowis-native-http-transfer-stress-tests$' --output-on-failure
+ctest --test-dir build-linux-tests-release -R '^aowis-dvmdb-http-transfer-stress-tests$' --output-on-failure
 ```
 
 The test creates temporary data under `/tmp` and keeps its private directory
@@ -171,7 +171,7 @@ conditions, or establish CPU, memory, or service latency SLAs.
 
 ## Real filesystem-full regression
 
-`aowis-native-physical-enospc-tests` uses the **production native store** and
+`aowis-dvmdb-physical-enospc-tests` uses the **production native store** and
 an isolated **32 MiB Linux tmpfs** mounted in a new user/mount namespace. The
 fixture allocates real filesystem blocks until a kernel write produces ENOSPC,
 then checks a failed commit, atomic named export and incremental import. After
@@ -181,7 +181,7 @@ repositories. No existing host filesystem or database is filled.
 ```bash
 ./compile_linux_tests.sh --both
 ctest --test-dir build-linux-tests-release \
-  -R '^aowis-native-physical-enospc-tests$' --output-on-failure -V
+  -R '^aowis-dvmdb-physical-enospc-tests$' --output-on-failure -V
 ```
 
 The test returns **SKIP** (not pass) when unprivileged user/mount namespaces or
@@ -194,7 +194,7 @@ block-device/VM qualification before broader durability claims.
 
 ## Abrupt process termination qualification
 
-`aowis-native-sigkill-restart-tests` exercises the **production native library**,
+`aowis-dvmdb-sigkill-restart-tests` exercises the **production native library**,
 not the fault-instrumented library. An independent child process repeatedly
 commits to a repository and reports each completed commit through a pipe. The
 parent terminates it with `SIGKILL` at varying points, reopens the repository,
@@ -212,7 +212,7 @@ The entire test uses disposable directories with randomized names.
 ```bash
 ./compile_linux_tests.sh --both
 ctest --test-dir build-linux-tests-release \
-  -R '^aowis-native-sigkill-restart-tests$' --output-on-failure -V
+  -R '^aowis-dvmdb-sigkill-restart-tests$' --output-on-failure -V
 ```
 
 **Limits of evidence:** `SIGKILL` does not drop the kernel page cache, emulate
@@ -236,8 +236,8 @@ live AOWIS repositories or host block devices.
   the root. Run physical and full verification on a separate copy and preserve
   logs. Never 'repair' an object by hand or delete a published head.
 - Offline compaction: stop all other repository users, take and verify a
-  backup, run `aowis-native-compact PATH` on the selected repository and then
-  run `aowis-native-verify --full PATH`. The engine refuses compaction if
+  backup, run `aowis-dvmdb-compact PATH` on the selected repository and then
+  run `aowis-dvmdb-verify --full PATH`. The engine refuses compaction if
   another handle owns a lifetime lock; always verify the output afterwards.
 - If ref publication reports an I/O error, treat publication as **ambiguous**:
   restart/reopen and inspect the actual durable branch head before retrying a

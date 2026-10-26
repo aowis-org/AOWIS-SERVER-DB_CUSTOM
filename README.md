@@ -71,58 +71,58 @@ Linux prerequisites: C++20 compiler, CMake, Ninja, OpenSSL development libraries
 
 `./git_submodule_init.sh` initializes the Model submodule and, where necessary, registers its Git submodule metadata. Commit any resulting gitlink or `.gitmodules` changes so future checkouts work.
 
-`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata or generated/ignored files. Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-native-zip-submodule-tests`.
+`./tools/zip_dvmdb.sh` creates `../dvmdb.zip` with the checked-out source files of the project **and every initialized Git submodule recursively**, including modified and new non-ignored files. The archive does not include Git metadata or generated/ignored files. Packaging fails if a submodule is not initialized; run `git submodule update --init --recursive` before creating a snapshot. The ZIP is a standalone source snapshot, not a Git checkout. The packaging behavior is covered by `aowis-dvmdb-zip-submodule-tests`.
 
-### DVMDB rename and patch convention
+### AOWIS DVMDB project and patch convention
 
-The Git repository, top-level source directory, CMake project, server executable,
-service packaging and project snapshot now use **DVMDB**:
+This is **AOWIS-SERVER-DVMDB**: AOWIS is the organization and model ecosystem,
+DVMDB is this database product. The single supported source ZIP and patch tools
+are:
 
 ```bash
-./tools/zip_dvmdb.sh       # ../dvmdb.zip, containing AOWIS-SERVER-DVMDB/
-./tools/zip_db.sh          # supported compatibility entrypoint, same output
+./tools/zip_dvmdb.sh       # ../dvmdb.zip, rooted at AOWIS-SERVER-DVMDB/
 ./tools/apply_patch.sh ~/Downloads/aowis-dvmdb-example.zip
 ```
 
-Patch ZIPs must begin with `aowis-dvmdb-`, and each archive entry must begin
-with `AOWIS-SERVER-DVMDB/`. The one-time rename patch is exceptionally named
-`aowis-db-custom-rename-project-to-dvmdb.zip` so it can be applied by the
-*previous* `apply_patch.sh`, which only knows the old prefix. After applying
-it, use DVMDB patch names exclusively. Old `db_custom.zip` snapshots are not
-automatically deleted from the parent directory.
+Patch filenames must begin `aowis-dvmdb-` and ZIP entries must be rooted at
+`AOWIS-SERVER-DVMDB/`. No legacy ZIP command, header namespace, or HTTP route
+aliases are installed. The REST prefix is `/dvmdb/v1` (not `/api/v1`).
+Existing clients must change their URLs and C++ API references accordingly.
 
-**Existing deployments:** the new executable name and default data directory
-are naming changes, **not** a storage-format migration. Never start a fresh
-empty root and assume it contains your old projects. Before a rollout stop all
-writers, take a verified offline backup, and explicitly point the new service
-at the existing data root or use a verified cold restore into the new root.
-When using the new systemd unit, ensure its service account, state directory,
-INI and sandbox write paths agree with the selected root. The API routes,
-canonical model identities, bundle extension and persistent pack bytes do not
-change. See [operations](docs/operations.md) for backup and restore rules.
+**Storage is still AOWIS storage.** The immutable object bytes, model type
+identifiers, pack/index markers, project manifests and replication bundle
+framing remain in their original AOWIS formats. Renaming these would change
+content-derived revision IDs and corrupt access to existing AOWIS histories;
+they are not `DB_CUSTOM` branding. The DVMDB rename is an API and deployment
+migration, not an on-disk rewrite.
 
+**Existing deployments:** Stop writers, take a verified offline backup and
+point the renamed service at the verified existing data root (or restore it
+into a new root). The installed executable, configuration, systemd unit,
+public header paths, CMake aliases and HTTP base URL have changed. See
+[operations](docs/operations.md) and the [DVMDB migration notes](docs/dvmdb-rename-migration.md).
 
-When `AOWIS_NATIVE_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. The project catalogue and HTTP route integration suites are included when their dependencies are enabled.
+When `AOWIS_DVMDB_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. The project catalogue and HTTP route integration suites are included when their dependencies are enabled.
 
-Useful CMake targets include `AOWIS::NativeModelCodec` and `AOWIS::NativeHydraulic`. The public namespaces are `aowis::native` and `aowis::native::hydraulic`.
+Useful CMake targets include `AOWIS::DvmdbModelCodec` and `AOWIS::DvmdbHydraulic`. The public namespaces are `aowis::dvmdb` and `aowis::dvmdb::hydraulic`.
 
 ### Native C++ API
 
 ```cpp
-#include <aowis/native/native_store.h>
-#include <aowis/native/hydraulic_network_persistence.h>
+#include <aowis/dvmdb/native_store.h>
+#include <aowis/dvmdb/hydraulic_network_persistence.h>
 
 // Use the native repository directly from C++.
-aowis::native::Repository repository("/path/to/repository");
+aowis::dvmdb::Repository repository("/path/to/repository");
 repository.createBranch("main");
-// Use aowis::native::hydraulic::saveHydraulicNetwork(),
+// Use aowis::dvmdb::hydraulic::saveHydraulicNetwork(),
 // loadHydraulicNetwork(), editHydraulicNetwork() and mergeHydraulicBranches()
 // with the canonical AOWIS NetworkHydraulic model.
 ```
 
-Engine failures, including hydraulic load failures, are `aowis::native::StorageError` exceptions (see `include/aowis/native/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
+Engine failures, including hydraulic load failures, are `aowis::dvmdb::StorageError` exceptions (see `include/aowis/dvmdb/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
 
-The project catalogue is also available as `AOWIS::NativeProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-dvmdb` (binds to 127.0.0.1:8755, project storage `./aowis-dvmdb-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
+The project catalogue is also available as `AOWIS::DvmdbProjectService` without a Qt dependency. To start the HTTP service with defaults use `./build-linux/aowis-server-dvmdb` (binds to 127.0.0.1:8755, project storage `./aowis-dvmdb-data`); see [service documentation](docs/native-database-service.md) for INI/CLI options, systemd deployment and API operations. The [OpenAPI contract](docs/dvmdb-http-api.yaml) documents implemented routes.
 
 For model semantics, query APIs and safe indexed edit rules, see [hydraulic persistence](docs/native-hydraulic-network.md). For branch/revision operations, see [revision history](docs/native-revision-history.md), [native merging](docs/native-branch-merging.md) and [hydraulic merging](docs/native-hydraulic-merging.md).
 
@@ -131,20 +131,20 @@ For model semantics, query APIs and safe indexed edit rules, see [hydraulic pers
 Each repository uses an append-only content pack and rebuildable index. Each model-indexed revision stores both its model-object Merkle root and a persistent reverse-reference Merkle root. Changes become visible when a durable branch reference is published; earlier revisions remain immutable. The pack is the sole supported physical repository format. An obsolete experimental block repository is rejected rather than silently opened as a pack; export such a pre-release repository with its compatible older executable and import its bundle into a fresh pack repository.
 
 ```bash
-./build-linux/aowis-native-verify /path/to/repository             # full (default)
-./build-linux/aowis-native-verify --physical /path/to/repository  # physical only
-./build-linux/aowis-native-compact /path/to/repository
+./build-linux/aowis-dvmdb-verify /path/to/repository             # full (default)
+./build-linux/aowis-dvmdb-verify --physical /path/to/repository  # physical only
+./build-linux/aowis-dvmdb-compact /path/to/repository
 ```
 
-`aowis-native-verify` now performs complete **native storage** verification by default: physical objects, published branch/revision ancestry, canonical Merkle trees, and exact model-to-reverse-reference consistency. The optional `--physical` mode checks only physical stored objects. Bundle imports reuse the same logical validator, rejecting malformed history before publication. This does not yet check application-specific hydraulic semantics. See [repository verification](docs/repository-verification.md). Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md).
+`aowis-dvmdb-verify` now performs complete **native storage** verification by default: physical objects, published branch/revision ancestry, canonical Merkle trees, and exact model-to-reverse-reference consistency. The optional `--physical` mode checks only physical stored objects. Bundle imports reuse the same logical validator, rejecting malformed history before publication. This does not yet check application-specific hydraulic semantics. See [repository verification](docs/repository-verification.md). Compaction retains objects reachable from all branch heads and their full parent histories and reclaims unreachable objects. **Compaction is offline** and requires exclusive access; close all repository handles first. See [storage architecture](docs/architecture.md).
 
 For whole-service **offline** backups and verified restores, use
-`tools/offline_backup.py` with a freshly built `aowis-native-verify`. The
+`tools/offline_backup.py` with a freshly built `aowis-dvmdb-verify`. The
 utility refuses active server/repository handles and publishes only a complete
 verified copy under a new directory name. See [operations](docs/operations.md)
-for commands and limitations. The `aowis-native-offline-backup-tests` CTest
+for commands and limitations. The `aowis-dvmdb-offline-backup-tests` CTest
 covers multiple projects, branches, active-user refusal and independent restore.
-The `aowis-native-upgrade-restore-tests` drill additionally checks a complete
+The `aowis-dvmdb-upgrade-restore-tests` drill additionally checks a complete
 cold relocation containing frozen historical packs, divergent branches and
 post-upgrade writes, including a second backup/restore cycle.
 
@@ -155,9 +155,9 @@ The binary repository format is not yet frozen for the first public release. A f
 Portable bundles exchange immutable branches between independent repositories, without transferring physical storage pages. Import verifies the graph before creating or fast-forwarding a branch and **never silently overwrites divergent work**.
 
 ```bash
-./build-linux/aowis-native-sync export \
+./build-linux/aowis-dvmdb-sync export \
   /path/to/source main /tmp/main.aowbundle
-./build-linux/aowis-native-sync import \
+./build-linux/aowis-dvmdb-sync import \
   /path/to/destination /tmp/main.aowbundle remote_main
 ```
 
@@ -169,17 +169,17 @@ Every benchmark creates its own repository. Supply a **nonexistent child directo
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-dvmdb-bench.XXXXXXXX)"
-./build-linux/aowis-native-hydraulic-edit-benchmark \
+./build-linux/aowis-dvmdb-hydraulic-edit-benchmark \
   "$run_root/repository" 100000 20 3
 ```
 
-The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. A dedicated `aowis-native-merge-history-benchmark` measures ancestry/diff/conflict processing without a durable merge commit, using configurable shared/divergent histories. The `tools/benchmark_native_index.py` driver separately measures pack-index reopen, RAM, lookup, sidecar rebuild, writes, compaction, and multiple open projects at configurable physical object counts. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
+The hydraulic edit benchmark reports import time, indexed edit/merge-related operation timings, membership chunk count and `peak_rss_kib`. It exercises real canonical model structures. A dedicated `aowis-dvmdb-merge-history-benchmark` measures ancestry/diff/conflict processing without a durable merge commit, using configurable shared/divergent histories. The `tools/benchmark_native_index.py` driver separately measures pack-index reopen, RAM, lookup, sidecar rebuild, writes, compaction, and multiple open projects at configurable physical object counts. Separate low-level synthetic storage and model benchmarks are also available. Treat results as workload-specific and measure verification, durability and memory as well as latency. See [benchmark methodology](docs/benchmark-plan.md).
 
 ## Recovery testing and operational limits
 
-The native test suite includes `aowis-native-recovery-tests`. It links a **separate test-only build** of the engine with deterministic fault checkpoints; ordinary library/server binaries contain no environment-variable crash hooks. The tests inject process exits, simulated `ENOSPC` and partial writes across object append, synchronization, branch publication, incremental import and compaction. They verify recovered physical/logical integrity, immutable model references, derived-index rebuilding and subsequent writes. An error **after** an atomic branch-ref rename can mean the operation already took effect: reopen the repository and inspect its head before retrying. An interrupted compaction **after** generation-pointer publication requires reopening the handle. External backups must be made with repository handles closed, or from a separately coordinated filesystem snapshot, and fully verified after restore. See the [operator recovery and backup runbook](docs/operations.md) for coordinated snapshots, disk-full response, publication ambiguity and offline compaction.
+The native test suite includes `aowis-dvmdb-recovery-tests`. It links a **separate test-only build** of the engine with deterministic fault checkpoints; ordinary library/server binaries contain no environment-variable crash hooks. The tests inject process exits, simulated `ENOSPC` and partial writes across object append, synchronization, branch publication, incremental import and compaction. They verify recovered physical/logical integrity, immutable model references, derived-index rebuilding and subsequent writes. An error **after** an atomic branch-ref rename can mean the operation already took effect: reopen the repository and inspect its head before retrying. An interrupted compaction **after** generation-pointer publication requires reopening the handle. External backups must be made with repository handles closed, or from a separately coordinated filesystem snapshot, and fully verified after restore. See the [operator recovery and backup runbook](docs/operations.md) for coordinated snapshots, disk-full response, publication ambiguity and offline compaction.
 
-A separate `aowis-native-physical-enospc-tests` CTest uses the **production**
+A separate `aowis-dvmdb-physical-enospc-tests` CTest uses the **production**
 native library on a private 32 MiB Linux tmpfs. It forces actual kernel ENOSPC
 while committing, exporting and importing, then checks published heads,
 repository reopening and retries. It skips explicitly where user/mount
@@ -198,12 +198,13 @@ The chosen server design is:
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
 - File-based synchronization and direct native C++ library access remain supported alongside the HTTP project service.
 
-The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /api/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for incremental download); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/dvmdb-http-api.yaml) and the [roadmap](docs/roadmap.md).
+The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for incremental download); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/dvmdb-http-api.yaml) and the [roadmap](docs/roadmap.md).
 
 ## Documentation
 
 | Document | Subject |
 |---|---|
+| [DVMDB migration](docs/dvmdb-rename-migration.md) | Public API and deployment rename; storage-format boundary |
 | [Architecture](docs/architecture.md) | Logical storage, physical formats, durability and limits |
 | [REST API design](docs/rest-api-design.md) | Agreed service boundaries, proposed resources and wire contracts |
 | [Roadmap](docs/roadmap.md) | Remaining implementation work |
@@ -240,7 +241,7 @@ durability drill, not a default CTest. The longer drills are opt-in:
 ./qualify_vm_powercut_docker.sh --rounds 4
 
 # Five-minute real-process HTTP mixed import/export soak:
-./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
+./build-linux-tests-release/aowis-dvmdb-http-transfer-stress-tests \
   --soak-seconds 300 ./build-linux-tests-release/aowis-server-dvmdb
 
 # Same soak with Linux RSS/CPU/FD evidence in a new run directory:

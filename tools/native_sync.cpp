@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <exception>
 #include <iostream>
@@ -8,16 +8,16 @@
 
 namespace {
 
-using aowis::native::BundleImportResult;
-using aowis::native::BundleImportStatus;
-using aowis::native::Repository;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::Repository;
 
 void usage() {
     std::cerr <<
-        "Usage: aowis-native-sync head REPOSITORY BRANCH\n"
-        "       aowis-native-sync export REPOSITORY BRANCH BUNDLE\n"
-        "       aowis-native-sync export-incremental REPOSITORY BRANCH BASE_REVISION BUNDLE\n"
-        "       aowis-native-sync import REPOSITORY BUNDLE LOCAL_BRANCH\n";
+        "Usage: aowis-dvmdb-sync head REPOSITORY BRANCH\n"
+        "       aowis-dvmdb-sync export REPOSITORY BRANCH BUNDLE\n"
+        "       aowis-dvmdb-sync export-incremental REPOSITORY BRANCH BASE_REVISION BUNDLE\n"
+        "       aowis-dvmdb-sync import REPOSITORY BUNDLE LOCAL_BRANCH\n";
 }
 
 } // namespace
@@ -35,10 +35,10 @@ int main(int argc, char** argv) {
         }
         Repository repository(argv[2]);
         if (command == "head") {
-            std::cout << aowis::native::toHex(repository.head(argv[3]).id) << '\n';
+            std::cout << aowis::dvmdb::toHex(repository.head(argv[3]).id) << '\n';
         } else if (command == "export-incremental") {
             repository.exportIncrementalBranchBundle(
-                argv[3], aowis::native::fromHex(argv[4]), argv[5]);
+                argv[3], aowis::dvmdb::fromHex(argv[4]), argv[5]);
             std::cout << "exported incremental branch " << argv[3] << " to " << argv[5] << '\n';
         } else if (command == "export") {
             repository.exportBranchBundle(argv[3], argv[4]);
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
                 "created" : result.status == BundleImportStatus::FastForward ?
                 "fast-forward" : "already up-to-date";
             std::cout << outcome << " " << argv[4] << " at " <<
-                aowis::native::toHex(result.head) << ", imported " <<
+                aowis::dvmdb::toHex(result.head) << ", imported " <<
                 result.objectsImported << " objects\n";
         }
         return 0;

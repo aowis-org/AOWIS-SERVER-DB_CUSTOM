@@ -1,12 +1,12 @@
-#include "aowis/native/model_codec_adapter.h"
-#include "aowis/native/storage_error.h"
+#include "aowis/dvmdb/model_codec_adapter.h"
+#include "aowis/dvmdb/storage_error.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <utility>
 #include <limits>
 
-namespace aowis::native::hydraulic {
+namespace aowis::dvmdb::hydraulic {
 
 Key keyFromUuid(const QUuid& uuid) {
     const QByteArray raw = uuid.toRfc4122();
@@ -46,7 +46,7 @@ QByteArray qByteArrayFromBytes(const Bytes& data) {
 ModelChange changeFor(const HydraulicNodeJunction& junction) {
     ModelRecord record;
     record.kind = junctionKind;
-    record.payload = bytesFromQByteArray(aowis::native::ModelCodec<HydraulicNodeJunction>::encode(junction));
+    record.payload = bytesFromQByteArray(aowis::dvmdb::ModelCodec<HydraulicNodeJunction>::encode(junction));
     if (record.payload.empty()) throw StorageError(StorageErrorKind::InvalidInput, "junction has a non-finite number or an undeclared enumerator");
     return ModelChange{keyFromUuid(junction.uuid), std::move(record)};
 }
@@ -56,7 +56,7 @@ ModelChange changeFor(const HydraulicLinkPipe& pipe) {
     record.kind = pipeKind;
     record.references.push_back(keyFromUuid(pipe.node_uuid_from));
     record.references.push_back(keyFromUuid(pipe.node_uuid_to));
-    record.payload = bytesFromQByteArray(aowis::native::ModelCodec<HydraulicLinkPipe>::encode(pipe));
+    record.payload = bytesFromQByteArray(aowis::dvmdb::ModelCodec<HydraulicLinkPipe>::encode(pipe));
     if (record.payload.empty()) throw StorageError(StorageErrorKind::InvalidInput, "pipe has a non-finite number or an undeclared enumerator");
     return ModelChange{keyFromUuid(pipe.uuid), std::move(record)};
 }
@@ -71,7 +71,7 @@ std::optional<HydraulicNodeJunction> readJunction(Repository& store,
         return std::nullopt;
     }
     std::optional<HydraulicNodeJunction> result =
-        aowis::native::ModelCodec<HydraulicNodeJunction>::decode(qByteArrayFromBytes(record->payload), error);
+        aowis::dvmdb::ModelCodec<HydraulicNodeJunction>::decode(qByteArrayFromBytes(record->payload), error);
     if (result && result->uuid != uuidFromKey(key)) {
         if (error) *error = QStringLiteral("Model record UUID differs from its tree key");
         return std::nullopt;
@@ -89,7 +89,7 @@ std::optional<HydraulicLinkPipe> readPipe(Repository& store,
         return std::nullopt;
     }
     std::optional<HydraulicLinkPipe> result =
-        aowis::native::ModelCodec<HydraulicLinkPipe>::decode(qByteArrayFromBytes(record->payload), error);
+        aowis::dvmdb::ModelCodec<HydraulicLinkPipe>::decode(qByteArrayFromBytes(record->payload), error);
     if (result) {
         if (result->uuid != uuidFromKey(key) ||
             result->node_uuid_from.isNull() || result->node_uuid_to.isNull()) {
@@ -108,4 +108,4 @@ std::optional<HydraulicLinkPipe> readPipe(Repository& store,
     return result;
 }
 
-}  // namespace aowis::native::hydraulic
+}  // namespace aowis::dvmdb::hydraulic

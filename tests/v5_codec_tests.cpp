@@ -1,4 +1,4 @@
-#include "aowis/native/model_codec_adapter.h"
+#include "aowis/dvmdb/model_codec_adapter.h"
 
 #include <QCoreApplication>
 #include <QDate>
@@ -13,11 +13,11 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::Repository;
-namespace hydraulic = aowis::native::hydraulic;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::Repository;
+namespace hydraulic = aowis::dvmdb::hydraulic;
 
 void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -35,7 +35,7 @@ QUuid fixedUuid(std::uint8_t kind, std::uint64_t ordinal) {
 }
 
 std::filesystem::path uniqueDirectory() {
-    std::string pattern = (std::filesystem::temp_directory_path() / "aowis-native-codec-test-XXXXXX").string();
+    std::string pattern = (std::filesystem::temp_directory_path() / "aowis-dvmdb-codec-test-XXXXXX").string();
     std::vector<char> name(pattern.begin(), pattern.end());
     name.push_back('\0');
     char* directory = ::mkdtemp(name.data());
@@ -66,10 +66,10 @@ void testCanonicalCodecAndRepository() {
         pipe.diameter_mm = 90.625;
         pipe.roughness_darcy_weisbach_mm = 0.025;
         const Bytes expectedA = hydraulic::bytesFromQByteArray(
-            aowis::native::ModelCodec<HydraulicNodeJunction>::encode(a));
+            aowis::dvmdb::ModelCodec<HydraulicNodeJunction>::encode(a));
         expect(!expectedA.empty(), "native model codec returned empty junction");
         expect(hydraulic::qByteArrayFromBytes(expectedA) ==
-               aowis::native::ModelCodec<HydraulicNodeJunction>::encode(a),
+               aowis::dvmdb::ModelCodec<HydraulicNodeJunction>::encode(a),
                "canonical codec bytes changed on roundtrip");
         expect(hydraulic::uuidFromKey(hydraulic::keyFromUuid(idA)) == idA,
                "UUID key transform inconsistent");
@@ -78,7 +78,7 @@ void testCanonicalCodecAndRepository() {
             store.createBranch("main");
             const std::vector<ModelChange> changes{hydraulic::changeFor(a), hydraulic::changeFor(b), hydraulic::changeFor(pipe)};
             store.commitModel("main", changes);
-            const std::optional<aowis::native::ModelRecord> stored = store.getModel("main", hydraulic::keyFromUuid(idA));
+            const std::optional<aowis::dvmdb::ModelRecord> stored = store.getModel("main", hydraulic::keyFromUuid(idA));
             expect(stored.has_value() && stored->kind == hydraulic::junctionKind &&
                    stored->payload == expectedA, "native store modified canonical native model bytes");
             QString error;

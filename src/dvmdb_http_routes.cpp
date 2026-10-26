@@ -1,8 +1,8 @@
-#include "aowis/native/db_http_routes.h"
-#include "aowis/native/storage_error.h"
+#include "aowis/dvmdb/dvmdb_http_routes.h"
+#include "aowis/dvmdb/storage_error.h"
 
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
-#include "aowis/native/hydraulic_network_persistence.h"
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+#include "aowis/dvmdb/hydraulic_network_persistence.h"
 #include <QByteArray>
 #include <variant>
 #include <type_traits>
@@ -37,7 +37,7 @@
 #include <utility>
 #include <vector>
 
-namespace aowis::native::http {
+namespace aowis::dvmdb::http {
 namespace {
 
 // Response size bounds of list-like routes; larger results return 413 and
@@ -48,12 +48,12 @@ constexpr std::size_t maxHttpEntityIds = 10000;
 const char* const bundleMime = "application/vnd.aowis.bundle";
 
 // Exact route patterns (also used to select per-route JSON body limits).
-const char* const routeProjects = "/api/v1/projects";
-const char* const routeBranches = "/api/v1/projects/:id/branches";
-const char* const routeBundle = "/api/v1/projects/:id/branches/:branch/bundle";
-const char* const routeMerges = "/api/v1/projects/:id/merges";
-const char* const routeNetworks = "/api/v1/projects/:id/branches/:branch/networks";
-const char* const routeEdits = "/api/v1/projects/:id/branches/:branch/networks/:network/edits";
+const char* const routeProjects = "/dvmdb/v1/projects";
+const char* const routeBranches = "/dvmdb/v1/projects/:id/branches";
+const char* const routeBundle = "/dvmdb/v1/projects/:id/branches/:branch/bundle";
+const char* const routeMerges = "/dvmdb/v1/projects/:id/merges";
+const char* const routeNetworks = "/dvmdb/v1/projects/:id/branches/:branch/networks";
+const char* const routeEdits = "/dvmdb/v1/projects/:id/branches/:branch/networks/:network/edits";
 
 // A handled request produces a JSON body and a status.
 struct Reply {
@@ -269,7 +269,7 @@ std::uint64_t descriptorSize(int fd) {
     return static_cast<std::uint64_t>(data.st_size);
 }
 
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
 using HydraulicEntity = hydraulic::HydraulicEntity;
 
 QUuid parseUuid(const std::string& value) {
@@ -568,11 +568,11 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
     });
 }
 
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
 void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
     // Snapshot-pinned complete hydraulic network. NetworkHydraulic uses the
     // shared canonical model codec, never a second JSON field serializer.
-    server.Get("/api/v1/projects/:id/branches/:branch/networks/:network",
+    server.Get("/dvmdb/v1/projects/:id/branches/:branch/networks/:network",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
@@ -612,7 +612,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             return Reply{201, revisionJson(committed)};
         });
     });
-    server.Get("/api/v1/projects/:id/branches/:branch/networks/:network/entities",
+    server.Get("/dvmdb/v1/projects/:id/branches/:branch/networks/:network/entities",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
@@ -637,7 +637,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             return Reply{200, result};
         });
     });
-    server.Get("/api/v1/projects/:id/branches/:branch/networks/:network/entities/:entity",
+    server.Get("/dvmdb/v1/projects/:id/branches/:branch/networks/:network/entities/:entity",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
@@ -813,10 +813,10 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         return httplib::Server::HandlerResponse::Handled;
     });
 
-    server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& response) {
+    server.Get("/dvmdb/v1/health", [](const httplib::Request&, httplib::Response& response) {
         send(response, Reply{200, QJsonObject{{"status", QStringLiteral("ok")}}});
     });
-    server.Get("/api/v1/ready", [&service](const httplib::Request&, httplib::Response& response) {
+    server.Get("/dvmdb/v1/ready", [&service](const httplib::Request&, httplib::Response& response) {
         guarded(response, [&]() {
             (void)service.listProjects();
             return Reply{200, QJsonObject{{"status", QStringLiteral("ready")}}};
@@ -837,7 +837,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{201, projectJson(service.createProject(requiredString(object, "name")))};
         });
     });
-    server.Get("/api/v1/projects/:id", [&service](const httplib::Request& request,
+    server.Get("/dvmdb/v1/projects/:id", [&service](const httplib::Request& request,
                                                   httplib::Response& response) {
         guarded(response, [&]() {
             return Reply{200, projectJson(service.project(pathParam(request, "id")))};
@@ -868,14 +868,14 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                                                 branchView, revision))};
         });
     });
-    server.Get("/api/v1/projects/:id/branches/:branch/head",
+    server.Get("/dvmdb/v1/projects/:id/branches/:branch/head",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             return Reply{200, revisionJson(service.head(pathParam(request, "id"),
                                                         pathParam(request, "branch")))};
         });
     });
-    server.Get("/api/v1/projects/:id/branches/:branch/history",
+    server.Get("/dvmdb/v1/projects/:id/branches/:branch/history",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             std::size_t limit = 100;
@@ -894,7 +894,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, QJsonObject{{"revisions", revisions}}};
         });
     });
-    server.Get("/api/v1/projects/:id/revisions/:hash",
+    server.Get("/dvmdb/v1/projects/:id/revisions/:hash",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             return Reply{200, revisionJson(service.revision(pathParam(request, "id"),
@@ -902,7 +902,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         });
     });
     // Diffs are immutable revision-to-revision comparisons, never two moving heads.
-    server.Get("/api/v1/projects/:id/diff", [&service](const httplib::Request& request,
+    server.Get("/dvmdb/v1/projects/:id/diff", [&service](const httplib::Request& request,
                                                       httplib::Response& response) {
         guarded(response, [&]() {
             const std::optional<std::string> fromText = queryValue(request, "from");
@@ -926,9 +926,9 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                           {"changes", differences}}};
         });
     });
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
     registerHydraulicRoutes(server, service);
 #endif
 }
 
-} // namespace aowis::native::http
+} // namespace aowis::dvmdb::http

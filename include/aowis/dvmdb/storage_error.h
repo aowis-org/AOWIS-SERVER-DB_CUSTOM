@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 
 // Classified failure of the native engine and its model layers. Callers map
 // the kind, never the message text, to their own error model (for example
@@ -63,4 +63,4 @@ inline StorageErrorKind storageErrorKindForErrno(int error) noexcept {
                        operation + ": " + std::strerror(error));
 }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

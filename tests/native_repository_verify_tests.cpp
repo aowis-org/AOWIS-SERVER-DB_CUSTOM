@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <array>
@@ -19,12 +19,12 @@
 #include <vector>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::VerificationReport;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::VerificationReport;
 
 void expect(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -63,13 +63,13 @@ void appendU64(Bytes& bytes, std::uint64_t value) {
 struct ForgedObjects {
     std::map<Hash, Bytes> entries;
     Hash add(const Bytes& bytes) {
-        const Hash hash = aowis::native::sha256(bytes);
+        const Hash hash = aowis::dvmdb::sha256(bytes);
         this->entries.emplace(hash, bytes);
         return hash;
     }
     Hash modelValue(const std::vector<Key>& refs) {
         Bytes raw{'V'};
-        const Bytes encoded = aowis::native::encodeModelRecord(
+        const Bytes encoded = aowis::dvmdb::encodeModelRecord(
             ModelRecord{1, refs, Bytes{'p', 'a', 'y', 'l', 'o', 'a', 'd'}});
         raw.insert(raw.end(), encoded.begin(), encoded.end());
         return add(raw);
@@ -133,7 +133,7 @@ void inject(const std::filesystem::path& directory,
 }
 void repoint(const std::filesystem::path& directory, const Hash& tip) {
     std::ofstream output(directory / "refs" / "heads" / "stable", std::ios::binary | std::ios::trunc);
-    output << aowis::native::toHex(tip) << '\n';
+    output << aowis::dvmdb::toHex(tip) << '\n';
     expect(output.good(), "cannot write forged ref");
 }
 
@@ -157,7 +157,7 @@ Hash makeBadHistory(ForgedObjects& objects, Fault fault, const Hash& goodHead) {
     case Fault::WrongChildSlot:
         return objects.revision(objects.branch(leafOne, leafTwo, 3), Hash{}, false, goodHead);
     case Fault::MissingRawValue: {
-        const Hash missing = aowis::native::sha256(Bytes{'V', 'a', 'b', 's', 'e', 'n', 't'});
+        const Hash missing = aowis::dvmdb::sha256(Bytes{'V', 'a', 'b', 's', 'e', 'n', 't'});
         return objects.revision(objects.leaf(key(1), missing), Hash{}, false, goodHead);
     }
     case Fault::InconsistentReferenceIndex: {
@@ -185,7 +185,7 @@ Hash makeBadHistory(ForgedObjects& objects, Fault fault, const Hash& goodHead) {
         return objects.revision(leafOne, Hash{}, false, badParent);
     }
     case Fault::MissingRevision:
-        return aowis::native::sha256(Bytes{'S', 'm', 'i', 's', 's', 'i', 'n', 'g'});
+        return aowis::dvmdb::sha256(Bytes{'S', 'm', 'i', 's', 's', 'i', 'n', 'g'});
     case Fault::InvalidRevisionMetadata: {
         Bytes bytes{'S'};
         appendHash(bytes, leafOne);
@@ -263,8 +263,8 @@ void testValidHistories() {
     repo.createBranch("feature", "main");
     (void)repo.commitModel("feature", {{key(3), ModelRecord{1, {key(1)}, Bytes{'c'}}}});
     (void)repo.commitModel("main", {{key(4), ModelRecord{1, {key(2)}, Bytes{'d'}}}});
-    const aowis::native::MergeResult merge = repo.mergeBranches("main", "feature");
-    expect(merge.status == aowis::native::MergeStatus::Merged &&
+    const aowis::dvmdb::MergeResult merge = repo.mergeBranches("main", "feature");
+    expect(merge.status == aowis::dvmdb::MergeStatus::Merged &&
            merge.revision.parents.size() == 2, "test fixture did not produce merge");
     const VerificationReport result = repo.verifyRepository();
     expect(result.branches == 2 && result.revisions >= 5 &&
@@ -373,7 +373,7 @@ void testCli(const std::string& executable) {
     // Repoint the actual branch to the forged tip; invalid content remains checksum-correct.
     {
         std::ofstream output(directory / "refs" / "heads" / "main", std::ios::trunc);
-        output << aowis::native::toHex(bad) << '\n';
+        output << aowis::dvmdb::toHex(bad) << '\n';
     }
     expect(runCli(executable, directory, "--physical") == 0 &&
            runCli(executable, directory, "--full") == 1 &&

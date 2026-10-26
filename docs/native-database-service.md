@@ -1,6 +1,6 @@
 # Native database HTTP/TCP service
 
-`aowis-server-dvmdb` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::NativeProjectService` and `AOWIS::NativeHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
+`aowis-server-dvmdb` hosts independent AOWIS versioned project repositories in one process. The REST transport uses the vendored cpp-httplib (`external/cpp-httplib`, pinned v0.60.1) with a worker thread pool; the project catalogue, repository manager and native storage library are callable directly from C++ (via `AOWIS::DvmdbProjectService` and `AOWIS::DvmdbHydraulic`) with no network connection. The underlying native storage engine remains Qt-free.
 
 ## Build
 
@@ -11,7 +11,7 @@ With Qt6 Core installed (Qt Network/HttpServer are not needed), run:
 ./compile_linux_tests.sh --both
 ```
 
-`AOWIS_NATIVE_WITH_HTTP_SERVER=ON` builds the executable and HTTP integration tests (the default when the model codec is enabled). A native-only build uses `-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF -DAOWIS_NATIVE_WITH_HTTP_SERVER=OFF`.
+`AOWIS_DVMDB_WITH_HTTP_SERVER=ON` builds the executable and HTTP integration tests (the default when the model codec is enabled). A native-only build uses `-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF -DAOWIS_DVMDB_WITH_HTTP_SERVER=OFF`.
 
 ## Run
 
@@ -35,7 +35,7 @@ until the new service has been verified against expected project IDs, branch
 heads and representative historical reads. No HTTP API or physical pack
 format IDs were renamed.
 
-The service listens on plain HTTP, **without TLS, authentication or authorization**. Expose it only on deliberately trusted networks. A cross-AOWIS security design is planned separately. Health: `GET /api/v1/health`; readiness: `GET /api/v1/ready`.
+The service listens on plain HTTP, **without TLS, authentication or authorization**. Expose it only on deliberately trusted networks. A cross-AOWIS security design is planned separately. Health: `GET /dvmdb/v1/health`; readiness: `GET /dvmdb/v1/ready`.
 
 ## Project catalogue and lifecycle
 
@@ -43,7 +43,7 @@ The service root contains a lifetime-locked `catalogue.lock` and a `projects/` d
 
 An interrupted creation may leave a `.creating-...` directory which startup ignores. Incomplete staging directories are not considered projects; administrators may remove them while the server is shut down after inspecting them. Once published, valid manifests are required: startup fails on damaged or unexpected catalogue entries rather than silently ignoring projects. The catalogue is locked exclusively across processes. The service retains at most one native `Repository` handle per project and closes them on shutdown, so all HTTP operations reuse a managed repository handle.
 
-**Concurrency.** Projects never wait for each other. The catalogue lock guards only the project list; each project's repository opens on first use under that project's own lock. Scoped operations of one project (saves, edits, merges, bundle imports and exports, branch creation) run one at a time; single reads (head, history, revision, branch list) take no operation lock. At most `[server] max_pending_per_project` scoped operations of one project may wait or run at once (default half of `worker_threads`, range 1..`worker_threads`, CLI `--max-pending-per-project`); further requests for that project get 503 `busy` with `Retry-After: 1`, a bundle upload before its body is read. This keeps workers free for other projects, `/api/v1/health` and `/api/v1/ready`. Do not run offline compaction while the service has a repository open. All projects use the pack format.
+**Concurrency.** Projects never wait for each other. The catalogue lock guards only the project list; each project's repository opens on first use under that project's own lock. Scoped operations of one project (saves, edits, merges, bundle imports and exports, branch creation) run one at a time; single reads (head, history, revision, branch list) take no operation lock. At most `[server] max_pending_per_project` scoped operations of one project may wait or run at once (default half of `worker_threads`, range 1..`worker_threads`, CLI `--max-pending-per-project`); further requests for that project get 503 `busy` with `Retry-After: 1`, a bundle upload before its body is read. This keeps workers free for other projects, `/dvmdb/v1/health` and `/dvmdb/v1/ready`. Do not run offline compaction while the service has a repository open. All projects use the pack format.
 
 If a disk error occurs immediately after catalogue publication, the service fails closed for subsequent operations; restart recovers the published directory if it exists and is complete. Project deletion and renaming are not exposed in this milestone.
 
@@ -53,34 +53,34 @@ See the machine-readable [OpenAPI contract](dvmdb-http-api.yaml) for request/res
 
 | Method | Path | Result |
 |---|---|---|
-| GET | `/api/v1/health`, `/api/v1/ready` | Process and catalogue checks |
-| GET, POST | `/api/v1/projects` | List and create projects |
-| GET | `/api/v1/projects/{projectId}` | Read project metadata |
-| GET, POST | `/api/v1/projects/{projectId}/branches` | List and create/fork branches |
-| GET | `/api/v1/projects/{projectId}/branches/{branch}/head` | Read current revision |
-| GET | `/api/v1/projects/{projectId}/branches/{branch}/history` | First-parent revision history (limit 1–1000, optional exclusive `after` cursor) |
-| GET | `/api/v1/projects/{projectId}/revisions/{revisionHash}` | Read immutable revision metadata |
-| GET | `/api/v1/projects/{projectId}/diff?from={hash}&to={hash}` | Immutable object diff, up to 1000 changed UUIDs |
-| GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` | Complete revision-pinned hydraulic network |
-| POST | `/api/v1/projects/{projectId}/branches/{branch}/networks` | Validated, atomic full-network save |
-| GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type={ordinal}` | Ordered UUIDs of one collection (up to 10000) |
-| GET | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` | Revision-pinned targeted entity |
-| POST | `/api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` | Atomic validated entity edits, up to 128 changes |
-| POST | `/api/v1/projects/{projectId}/merges` | Semantic hydraulic three-way merge and explicit conflict choices |
-| GET | `/api/v1/projects/{projectId}/branches/{branch}/bundle[?base={revisionHash}]` | Binary full or incremental snapshot export |
-| POST | `/api/v1/projects/{projectId}/branches/{branch}/bundle` | Binary branch import; fast-forward or idempotent retry |
+| GET | `/dvmdb/v1/health`, `/dvmdb/v1/ready` | Process and catalogue checks |
+| GET, POST | `/dvmdb/v1/projects` | List and create projects |
+| GET | `/dvmdb/v1/projects/{projectId}` | Read project metadata |
+| GET, POST | `/dvmdb/v1/projects/{projectId}/branches` | List and create/fork branches |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/head` | Read current revision |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/history` | First-parent revision history (limit 1–1000, optional exclusive `after` cursor) |
+| GET | `/dvmdb/v1/projects/{projectId}/revisions/{revisionHash}` | Read immutable revision metadata |
+| GET | `/dvmdb/v1/projects/{projectId}/diff?from={hash}&to={hash}` | Immutable object diff, up to 1000 changed UUIDs |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` | Complete revision-pinned hydraulic network |
+| POST | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks` | Validated, atomic full-network save |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type={ordinal}` | Ordered UUIDs of one collection (up to 10000) |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` | Revision-pinned targeted entity |
+| POST | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` | Atomic validated entity edits, up to 128 changes |
+| POST | `/dvmdb/v1/projects/{projectId}/merges` | Semantic hydraulic three-way merge and explicit conflict choices |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/bundle[?base={revisionHash}]` | Binary full or incremental snapshot export |
+| POST | `/dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` | Binary branch import; fast-forward or idempotent retry |
 
 Example:
 
 ```bash
-curl -sS http://127.0.0.1:8755/api/v1/health
+curl -sS http://127.0.0.1:8755/dvmdb/v1/health
 curl -sS -H 'Content-Type: application/json' -d '{"name":"Water Distribution"}' \
-  http://127.0.0.1:8755/api/v1/projects
+  http://127.0.0.1:8755/dvmdb/v1/projects
 ```
 
 Project creation accepts `{"name":"..."}`; any other field is rejected (400). Creating a branch accepts `{"name":"scenario"}` (new independent raw history), `{"name":"scenario","fromBranch":"main"}` (fork current head) or `{"name":"scenario","fromBranch":"main","revision":"<64-character-hash>"}` (fork a particular reachable revision). A historical fork never changes the source branch. Branch names are `[A-Za-z0-9_-]`, maximum 96 characters; project IDs are lowercase UUIDs. JSON mutation bodies are limited per route (see request limits below) before they are read. Responses use JSON and include machine-readable error codes.
 
-**Error model.** The engine raises `aowis::native::StorageError` (a `std::runtime_error`) carrying a `StorageErrorKind`; the service maps the kind, never message text: `InvalidInput` 400 `invalid_request`, `NotFound` 404 `not_found`, `Conflict` 409 `conflict`, `LimitExceeded` 413 `limit_exceeded`, `Unavailable` 503 `unavailable` (a full project queue is 503 `busy` with `Retry-After`), `ResourceExhausted` (ENOSPC/EDQUOT) 507 `insufficient_storage`, and `Corruption`/`Io`/`Internal` 500 `internal_error`. Client errors return the engine message; 5xx responses return a generic message and the details are logged with the kind (`AOWIS database request failed [corruption]: ...`). A structural defect in an uploaded bundle is `InvalidInput`; the same defect found in the local repository is `Corruption`. `ProjectService` methods keep their contract of reporting client mistakes as `ProjectError`.
+**Error model.** The engine raises `aowis::dvmdb::StorageError` (a `std::runtime_error`) carrying a `StorageErrorKind`; the service maps the kind, never message text: `InvalidInput` 400 `invalid_request`, `NotFound` 404 `not_found`, `Conflict` 409 `conflict`, `LimitExceeded` 413 `limit_exceeded`, `Unavailable` 503 `unavailable` (a full project queue is 503 `busy` with `Retry-After`), `ResourceExhausted` (ENOSPC/EDQUOT) 507 `insufficient_storage`, and `Corruption`/`Io`/`Internal` 500 `internal_error`. Client errors return the engine message; 5xx responses return a generic message and the details are logged with the kind (`AOWIS database request failed [corruption]: ...`). A structural defect in an uploaded bundle is `InvalidInput`; the same defect found in the local repository is `Corruption`. `ProjectService` methods keep their contract of reporting client mistakes as `ProjectError`.
 
 ### Canonical hydraulic API
 
@@ -111,11 +111,11 @@ The service does not yet provide network enumeration, a dry-run merge preview, p
 
 ## Verification and integration tests
 
-`aowis-native-project-service-tests` covers the pack format, catalogue restart, project isolation, staged creation debris, malformed manifests, invalid path/ID inputs, multiple project/branch operations, concurrent creation and cross-process locking; `aowis-native-project-concurrency-tests` covers project independence, per-project serialization, the queue limit and racing writers. When the HTTP server is enabled, `aowis-native-http-tests` exercises the routes over real localhost TCP with Qt Network, including error codes, CRUD, pagination and restart. Both are part of `./compile_linux_tests.sh --both`.
+`aowis-dvmdb-project-service-tests` covers the pack format, catalogue restart, project isolation, staged creation debris, malformed manifests, invalid path/ID inputs, multiple project/branch operations, concurrent creation and cross-process locking; `aowis-dvmdb-project-concurrency-tests` covers project independence, per-project serialization, the queue limit and racing writers. When the HTTP server is enabled, `aowis-dvmdb-http-tests` exercises the routes over real localhost TCP with Qt Network, including error codes, CRUD, pagination and restart. Both are part of `./compile_linux_tests.sh --both`.
 
 ### Portable bundle replication over HTTP
 
-`GET /api/v1/projects/{id}/branches/{branch}/bundle` exports the same validated `.aowbundle` format used by `aowis-native-sync`. Add `?base=<64-character-revision-hash>` to omit immutable objects already reachable from that ancestor. `POST` the binary bundle to the corresponding endpoint on a destination project, choosing a tracking branch if you wish to preserve independent work; import never overwrites divergent history. The response is `{"status":"created|fast_forward|up_to_date","head":"...","objectsImported":N}`. Errors are JSON with 400 for malformed transfer, 409 for divergent history or invalid incremental base, and 413 for transfer ceilings.
+`GET /dvmdb/v1/projects/{id}/branches/{branch}/bundle` exports the same validated `.aowbundle` format used by `aowis-dvmdb-sync`. Add `?base=<64-character-revision-hash>` to omit immutable objects already reachable from that ancestor. `POST` the binary bundle to the corresponding endpoint on a destination project, choosing a tracking branch if you wish to preserve independent work; import never overwrites divergent history. The response is `{"status":"created|fast_forward|up_to_date","head":"...","objectsImported":N}`. Errors are JSON with 400 for malformed transfer, 409 for divergent history or invalid incremental base, and 413 for transfer ceilings.
 
 The `[storage]` INI section also sets `max_internal_scratch_mib` (default 1024 MiB, range 1–16384; command-line `--max-internal-scratch-mib`). It limits the combined logical extent of the native engine's export visited tables, export/reference sort runs, import location indices, verification marks and trie summaries across all projects served by this process. Saturation returns 503 `scratch_busy` with `Retry-After: 1`. Unlike physical ENOSPC (507), quota saturation is transient and releases its reservations when operations finish. This cap does not cover HTTP spools, pack growth, compaction, or other processes and is not a filesystem quota. See [operations](operations.md).
 

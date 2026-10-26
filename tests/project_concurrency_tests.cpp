@@ -1,7 +1,7 @@
 // Review finding F4: projects never wait for each other. The catalogue mutex
 // guards only the project map; each project serializes its own scoped
 // operations and limits how many may queue (ProjectErrorKind::Busy).
-#include "aowis/native/project_service.h"
+#include "aowis/dvmdb/project_service.h"
 
 #include <atomic>
 #include <chrono>
@@ -21,18 +21,18 @@
 #include <vector>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::ProjectError;
-using aowis::native::ProjectErrorKind;
-using aowis::native::ProjectService;
-using aowis::native::Repository;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::ProjectError;
+using aowis::dvmdb::ProjectErrorKind;
+using aowis::dvmdb::ProjectService;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
 using Clock = std::chrono::steady_clock;
 
 void expect(bool value, const std::string& message) {

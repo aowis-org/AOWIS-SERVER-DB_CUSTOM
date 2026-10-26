@@ -1,12 +1,12 @@
-#ifndef AOWIS_NATIVE_MODEL_CODEC_H
-#define AOWIS_NATIVE_MODEL_CODEC_H
+#ifndef AOWIS_DVMDB_MODEL_CODEC_H
+#define AOWIS_DVMDB_MODEL_CODEC_H
 
 #include <optional>
 #include <QByteArray>
 #include <QString>
 #include <aowis/model/hydraulic/network_hydraulic.h>
 
-namespace aowis::native
+namespace aowis::dvmdb
 {
 // Stable, schema-versioned, typed encoding of AOWIS-SERVER-MODEL values.
 // All fields are explicitly listed in src/model_codec.cpp; a new Model field
@@ -353,5 +353,5 @@ template<> struct ModelCodec<WaterQualityWallReaction> final
     static std::optional<WaterQualityWallReaction> decode(const QByteArray &bytes, QString *error = nullptr);
 };
 
-} // namespace aowis::native
-#endif // AOWIS_NATIVE_MODEL_CODEC_H
+} // namespace aowis::dvmdb
+#endif // AOWIS_DVMDB_MODEL_CODEC_H

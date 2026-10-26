@@ -25,7 +25,7 @@ class ReleaseBuildSelectionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.build_dir = Path(self.temp.name) / "build-linux-tests-release"
         self.build_dir.mkdir()
-        self.binary = self.build_dir / "aowis-native-index-scaling-benchmark"
+        self.binary = self.build_dir / "aowis-dvmdb-index-scaling-benchmark"
 
     def configure(self, kind="Release", project=source_root):
         (self.build_dir / "CMakeCache.txt").write_text(

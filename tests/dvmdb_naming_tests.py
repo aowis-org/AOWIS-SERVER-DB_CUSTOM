@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise DVMDB patch naming, archive roots and legacy ZIP entrypoint."""
+"""Exercise canonical AOWIS DVMDB patch names, archive roots, and no legacy entrypoints."""
 
 import argparse
 from pathlib import Path
@@ -26,7 +26,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply-script", type=Path, required=True)
     parser.add_argument("--zip-script", type=Path, required=True)
-    parser.add_argument("--legacy-zip-script", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
     arguments = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="aowis-dvmdb-naming-") as temporary:
@@ -36,20 +36,27 @@ def main() -> None:
         scripts.mkdir(parents=True)
         shutil.copy2(arguments.apply_script, scripts / "apply_patch.sh")
         shutil.copy2(arguments.zip_script, scripts / "zip_dvmdb.sh")
-        shutil.copy2(arguments.legacy_zip_script, scripts / "zip_db.sh")
         (project / ".gitignore").write_text("/.aowis-patch-delete.txt\n", encoding="utf-8")
         (project / "obsolete.txt").write_text("old\n", encoding="utf-8")
+        (project / "legacy_tree").mkdir()
+        (project / "legacy_tree" / "obsolete.txt").write_text("old\n", encoding="utf-8")
         run("git", "init", "-q", str(project))
         run("git", "-C", str(project), "add", "-A")
 
-        # Both supported CLI entrypoints create the new default archive name.
-        run("bash", str(scripts / "zip_db.sh"))
+        # One entrypoint; no compatibility wrapper or old public API paths.
+        assert not (scripts / "zip_db.sh").exists()
+        assert not (arguments.source_root / "tools" / "zip_db.sh").exists()
+        assert not (arguments.source_root / "include" / "aowis" / "native").exists()
+        assert not (arguments.source_root / "include" / "aowis" / "dvmdb" / "db_http_routes.h").exists()
+        assert not (arguments.source_root / "src" / "db_http_routes.cpp").exists()
+        assert (arguments.source_root / "include" / "aowis" / "dvmdb" / "dvmdb_http_routes.h").is_file()
+        assert (arguments.source_root / "src" / "dvmdb_http_routes.cpp").is_file()
+        run("bash", str(scripts / "zip_dvmdb.sh"))
         output = directory / "dvmdb.zip"
-        assert output.is_file(), "legacy ZIP entrypoint did not create dvmdb.zip"
+        assert output.is_file()
         with zipfile.ZipFile(output) as archive:
             assert all(item.startswith("AOWIS-SERVER-DVMDB/")
                        for item in archive.namelist()), "incorrect ZIP root"
-        run("bash", str(scripts / "zip_dvmdb.sh"))
         assert output.is_file()
 
         prefix = "AOWIS-SERVER-DVMDB/"
@@ -68,11 +75,12 @@ def main() -> None:
         valid = directory / "aowis-dvmdb-valid.zip"
         patch_archive(valid, {
             prefix + "new_file.txt": "new\n",
-            prefix + ".aowis-patch-delete.txt": "obsolete.txt\n",
+            prefix + ".aowis-patch-delete.txt": "obsolete.txt\nlegacy_tree/obsolete.txt\n",
         })
         run("bash", str(scripts / "apply_patch.sh"), str(valid))
         assert (project / "new_file.txt").read_text() == "new\n"
         assert not (project / "obsolete.txt").exists(), "obsolete renamed file was retained"
+        assert not (project / "legacy_tree").exists(), "obsolete directory was retained"
         assert not (project / ".aowis-patch-delete.txt").exists(), "deletion manifest was retained"
         with zipfile.ZipFile(output) as archive:
             names = archive.namelist()
@@ -80,7 +88,7 @@ def main() -> None:
             assert prefix + "obsolete.txt" not in names
             assert prefix + ".aowis-patch-delete.txt" not in names
 
-    print("DVMDB naming, patch application and source archive: passed")
+    print("DVMDB-only naming, patch application and source archive: passed")
 
 
 if __name__ == "__main__":

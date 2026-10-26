@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <array>
@@ -19,11 +19,11 @@
 
 namespace {
 namespace fs = std::filesystem;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
 
 void require(bool valid, const std::string& message) {
     if (!valid) throw std::runtime_error(message);

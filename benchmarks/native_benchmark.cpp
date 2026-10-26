@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <chrono>
 #include <cstdint>
@@ -11,10 +11,10 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Key;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
 
 Key keyFor(std::uint64_t number) {
     // Deterministic scattered UUID-like keys; not chronological UUIDs.
@@ -74,7 +74,7 @@ std::uint64_t integer(const char* input) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
-        std::cerr << "Usage: aowis-native-benchmark <NEW_DIRECTORY> [objects=1000] [revisions=10] [edits=10] [payload=unique|legacy]\n"
+        std::cerr << "Usage: aowis-dvmdb-benchmark <NEW_DIRECTORY> [objects=1000] [revisions=10] [edits=10] [payload=unique|legacy]\n"
                   << "Creates a new durable repository. No AOWIS model validation is included yet.\n";
         return 2;
     }
@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
         }
         const double revisionMs = elapsedMs(revising);
         const std::chrono::steady_clock::time_point comparing = std::chrono::steady_clock::now();
-        const std::vector<aowis::native::Difference> diff = repo.diff("baseline", "main");
+        const std::vector<aowis::dvmdb::Difference> diff = repo.diff("baseline", "main");
         const double diffMs = elapsedMs(comparing);
         const std::chrono::steady_clock::time_point scanning = std::chrono::steady_clock::now();
         const std::size_t scanned = repo.scan("main").size();
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
         if (scanned != objects) throw std::runtime_error("scan has incorrect object count");
         const std::uint64_t packBytes = repo.packSize();
         const std::uint64_t storedObjects = repo.objectCount();
-        const aowis::native::Revision finalRevision = repo.head("main");
+        const aowis::dvmdb::Revision finalRevision = repo.head("main");
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
         Repository reopened(path);
         if (reopened.head("main").root != finalRevision.root) {

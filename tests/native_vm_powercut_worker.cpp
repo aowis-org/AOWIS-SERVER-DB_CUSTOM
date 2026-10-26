@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -10,10 +10,10 @@
 #include <vector>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Key;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
 
 Key counterKey() {
     Key result{};
@@ -47,13 +47,13 @@ void check(Repository& repository) {
     repository.verifyRepository();
     const std::uint64_t sequence = readCounter(repository);
     std::cout << "STATE " << sequence << " "
-              << aowis::native::toHex(repository.head("main").id) << std::endl;
+              << aowis::dvmdb::toHex(repository.head("main").id) << std::endl;
 }
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc != 3) {
-        std::cerr << "Usage: aowis-native-vm-powercut-worker init|writer|verify REPOSITORY\n";
+        std::cerr << "Usage: aowis-dvmdb-vm-powercut-worker init|writer|verify REPOSITORY\n";
         return 2;
     }
     try {
@@ -80,9 +80,9 @@ int main(int argc, char** argv) {
             // bounds crash-publication ambiguity to at most one revision.
             for (;;) {
                 ++next;
-                const aowis::native::Revision revision = repository.commit(
+                const aowis::dvmdb::Revision revision = repository.commit(
                     "main", {Change{counterKey(), counterData(next)}});
-                std::cout << "ACK " << next << " " << aowis::native::toHex(revision.id)
+                std::cout << "ACK " << next << " " << aowis::dvmdb::toHex(revision.id)
                           << std::endl;
                 std::string proceed;
                 if (!std::getline(std::cin, proceed) || proceed != "GO") break;

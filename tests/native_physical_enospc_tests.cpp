@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -16,13 +16,13 @@
 
 namespace {
 namespace fs = std::filesystem;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::Repository;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
 
 void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);

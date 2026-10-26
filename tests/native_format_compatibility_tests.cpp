@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -15,10 +15,10 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
 
 constexpr std::string_view baseHash = "b8d2bafee89295d4bb183f90b7aad1e2e4a8a76b39229827f79c71405935f468";
 constexpr std::string_view featureHash = "4f0f347555c80634f2578dae167d80b841759511a3b891ab0045a479a8f15bb2";
@@ -46,30 +46,30 @@ void checkValue(Repository& repository, const std::string& branch, std::uint8_t 
 }
 
 void checkMain(Repository& repository) {
-    expect(aowis::native::toHex(repository.head("main").id) == tipHash,
+    expect(aowis::dvmdb::toHex(repository.head("main").id) == tipHash,
            "frozen main revision identity changed");
     checkValue(repository, "main", 0x10, bytes("alpha-v2"));
     checkValue(repository, "main", 0x20, std::nullopt);
     checkValue(repository, "main", 0x30, bytes("gamma-v2"));
-    const std::vector<aowis::native::Revision> history = repository.history("main");
+    const std::vector<aowis::dvmdb::Revision> history = repository.history("main");
     expect(history.size() == 4, "frozen main ancestry length changed");
-    expect(aowis::native::toHex(history[1].id) == middleHash, "middle revision changed");
-    expect(aowis::native::toHex(history[2].id) == baseHash, "base revision changed");
-    expect(repository.getAtRevision(aowis::native::fromHex(baseHash), key(0x10)) == bytes("alpha-v1"),
+    expect(aowis::dvmdb::toHex(history[1].id) == middleHash, "middle revision changed");
+    expect(aowis::dvmdb::toHex(history[2].id) == baseHash, "base revision changed");
+    expect(repository.getAtRevision(aowis::dvmdb::fromHex(baseHash), key(0x10)) == bytes("alpha-v1"),
            "frozen historical read failed");
-    expect(repository.getAtRevision(aowis::native::fromHex(baseHash), key(0x20)) == bytes("beta-v1"),
+    expect(repository.getAtRevision(aowis::dvmdb::fromHex(baseHash), key(0x20)) == bytes("beta-v1"),
            "frozen historical value changed");
 }
 
 void checkFeature(Repository& repository) {
-    expect(aowis::native::toHex(repository.head("feature").id) == featureHash,
+    expect(aowis::dvmdb::toHex(repository.head("feature").id) == featureHash,
            "frozen feature revision identity changed");
     checkValue(repository, "feature", 0x10, bytes("alpha-v1"));
     checkValue(repository, "feature", 0x20, bytes("beta-feature"));
     checkValue(repository, "feature", 0x40, bytes("feature-new"));
-    const std::vector<aowis::native::Revision> history = repository.history("feature");
+    const std::vector<aowis::dvmdb::Revision> history = repository.history("feature");
     expect(history.size() == 3, "frozen feature ancestry length changed");
-    expect(aowis::native::toHex(history[1].id) == baseHash, "feature ancestor changed");
+    expect(aowis::dvmdb::toHex(history[1].id) == baseHash, "feature ancestor changed");
 }
 
 struct TemporaryRoot {
@@ -93,7 +93,7 @@ void checkFrozenFile(const std::filesystem::path& file, std::string_view digest)
     std::ifstream input(file, std::ios::binary);
     expect(input.good(), "missing compatibility fixture: " + file.string());
     const Bytes contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    expect(!input.bad() && aowis::native::toHex(aowis::native::sha256(contents)) == digest,
+    expect(!input.bad() && aowis::dvmdb::toHex(aowis::dvmdb::sha256(contents)) == digest,
            "compatibility fixture changed without an explicit compatibility decision: " + file.string());
 }
 
@@ -137,7 +137,7 @@ void exercise(const std::filesystem::path& fixture) {
     {
         Repository imported(temporary.path / "bundles");
         imported.importBranchBundle(fixture / "base.aowbundle", "main");
-        expect(aowis::native::toHex(imported.head("main").id) == baseHash,
+        expect(aowis::dvmdb::toHex(imported.head("main").id) == baseHash,
                "historical full bundle imported at wrong revision");
         checkValue(imported, "main", 0x10, bytes("alpha-v1"));
         imported.importBranchBundle(fixture / "delta.aowbundle", "main");
@@ -184,7 +184,7 @@ void exercise(const std::filesystem::path& fixture) {
 
 int main(int argc, char** argv) {
     try {
-        expect(argc == 2, "usage: aowis-native-format-compatibility-tests FIXTURE_ROOT");
+        expect(argc == 2, "usage: aowis-dvmdb-format-compatibility-tests FIXTURE_ROOT");
         exercise(std::filesystem::absolute(argv[1]));
         std::cout << "Frozen pack and portable bundle compatibility passed\n";
         return 0;

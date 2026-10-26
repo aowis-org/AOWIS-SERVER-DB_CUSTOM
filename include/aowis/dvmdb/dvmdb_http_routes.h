@@ -1,7 +1,7 @@
 #pragma once
 
-#include "aowis/native/project_service.h"
-#include "aowis/native/transfer_staging_budget.h"
+#include "aowis/dvmdb/project_service.h"
+#include "aowis/dvmdb/transfer_staging_budget.h"
 
 #include <cstddef>
 #include <memory>
@@ -10,7 +10,7 @@ namespace httplib {
 class Server;
 }
 
-namespace aowis::native::http {
+namespace aowis::dvmdb::http {
 
 // Request bounds applied before a body byte is read. Bundle uploads may be up
 // to BundleLimits::maxBytes and stream into a project scratch file; JSON
@@ -27,4 +27,4 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                     BundleLimits transferLimits = BundleLimits{32ULL * 1024ULL * 1024ULL,
                                                                100000ULL, 8ULL * 1024ULL * 1024ULL},
                     std::shared_ptr<TransferStagingBudget> stagingBudget = nullptr);
-} // namespace aowis::native::http
+} // namespace aowis::dvmdb::http

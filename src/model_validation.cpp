@@ -1,4 +1,4 @@
-#include <aowis/native/model_validation.h>
+#include <aowis/dvmdb/model_validation.h>
 
 #include <QHash>
 #include <QSet>
@@ -6,7 +6,7 @@
 #include <cmath>
 #include <utility>
 
-namespace aowis::native
+namespace aowis::dvmdb
 {
 QString ModelValidationReport::summary() const
 {
@@ -323,4 +323,4 @@ HydraulicDependencyValidation validateHydraulicNetworkWithDependencies(
     return result;
 }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

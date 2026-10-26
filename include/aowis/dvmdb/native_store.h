@@ -16,9 +16,9 @@
 #include <utility>
 #include <vector>
 
-#include "aowis/native/storage_error.h"
+#include "aowis/dvmdb/storage_error.h"
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 
 using Bytes = std::vector<std::uint8_t>;
 using Hash = std::array<std::uint8_t, 32>;
@@ -446,4 +446,4 @@ private:
     void syncPack();
 };
 
-}  // namespace aowis::native
+}  // namespace aowis::dvmdb

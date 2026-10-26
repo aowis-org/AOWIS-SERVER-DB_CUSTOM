@@ -20,7 +20,7 @@ def rebuild_selected_release_benchmark(binary):
     This avoids silently benchmarking a stale build-linux-tests-release binary
     after somebody rebuilt only build-linux (or vice versa).
     """
-    if binary.name != "aowis-native-index-scaling-benchmark":
+    if binary.name != "aowis-dvmdb-index-scaling-benchmark":
         raise RuntimeError(f"unexpected physical-index benchmark executable: {binary.name}")
     build_dir = binary.parent
     cache = build_dir / "CMakeCache.txt"
@@ -226,7 +226,7 @@ def handle_termination(_signal_number, _frame):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True,
-                        help="Release-build aowis-native-index-scaling-benchmark")
+                        help="Release-build aowis-dvmdb-index-scaling-benchmark")
     parser.add_argument("--sizes", default="100000,1000000,10000000",
                         help="comma-separated minimum physical object targets")
     parser.add_argument("--keys", type=int, default=4096,
@@ -270,7 +270,7 @@ def main():
     if args.work_root is not None and not args.work_root.is_dir():
         parser.error("work-root must already be a directory")
 
-    with tempfile.TemporaryDirectory(prefix="aowis-native-index-bench-",
+    with tempfile.TemporaryDirectory(prefix="aowis-dvmdb-index-bench-",
                                      dir=args.work_root) as temporary:
         root = Path(temporary)
         rows = []

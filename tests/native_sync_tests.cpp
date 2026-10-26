@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <chrono>
 #include <cstdint>
@@ -11,14 +11,14 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::BundleImportStatus;
-using aowis::native::BundleImportResult;
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::Revision;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::Revision;
 
 void expect(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -35,7 +35,7 @@ struct TemporaryDirectory {
     explicit TemporaryDirectory(std::string_view label) {
         static std::uint64_t counter = 0;
         this->path = std::filesystem::temp_directory_path() /
-            ("aowis-native-sync-" + std::string(label) + "-" +
+            ("aowis-dvmdb-sync-" + std::string(label) + "-" +
              std::to_string(::getpid()) + "-" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
              "-" + std::to_string(++counter));
@@ -73,8 +73,8 @@ void testPortableBundles() {
         source.createBranch("feature", "main");
         source.commit("main", {{key(2), bytes("on-main")}});
         source.commit("feature", {{key(3), bytes("on-feature")}});
-        const aowis::native::MergeResult merged = source.mergeBranches("main", "feature");
-        expect(merged.status == aowis::native::MergeStatus::Merged &&
+        const aowis::dvmdb::MergeResult merged = source.mergeBranches("main", "feature");
+        expect(merged.status == aowis::dvmdb::MergeStatus::Merged &&
                merged.revision.parents.size() == 2,
                "merge fixture did not preserve two-parent ancestry");
         mergeTip = merged.revision.id;
@@ -229,8 +229,8 @@ void testMergeParentIncremental() {
     const std::filesystem::path delta = temporary.path / "merged.aowbundle";
     source.exportBranchBundle("feature", initial);
     destination.importBranchBundle(initial, "remote_merge");
-    const aowis::native::MergeResult merged = source.mergeBranches("main", "feature");
-    expect(merged.status == aowis::native::MergeStatus::Merged &&
+    const aowis::dvmdb::MergeResult merged = source.mergeBranches("main", "feature");
+    expect(merged.status == aowis::dvmdb::MergeStatus::Merged &&
                merged.revision.parents.size() == 2 &&
                merged.revision.parents[1] == featureHead,
            "two-parent incremental fixture is invalid");
@@ -286,7 +286,7 @@ void testIncrementalBundles() {
         Repository source(sourcePath);
         Repository destination(destinationPath);
         source.createBranch("main");
-        std::vector<aowis::native::Change> initial;
+        std::vector<aowis::dvmdb::Change> initial;
         for (std::uint64_t index = 1; index <= 250; ++index) {
             initial.push_back({key(index), Bytes(240, static_cast<std::uint8_t>(index))});
         }

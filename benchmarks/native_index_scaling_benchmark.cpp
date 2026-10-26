@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -17,10 +17,10 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Key;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
 using Clock = std::chrono::steady_clock;
 namespace fs = std::filesystem;
 
@@ -135,7 +135,7 @@ void repoMetrics(Repository& repo, const fs::path& path) {
     metric("physical_objects", repo.objectCount());
     metric("pack_bytes", repo.packSize());
     metric("index_bytes", indexBytes(path));
-    std::cout << "head=" << aowis::native::toHex(repo.head("main").id) << '\n';
+    std::cout << "head=" << aowis::dvmdb::toHex(repo.head("main").id) << '\n';
 }
 
 void prepare(const fs::path& path, std::uint64_t minimum, std::uint64_t keys,
@@ -217,7 +217,7 @@ void writeProbe(const fs::path& path, std::uint64_t keys, std::uint64_t batch,
     std::vector<double> timings;
     timings.reserve(static_cast<std::size_t>(rounds));
     const std::uint64_t initialCount = repo.objectCount();
-    const aowis::native::Hash oldHead = repo.head("main").id;
+    const aowis::dvmdb::Hash oldHead = repo.head("main").id;
     // Use a unique revision-version marker per run, preventing dedup across repeated probes.
     std::uint64_t nonce = 0;
     for (unsigned i = 0; i < 8; ++i) nonce = (nonce << 8U) | oldHead[i];
@@ -249,7 +249,7 @@ void compactProbe(const fs::path& path) {
     checkRepository(path);
     Repository repo(path);
     const Clock::time_point started = Clock::now();
-    const aowis::native::CompactionStats stats = repo.compact();
+    const aowis::dvmdb::CompactionStats stats = repo.compact();
     std::cout << "phase=compact\n";
     metric("duration_ms", msSince(started));
     metric("objects_before", stats.objectsBefore);
@@ -304,7 +304,7 @@ int main(int argc, char** argv) {
         } else if (mode == "multi" && argc >= 4) {
             multiProbe(argc, argv);
         } else {
-            throw std::runtime_error("Usage: aowis-native-index-scaling-benchmark\n"
+            throw std::runtime_error("Usage: aowis-dvmdb-index-scaling-benchmark\n"
                 "  prepare <NEW_REPOSITORY> <MIN_PHYSICAL_OBJECTS> <KEYS> <EDIT_BATCH>\n"
                 "  probe <EXISTING_REPOSITORY> <KEYS> <READ_SAMPLES>\n"
                 "  write <EXISTING_REPOSITORY> <KEYS> <EDIT_BATCH> <ROUNDS>\n"

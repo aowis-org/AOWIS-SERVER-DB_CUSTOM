@@ -1,5 +1,5 @@
 // Review findings F9 (bounded diffs) and F10a (branch-scoped revisions).
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <chrono>
 #include <cstdint>
@@ -19,16 +19,16 @@
 #include <vector>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Difference;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::MergeStatus;
-using aowis::native::Repository;
-using aowis::native::Revision;
-using aowis::native::StorageError;
-using aowis::native::StorageErrorKind;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Difference;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::MergeStatus;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::Revision;
+using aowis::dvmdb::StorageError;
+using aowis::dvmdb::StorageErrorKind;
 
 void expect(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);
@@ -38,7 +38,7 @@ struct TestDirectory {
     explicit TestDirectory(std::string_view label) {
         static unsigned counter = 0;
         this->path = std::filesystem::temp_directory_path() /
-            ("aowis-native-diff-scope-" + std::string(label) + "-" + std::to_string(::getpid()) +
+            ("aowis-dvmdb-diff-scope-" + std::string(label) + "-" + std::to_string(::getpid()) +
              "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
              "-" + std::to_string(++counter));
         std::filesystem::create_directories(this->path);
@@ -65,7 +65,7 @@ void expectKind(StorageErrorKind expected, const std::string& label,
 Hash valueHash(const Bytes& payload) {
     Bytes encoded{'V'};
     encoded.insert(encoded.end(), payload.begin(), payload.end());
-    return aowis::native::sha256(encoded);
+    return aowis::dvmdb::sha256(encoded);
 }
 
 using Model = std::map<Key, Bytes>;
@@ -220,7 +220,7 @@ void testPrefixSplitAboveLargeSubtree() {
         leaf.insert(leaf.end(), probeKey.begin(), probeKey.end());
         const Hash value = valueHash(*changes[5000].value);
         leaf.insert(leaf.end(), value.begin(), value.end());
-        corruptPackObject(directory.path / "repo" / "objects.pack", aowis::native::sha256(leaf));
+        corruptPackObject(directory.path / "repo" / "objects.pack", aowis::dvmdb::sha256(leaf));
     }
     expectKind(StorageErrorKind::Corruption, "probe leaf is really damaged",
                [&] { (void)repository.get("main", probeKey); });
@@ -260,7 +260,7 @@ void testLimitBoundaries() {
                [&] { (void)repository.diffRevisions(full, empty, 1000); });
     expect(repository.diffRevisions(full, full, 0).empty(), "self diff not empty");
     expectKind(StorageErrorKind::NotFound, "bounded diff with unknown revision", [&] {
-        (void)repository.diffRevisions(aowis::native::sha256(Bytes{4}), full, 10);
+        (void)repository.diffRevisions(aowis::dvmdb::sha256(Bytes{4}), full, 10);
     });
 }
 
@@ -285,7 +285,7 @@ void testRevisionOnBranch() {
     expect(repository.revisionOnBranch("main", sideOnly.id), "merged second-parent history not on branch");
     expect(!repository.revisionOnBranch("side", mainOnly.id), "merge leaked target history into source");
     expectKind(StorageErrorKind::NotFound, "unknown revision",
-               [&] { (void)repository.revisionOnBranch("main", aowis::native::sha256(Bytes{7})); });
+               [&] { (void)repository.revisionOnBranch("main", aowis::dvmdb::sha256(Bytes{7})); });
     expectKind(StorageErrorKind::NotFound, "tree hash is not a revision",
                [&] { (void)repository.revisionOnBranch("main", first.root); });
     expectKind(StorageErrorKind::NotFound, "unknown branch",

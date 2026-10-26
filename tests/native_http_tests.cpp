@@ -1,6 +1,6 @@
-#include "aowis/native/db_http_routes.h"
+#include "aowis/dvmdb/dvmdb_http_routes.h"
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
-#include "aowis/native/hydraulic_network_persistence.h"
+#include "aowis/dvmdb/hydraulic_network_persistence.h"
 #endif
 
 #include <httplib.h>
@@ -198,10 +198,10 @@ private:
 // In-process server on a loopback port, serving from worker threads.
 class TestServer {
 public:
-    TestServer(aowis::native::ProjectService& service, aowis::native::BundleLimits limits,
-               std::shared_ptr<aowis::native::http::TransferStagingBudget> stagingBudget = nullptr) {
+    TestServer(aowis::dvmdb::ProjectService& service, aowis::dvmdb::BundleLimits limits,
+               std::shared_ptr<aowis::dvmdb::http::TransferStagingBudget> stagingBudget = nullptr) {
         this->server_.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 128); };
-        aowis::native::http::registerRoutes(this->server_, service, limits, stagingBudget);
+        aowis::dvmdb::http::registerRoutes(this->server_, service, limits, stagingBudget);
         const int bound = this->server_.bind_to_any_port("127.0.0.1");
         check(bound > 0, "unable to listen");
         this->port_ = static_cast<quint16>(bound);
@@ -223,11 +223,11 @@ private:
 };
 
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
-void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service,
+void exerciseHydraulicApi(Client& client, aowis::dvmdb::ProjectService& service,
                           const QString& projectId, const QString& otherProject,
                           const QString& rawHead) {
-    namespace native = aowis::native;
-    const QString prefix = QStringLiteral("/api/v1/projects/") + projectId;
+    namespace native = aowis::dvmdb;
+    const QString prefix = QStringLiteral("/dvmdb/v1/projects/") + projectId;
     const QString main = prefix + "/branches/main";
     const QUuid networkUuid = QUuid::createUuid();
     const QUuid junctionUuid = QUuid::createUuid();
@@ -270,7 +270,7 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
           "invalid duplicate-UUID network accepted");
     check(client.call("GET", main + "/head").json.value("id").toString() == createdHead,
           "semantic validation failure changed branch head");
-    check(client.call("GET", "/api/v1/projects/" + otherProject +
+    check(client.call("GET", "/dvmdb/v1/projects/" + otherProject +
                       "/branches/main/networks/" + networkId).status == 404,
           "hydraulic network leaked across projects");
 
@@ -519,15 +519,15 @@ void exerciseHydraulicApi(Client& client, aowis::native::ProjectService& service
 
 // Real TCP bundle transfer: full/incremental between independent repositories, corrupt/truncated,
 // stale/divergent branches, transfer limits, and idempotent retry.
-void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
+void exerciseBundleApi(Client& client, aowis::dvmdb::ProjectService& service,
                        const QString& sourceId) {
-    namespace native = aowis::native;
-    const Response destination = client.call("POST", "/api/v1/projects",
+    namespace native = aowis::dvmdb;
+    const Response destination = client.call("POST", "/dvmdb/v1/projects",
         QJsonObject{{"name", "Replication recipient"}});
     check(destination.status == 201, "destination creation failed");
     const QString destinationId = destination.json.value("id").toString();
-    const QString from = QStringLiteral("/api/v1/projects/") + sourceId + "/branches/sync_demo";
-    const QString to = QStringLiteral("/api/v1/projects/") + destinationId + "/branches/tracking";
+    const QString from = QStringLiteral("/dvmdb/v1/projects/") + sourceId + "/branches/sync_demo";
+    const QString to = QStringLiteral("/dvmdb/v1/projects/") + destinationId + "/branches/tracking";
     native::Key item{};
     item[15] = 37;
     native::Key largeItem{};
@@ -554,7 +554,7 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
           "unknown export base accepted");
     check(client.callRaw("GET", from + "/bundle?unexpected=1").status == 400,
           "unknown bundle query argument accepted");
-    check(client.callRaw("GET", "/api/v1/projects/invalid/branches/sync_demo/bundle").status == 400,
+    check(client.callRaw("GET", "/dvmdb/v1/projects/invalid/branches/sync_demo/bundle").status == 400,
           "invalid project bundle URL accepted");
     check(client.callRaw("POST", to + "/bundle", QByteArray()).status == 400,
           "empty bundle import accepted");
@@ -627,13 +627,13 @@ void exerciseBundleApi(Client& client, aowis::native::ProjectService& service,
 }
 
 // Review F2/F10b: classification by StorageErrorKind, never message text.
-void exerciseErrorClassification(Client& client, aowis::native::ProjectService& service,
+void exerciseErrorClassification(Client& client, aowis::dvmdb::ProjectService& service,
                                  const std::filesystem::path& root) {
-    namespace native = aowis::native;
-    const Response created = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Errors"}});
+    namespace native = aowis::dvmdb;
+    const Response created = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Errors"}});
     check(created.status == 201, "error-classification project creation failed");
     const QString id = created.json.value("id").toString();
-    const QString prefix = "/api/v1/projects/" + id;
+    const QString prefix = "/dvmdb/v1/projects/" + id;
     native::Revision committed;
     service.withRepository(id.toStdString(), [&](native::Repository& repository) {
         native::Key key{};
@@ -677,12 +677,12 @@ void exerciseErrorClassification(Client& client, aowis::native::ProjectService& 
 
 // Review F9/F10a: list-like responses are bounded before materialization, and
 // branch-scoped routes only serve revisions of that branch.
-void exerciseBoundsAndScoping(Client& client, aowis::native::ProjectService& service) {
-    namespace native = aowis::native;
-    const Response created = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Bounds"}});
+void exerciseBoundsAndScoping(Client& client, aowis::dvmdb::ProjectService& service) {
+    namespace native = aowis::dvmdb;
+    const Response created = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Bounds"}});
     check(created.status == 201, "bounds project creation failed");
     const QString id = created.json.value("id").toString();
-    const QString prefix = "/api/v1/projects/" + id;
+    const QString prefix = "/dvmdb/v1/projects/" + id;
     native::Hash empty{};
     native::Hash exactly1000{};
     native::Hash over1000{};
@@ -780,12 +780,12 @@ void exerciseBoundsAndScoping(Client& client, aowis::native::ProjectService& ser
 
 // Phase 5 (cpp-httplib): limits are enforced before bodies are read, uploads
 // stream without holding project locks, and requests run concurrently.
-void exerciseTransport(Client& client, aowis::native::ProjectService& service,
+void exerciseTransport(Client& client, aowis::dvmdb::ProjectService& service,
                        const std::filesystem::path& root, std::uint64_t transferLimit) {
-    namespace native = aowis::native;
+    namespace native = aowis::dvmdb;
     const quint16 port = client.port();
-    const Response sourceProject = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Transport source"}});
-    const Response targetProject = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Transport target"}});
+    const Response sourceProject = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Transport source"}});
+    const Response targetProject = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Transport target"}});
     check(sourceProject.status == 201 && targetProject.status == 201, "transport projects not created");
     const QString sourceId = sourceProject.json.value("id").toString();
     const QString targetId = targetProject.json.value("id").toString();
@@ -799,10 +799,10 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
         }
         repository.commit("main", changes);
     });
-    const BinaryResponse bundle = client.callRaw("GET", "/api/v1/projects/" + sourceId + "/branches/main/bundle");
+    const BinaryResponse bundle = client.callRaw("GET", "/dvmdb/v1/projects/" + sourceId + "/branches/main/bundle");
     check(bundle.status == 200 && bundle.body.size() > 100 * 1024 &&
           bundle.contentType == "application/vnd.aowis.bundle", "transport bundle export failed");
-    const QByteArray uploadPath = "/api/v1/projects/" + targetId.toUtf8() + "/branches/incoming/bundle";
+    const QByteArray uploadPath = "/dvmdb/v1/projects/" + targetId.toUtf8() + "/branches/incoming/bundle";
 
     // 1. A declared length above the transfer limit is refused before any body
     //    byte is sent; the server answers and closes the connection.
@@ -818,11 +818,11 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
     }
     // 2. Per-route JSON limits, also decided before the body is read.
     const std::vector<std::pair<QByteArray, std::size_t>> jsonRoutes{
-        {"/api/v1/projects", aowis::native::http::maxJsonSmallBytes},
-        {"/api/v1/projects/" + targetId.toUtf8() + "/branches", aowis::native::http::maxJsonSmallBytes},
-        {"/api/v1/projects/" + targetId.toUtf8() + "/merges", aowis::native::http::maxJsonMergeBytes},
-        {"/api/v1/projects/" + targetId.toUtf8() + "/branches/main/networks",
-         aowis::native::http::maxJsonModelBytes}};
+        {"/dvmdb/v1/projects", aowis::dvmdb::http::maxJsonSmallBytes},
+        {"/dvmdb/v1/projects/" + targetId.toUtf8() + "/branches", aowis::dvmdb::http::maxJsonSmallBytes},
+        {"/dvmdb/v1/projects/" + targetId.toUtf8() + "/merges", aowis::dvmdb::http::maxJsonMergeBytes},
+        {"/dvmdb/v1/projects/" + targetId.toUtf8() + "/branches/main/networks",
+         aowis::dvmdb::http::maxJsonModelBytes}};
     for (const std::pair<QByteArray, std::size_t>& route : jsonRoutes) {
         RawConnection raw(port);
         raw.send("POST " + route.first + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
@@ -833,7 +833,7 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
     }
     {
         RawConnection raw(port);
-        raw.send("POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+        raw.send("POST /dvmdb/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                  "Transfer-Encoding: chunked\r\n\r\n10\r\n{\"name\":\"chunk\"}\r\n0\r\n\r\n");
         const QByteArray reply = raw.receive(3000);
         check(statusOf(reply) == 411 && reply.contains("length_required"),
@@ -852,7 +852,7 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
         const QByteArray reply = raw.receive(3000);
         check(statusOf(reply) == 413, "chunked upload beyond the limit not rejected with 413");
     }
-    check(client.call("GET", "/api/v1/projects/" + targetId + "/branches/incoming/head").status == 404,
+    check(client.call("GET", "/dvmdb/v1/projects/" + targetId + "/branches/incoming/head").status == 404,
           "rejected upload published a branch");
     // 4. A slow upload neither blocks other requests nor holds the catalogue
     //    or project lock while its body is still arriving.
@@ -862,9 +862,9 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
                   QByteArray::number(bundle.body.size()) + "\r\n\r\n" + bundle.body.left(bundle.body.size() / 2));
         QElapsedTimer elapsed;
         elapsed.start();
-        check(client.call("GET", "/api/v1/health").status == 200, "health blocked by a slow upload");
-        check(client.call("GET", "/api/v1/projects").status == 200, "catalogue blocked by a slow upload");
-        check(client.call("GET", "/api/v1/projects/" + targetId + "/branches").status == 200,
+        check(client.call("GET", "/dvmdb/v1/health").status == 200, "health blocked by a slow upload");
+        check(client.call("GET", "/dvmdb/v1/projects").status == 200, "catalogue blocked by a slow upload");
+        check(client.call("GET", "/dvmdb/v1/projects/" + targetId + "/branches").status == 200,
               "target project blocked by a slow upload");
         check(elapsed.elapsed() < 2000, "requests during a slow upload were delayed");
         slow.send(bundle.body.mid(bundle.body.size() / 2));
@@ -875,12 +875,12 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
     // 5. An upload abandoned halfway publishes nothing and leaves no file.
     {
         RawConnection abandoned(port);
-        abandoned.send("POST /api/v1/projects/" + targetId.toUtf8() + "/branches/abandoned/bundle HTTP/1.1\r\n"
+        abandoned.send("POST /dvmdb/v1/projects/" + targetId.toUtf8() + "/branches/abandoned/bundle HTTP/1.1\r\n"
                        "Host: 127.0.0.1\r\nContent-Length: " + QByteArray::number(bundle.body.size()) +
                        "\r\n\r\n" + bundle.body.left(bundle.body.size() / 3));
         abandoned.close();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        check(client.call("GET", "/api/v1/projects/" + targetId + "/branches/abandoned/head").status == 404,
+        check(client.call("GET", "/dvmdb/v1/projects/" + targetId + "/branches/abandoned/head").status == 404,
               "abandoned upload published a branch");
         check(std::filesystem::is_empty(root / "projects" / targetId.toStdString() / "repository" / "tmp"),
               "abandoned upload left a scratch file");
@@ -895,8 +895,8 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
                     Client parallel(port);
                     for (int request = 0; request < 20; ++request) {
                         const QString path = request % 2 == 0
-                            ? "/api/v1/projects/" + targetId + "/branches/incoming/head"
-                            : "/api/v1/projects/" + sourceId + "/branches/main/history?limit=1";
+                            ? "/dvmdb/v1/projects/" + targetId + "/branches/incoming/head"
+                            : "/dvmdb/v1/projects/" + sourceId + "/branches/main/history?limit=1";
                         if (parallel.call("GET", path).status != 200) failures.fetch_add(1);
                     }
                 } catch (...) {
@@ -909,7 +909,7 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
         check(failures.load() == 0, "concurrent requests failed");
     }
     // 7. Protocol-level rejections by httplib also carry JSON error bodies.
-    const Response unknownRoute = client.call("GET", "/api/v1/no-such-route");
+    const Response unknownRoute = client.call("GET", "/dvmdb/v1/no-such-route");
     check(unknownRoute.status == 404 &&
           unknownRoute.json.value("error").toObject().value("code").toString() == "not_found",
           "unknown route did not return a JSON 404");
@@ -918,10 +918,10 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
     QByteArray manyHeaders;
     for (int i = 0; i < 200; ++i) manyHeaders += "X-" + QByteArray::number(i) + ": a\r\n";
     const std::vector<std::tuple<QByteArray, int, QByteArray>> protocolCases{
-        {"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Large: " + QByteArray(16 * 1024, 'a') +
+        {"GET /dvmdb/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Large: " + QByteArray(16 * 1024, 'a') +
              "\r\n\r\n", 400, "invalid_request"},
-        {"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n" + manyHeaders + "\r\n", 400, "invalid_request"},
-        {"GET /api/v1/" + QByteArray(9000, 'a') + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 414, "uri_too_long"}};
+        {"GET /dvmdb/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n" + manyHeaders + "\r\n", 400, "invalid_request"},
+        {"GET /dvmdb/v1/" + QByteArray(9000, 'a') + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 414, "uri_too_long"}};
     for (const std::tuple<QByteArray, int, QByteArray>& protocolCase : protocolCases) {
         RawConnection raw(port);
         raw.send(std::get<0>(protocolCase));
@@ -935,9 +935,9 @@ void exerciseTransport(Client& client, aowis::native::ProjectService& service,
 // release(), so tests can observe what still runs meanwhile.
 class ProjectHold {
 public:
-    ProjectHold(aowis::native::ProjectService& service, const std::string& projectId) {
+    ProjectHold(aowis::dvmdb::ProjectService& service, const std::string& projectId) {
         this->thread_ = std::thread([this, &service, projectId] {
-            service.withRepository(projectId, [this](aowis::native::Repository&) {
+            service.withRepository(projectId, [this](aowis::dvmdb::Repository&) {
                 std::unique_lock<std::mutex> lock(this->mutex_);
                 this->entered_ = true;
                 this->changed_.notify_all();
@@ -979,7 +979,7 @@ struct Joiner {
     std::thread& thread;
 };
 
-void waitForPending(aowis::native::ProjectService& service, const QString& id, std::size_t count) {
+void waitForPending(aowis::dvmdb::ProjectService& service, const QString& id, std::size_t count) {
     const std::chrono::steady_clock::time_point deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (service.pendingOperations(id.toStdString()) != count) {
@@ -998,16 +998,16 @@ std::chrono::milliseconds timed(const std::function<void()>& action) {
 // other projects; a full project queue answers 503 with Retry-After before
 // reading an upload; racing writes of one project serialize correctly.
 void exerciseConcurrency() {
-    namespace native = aowis::native;
+    namespace native = aowis::dvmdb;
     TemporaryRoot root;
     native::ProjectService service(root.root(), 3);
     TestServer server(service, native::BundleLimits{64ULL * 1024ULL * 1024ULL, 100000ULL,
                                                     8ULL * 1024ULL * 1024ULL});
     Client client(server.port());
-    const QString a = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "A"}}).json.value("id").toString();
-    const QString b = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "B"}}).json.value("id").toString();
-    const QString aPrefix = "/api/v1/projects/" + a;
-    const QString bPrefix = "/api/v1/projects/" + b;
+    const QString a = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "A"}}).json.value("id").toString();
+    const QString b = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "B"}}).json.value("id").toString();
+    const QString aPrefix = "/dvmdb/v1/projects/" + a;
+    const QString bPrefix = "/dvmdb/v1/projects/" + b;
 
     // A bundle of ~4 MiB for project B, built in an independent repository.
     QByteArray bundle;
@@ -1040,9 +1040,9 @@ void exerciseConcurrency() {
     {
         ProjectHold hold(service, a.toStdString());
         // Everything else answers promptly while A's operation runs.
-        check(timed([&] { check(client.call("GET", "/api/v1/health").status == 200, "health failed"); }) <
+        check(timed([&] { check(client.call("GET", "/dvmdb/v1/health").status == 200, "health failed"); }) <
               std::chrono::milliseconds(200), "/health waited for a project operation");
-        check(timed([&] { check(client.call("GET", "/api/v1/ready").status == 200, "ready failed"); }) <
+        check(timed([&] { check(client.call("GET", "/dvmdb/v1/ready").status == 200, "ready failed"); }) <
               std::chrono::milliseconds(200), "/ready waited for a project operation");
         check(client.call("GET", aPrefix + "/branches/main/head").status == 200, "read of held project failed");
         check(client.call("POST", bPrefix + "/branches", QJsonObject{{"name", "side"}}).status == 201,
@@ -1059,7 +1059,7 @@ void exerciseConcurrency() {
         unsigned probes = 0;
         while (importing.load() || probes == 0) {
             slowest = std::max(slowest, timed([&] {
-                check(client.call("GET", "/api/v1/health").status == 200, "health failed during import");
+                check(client.call("GET", "/dvmdb/v1/health").status == 200, "health failed during import");
             }));
             ++probes;
         }
@@ -1113,7 +1113,7 @@ void exerciseConcurrency() {
             NetworkHydraulic network;
             network.uuid = QUuid::createUuid();
             network.id = QStringLiteral("race");
-            return QString::fromLatin1(aowis::native::ModelCodec<NetworkHydraulic>::encode(network).toBase64());
+            return QString::fromLatin1(aowis::dvmdb::ModelCodec<NetworkHydraulic>::encode(network).toBase64());
         };
         const QString one = payload();
         const QString two = payload();
@@ -1146,7 +1146,7 @@ void exerciseConcurrency() {
 
     // Stress: 8 clients, mixed reads and writes over three projects. Every
     // answer is a success or a 503 for a full queue; nothing else.
-    const QString c = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "C"}}).json.value("id").toString();
+    const QString c = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "C"}}).json.value("id").toString();
     const std::vector<QString> projects{a, b, c};
     std::atomic<unsigned> created{0};
     std::atomic<unsigned> busyAnswers{0};
@@ -1156,7 +1156,7 @@ void exerciseConcurrency() {
         clients.emplace_back([&, worker] {
             Client own(server.port());
             for (unsigned step = 0; step < 30; ++step) {
-                const QString prefix = "/api/v1/projects/" + projects[(worker + step) % projects.size()];
+                const QString prefix = "/dvmdb/v1/projects/" + projects[(worker + step) % projects.size()];
                 int status = 0;
                 switch (step % 4) {
                 case 0:
@@ -1166,7 +1166,7 @@ void exerciseConcurrency() {
                     break;
                 case 1: status = own.call("GET", prefix + "/branches/main/head").status; break;
                 case 2: status = own.callRaw("GET", prefix + "/branches/main/bundle").status; break;
-                default: status = own.call("GET", "/api/v1/health").status; break;
+                default: status = own.call("GET", "/dvmdb/v1/health").status; break;
                 }
                 if (status == 503) ++busyAnswers;
                 else if (status != 200 && status != 201) ++unexpected;
@@ -1177,7 +1177,7 @@ void exerciseConcurrency() {
     check(unexpected == 0, "unexpected status under concurrent load");
     std::size_t branches = 0;
     for (const QString& project : projects) {
-        branches += static_cast<std::size_t>(client.call("GET", "/api/v1/projects/" + project + "/branches")
+        branches += static_cast<std::size_t>(client.call("GET", "/dvmdb/v1/projects/" + project + "/branches")
                                                  .json.value("branches").toArray().size());
         service.withRepository(project.toStdString(), [](native::Repository& repository) {
             (void)repository.verifyRepository();
@@ -1195,39 +1195,39 @@ void exercise() {
     QString firstRevision;
     quint16 listenerPort = 0;
     {
-        aowis::native::ProjectService service(root.root());
-        const aowis::native::BundleLimits limits{1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL};
+        aowis::dvmdb::ProjectService service(root.root());
+        const aowis::dvmdb::BundleLimits limits{1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL};
         TestServer server(service, limits);
         listenerPort = server.port();
         Client client(server.port());
-        check(client.call("GET", "/api/v1/health").status == 200, "health failed");
-        check(client.call("GET", "/api/v1/ready").status == 200, "readiness failed");
-        check(client.call("GET", "/api/v1/projects").json.value("projects").toArray().isEmpty(),
+        check(client.call("GET", "/dvmdb/v1/health").status == 200, "health failed");
+        check(client.call("GET", "/dvmdb/v1/ready").status == 200, "readiness failed");
+        check(client.call("GET", "/dvmdb/v1/projects").json.value("projects").toArray().isEmpty(),
               "catalogue initially nonempty");
-        check(client.call("POST", "/api/v1/projects", QJsonObject{{"name", ""}}).status == 400,
+        check(client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", ""}}).status == 400,
               "invalid create accepted");
-        check(client.call("POST", "/api/v1/projects", QJsonObject{{"name", "X"}, {"evil", 42}}).status == 400,
+        check(client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "X"}, {"evil", 42}}).status == 400,
               "unknown field accepted");
-        const Response first = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Hydraulik Ü"}});
+        const Response first = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Hydraulik Ü"}});
         check(first.status == 201, "create project failed");
         firstId = first.json.value("id").toString();
         check(first.json.value("name").toString() == "Hydraulik Ü", "project name wrong");
         check(first.json.keys() == QStringList({"id", "name"}), "project JSON has unexpected fields");
-        check(client.call("POST", "/api/v1/projects",
+        check(client.call("POST", "/dvmdb/v1/projects",
                           QJsonObject{{"name", "X"}, {"storage", "pack"}}).status == 400,
               "removed storage field accepted");
-        const Response second = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Independent"}});
+        const Response second = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Independent"}});
         check(second.status == 201 && second.json.value("id").toString() != firstId,
               "second project creation failed");
-        check(client.call("GET", "/api/v1/projects").json.value("projects").toArray().size() == 2,
+        check(client.call("GET", "/dvmdb/v1/projects").json.value("projects").toArray().size() == 2,
               "project listing incorrect");
-        check(client.call("GET", "/api/v1/projects/invalid-id").status == 400,
+        check(client.call("GET", "/dvmdb/v1/projects/invalid-id").status == 400,
               "invalid project UUID was accepted");
-        check(client.call("GET", "/api/v1/projects/00000000-0000-4000-8000-000000000000").status == 404,
+        check(client.call("GET", "/dvmdb/v1/projects/00000000-0000-4000-8000-000000000000").status == 404,
               "unknown project accepted");
-        check(client.call("GET", "/api/v1/projects/" + firstId).status == 200,
+        check(client.call("GET", "/dvmdb/v1/projects/" + firstId).status == 200,
               "project details failed");
-        const QString prefix = "/api/v1/projects/" + firstId;
+        const QString prefix = "/dvmdb/v1/projects/" + firstId;
         check(client.call("GET", prefix + "/branches").json.value("branches").toArray().size() == 1,
               "initial branch missing");
         const Response head = client.call("GET", prefix + "/branches/main/head");
@@ -1264,7 +1264,7 @@ void exercise() {
               "empty branch creation failed");
         check(client.call("GET", prefix + "/branches").json.value("branches").toArray().size() == 3,
               "branch listing wrong");
-        check(client.call("GET", "/api/v1/projects/" + second.json.value("id").toString() + "/branches")
+        check(client.call("GET", "/dvmdb/v1/projects/" + second.json.value("id").toString() + "/branches")
                    .json.value("branches").toArray().size() == 1, "branch leaked to another project");
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
         exerciseHydraulicApi(client, service, firstId, second.json.value("id").toString(), firstRevision);
@@ -1293,9 +1293,9 @@ void exercise() {
         check(!RawConnection(listenerPort).connected(), "stopped HTTP server still accepts connections");
     }
     {
-        aowis::native::ProjectService reopened(root.root());
+        aowis::dvmdb::ProjectService reopened(root.root());
         check(reopened.project(firstId.toStdString()).name == "Hydraulik Ü", "restart lost project name");
-        check(aowis::native::toHex(reopened.head(firstId.toStdString(), "design").id) ==
+        check(aowis::dvmdb::toHex(reopened.head(firstId.toStdString(), "design").id) ==
               firstRevision.toStdString(), "restart lost fork revision");
     }
 }
@@ -1311,7 +1311,7 @@ struct ServerRun {
 // staging budget and reject new staging on project B, but not block /health.
 // Closing A must release capacity without changing any branch.
 void exerciseTransferStagingBudget() {
-    namespace native = aowis::native;
+    namespace native = aowis::dvmdb;
     TemporaryRoot root;
     native::ProjectService service(root.root());
     constexpr std::uint64_t transferBytes = 1024ULL * 1024ULL;
@@ -1319,16 +1319,16 @@ void exerciseTransferStagingBudget() {
         std::make_shared<native::http::TransferStagingBudget>(transferBytes);
     TestServer server(service, native::BundleLimits{transferBytes, 10000, transferBytes}, staging);
     Client client(server.port());
-    const Response first = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Slow source"}});
-    const Response second = client.call("POST", "/api/v1/projects", QJsonObject{{"name", "Other project"}});
+    const Response first = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Slow source"}});
+    const Response second = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Other project"}});
     check(first.status == 201 && second.status == 201, "staging test projects not created");
     const QString firstId = first.json.value("id").toString();
     const QString secondId = second.json.value("id").toString();
-    const QString otherBundle = "/api/v1/projects/" + secondId + "/branches/main/bundle";
+    const QString otherBundle = "/dvmdb/v1/projects/" + secondId + "/branches/main/bundle";
     {
         RawConnection slow(server.port());
         check(slow.connected(), "slow staging client failed to connect");
-        slow.send("POST /api/v1/projects/" + firstId.toUtf8() +
+        slow.send("POST /dvmdb/v1/projects/" + firstId.toUtf8() +
                   "/branches/unpublished/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                   "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 100000\r\n\r\n"
                   "partially-sent");
@@ -1340,7 +1340,7 @@ void exerciseTransferStagingBudget() {
         const BinaryResponse rejected = client.callRaw("GET", otherBundle);
         check(rejected.status == 503 && rejected.body.contains("staging_busy") &&
               rejected.retryAfter == "1", "other project staging was not rejected with retry hint");
-        check(client.call("GET", "/api/v1/health").status == 200,
+        check(client.call("GET", "/dvmdb/v1/health").status == 200,
               "health endpoint blocked by exhausted staging budget");
         slow.close();
     }
@@ -1352,11 +1352,11 @@ void exerciseTransferStagingBudget() {
     check(client.callRaw("GET", otherBundle).status == 200,
           "transfer not admitted after disconnected upload released quota");
     check(staging->reservedBytes() == 0, "completed download retained staging reservation");
-    check(client.call("GET", "/api/v1/projects/" + firstId + "/branches/unpublished/head").status == 404,
+    check(client.call("GET", "/dvmdb/v1/projects/" + firstId + "/branches/unpublished/head").status == 404,
           "abandoned upload published an incomplete branch");
 }
 
-// Starts the real executable, probes /api/v1/health on 127.0.0.1, optionally
+// Starts the real executable, probes /dvmdb/v1/health on 127.0.0.1, optionally
 // runs `whileRunning`, then stops it with SIGTERM. A process that exits on
 // its own is reported with its exit code.
 ServerRun runServer(const QString& executable, QStringList arguments,
@@ -1384,7 +1384,9 @@ ServerRun runServer(const QString& executable, QStringList arguments,
         }
         if (run.listened) {
             Client client(port);
-            check(client.call("GET", "/api/v1/health").status == 200, "executable health failed");
+            check(client.call("GET", "/dvmdb/v1/health").status == 200, "executable health failed");
+            check(client.call("GET", "/api/v1/health").status == 404,
+                  "legacy HTTP route unexpectedly accepted");
             if (whileRunning) whileRunning(port);
             process.terminate(); // SIGTERM
         }
@@ -1412,7 +1414,7 @@ void exerciseExecutable(const QString& executable) {
     const ServerRun normal = runServer(executable, {QStringLiteral("--bind"), QStringLiteral("127.0.0.1")},
         [](quint16 port) {
             Client client(port);
-            const Response created = client.call("POST", "/api/v1/projects",
+            const Response created = client.call("POST", "/dvmdb/v1/projects",
                                                  QJsonObject{{"name", "Shutdown test"}});
             check(created.status == 201 && created.json.value("name").toString() == "Shutdown test",
                   "executable did not create a project");

@@ -104,10 +104,10 @@ def build_worker(cache, source=SOURCE):
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         run(["cmake", "-S", source, "-B", build, "-G", "Ninja",
              "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=ON",
-             "-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF", "-DAOWIS_NATIVE_WITH_HTTP_SERVER=OFF"])
-        run(["cmake", "--build", build, "--target", "aowis-native-vm-powercut-worker",
+             "-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF", "-DAOWIS_DVMDB_WITH_HTTP_SERVER=OFF"])
+        run(["cmake", "--build", build, "--target", "aowis-dvmdb-vm-powercut-worker",
              "--parallel", "2"])
-    worker = build / "aowis-native-vm-powercut-worker"
+    worker = build / "aowis-dvmdb-vm-powercut-worker"
     if not worker.is_file():
         raise RuntimeError("CMake did not produce a guest worker: " + str(worker))
     return worker

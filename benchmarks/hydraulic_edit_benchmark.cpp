@@ -1,4 +1,4 @@
-#include <aowis/native/hydraulic_network_persistence.h>
+#include <aowis/dvmdb/hydraulic_network_persistence.h>
 
 #include <QCoreApplication>
 
@@ -13,8 +13,8 @@
 #include <string>
 #include <utility>
 
-namespace native = aowis::native;
-namespace hydraulic = aowis::native::hydraulic;
+namespace native = aowis::dvmdb;
+namespace hydraulic = aowis::dvmdb::hydraulic;
 
 namespace {
 QUuid uuid(std::uint32_t value) {
@@ -48,7 +48,7 @@ double elapsedMs(const std::chrono::steady_clock::time_point start) {
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     if (argc < 3 || argc > 6) {
-        std::cerr << "usage: aowis-native-hydraulic-edit-benchmark NEW_REPOSITORY PIPES [SCALAR_EDITS=20] [TOPOLOGY_EDITS=3]\n";
+        std::cerr << "usage: aowis-dvmdb-hydraulic-edit-benchmark NEW_REPOSITORY PIPES [SCALAR_EDITS=20] [TOPOLOGY_EDITS=3]\n";
         return 2;
     }
     try {

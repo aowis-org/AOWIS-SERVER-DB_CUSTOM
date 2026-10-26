@@ -1,6 +1,6 @@
 #pragma once
 
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <atomic>
 #include <cstddef>
@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 
 // Transport-independent catalogue and repository lifecycle API. One process
 // owns a project root at a time; operations on this instance are thread-safe.
@@ -122,4 +122,4 @@ private:
     std::map<std::string, std::shared_ptr<Project>> entries_;
 };
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

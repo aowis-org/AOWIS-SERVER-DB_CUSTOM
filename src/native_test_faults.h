@@ -1,10 +1,10 @@
 #pragma once
 
 // Private fault checkpoints. Only the dedicated recovery-test library is built
-// with AOWIS_NATIVE_FAULT_TEST_BUILD; shipping binaries never examine an
+// with AOWIS_DVMDB_FAULT_TEST_BUILD; shipping binaries never examine an
 // environment variable or expose crash injection.
-#ifdef AOWIS_NATIVE_FAULT_TEST_BUILD
-#include "aowis/native/storage_error.h"
+#ifdef AOWIS_DVMDB_FAULT_TEST_BUILD
+#include "aowis/dvmdb/storage_error.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -16,12 +16,12 @@
 #include <unistd.h>
 #endif
 
-namespace aowis::native::detail {
+namespace aowis::dvmdb::detail {
 inline void faultCheckpoint(const char* name) {
-#ifdef AOWIS_NATIVE_FAULT_TEST_BUILD
-    const char* selected = ::getenv("AOWIS_NATIVE_TEST_FAULT");
+#ifdef AOWIS_DVMDB_FAULT_TEST_BUILD
+    const char* selected = ::getenv("AOWIS_DVMDB_TEST_FAULT");
     if (selected == nullptr || std::strcmp(selected, name) != 0) return;
-    const char* action = ::getenv("AOWIS_NATIVE_TEST_ACTION");
+    const char* action = ::getenv("AOWIS_DVMDB_TEST_ACTION");
     if (action != nullptr && std::strcmp(action, "crash") == 0) ::_exit(93);
     // Same classification as a real ENOSPC reported through systemCall().
     errno = ENOSPC;
@@ -35,8 +35,8 @@ inline void faultCheckpoint(const char* name) {
 // The target fd has already been opened by the production write path.
 inline void faultPartialWrite(int fd, const std::uint8_t* bytes, std::size_t size,
                               std::uint64_t offset, const char* name) {
-#ifdef AOWIS_NATIVE_FAULT_TEST_BUILD
-    const char* selected = ::getenv("AOWIS_NATIVE_TEST_FAULT");
+#ifdef AOWIS_DVMDB_FAULT_TEST_BUILD
+    const char* selected = ::getenv("AOWIS_DVMDB_TEST_FAULT");
     if (selected == nullptr || std::strcmp(selected, name) != 0) return;
     const std::size_t half = size / 2U;
     std::size_t done = 0;
@@ -55,11 +55,11 @@ inline void faultPartialWrite(int fd, const std::uint8_t* bytes, std::size_t siz
 // Recovery tests force the named mkostemp() fallback that is otherwise only
 // used on filesystems without O_TMPFILE support.
 inline bool forceNamedScratchFiles() {
-#ifdef AOWIS_NATIVE_FAULT_TEST_BUILD
-    const char* forced = ::getenv("AOWIS_NATIVE_TEST_NAMED_SCRATCH");
+#ifdef AOWIS_DVMDB_FAULT_TEST_BUILD
+    const char* forced = ::getenv("AOWIS_DVMDB_TEST_NAMED_SCRATCH");
     return forced != nullptr && std::strcmp(forced, "1") == 0;
 #else
     return false;
 #endif
 }
-} // namespace aowis::native::detail
+} // namespace aowis::dvmdb::detail

@@ -10,7 +10,7 @@ Use the Release build of the real AOWIS hydraulic persistence benchmark:
 
 ```bash
 run_root="$(mktemp -d /tmp/aowis-hydraulic-bench.XXXXXXXX)"
-./build-linux-tests-release/aowis-native-hydraulic-edit-benchmark \
+./build-linux-tests-release/aowis-dvmdb-hydraulic-edit-benchmark \
   "$run_root/network" 100000 20 3
 ```
 
@@ -29,13 +29,13 @@ avoid mixing fixture construction with importer latency:
 fixture_root="$(mktemp -d /tmp/aowis-replication-fixture.XXXXXXXX)"
 rmdir "$fixture_root"
 python3 tools/benchmark_replication_scaling.py \
-  --binary ./build-linux-tests-release/aowis-native-replication-scaling-benchmark \
+  --binary ./build-linux-tests-release/aowis-dvmdb-replication-scaling-benchmark \
   --objects 100000 --commits 20 --payload-bytes 96 \
   --kinds model --backends pack --mode prepare \
   --fixture-dir "$fixture_root" --progress
 
 python3 tools/benchmark_replication_scaling.py \
-  --binary ./build-linux-tests-release/aowis-native-replication-scaling-benchmark \
+  --binary ./build-linux-tests-release/aowis-dvmdb-replication-scaling-benchmark \
   --objects 100000 --commits 20 --payload-bytes 96 \
   --kinds model --backends pack --repeats 3 --mode imports \
   --fixture-dir "$fixture_root" --output "$fixture_root/results.csv"
@@ -49,9 +49,9 @@ uses a new disposable repository; the fixture can be retained for reruns.
 
 ## Recovery, concurrency and maintenance
 
-`aowis-native-pack-operational-stress-tests` covers multiple simultaneous
+`aowis-dvmdb-pack-operational-stress-tests` covers multiple simultaneous
 repository handles, readers/writers, stale edits, model merges, incremental
-sync, compaction exclusivity and reopening. `aowis-native-recovery-tests`
+sync, compaction exclusivity and reopening. `aowis-dvmdb-recovery-tests`
 adds deterministic crash and ENOSPC injection. Before public release also
 run real power-failure and filesystem-specific tests where practical.
 
@@ -62,7 +62,7 @@ production guarantees.
 
 ## Physical object index
 
-`aowis-native-index-scaling-benchmark` and `tools/benchmark_native_index.py`
+`aowis-dvmdb-index-scaling-benchmark` and `tools/benchmark_native_index.py`
 measure the **existing** SHA-256-to-pack-location index. They do not
 silently swap in a second storage engine. Use the optimized Release binary.
 The driver **automatically rebuilds the exact Release target supplied in
@@ -75,7 +75,7 @@ so it also works after `./compile_linux.sh`:
 ```bash
 run_root="$(mktemp -d /tmp/aowis-index-capacity.XXXXXXXX)"
 python3 tools/benchmark_native_index.py \
-  --binary ./build-linux/aowis-native-index-scaling-benchmark \
+  --binary ./build-linux/aowis-dvmdb-index-scaling-benchmark \
   --sizes 100000,1000000,10000000 \
   --keys 4096 --batch 1024 --reads 1000 --write-rounds 5 \
   --multi-projects 2 --work-root "$run_root" \
@@ -87,7 +87,7 @@ skips the automatic rebuild; use it only when that is intentional. Smoke tests
 run as part of CTest and do not invoke a nested CMake build.
 
 For a quick validation of the benchmark itself, run
-`ctest --test-dir build-linux-tests-release -R aowis-native-index-scaling-smoke
+`ctest --test-dir build-linux-tests-release -R aowis-dvmdb-index-scaling-smoke
 --output-on-failure`. The benchmark driver creates randomized disposable
 subdirectories, refuses existing fixture paths, and removes fixtures after
 sampling. **It never modifies an existing user repository.** Rebuild,
@@ -207,7 +207,7 @@ publishing a deployment resource envelope.
 
 ## Representative canonical hydraulic workload qualification
 
-The existing `aowis-native-hydraulic-edit-benchmark` uses **real serialized
+The existing `aowis-dvmdb-hydraulic-edit-benchmark` uses **real serialized
 NetworkHydraulic objects**, not the synthetic model-record topology benchmark.
 It now also measures indexed pipe reads, complete network reconstruction,
 divergent-branch diff, a validated two-parent hydraulic field merge, and
@@ -220,10 +220,10 @@ Build the actual **Release** targets and run repeated independent fixtures:
 
 ```bash
 cmake --build build-linux-tests-release --target \
-  aowis-native-hydraulic-edit-benchmark aowis-native-verify --parallel
+  aowis-dvmdb-hydraulic-edit-benchmark aowis-dvmdb-verify --parallel
 python3 tools/qualify_hydraulic_workload.py \
-  --binary ./build-linux-tests-release/aowis-native-hydraulic-edit-benchmark \
-  --verifier ./build-linux-tests-release/aowis-native-verify \
+  --binary ./build-linux-tests-release/aowis-dvmdb-hydraulic-edit-benchmark \
+  --verifier ./build-linux-tests-release/aowis-dvmdb-verify \
   --pipes 10000 --edits 20 --topology-edits 3 --repeats 3
 ```
 

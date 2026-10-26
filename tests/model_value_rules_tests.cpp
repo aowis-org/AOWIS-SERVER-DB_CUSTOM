@@ -2,10 +2,10 @@
 // impossible number is ever stored or read. Covers the codec (both
 // directions), the value rules (docs/model-value-rules.md) and every
 // hydraulic save and edit path, including the indexed fast paths.
-#include "aowis/native/hydraulic_network_persistence.h"
+#include "aowis/dvmdb/hydraulic_network_persistence.h"
 
-#include <aowis/native/model_codec.h>
-#include <aowis/native/model_validation.h>
+#include <aowis/dvmdb/model_codec.h>
+#include <aowis/dvmdb/model_validation.h>
 
 #include <QCoreApplication>
 
@@ -28,8 +28,8 @@ template<typename T> struct ModelEnumValues;
 #include "model_enum_values.inc"
 
 namespace {
-namespace native = aowis::native;
-namespace hydraulic = aowis::native::hydraulic;
+namespace native = aowis::dvmdb;
+namespace hydraulic = aowis::dvmdb::hydraulic;
 using native::ModelCodec;
 using native::ModelValidationReport;
 

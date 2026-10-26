@@ -1,4 +1,4 @@
-#include "aowis/native/access_policy.h"
+#include "aowis/dvmdb/access_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include <openssl/rand.h>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 namespace {
 
 constexpr std::size_t maxPolicyBytes = 8U * 1024U * 1024U;
@@ -400,4 +400,4 @@ Key parseAccessUuid(std::string_view value) {
     return result;
 }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

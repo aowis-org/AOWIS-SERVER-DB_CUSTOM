@@ -1,4 +1,4 @@
-#include "aowis/native/project_service.h"
+#include "aowis/dvmdb/project_service.h"
 
 #include <array>
 #include <cerrno>
@@ -12,12 +12,12 @@
 #include <vector>
 
 namespace {
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelRecord;
-using aowis::native::ProjectInfo;
-using aowis::native::ProjectService;
-using aowis::native::Repository;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::ProjectInfo;
+using aowis::dvmdb::ProjectService;
+using aowis::dvmdb::Repository;
 
 void require(bool value, const std::string& message) {
     if (!value) throw std::runtime_error(message);

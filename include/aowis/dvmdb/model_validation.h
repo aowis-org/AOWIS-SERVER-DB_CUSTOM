@@ -1,5 +1,5 @@
-#ifndef AOWIS_NATIVE_MODEL_VALIDATION_H
-#define AOWIS_NATIVE_MODEL_VALIDATION_H
+#ifndef AOWIS_DVMDB_MODEL_VALIDATION_H
+#define AOWIS_DVMDB_MODEL_VALIDATION_H
 
 #include <aowis/model/hydraulic/network_hydraulic.h>
 
@@ -7,7 +7,7 @@
 #include <QUuid>
 #include <QVector>
 
-namespace aowis::native
+namespace aowis::dvmdb
 {
 struct ModelValidationIssue
 {
@@ -83,5 +83,5 @@ ModelValidationReport validateHydraulicEntityValues(const HydraulicControlSimple
 ModelValidationReport validateHydraulicEntityValues(const HydraulicControlRule &entity);
 ModelValidationReport validateHydraulicEntityValues(const HydraulicMapLabel &entity);
 
-} // namespace aowis::native
-#endif // AOWIS_NATIVE_MODEL_VALIDATION_H
+} // namespace aowis::dvmdb
+#endif // AOWIS_DVMDB_MODEL_VALIDATION_H

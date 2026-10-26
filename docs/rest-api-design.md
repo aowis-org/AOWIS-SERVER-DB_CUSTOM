@@ -14,28 +14,28 @@
 
 ## Implemented and planned routes
 
-The table distinguishes implemented routes from the remaining proposed network-enumeration endpoint; the machine-readable OpenAPI specification documents actual operations. The `/api/v1` prefix versions the HTTP interface, **not the model serialization format**.
+The table distinguishes implemented routes from the remaining proposed network-enumeration endpoint; the machine-readable OpenAPI specification documents actual operations. The `/dvmdb/v1` prefix versions the HTTP interface, **not the model serialization format**.
 
 | Operation | Proposed method and route |
 |---|---|
-| Service health and readiness | `GET /api/v1/health`, `GET /api/v1/ready` |
-| List projects | `GET /api/v1/projects` |
-| Create project | `POST /api/v1/projects` |
-| Read project details | `GET /api/v1/projects/{projectId}` |
-| List project branches | `GET /api/v1/projects/{projectId}/branches` |
-| Create/fork branch | `POST /api/v1/projects/{projectId}/branches` |
-| Read branch head | `GET /api/v1/projects/{projectId}/branches/{branch}/head` |
-| Browse branch history | `GET /api/v1/projects/{projectId}/branches/{branch}/history` |
-| Inspect immutable revision | `GET /api/v1/projects/{projectId}/revisions/{revisionHash}` |
-| Compare revisions | `GET /api/v1/projects/{projectId}/diff?from={hash}&to={hash}` (implemented) |
-| List hydraulic networks | `GET /api/v1/projects/{projectId}/branches/{branch}/networks` (planned) |
-| Read network | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` (implemented) |
-| List a network's entities | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type=9` (implemented, ordinal type) |
-| Read one entity | `GET /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` (implemented) |
-| Edit entities atomically | `POST /api/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` (implemented) |
-| Perform merge | `POST /api/v1/projects/{projectId}/merges` (implemented; conflicts returned without publication) |
-| Export branch bundle | `GET /api/v1/projects/{projectId}/branches/{branch}/bundle` |
-| Import branch bundle | `POST /api/v1/projects/{projectId}/branches/{branch}/bundle` |
+| Service health and readiness | `GET /dvmdb/v1/health`, `GET /dvmdb/v1/ready` |
+| List projects | `GET /dvmdb/v1/projects` |
+| Create project | `POST /dvmdb/v1/projects` |
+| Read project details | `GET /dvmdb/v1/projects/{projectId}` |
+| List project branches | `GET /dvmdb/v1/projects/{projectId}/branches` |
+| Create/fork branch | `POST /dvmdb/v1/projects/{projectId}/branches` |
+| Read branch head | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/head` |
+| Browse branch history | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/history` |
+| Inspect immutable revision | `GET /dvmdb/v1/projects/{projectId}/revisions/{revisionHash}` |
+| Compare revisions | `GET /dvmdb/v1/projects/{projectId}/diff?from={hash}&to={hash}` (implemented) |
+| List hydraulic networks | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks` (planned) |
+| Read network | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` (implemented) |
+| List a network's entities | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type=9` (implemented, ordinal type) |
+| Read one entity | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` (implemented) |
+| Edit entities atomically | `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` (implemented) |
+| Perform merge | `POST /dvmdb/v1/projects/{projectId}/merges` (implemented; conflicts returned without publication) |
+| Export branch bundle | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` |
+| Import branch bundle | `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` |
 
 An implemented incremental export supplies a known base revision as a `base` query parameter; the native exporter verifies it is an ancestor of the requested branch head. We should avoid shipping full bundles where a correct delta is possible. The project ID is a UUID from the server catalogue, **never a client-provided filesystem path**.
 

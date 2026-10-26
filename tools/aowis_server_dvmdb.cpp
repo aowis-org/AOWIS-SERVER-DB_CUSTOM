@@ -1,4 +1,4 @@
-#include "aowis/native/db_http_routes.h"
+#include "aowis/dvmdb/dvmdb_http_routes.h"
 
 #include <httplib.h>
 
@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
             std::cerr << "Invalid synchronization transfer limits\n";
             return 2;
         }
-        const aowis::native::BundleLimits limits{
+        const aowis::dvmdb::BundleLimits limits{
             static_cast<std::uint64_t>(transferMib) * 1024ULL * 1024ULL,
             static_cast<std::uint64_t>(count),
             static_cast<std::uint64_t>(individualMib) * 1024ULL * 1024ULL};
@@ -203,9 +203,9 @@ int main(int argc, char** argv) {
         // Default: errors go to stderr/journald. Optional file logging
         // redirects the C++ service diagnostics, restoring stderr on exit.
         ScopedErrorLog errorLog(logPath);
-        aowis::native::setInternalScratchLimit(
+        aowis::dvmdb::setInternalScratchLimit(
             static_cast<std::uint64_t>(internalScratch) * 1024ULL * 1024ULL);
-        aowis::native::ProjectService service(rootValue.toStdString(), pendingLimit);
+        aowis::dvmdb::ProjectService service(rootValue.toStdString(), pendingLimit);
         httplib::Server server;
         // Fixed pool; at most 16 waiting connections per worker are queued,
         // further connections are closed instead of piling up.
@@ -213,10 +213,10 @@ int main(int argc, char** argv) {
             const std::size_t threads = static_cast<std::size_t>(workerCount);
             return new httplib::ThreadPool(threads, threads, threads * 16U);
         };
-        std::shared_ptr<aowis::native::http::TransferStagingBudget> stagingBudget =
-            std::make_shared<aowis::native::http::TransferStagingBudget>(
+        std::shared_ptr<aowis::dvmdb::http::TransferStagingBudget> stagingBudget =
+            std::make_shared<aowis::dvmdb::http::TransferStagingBudget>(
                 static_cast<std::uint64_t>(inflight) * 1024ULL * 1024ULL);
-        aowis::native::http::registerRoutes(server, service, limits, stagingBudget);
+        aowis::dvmdb::http::registerRoutes(server, service, limits, stagingBudget);
         if (!server.bind_to_port(address, static_cast<int>(requestedPort))) {
             std::cerr << "Unable to bind HTTP listener on " << address << ':' << requestedPort
                       << ": " << std::strerror(errno) << '\n';

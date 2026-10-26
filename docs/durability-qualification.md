@@ -35,7 +35,7 @@ outputs explicitly:
 mkdir -p build-qualification
 set -o pipefail
 ./compile_linux_tests.sh --both 2>&1 | tee build-qualification/ctest.log
-./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
+./build-linux-tests-release/aowis-dvmdb-http-transfer-stress-tests \
   --soak-seconds 300 ./build-linux-tests-release/aowis-server-dvmdb \
   2>&1 | tee build-qualification/http-soak.log
 ./qualify_vm_powercut_docker.sh --rounds 4 --filesystems ext4 xfs
@@ -221,7 +221,7 @@ Build the production worker (the test build includes the same production native
 store; unlike the injected-fault tests it does not use special hooks):
 
 ```bash
-cmake --build build-linux-tests-release --target aowis-native-vm-powercut-worker --parallel
+cmake --build build-linux-tests-release --target aowis-dvmdb-vm-powercut-worker --parallel
 ```
 
 Run the ext4/XFS drill, using an existing downloaded, bootable **test** guest
@@ -234,7 +234,7 @@ python3 tools/qualify_vm_powercut.py \
   --cloud-init-seed /tmp/aowis-vm-seed.img \
   --ssh-key "$HOME/.ssh/aowis-vm-test" \
   --guest-user aowis-test \
-  --worker ./build-linux-tests-release/aowis-native-vm-powercut-worker \
+  --worker ./build-linux-tests-release/aowis-dvmdb-vm-powercut-worker \
   --filesystems ext4 xfs --rounds 24 --kvm \
   --work-root "$work_root"
 ```
@@ -261,11 +261,11 @@ specified guest, filesystem, virtio device and tested power-cut timings.
 
 ## 2. Sustained multi-project HTTP soak
 
-The existing `aowis-native-http-transfer-stress-tests` binary has an **opt-in**
+The existing `aowis-dvmdb-http-transfer-stress-tests` binary has an **opt-in**
 mode that holds **one HTTP server process** for the requested duration. Six
 concurrent workers continuously import immutable multi-MiB native bundles into
 new branches across three projects, export them, byte-compare bundle contents,
-read the branch heads and continuously probe `/api/v1/health`. Legitimate
+read the branch heads and continuously probe `/dvmdb/v1/health`. Legitimate
 admission-budget 503 responses are retried and counted. When time expires,
 the server is stopped and **all** project repositories are reopened, fully
 verified and checked against the completed import count. Failure preserves the
@@ -273,7 +273,7 @@ fixture directory and server log for investigation.
 
 ```bash
 ./compile_linux_tests.sh --both
-./build-linux-tests-release/aowis-native-http-transfer-stress-tests \
+./build-linux-tests-release/aowis-dvmdb-http-transfer-stress-tests \
   --soak-seconds 3600 ./build-linux-tests-release/aowis-server-dvmdb
 ```
 
@@ -376,7 +376,7 @@ The two runs were not controlled for background machine load; the post-change
 61.52/s does not define a portable throughput SLA. See
 [engineering findings](engineering-findings.md) for full details.
 
-The short Python CTest named `aowis-native-http-resource-monitor-tests`
+The short Python CTest named `aowis-dvmdb-http-resource-monitor-tests`
 checks process discovery, sample recording, success parsing, and rejection of
 misleading success text without a server. It uses a synthetic *process tree*,
 not QEMU or a live HTTP service. The production HTTP soak remains opt-in.

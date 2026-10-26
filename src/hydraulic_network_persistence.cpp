@@ -1,8 +1,8 @@
-#include "aowis/native/hydraulic_network_persistence.h"
-#include "aowis/native/storage_error.h"
+#include "aowis/dvmdb/hydraulic_network_persistence.h"
+#include "aowis/dvmdb/storage_error.h"
 
-#include <aowis/native/model_validation.h>
-#include <aowis/native/model_field_merge.h>
+#include <aowis/dvmdb/model_validation.h>
+#include <aowis/dvmdb/model_field_merge.h>
 
 #include <QDataStream>
 #include <QCryptographicHash>
@@ -22,13 +22,13 @@
 #include <stdexcept>
 #include <utility>
 
-namespace aowis::native::hydraulic {
+namespace aowis::dvmdb::hydraulic {
 namespace {
 
 // Persist all 18 canonical hydraulic entity types using native numeric
 // kind IDs for the experimental engine. The original junction/pipe
 // values MUST remain unchanged. These are NOT public stable wire type tags.
-#define AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(X) \
+#define AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(X) \
     X(pipe_materials, HydraulicPipeMaterial, 8) \
     X(patterns_time, HydraulicPatternTime, 9) \
     X(curves_tank_volume, HydraulicCurveTankVolume, 10) \
@@ -73,7 +73,7 @@ struct MemberChunk {
 
 void clearCollections(NetworkHydraulic& network) {
 #define CLEAR(name, type, kind) network.name.clear();
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(CLEAR)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(CLEAR)
 #undef CLEAR
 }
 
@@ -81,7 +81,7 @@ QByteArray encodeManifest(const Manifest& manifest) {
     QByteArray output;
     QDataStream stream(&output, QIODevice::WriteOnly);
     stream.setVersion(QDataStream::Qt_6_0);
-    const QByteArray metadata = aowis::native::ModelCodec<NetworkHydraulic>::encode(manifest.metadata);
+    const QByteArray metadata = aowis::dvmdb::ModelCodec<NetworkHydraulic>::encode(manifest.metadata);
     if (metadata.isEmpty()) throw StorageError(StorageErrorKind::Internal, "cannot encode hydraulic network metadata");
     stream << manifestMagic << manifestVersion << metadata;
     for (std::size_t index = 0; index < collectionCount; ++index) {
@@ -103,13 +103,13 @@ Manifest decodeManifest(const QByteArray& bytes) {
     if (stream.status() != QDataStream::Ok || magic != manifestMagic || version != manifestVersion)
         throw StorageError(StorageErrorKind::Corruption, "unsupported hydraulic network manifest (requires fresh v2 repository)");
     QString error;
-    std::optional<NetworkHydraulic> decoded = aowis::native::ModelCodec<NetworkHydraulic>::decode(metadata, &error);
+    std::optional<NetworkHydraulic> decoded = aowis::dvmdb::ModelCodec<NetworkHydraulic>::decode(metadata, &error);
     if (!decoded) throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic network metadata: " + error.toStdString());
     Manifest result;
     result.metadata = std::move(*decoded);
 #define CHECK_EMPTY(name, type, kind) \
     if (!result.metadata.name.isEmpty()) throw StorageError(StorageErrorKind::Corruption, "network metadata contains inline " #name);
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(CHECK_EMPTY)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(CHECK_EMPTY)
 #undef CHECK_EMPTY
     std::set<Key> seen;
     for (std::size_t index = 0; index < collectionCount; ++index) {
@@ -309,11 +309,11 @@ using Dependency = std::pair<Key, Key>;
 using DependencyIndex = std::vector<Dependency>;
 
 DependencyIndex indexedDependencies(
-    const QVector<aowis::native::HydraulicDependency>& dependencies,
+    const QVector<aowis::dvmdb::HydraulicDependency>& dependencies,
     const std::set<Key>& members) {
     DependencyIndex result;
     result.reserve(static_cast<std::size_t>(dependencies.size()));
-    for (const aowis::native::HydraulicDependency& dependency : dependencies) {
+    for (const aowis::dvmdb::HydraulicDependency& dependency : dependencies) {
         if (dependency.source_uuid.isNull() || dependency.target_uuid.isNull()) continue;
         const Key source = keyFromUuid(dependency.source_uuid);
         const Key target = keyFromUuid(dependency.target_uuid);
@@ -343,7 +343,7 @@ void addEntities(const QList<T>& entities, std::uint16_t kind,
     for (const T& entity : entities) {
         ModelRecord record;
         record.kind = kind;
-        record.payload = bytesFromQByteArray(aowis::native::ModelCodec<T>::encode(entity));
+        record.payload = bytesFromQByteArray(aowis::dvmdb::ModelCodec<T>::encode(entity));
         if (record.payload.empty()) throw StorageError(StorageErrorKind::Internal, "cannot encode hydraulic model entity");
         const Key key = keyFromUuid(entity.uuid);
         record.references = entityReferences(references, key);
@@ -362,7 +362,7 @@ void restoreEntities(Repository& repository, const Hash& revisionId,
             throw StorageError(StorageErrorKind::Corruption, "missing or wrong-type hydraulic entity: " + uuid.toString().toStdString());
         }
         QString error;
-        std::optional<T> entity = aowis::native::ModelCodec<T>::decode(qByteArrayFromBytes(record->payload), &error);
+        std::optional<T> entity = aowis::dvmdb::ModelCodec<T>::decode(qByteArrayFromBytes(record->payload), &error);
         if (!entity || entity->uuid != uuid) {
             throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic entity payload: " + uuid.toString().toStdString() +
                                      " " + error.toStdString());
@@ -383,7 +383,7 @@ Manifest manifestFor(const NetworkHydraulic& network) {
 #define LIST_IDS(name, type, kind) \
     for (const type& item : network.name) result.members[ordinal].append(item.uuid); \
     ++ordinal;
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(LIST_IDS)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(LIST_IDS)
 #undef LIST_IDS
     return result;
 }
@@ -421,7 +421,7 @@ void applyEntityChange(NetworkHydraulic& network, const HydraulicEntityChange& c
         return; \
     } \
     ++ordinal;
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(APPLY_EDIT)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(APPLY_EDIT)
 #undef APPLY_EDIT
     throw StorageError(StorageErrorKind::Internal, "unknown hydraulic entity collection");
 }
@@ -436,13 +436,13 @@ ModelChange encodeChangedEntity(const HydraulicEntityChange& change,
     static_assert(std::variant_size_v<HydraulicEntity> == collectionCount);
     const std::array<std::uint16_t, collectionCount> kinds = {
 #define MEMBER_KIND(name, type, kind) static_cast<std::uint16_t>(kind),
-        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
+        AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
 #undef MEMBER_KIND
     };
     record.kind = kinds[change.value->index()];
     std::visit([&record](const auto& entity) {
         using T = std::decay_t<decltype(entity)>;
-        record.payload = bytesFromQByteArray(aowis::native::ModelCodec<T>::encode(entity));
+        record.payload = bytesFromQByteArray(aowis::dvmdb::ModelCodec<T>::encode(entity));
     }, *change.value);
     if (record.payload.empty()) throw StorageError(StorageErrorKind::Internal, "cannot encode changed hydraulic entity");
     record.references = entityReferences(references, result.key);
@@ -1038,7 +1038,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
 
     static constexpr std::array<std::uint16_t, collectionCount> kinds = {
 #define MEMBER_KIND(name, type, kind) static_cast<std::uint16_t>(kind),
-        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
+        AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
 #undef MEMBER_KIND
     };
     std::set<Key> seen;
@@ -1143,8 +1143,8 @@ std::optional<Revision> tryIndexedMembershipEdits(
     // this includes report selections and embedded multi-species relationships.
     QSet<QUuid> metadataReferences;
     if (!removals.empty()) {
-        for (const aowis::native::HydraulicReference& reference :
-             aowis::native::hydraulicReferences(manifest.metadata)) {
+        for (const aowis::dvmdb::HydraulicReference& reference :
+             aowis::dvmdb::hydraulicReferences(manifest.metadata)) {
             if (reference.source_uuid == networkUuid && !reference.target_uuid.isNull())
                 metadataReferences.insert(reference.target_uuid);
         }
@@ -1462,7 +1462,7 @@ std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
         decoded.emplace(std::move(*item)); \
         break; \
     }
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(LOAD_ONE)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(LOAD_ONE)
 #undef LOAD_ONE
     default:
         throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity has unknown storage kind");
@@ -1509,9 +1509,9 @@ void candidateEntities(const CandidateReader& read, const QList<QUuid>& ids,
         if (!record || record->kind != kind)
             throw StorageError(StorageErrorKind::Corruption, "merged network contains a missing/wrong-kind entity");
         const QByteArray bytes = qByteArrayFromBytes(record->payload);
-        const std::optional<T> decoded = aowis::native::ModelCodec<T>::decode(bytes);
+        const std::optional<T> decoded = aowis::dvmdb::ModelCodec<T>::decode(bytes);
         if (!decoded || decoded->uuid != id ||
-            aowis::native::ModelCodec<T>::encode(*decoded) != bytes)
+            aowis::dvmdb::ModelCodec<T>::encode(*decoded) != bytes)
             throw StorageError(StorageErrorKind::Corruption, "merged network contains noncanonical entity bytes");
         for (const Key& ref : record->references)
             recorded.emplace_back(keyFromUuid(id), ref);
@@ -1556,10 +1556,10 @@ std::optional<std::string> validateMergedHydraulicSnapshot(const MergeCandidate&
             candidateEntities(candidate.get, manifest.members[ordinal], \
                               static_cast<std::uint16_t>(kind), network.name, stored); \
             ++ordinal;
-            AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE_MERGED)
+            AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE_MERGED)
 #undef RESTORE_MERGED
-            const aowis::native::HydraulicDependencyValidation validated =
-                aowis::native::validateHydraulicNetworkWithDependencies(network);
+            const aowis::dvmdb::HydraulicDependencyValidation validated =
+                aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
             if (!validated.report.valid())
                 throw StorageError(StorageErrorKind::Corruption, "invalid combined hydraulic model: " +
                                          validated.report.summary().toStdString());
@@ -1715,7 +1715,7 @@ std::optional<std::string> reconcileExplicitHydraulicMembership(
             std::size_t type = collectionCount;
             const std::array<std::uint16_t, collectionCount> kinds = {
 #define RESTORE_KIND(name, entityType, kind) static_cast<std::uint16_t>(kind),
-                AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE_KIND)
+                AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE_KIND)
 #undef RESTORE_KIND
             };
             for (std::size_t i = 0; i < kinds.size(); ++i)
@@ -1825,7 +1825,7 @@ MergeResolution resolveHydraulicRecord(const Key& key, const ModelRecord& base,
     };
     const std::array<std::uint16_t, collectionCount> kinds = {
 #define MERGE_CODE(name, type, kind) static_cast<std::uint16_t>(kind),
-        AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(MERGE_CODE)
+        AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(MERGE_CODE)
 #undef MERGE_CODE
     };
     for (std::size_t i = 0; i < kinds.size(); ++i)
@@ -1835,8 +1835,8 @@ MergeResolution resolveHydraulicRecord(const Key& key, const ModelRecord& base,
     const QByteArray targetBytes = qByteArrayFromBytes(target.payload);
     const QByteArray sourceBytes = qByteArrayFromBytes(source.payload);
     if (!fieldChoices.isEmpty()) {
-        const std::optional<aowis::native::ModelFieldMerge> preview =
-            aowis::native::mergeModelFields(uuidFromKey(key), kindName,
+        const std::optional<aowis::dvmdb::ModelFieldMerge> preview =
+            aowis::dvmdb::mergeModelFields(uuidFromKey(key), kindName,
                 baseBytes, targetBytes, sourceBytes);
         if (!preview) throw StorageError(StorageErrorKind::Corruption, "cannot resolve fields of an invalid canonical model");
         for (QMap<QString, bool>::const_iterator choice = fieldChoices.cbegin();
@@ -1846,8 +1846,8 @@ MergeResolution resolveHydraulicRecord(const Key& key, const ModelRecord& base,
                                          choice.key().toStdString());
         }
     }
-    const std::optional<aowis::native::ModelFieldMerge> merged =
-        aowis::native::mergeModelFields(uuidFromKey(key), kindName,
+    const std::optional<aowis::dvmdb::ModelFieldMerge> merged =
+        aowis::dvmdb::mergeModelFields(uuidFromKey(key), kindName,
             baseBytes, targetBytes, sourceBytes, fieldChoices);
     if (!merged) return rejected;
     if (!merged->conflicting_fields.isEmpty()) {
@@ -1956,8 +1956,8 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
     const std::set<Key> newMembers = memberKeys(next);
     DependencyIndex references;
     {
-        const aowis::native::HydraulicDependencyValidation validated =
-            aowis::native::validateHydraulicNetworkWithDependencies(network);
+        const aowis::dvmdb::HydraulicDependencyValidation validated =
+            aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
         if (!validated.report.valid())
             throw StorageError(StorageErrorKind::InvalidInput, "invalid hydraulic network: " + validated.report.summary().toStdString());
         references = indexedDependencies(validated.dependencies, newMembers);
@@ -1999,7 +1999,7 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
     // IDs are already in the manifest; build canonical payload records only.
 #define APPEND(name, type, kind) \
     addEntities(network.name, static_cast<std::uint16_t>(kind), references, changes);
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(APPEND)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(APPEND)
 #undef APPEND
     for (const Key& key : oldMembers) {
         if (!newMembers.contains(key)) changes.push_back(ModelChange{key, std::nullopt});
@@ -2042,8 +2042,8 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
     // indexed fast paths below may store it.
     for (const HydraulicEntityChange& change : changes) {
         if (!change.value || change.value->valueless_by_exception()) continue;
-        const aowis::native::ModelValidationReport values = std::visit(
-            [](const auto& entity) { return aowis::native::validateHydraulicEntityValues(entity); },
+        const aowis::dvmdb::ModelValidationReport values = std::visit(
+            [](const auto& entity) { return aowis::dvmdb::validateHydraulicEntityValues(entity); },
             *change.value);
         if (!values.valid())
             throw StorageError(StorageErrorKind::InvalidInput,
@@ -2123,8 +2123,8 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
     const std::set<Key> nextKeys = memberKeys(next);
     DependencyIndex references;
     {
-        const aowis::native::HydraulicDependencyValidation validated =
-            aowis::native::validateHydraulicNetworkWithDependencies(*network);
+        const aowis::dvmdb::HydraulicDependencyValidation validated =
+            aowis::dvmdb::validateHydraulicNetworkWithDependencies(*network);
         if (!validated.report.valid())
             throw StorageError(StorageErrorKind::InvalidInput, "invalid hydraulic edit: " + validated.report.summary().toStdString());
         references = indexedDependencies(validated.dependencies, nextKeys);
@@ -2192,10 +2192,10 @@ std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(Repository& repos
     restoreEntities(repository, revisionId, manifest.members[ordinal], \
                     static_cast<std::uint16_t>(kind), network.name, storedReferences); \
     ++ordinal;
-    AOWIS_NATIVE_HYDRAULIC_COLLECTIONS(RESTORE)
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE)
 #undef RESTORE
-    const aowis::native::HydraulicDependencyValidation validated =
-        aowis::native::validateHydraulicNetworkWithDependencies(network);
+    const aowis::dvmdb::HydraulicDependencyValidation validated =
+        aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
     if (!validated.report.valid())
         throw StorageError(StorageErrorKind::Corruption, "loaded network invalid: " + validated.report.summary().toStdString());
     const DependencyIndex canonicalReferences = indexedDependencies(validated.dependencies, members);
@@ -2218,4 +2218,4 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
     return loadHydraulicNetworkAtRevision(repository, snapshot.id, networkUuid);
 }
 
-} // namespace aowis::native::hydraulic
+} // namespace aowis::dvmdb::hydraulic

@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -13,13 +13,13 @@
 #include <vector>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::MergeStatus;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::MergeStatus;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
 
 void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -173,7 +173,7 @@ void exercise() {
     }
     {
         Repository maintenance(source);
-        const aowis::native::CompactionStats stats = maintenance.compact();
+        const aowis::dvmdb::CompactionStats stats = maintenance.compact();
         check(stats.objectsAfter <= stats.objectsBefore, "compaction increased object count");
     }
     {

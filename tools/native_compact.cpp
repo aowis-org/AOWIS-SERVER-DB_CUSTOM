@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <filesystem>
 #include <iostream>
@@ -6,7 +6,7 @@
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::cerr << "Usage: aowis-native-compact <EXISTING_REPOSITORY_DIRECTORY>\n";
+        std::cerr << "Usage: aowis-dvmdb-compact <EXISTING_REPOSITORY_DIRECTORY>\n";
         return 2;
     }
     try {
@@ -15,8 +15,8 @@ int main(int argc, char** argv) {
             !std::filesystem::exists(directory / "objects.current")) {
             throw std::runtime_error("repository does not exist");
         }
-        aowis::native::Repository repository(directory);
-        const aowis::native::CompactionStats result = repository.compact();
+        aowis::dvmdb::Repository repository(directory);
+        const aowis::dvmdb::CompactionStats result = repository.compact();
         std::cout << "objects_before=" << result.objectsBefore << '\n'
                   << "objects_after=" << result.objectsAfter << '\n'
                   << "pack_bytes_before=" << result.packBytesBefore << '\n'

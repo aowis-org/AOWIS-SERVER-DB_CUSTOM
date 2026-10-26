@@ -1,4 +1,4 @@
-#include "aowis/native/transfer_staging_budget.h"
+#include "aowis/dvmdb/transfer_staging_budget.h"
 
 #include <atomic>
 #include <cstdint>
@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace {
-using aowis::native::http::TransferStagingBudget;
+using aowis::dvmdb::http::TransferStagingBudget;
 
 void check(bool value, const char* reason) {
     if (!value) throw std::runtime_error(reason);

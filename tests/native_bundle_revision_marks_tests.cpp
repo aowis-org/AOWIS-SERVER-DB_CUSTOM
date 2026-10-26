@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <array>
 #include <cstdint>
@@ -15,18 +15,18 @@
 
 namespace {
 
-using aowis::native::BundleImportResult;
-using aowis::native::BundleImportStatus;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::MergeResult;
-using aowis::native::MergeStatus;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::VerificationReport;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::MergeResult;
+using aowis::dvmdb::MergeStatus;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::VerificationReport;
 
 void check(bool condition, std::string_view error) {
     if (!condition) throw std::runtime_error(std::string(error));

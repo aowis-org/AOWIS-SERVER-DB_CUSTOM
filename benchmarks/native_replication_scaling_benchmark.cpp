@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -18,17 +18,17 @@
 
 namespace {
 
-using aowis::native::BundleImportResult;
-using aowis::native::BundleImportProfile;
-using aowis::native::BundleImportStatus;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
-using aowis::native::VerificationReport;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::BundleImportProfile;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::VerificationReport;
 
 void require(bool valid, std::string_view reason) {
     if (!valid) throw std::runtime_error(std::string(reason));
@@ -85,7 +85,7 @@ void writeHeads(const std::filesystem::path& directory, const Hash& base,
                 const Hash& full) {
     std::ofstream out(directory / "heads.txt", std::ios::trunc);
     require(out.good(), "cannot write fixture heads");
-    out << aowis::native::toHex(base) << '\n' << aowis::native::toHex(full) << '\n';
+    out << aowis::dvmdb::toHex(base) << '\n' << aowis::dvmdb::toHex(full) << '\n';
     out.flush();
     require(out.good(), "failed to write fixture heads");
 }
@@ -96,7 +96,7 @@ std::pair<Hash, Hash> readHeads(const std::filesystem::path& directory) {
     std::string full;
     require(static_cast<bool>(std::getline(in, base)) &&
             static_cast<bool>(std::getline(in, full)), "fixture heads are missing");
-    return {aowis::native::fromHex(base), aowis::native::fromHex(full)};
+    return {aowis::dvmdb::fromHex(base), aowis::dvmdb::fromHex(full)};
 }
 
 // Linux getrusage(RUSAGE_SELF).ru_maxrss can retain the spawning process's
@@ -206,7 +206,7 @@ void prepare(const std::filesystem::path& directory, std::uint32_t objects,
               << "\nfixture_ms=" << milliseconds(start, finish)
               << "\nbundle_full_bytes=" << std::filesystem::file_size(directory / "full.aowbundle")
               << "\nbundle_delta_bytes=" << std::filesystem::file_size(directory / "delta.aowbundle")
-              << "\nsource_head=" << aowis::native::toHex(full) << '\n';
+              << "\nsource_head=" << aowis::dvmdb::toHex(full) << '\n';
 }
 
 void import(const std::filesystem::path& fixture, const std::filesystem::path& destination,
@@ -259,7 +259,7 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
               << "\nverified_reachable_objects=" << report.reachableObjects
               << "\nbundle_bytes=" << std::filesystem::file_size(bundle)
               << "\nstorage_pack_bytes=" << receiver.packSize()
-              << "\nhead=" << aowis::native::toHex(result.head) << '\n';
+              << "\nhead=" << aowis::dvmdb::toHex(result.head) << '\n';
 }
 
 } // namespace

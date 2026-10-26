@@ -1,6 +1,6 @@
 # Hydraulic-aware three-way branch merges
 
-`aowis::native::hydraulic::mergeHydraulicBranches(repository, target, source)` builds
+`aowis::dvmdb::hydraulic::mergeHydraulicBranches(repository, target, source)` builds
 on the native two-parent revision/merge API while validating the combined
 hydraulic model **before any bytes are appended or the target branch ref moves**.
 The operation returns `MergeStatus::Conflicts` with diagnostics on rejected
@@ -15,7 +15,7 @@ canonical seven-field metadata merge already defined by `ModelCodec`.
 
 ## Explicit conflict resolution
 
-In the examples, `namespace hydraulic = aowis::native::hydraulic;`.
+In the examples, `namespace hydraulic = aowis::dvmdb::hydraulic;`.
 
 The optional third argument, `HydraulicMergeSelections`, allows the AOWIS UI to
 resolve individual fields after previewing a conflict:

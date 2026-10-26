@@ -48,7 +48,7 @@ def fixture(base, name, imports, executable="a" * 64, progress=True):
                              "pid": 12344, "rss_kib": 12000, "high_water_kib": 13000,
                              "threads": 7, "fds": 9, "cpu_seconds": float(index * 2)})
     report = {
-        "kind": "aowis-native-http-resource-qualification", "version": 1,
+        "kind": "aowis-dvmdb-http-resource-qualification", "version": 1,
         "log_sha256": checksum(folder / "soak.log"),
         "soak": {"duration_s": 120, "imports": imports, "exports": imports,
                  "projects": 3, "admission_503": 0, "worst_health_ms": 4},

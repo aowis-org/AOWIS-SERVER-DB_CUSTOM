@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <array>
@@ -19,12 +19,12 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::BundleImportStatus;
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
 
 void expect(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -67,13 +67,13 @@ struct BundleBuilder {
     std::map<Hash, Bytes> objects;
 
     Hash add(const Bytes& bytes) {
-        const Hash hash = aowis::native::sha256(bytes);
+        const Hash hash = aowis::dvmdb::sha256(bytes);
         this->objects.emplace(hash, bytes);
         return hash;
     }
 
     Hash modelValue(const std::vector<Key>& references, bool noncanonical = false) {
-        Bytes envelope = aowis::native::encodeModelRecord(
+        Bytes envelope = aowis::dvmdb::encodeModelRecord(
             ModelRecord{1, references, Bytes{'m', 'o', 'd', 'e', 'l'}});
         if (noncanonical) {
             expect(references.size() == 2, "noncanonical fixture requires two references");
@@ -87,7 +87,7 @@ struct BundleBuilder {
     }
 
     Hash duplicateReferenceValue(const Key& reference) {
-        Bytes envelope = aowis::native::encodeModelRecord(
+        Bytes envelope = aowis::dvmdb::encodeModelRecord(
             ModelRecord{1, {reference, key(3)}, Bytes{'m'}});
         // Maintain a syntactically valid canonical envelope length, but make
         // its two incoming dependency UUIDs identical.
@@ -286,14 +286,14 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
     bool rejected = false;
     try {
         (void)target.importBranchBundle(bundle, branch);
-    } catch (const aowis::native::StorageError& error) {
+    } catch (const aowis::dvmdb::StorageError& error) {
         rejected = true;
         expect(std::string(error.what()).find(reason) != std::string::npos,
                "wrong rejection reason for " + label + ": " + error.what());
         // A malformed bundle is client input, never local corruption (review F2).
-        expect(error.kind() == aowis::native::StorageErrorKind::InvalidInput,
+        expect(error.kind() == aowis::dvmdb::StorageErrorKind::InvalidInput,
                "malformed bundle not classified as InvalidInput: " + label + " (" +
-               aowis::native::StorageError::kindName(error.kind()) + ")");
+               aowis::dvmdb::StorageError::kindName(error.kind()) + ")");
     }
     expect(rejected, "forged model history accepted: " + label);
     expect(target.head("stable").id == headBefore &&
@@ -553,7 +553,7 @@ void testHistoricalReferenceDeltas() {
         std::map<Key, Hash> models = baseModels;
         models[key(2)] = builder.add([] {
             Bytes value{'V'};
-            const Bytes record = aowis::native::encodeModelRecord(
+            const Bytes record = aowis::dvmdb::encodeModelRecord(
                 ModelRecord{1, {key(1)}, Bytes{'n', 'e', 'w'}});
             value.insert(value.end(), record.begin(), record.end());
             return value;

@@ -13,16 +13,16 @@ A base revision must be in the sender's ancestry and complete in the recipient's
 ## Offline example
 
 ```bash
-./build-linux/aowis-native-sync export \
+./build-linux/aowis-dvmdb-sync export \
   /path/to/source main /tmp/main.aowbundle
-./build-linux/aowis-native-sync import \
+./build-linux/aowis-dvmdb-sync import \
   /path/to/destination /tmp/main.aowbundle remote_main
 
-base="$(./build-linux/aowis-native-sync head \
+base="$(./build-linux/aowis-dvmdb-sync head \
   /path/to/destination remote_main)"
-./build-linux/aowis-native-sync export-incremental \
+./build-linux/aowis-dvmdb-sync export-incremental \
   /path/to/source main "$base" /tmp/update.aowbundle
-./build-linux/aowis-native-sync import \
+./build-linux/aowis-dvmdb-sync import \
   /path/to/destination /tmp/update.aowbundle remote_main
 ```
 
@@ -30,7 +30,7 @@ Imports verify object hashes, structural record types, revision ancestry and obj
 
 Model-indexed revisions undergo an additional semantic consistency check: canonical model-record encoding and sorted unique dependency UUIDs, nonzero/self-reference rules, live dependency targets, and *exact* equality between model-derived incoming references and the stored reverse-reference Merkle index. Every revision carried by the bundle is included, including both merge parents. Every first model snapshot after a raw revision is checked in full; subsequent snapshots with a verified model-indexed parent validate Merkle differences in both the model and reverse-reference trees. Unchanged content-addressed subtrees inherit only the independently verified parent snapshot invariants. Changed model edges must exactly equal changed reverse-index edges, newly introduced targets must exist, and deleting a still-referenced UUID is rejected even if its referrers are unchanged. Both merge parents are verified before the merge revision; ancestry is traversed iteratively, avoiding C++ recursion over long histories. Immutable snapshots with the same pair of roots are checked once per import. Invalid histories are rejected before any imported data or branch ref is written; imported hashes are never silently rewritten to repair history.
 
-**Integrity scope:** Imported bundles and persisted repositories use the same generic logical validation. `aowis-native-verify` performs full on-disk physical and logical verification by default (`--physical` restricts it to physical checks). Neither the importer nor this checker validates opaque domain-specific hydraulic semantics. The import location index, per-object logical visitation/type marks, and imported Merkle-tree summaries are file-backed and automatically discarded; the first-pass SHA-256 scan uses a fixed 64 KiB scratch buffer. Local objects referenced by incremental bundles are boundaries (see below) and keep only small in-memory state. Revision ancestry and snapshot-root bookkeeping retain state proportional to history size. The baseline full-snapshot reference verifier sorts dependency edges in 8,192-entry memory chunks and merges file-backed sorted runs. Later revisions compare only changed Merkle paths, model references, and reverse-reference entries against an already verified parent, without retaining a complete in-memory edge map. Deterministic crash-recovery tests exist, but actual power-loss behavior still needs field validation. See [repository verification](repository-verification.md). Missing objects, invalid baselines and branch divergence are rejected. Object hashes and revision identities remain portable between independent pack repositories.
+**Integrity scope:** Imported bundles and persisted repositories use the same generic logical validation. `aowis-dvmdb-verify` performs full on-disk physical and logical verification by default (`--physical` restricts it to physical checks). Neither the importer nor this checker validates opaque domain-specific hydraulic semantics. The import location index, per-object logical visitation/type marks, and imported Merkle-tree summaries are file-backed and automatically discarded; the first-pass SHA-256 scan uses a fixed 64 KiB scratch buffer. Local objects referenced by incremental bundles are boundaries (see below) and keep only small in-memory state. Revision ancestry and snapshot-root bookkeeping retain state proportional to history size. The baseline full-snapshot reference verifier sorts dependency edges in 8,192-entry memory chunks and merges file-backed sorted runs. Later revisions compare only changed Merkle paths, model references, and reverse-reference entries against an already verified parent, without retaining a complete in-memory edge map. Deterministic crash-recovery tests exist, but actual power-loss behavior still needs field validation. See [repository verification](repository-verification.md). Missing objects, invalid baselines and branch divergence are rejected. Object hashes and revision identities remain portable between independent pack repositories.
 
 **Incremental import work follows the delta.** Objects that an incremental bundle references but does not carry must already be stored locally. Everything in a repository was verified when it was committed or imported, so such an object is a *boundary*: the importer reads that one object and checks it where it attaches to the bundled graph, without walking the subtree or ancestry below it again.
 
@@ -38,7 +38,7 @@ Model-indexed revisions undergo an additional semantic consistency check: canoni
 - Value kinds stay enforced. Every model or reverse-index leaf that differs from the verified parent snapshot is decoded by the semantic check, so a local subtree grafted into the wrong kind of tree is rejected there. A local subtree used as a raw tree must hold `V` values (one leaf decides, values of a stored subtree are homogeneous). Values referenced by bundled leaves are always read and checked.
 - A local revision must be a valid revision object; its snapshot counts as verified and its ancestry is not walked. The base (and, for a fast-forward, the current branch head) must be a boundary or an ancestor of one; only that last case reads local revision history.
 
-A 1-record change on a 2,000-record model reads about 100 local objects, independent of the history length; previously the importer re-verified the whole local history (about 9,400 reads at 50 commits, 200,000 at 800). `aowis-native-verify` still verifies complete histories.
+A 1-record change on a 2,000-record model reads about 100 local objects, independent of the history length; previously the importer re-verified the whole local history (about 9,400 reads at 50 commits, 200,000 at 800). `aowis-dvmdb-verify` still verifies complete histories.
 
 ## Branch collaboration
 
@@ -48,17 +48,17 @@ Import into a dedicated tracking branch (for example `remote_main`), inspect it,
 
 The same immutable `.aowbundle` format is available over HTTP, with project/branch scoping by ID rather than filesystem path:
 
-- `GET /api/v1/projects/{projectId}/branches/{branch}/bundle` exports a full bundle.
+- `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` exports a full bundle.
 - `GET .../bundle?base={revisionHash}` exports a delta relative to a known ancestor.
 - `POST .../bundle` accepts the binary body (`Content-Type: application/vnd.aowis.bundle`), creates or fast-forwards the target branch, and returns `created`, `fast_forward` or `up_to_date` with its new head and imported object count.
 
 For example, download from one server and import to another:
 
 ```bash
-curl --fail -o update.aowbundle 'http://127.0.0.1:8755/api/v1/projects/PROJECT_ID/branches/main/bundle'
+curl --fail -o update.aowbundle 'http://127.0.0.1:8755/dvmdb/v1/projects/PROJECT_ID/branches/main/bundle'
 curl --fail -X POST -H 'Content-Type: application/vnd.aowis.bundle' \
   --data-binary @update.aowbundle \
-  'http://127.0.0.1:8756/api/v1/projects/OTHER_PROJECT_ID/branches/remote_main/bundle'
+  'http://127.0.0.1:8756/dvmdb/v1/projects/OTHER_PROJECT_ID/branches/remote_main/bundle'
 ```
 
 The importer performs the same hash, trie, revision and model/reference validation as offline imports before writing objects or publishing a branch. Reimports are idempotent; divergent histories are HTTP 409. Full/delta endpoints return HTTP 413 for configured transfer ceilings.

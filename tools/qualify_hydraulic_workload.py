@@ -100,8 +100,8 @@ def execute(args, log_path, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=Path("build-linux-tests-release/aowis-native-hydraulic-edit-benchmark"))
-    parser.add_argument("--verifier", type=Path, default=Path("build-linux-tests-release/aowis-native-verify"))
+    parser.add_argument("--binary", type=Path, default=Path("build-linux-tests-release/aowis-dvmdb-hydraulic-edit-benchmark"))
+    parser.add_argument("--verifier", type=Path, default=Path("build-linux-tests-release/aowis-dvmdb-verify"))
     parser.add_argument("--pipes", type=int, default=10000)
     parser.add_argument("--edits", type=int, default=20)
     parser.add_argument("--topology-edits", type=int, default=3)
@@ -123,7 +123,7 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix="hydraulic-workload-", dir=root))
     summary = {
-        "kind": "aowis-native-hydraulic-workload-qualification",
+        "kind": "aowis-dvmdb-hydraulic-workload-qualification",
         "version": 1,
         "recorded_utc": datetime.now(timezone.utc).isoformat(),
         "scope": "Canonical model operations and full verification in fresh processes; warm/uncontrolled OS page cache",

@@ -105,7 +105,7 @@ def run_test():
         runs = list(output.glob("http-resources-*/report.json"))
         require(len(runs) == 1, "expected one complete resource report")
         report = json.loads(runs[0].read_text(encoding="utf-8"))
-        require(report["kind"] == "aowis-native-http-resource-qualification", "report kind")
+        require(report["kind"] == "aowis-dvmdb-http-resource-qualification", "report kind")
         require(report["soak"]["imports"] == 7 and report["soak"]["admission_503"] == 2,
                 "soak summary wasn't parsed")
         require(report["sampling"]["server"]["samples"] >= 10, "missing server samples")

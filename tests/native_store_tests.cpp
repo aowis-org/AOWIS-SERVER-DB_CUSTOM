@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 #include <fcntl.h>
 #include <sys/file.h>
 
@@ -16,13 +16,13 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Difference;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::Repository;
-using aowis::native::Revision;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Difference;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::Revision;
 
 Key key(std::uint64_t number) {
     Key result{};
@@ -44,7 +44,7 @@ std::filesystem::path temporaryPath(std::string_view name) {
     const std::uint64_t clock = static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
     return std::filesystem::temp_directory_path() /
-        ("aowis-native-test-" + std::string(name) + "-" + std::to_string(::getpid()) +
+        ("aowis-dvmdb-test-" + std::string(name) + "-" + std::to_string(::getpid()) +
          "-" + std::to_string(clock));
 }
 
@@ -182,7 +182,7 @@ void testCompactionAndRetainedHistory() {
     }
     {
         const std::filesystem::path pack = test.directory / "objects.pack";
-        const Hash orphanHash = aowis::native::sha256(orphan);
+        const Hash orphanHash = aowis::dvmdb::sha256(orphan);
         std::array<std::uint8_t, 45> header{};
         header[0] = 'A'; header[1] = 'O'; header[2] = 'B'; header[3] = 'J'; header[4] = 1;
         std::copy(orphanHash.begin(), orphanHash.end(), header.begin() + 5);
@@ -204,7 +204,7 @@ void testCompactionAndRetainedHistory() {
         expect(repository.head("main").id == mainAfter &&
                repository.head("feature").id == featureBefore,
                "unpublished object changed retained heads");
-        const aowis::native::CompactionStats stats = repository.compact();
+        const aowis::dvmdb::CompactionStats stats = repository.compact();
         expect(stats.objectsBefore == withOrphan && stats.objectsAfter + 1 == withOrphan,
                "compaction did not remove exactly the unreachable object");
         expect(stats.packBytesBefore == stats.packBytesAfter + 45 + orphan.size(),
@@ -218,7 +218,7 @@ void testCompactionAndRetainedHistory() {
                repository.get("feature", key(1)) == value("old"),
                "compaction lost a retained historical value");
         repository.verifyPack();
-        const aowis::native::CompactionStats repeated = repository.compact();
+        const aowis::dvmdb::CompactionStats repeated = repository.compact();
         expect(repeated.objectsAfter == stats.objectsAfter &&
                repeated.packBytesAfter == stats.packBytesAfter,
                "repeating compaction should not change a clean repository");
@@ -477,19 +477,19 @@ void testTypedModelRecordsAndReferences() {
     const Key nodeA = key(11);
     const Key nodeB = key(12);
     const Key pipe = key(13);
-    const aowis::native::ModelRecord junction{1, {}, value("junction-canonical-codec-bytes")};
-    const aowis::native::ModelRecord link{4, {nodeA, nodeB}, value("pipe-canonical-codec-bytes")};
-    const Bytes serialized = aowis::native::encodeModelRecord(link);
-    const aowis::native::ModelRecord unpacked = aowis::native::decodeModelRecord(serialized);
+    const aowis::dvmdb::ModelRecord junction{1, {}, value("junction-canonical-codec-bytes")};
+    const aowis::dvmdb::ModelRecord link{4, {nodeA, nodeB}, value("pipe-canonical-codec-bytes")};
+    const Bytes serialized = aowis::dvmdb::encodeModelRecord(link);
+    const aowis::dvmdb::ModelRecord unpacked = aowis::dvmdb::decodeModelRecord(serialized);
     expect(unpacked.kind == link.kind && unpacked.references == link.references &&
            unpacked.payload == link.payload, "model envelope changed codec bytes");
-    const aowis::native::ModelRecord unordered{4, {nodeB, nodeA, nodeB}, link.payload};
-    expect(aowis::native::encodeModelRecord(unordered) == serialized,
+    const aowis::dvmdb::ModelRecord unordered{4, {nodeB, nodeA, nodeB}, link.payload};
+    expect(aowis::dvmdb::encodeModelRecord(unordered) == serialized,
            "reference set order changed canonical envelope hash");
     for (std::size_t length = 0; length < serialized.size(); ++length) {
         bool rejected = false;
         try {
-            aowis::native::decodeModelRecord(Bytes(serialized.begin(), serialized.begin() +
+            aowis::dvmdb::decodeModelRecord(Bytes(serialized.begin(), serialized.begin() +
                 static_cast<std::ptrdiff_t>(length)));
         } catch (const std::runtime_error&) { rejected = true; }
         expect(rejected, "accepted truncated model envelope");
@@ -503,7 +503,7 @@ void testTypedModelRecordsAndReferences() {
            "canonical payload changed after storage");
     const Hash savedRoot = repository.head("main").root;
     const std::uint64_t savedPackSize = repository.packSize();
-    auto invalid = [&](const std::vector<aowis::native::ModelChange>& changes) {
+    auto invalid = [&](const std::vector<aowis::dvmdb::ModelChange>& changes) {
         bool rejected = false;
         try { repository.commitModel("main", changes); }
         catch (const std::runtime_error&) { rejected = true; }
@@ -512,9 +512,9 @@ void testTypedModelRecordsAndReferences() {
         expect(repository.packSize() == savedPackSize, "rejected transaction appended pack data");
     };
     invalid({{nodeA, std::nullopt}});
-    invalid({{key(14), aowis::native::ModelRecord{4, {key(99)}, value("missing")}}});
+    invalid({{key(14), aowis::dvmdb::ModelRecord{4, {key(99)}, value("missing")}}});
     invalid({{nodeA, std::nullopt}, {pipe, link}});
-    invalid({{key(20), aowis::native::ModelRecord{1, {key(20)}, value("self")}}});
+    invalid({{key(20), aowis::dvmdb::ModelRecord{1, {key(20)}, value("self")}}});
     invalid({{key(21), junction}, {key(21), junction}});
     invalid({{Key{}, junction}});
     // Removing both an edge and one endpoint is legal in one commit.
@@ -535,9 +535,9 @@ void testTypedModelConcurrentHandles() {
     TemporaryRepo test("model-concurrent");
     Repository first(test.directory);
     first.createBranch("main");
-    first.commitModel("main", {{key(1), aowis::native::ModelRecord{1, {}, value("node")}}});
+    first.commitModel("main", {{key(1), aowis::dvmdb::ModelRecord{1, {}, value("node")}}});
     Repository second(test.directory);
-    second.commitModel("main", {{key(2), aowis::native::ModelRecord{4, {key(1)}, value("pipe")}}});
+    second.commitModel("main", {{key(2), aowis::dvmdb::ModelRecord{4, {key(1)}, value("pipe")}}});
     bool rejected = false;
     try { first.commitModel("main", {{key(1), std::nullopt}}); }
     catch (const std::runtime_error&) { rejected = true; }
@@ -551,10 +551,10 @@ void testDurableReverseReferences() {
     const Key nodeC = key(103);
     const Key pipeA = key(201);
     const Key pipeB = key(202);
-    const aowis::native::ModelRecord node{1, {}, value("junction")};
-    const aowis::native::ModelRecord ab{4, {nodeA, nodeB}, value("pipe-ab")};
-    const aowis::native::ModelRecord ac{4, {nodeA, nodeC}, value("pipe-ac")};
-    const std::vector<aowis::native::ModelChange> initial{
+    const aowis::dvmdb::ModelRecord node{1, {}, value("junction")};
+    const aowis::dvmdb::ModelRecord ab{4, {nodeA, nodeB}, value("pipe-ab")};
+    const aowis::dvmdb::ModelRecord ac{4, {nodeA, nodeC}, value("pipe-ac")};
+    const std::vector<aowis::dvmdb::ModelChange> initial{
         {pipeA, ab}, {pipeB, ab}, {nodeA, node}, {nodeB, node}, {nodeC, node}};
     Hash firstIndex{};
     {
@@ -657,14 +657,14 @@ void testMoveAwareModelAndRawCommits() {
         repository.createBranch("raw-duplicate");
         repository.createBranch("raw-canonical");
 
-        std::vector<aowis::native::ModelChange> changes;
+        std::vector<aowis::dvmdb::ModelChange> changes;
         changes.reserve(2048);
         const Bytes nodeValue(96, static_cast<std::uint8_t>('n'));
         const Bytes linkValue(96, static_cast<std::uint8_t>('l'));
         for (std::uint64_t id = 1; id <= 1024; ++id) {
-            changes.push_back({key(id), aowis::native::ModelRecord{1, {}, nodeValue}});
+            changes.push_back({key(id), aowis::dvmdb::ModelRecord{1, {}, nodeValue}});
             changes.push_back({key(id + 4096),
-                aowis::native::ModelRecord{4, {key(id), key(id)}, linkValue}});
+                aowis::dvmdb::ModelRecord{4, {key(id), key(id)}, linkValue}});
         }
         std::reverse(changes.begin(), changes.end());
         const Revision borrowed = repository.commitModel("borrowed", changes);
@@ -700,23 +700,23 @@ void testModelExpectedBranchHead() {
         TemporaryRepo test("expected-model-head");
         Repository repository(test.directory);
         repository.createBranch("main");
-        const aowis::native::ModelRecord initial{1, {}, value("first")};
+        const aowis::dvmdb::ModelRecord initial{1, {}, value("first")};
         const Revision first = repository.commitModel("main", {{key(1), initial}});
         const Revision second = repository.commitModel("main", {
-            {key(1), aowis::native::ModelRecord{1, {}, value("second")}}
+            {key(1), aowis::dvmdb::ModelRecord{1, {}, value("second")}}
         }, first.id);
         expect(second.id != first.id, "model update failed to move branch head");
         const std::uint64_t before = repository.packSize();
         bool rejected = false;
         try {
             repository.commitModel("main", {
-                {key(1), aowis::native::ModelRecord{1, {}, value("stale")}}
+                {key(1), aowis::dvmdb::ModelRecord{1, {}, value("stale")}}
             }, first.id);
         } catch (const std::runtime_error&) { rejected = true; }
         expect(rejected && repository.head("main").id == second.id &&
                repository.packSize() == before,
                "stale model commit changed the ref or persistent data");
-        const std::optional<aowis::native::ModelRecord> restored =
+        const std::optional<aowis::dvmdb::ModelRecord> restored =
             repository.getModel("main", key(1));
         expect(restored.has_value() && restored->payload == value("second"),
                "stale model commit replaced committed content");
@@ -778,7 +778,7 @@ void testHistoricalRevisionApis() {
             catch (const std::runtime_error&) { rejected = true; }
             expect(rejected, "zero revision was accepted");
             rejected = false;
-            try { (void)repository.revision(aowis::native::sha256(value("not-a-revision"))); }
+            try { (void)repository.revision(aowis::dvmdb::sha256(value("not-a-revision"))); }
             catch (const std::runtime_error&) { rejected = true; }
             expect(rejected, "unknown revision was accepted");
             const std::vector<Difference> difference = repository.diffRevisions(first, second);
@@ -808,12 +808,12 @@ void testHistoricalRevisionApis() {
             expect(rejected, "historical branch name reused");
 
             repository.createBranch("models");
-            const aowis::native::ModelRecord source{11, {}, value("source")};
-            const aowis::native::ModelRecord dependent{12, {key(101)}, value("child")};
+            const aowis::dvmdb::ModelRecord source{11, {}, value("source")};
+            const aowis::dvmdb::ModelRecord dependent{12, {key(101)}, value("child")};
             indexed = repository.commitModel("models", {{key(101), source},
                                                        {key(102), dependent}}).id;
             indexedNext = repository.commitModel("models", {{key(102), std::nullopt}}).id;
-            const std::optional<aowis::native::ModelRecord> saved =
+            const std::optional<aowis::dvmdb::ModelRecord> saved =
                 repository.getModelAtRevision(indexed, key(102));
             expect(saved && saved->kind == 12 && saved->payload == value("child") &&
                    saved->references == std::vector<Key>{key(101)} &&
@@ -854,9 +854,9 @@ void testHistoricalRevisionApis() {
 } // namespace
 
 void testThreeWayBranchMerges() {
-    using aowis::native::MergeStatus;
-    using aowis::native::ModelChange;
-    using aowis::native::ModelRecord;
+    using aowis::dvmdb::MergeStatus;
+    using aowis::dvmdb::ModelChange;
+    using aowis::dvmdb::ModelRecord;
     {
         TemporaryRepo test("branch-merging");
         Hash firstMerge{};
@@ -876,7 +876,7 @@ void testThreeWayBranchMerges() {
                 {key(2), value("feature edit")}, {key(4), value("feature add")}
             });
             sourceOnly = featureTip.id;
-            const aowis::native::MergeResult merged = repository.mergeBranches("main", "feature");
+            const aowis::dvmdb::MergeResult merged = repository.mergeBranches("main", "feature");
             expect(merged.status == MergeStatus::Merged && merged.base == base.id &&
                    merged.targetBefore == mainTip.id && merged.sourceHead == featureTip.id &&
                    merged.conflicts.empty() &&
@@ -898,7 +898,7 @@ void testThreeWayBranchMerges() {
             const Revision followup = repository.commit("feature", {
                 {key(5), value("follow up")}
             });
-            const aowis::native::MergeResult again = repository.mergeBranches("main", "feature");
+            const aowis::dvmdb::MergeResult again = repository.mergeBranches("main", "feature");
             expect(again.status == MergeStatus::Merged && again.base == featureTip.id &&
                    again.revision.parents == std::vector<Hash>({firstMerge, followup.id}) &&
                    repository.get("main", key(5)) == value("follow up"),
@@ -921,7 +921,7 @@ void testThreeWayBranchMerges() {
 }
 
 void testMergeConflictsAndFastForward() {
-    using aowis::native::MergeStatus;
+    using aowis::dvmdb::MergeStatus;
     {
         TemporaryRepo test("merge-conflicts");
         Repository repository(test.directory);
@@ -931,7 +931,7 @@ void testMergeConflictsAndFastForward() {
         const Revision main = repository.commit("main", {{key(1), value("main")}});
         repository.commit("feature", {{key(1), value("feature")}});
         const std::uint64_t bytesBefore = repository.packSize();
-        const aowis::native::MergeResult rejected = repository.mergeBranches("main", "feature");
+        const aowis::dvmdb::MergeResult rejected = repository.mergeBranches("main", "feature");
         expect(rejected.status == MergeStatus::Conflicts && rejected.conflicts.size() == 1 &&
                rejected.conflicts[0].key == key(1) && rejected.conflicts[0].base &&
                rejected.conflicts[0].target && rejected.conflicts[0].source &&
@@ -942,7 +942,7 @@ void testMergeConflictsAndFastForward() {
         repository.createBranch("modified", "main");
         repository.commit("deleted", {{key(1), std::nullopt}});
         repository.commit("modified", {{key(1), value("modified")}});
-        const aowis::native::MergeResult deleteVsUpdate =
+        const aowis::dvmdb::MergeResult deleteVsUpdate =
             repository.mergeBranches("deleted", "modified");
         expect(deleteVsUpdate.status == MergeStatus::Conflicts &&
                deleteVsUpdate.conflicts.size() == 1 &&
@@ -950,7 +950,7 @@ void testMergeConflictsAndFastForward() {
                "delete versus update must not silently discard either edit");
         repository.createBranch("new", "main");
         const Revision advanced = repository.commit("new", {{key(10), value("advanced")}});
-        const aowis::native::MergeResult fast = repository.mergeBranches("main", "new");
+        const aowis::dvmdb::MergeResult fast = repository.mergeBranches("main", "new");
         expect(fast.status == MergeStatus::FastForward && fast.revision.id == advanced.id &&
                repository.head("main").id == advanced.id &&
                repository.get("main", key(10)) == value("advanced"),
@@ -970,7 +970,7 @@ void testMergeConflictsAndFastForward() {
         const Revision sameRight = repository.commit("same-right", {
             {key(20), value("identical")}
         });
-        const aowis::native::MergeResult convergent =
+        const aowis::dvmdb::MergeResult convergent =
             repository.mergeBranches("same-left", "same-right");
         expect(convergent.status == MergeStatus::Merged &&
                convergent.revision.root == sameLeft.root &&
@@ -995,8 +995,8 @@ void testMergeConflictsAndFastForward() {
 }
 
 void testIndexedModelMerges() {
-    using aowis::native::MergeStatus;
-    using aowis::native::ModelRecord;
+    using aowis::dvmdb::MergeStatus;
+    using aowis::dvmdb::ModelRecord;
     {
         TemporaryRepo test("indexed-model-merge");
         Repository repository(test.directory);
@@ -1013,7 +1013,7 @@ void testIndexedModelMerges() {
         repository.commitModel("feature", {
             {key(4), ModelRecord{2, {key(1)}, value("second dependent")}}
         });
-        const aowis::native::MergeResult merged = repository.mergeBranches("main", "feature");
+        const aowis::dvmdb::MergeResult merged = repository.mergeBranches("main", "feature");
         expect(merged.status == MergeStatus::Merged && merged.revision.modelIndexed &&
                merged.revision.parents.size() == 2 &&
                repository.referencingModel("main", key(1)) ==
@@ -1035,7 +1035,7 @@ void testIndexedModelMerges() {
         });
         const Hash unchanged = repository.head("delete-branch").id;
         const std::uint64_t bytesBefore = repository.packSize();
-        const aowis::native::MergeResult dependency =
+        const aowis::dvmdb::MergeResult dependency =
             repository.mergeBranches("delete-branch", "new-dependent");
         expect(dependency.status == MergeStatus::Conflicts &&
                !dependency.conflicts.empty() &&
@@ -1051,7 +1051,7 @@ void testIndexedModelMerges() {
         repository.commitModel("edit-right", {
             {key(3), ModelRecord{3, {}, value("right")}}
         });
-        const aowis::native::MergeResult sameKey =
+        const aowis::dvmdb::MergeResult sameKey =
             repository.mergeBranches("edit-left", "edit-right");
         expect(sameKey.status == MergeStatus::Conflicts &&
                sameKey.conflicts.size() == 1 && sameKey.conflicts[0].key == key(3),
@@ -1062,7 +1062,7 @@ void testIndexedModelMerges() {
         repository.createBranch("fresh-other", "fresh");
         repository.commitModel("fresh", {{key(11), ModelRecord{1, {}, value("one")}}});
         repository.commitModel("fresh-other", {{key(12), ModelRecord{1, {}, value("two")}}});
-        const aowis::native::MergeResult fromEmpty =
+        const aowis::dvmdb::MergeResult fromEmpty =
             repository.mergeBranches("fresh", "fresh-other");
         expect(fromEmpty.status == MergeStatus::Merged && fromEmpty.revision.modelIndexed &&
                repository.getModel("fresh", key(11)) &&
@@ -1073,10 +1073,10 @@ void testIndexedModelMerges() {
 }
 
 void testMergeHooksAndSemanticPreflight() {
-    using aowis::native::MergeStatus;
-    using aowis::native::MergeOptions;
-    using aowis::native::MergeResolution;
-    using aowis::native::ModelRecord;
+    using aowis::dvmdb::MergeStatus;
+    using aowis::dvmdb::MergeOptions;
+    using aowis::dvmdb::MergeResolution;
+    using aowis::dvmdb::ModelRecord;
     {
         TemporaryRepo fixture("merge-candidate-hooks");
         Repository repository(fixture.directory);
@@ -1099,7 +1099,7 @@ void testMergeHooksAndSemanticPreflight() {
                    "merge resolver received wrong snapshots");
             return MergeResolution{ModelRecord{1, {}, value("merged")}, {}};
         };
-        options.validate = [&validationCalls](const aowis::native::MergeCandidate& candidate)
+        options.validate = [&validationCalls](const aowis::dvmdb::MergeCandidate& candidate)
             -> std::optional<std::string> {
             ++validationCalls;
             expect(candidate.get(key(1))->payload == value("merged") &&
@@ -1136,16 +1136,16 @@ void testMergeHooksAndSemanticPreflight() {
         options.checkSelections = {};
         resolverCalls = 0;
         validationCalls = 0;
-        const aowis::native::MergeResult rejected = repository.mergeBranches("main", "feature", options);
+        const aowis::dvmdb::MergeResult rejected = repository.mergeBranches("main", "feature", options);
         expect(rejected.status == MergeStatus::Conflicts && !rejected.conflicts.empty() &&
                rejected.conflicts.front().reason == "semantic model constraint failed" &&
                repository.head("main").id == before && repository.packSize() == bytesBefore &&
                resolverCalls == 1 && validationCalls == 1,
                "semantic preflight did not reject merge before writing");
-        options.validate = [](const aowis::native::MergeCandidate&) -> std::optional<std::string> {
+        options.validate = [](const aowis::dvmdb::MergeCandidate&) -> std::optional<std::string> {
             return std::nullopt;
         };
-        const aowis::native::MergeResult merged = repository.mergeBranches("main", "feature", options);
+        const aowis::dvmdb::MergeResult merged = repository.mergeBranches("main", "feature", options);
         expect(merged.status == MergeStatus::Merged && merged.revision.parents.size() == 2 &&
                repository.getModel("main", key(1))->payload == value("merged") &&
                repository.referencingModel("main", key(1)) == std::vector<Key>{key(2)},
@@ -1172,7 +1172,7 @@ void testMergeHooksAndSemanticPreflight() {
                                 const ModelRecord&) {
             return MergeResolution{std::nullopt, {"diameter_mm", "node_uuid_from"}};
         };
-        const aowis::native::MergeResult conflict = repository.mergeBranches("left", "right", unresolved);
+        const aowis::dvmdb::MergeResult conflict = repository.mergeBranches("left", "right", unresolved);
         expect(conflict.status == MergeStatus::Conflicts && conflict.conflicts.size() == 1 &&
                conflict.conflicts[0].reason.find("diameter_mm") != std::string::npos &&
                repository.head("left").id == unchanged,
@@ -1182,10 +1182,10 @@ void testMergeHooksAndSemanticPreflight() {
 
 
 void testWholeObjectMergeChoices() {
-    using aowis::native::MergeChoiceSide;
-    using aowis::native::MergeOptions;
-    using aowis::native::MergeStatus;
-    using aowis::native::ModelRecord;
+    using aowis::dvmdb::MergeChoiceSide;
+    using aowis::dvmdb::MergeOptions;
+    using aowis::dvmdb::MergeStatus;
+    using aowis::dvmdb::ModelRecord;
     {
         TemporaryRepo temporary("merge-object-choices");
         {
@@ -1209,7 +1209,7 @@ void testWholeObjectMergeChoices() {
             MergeOptions sourceChoice;
             sourceChoice.expectedTargetHead = targetBefore;
             sourceChoice.expectedSourceHead = sourceBefore;
-            sourceChoice.chooseConflict = [&chosenCount](const aowis::native::MergeConflict& conflict)
+            sourceChoice.chooseConflict = [&chosenCount](const aowis::dvmdb::MergeConflict& conflict)
                 -> std::optional<MergeChoiceSide> {
                 expect(conflict.key == key(1) && conflict.base && conflict.target && conflict.source,
                        "unexpected whole-object conflict keys");
@@ -1220,7 +1220,7 @@ void testWholeObjectMergeChoices() {
                 if (chosenCount != 1) return std::string("object choice unused");
                 return std::nullopt;
             };
-            const aowis::native::MergeResult merged =
+            const aowis::dvmdb::MergeResult merged =
                 repository.mergeBranches("choose-source", "other-source", sourceChoice);
             expect(merged.status == MergeStatus::Merged && merged.revision.parents ==
                        std::vector<Hash>({targetBefore, sourceBefore}) &&
@@ -1229,7 +1229,7 @@ void testWholeObjectMergeChoices() {
                    "source whole-record choice did not preserve ancestry/branch isolation");
 
             MergeOptions targetChoice;
-            targetChoice.chooseConflict = [](const aowis::native::MergeConflict& conflict)
+            targetChoice.chooseConflict = [](const aowis::dvmdb::MergeConflict& conflict)
                 -> std::optional<MergeChoiceSide> {
                 return conflict.key == key(1) ? std::optional<MergeChoiceSide>{MergeChoiceSide::Target}
                                               : std::nullopt;
@@ -1250,13 +1250,13 @@ void testWholeObjectMergeChoices() {
                    repository.packSize() == oldBytes,
                    "delete-versus-modify must require explicit choice");
             MergeOptions deleteChoice;
-            deleteChoice.chooseConflict = [](const aowis::native::MergeConflict& conflict)
+            deleteChoice.chooseConflict = [](const aowis::dvmdb::MergeConflict& conflict)
                 -> std::optional<MergeChoiceSide> {
                 if (conflict.key == key(1) && !conflict.target && conflict.source)
                     return MergeChoiceSide::Target;
                 return std::nullopt;
             };
-            const aowis::native::MergeResult deletedMerge =
+            const aowis::dvmdb::MergeResult deletedMerge =
                 repository.mergeBranches("deleted", "modified", deleteChoice);
             expect(deletedMerge.status == MergeStatus::Merged &&
                    !repository.getModel("deleted", key(1)) &&
@@ -1275,10 +1275,10 @@ void testWholeObjectMergeChoices() {
 }
 
 void testMergeCandidateReconciliation() {
-    using aowis::native::MergeOptions;
-    using aowis::native::MergeStatus;
-    using aowis::native::MergeCandidate;
-    using aowis::native::ModelRecord;
+    using aowis::dvmdb::MergeOptions;
+    using aowis::dvmdb::MergeStatus;
+    using aowis::dvmdb::MergeCandidate;
+    using aowis::dvmdb::ModelRecord;
     {
         TemporaryRepo temporary("merge-candidate-reconciliation");
         Repository repository(temporary.directory);
@@ -1318,7 +1318,7 @@ void testMergeCandidateReconciliation() {
             set(key(3), ModelRecord{1, {key(1)}, value("combined")});
             return std::nullopt;
         };
-        const aowis::native::MergeResult merged =
+        const aowis::dvmdb::MergeResult merged =
             repository.mergeBranches("main", "feature", valid);
         expect(merged.status == MergeStatus::Merged &&
                repository.getModel("main", key(3))->payload == value("combined") &&
@@ -1334,11 +1334,11 @@ void testMergeCandidateReconciliation() {
 // A fast-forward is still a publication: optional domain validation must see
 // the complete source model snapshot under the same publication lock.
 void testFastForwardSemanticPreflight() {
-    using aowis::native::MergeCandidate;
-    using aowis::native::MergeOptions;
-    using aowis::native::MergeStatus;
-    using aowis::native::ModelChange;
-    using aowis::native::ModelRecord;
+    using aowis::dvmdb::MergeCandidate;
+    using aowis::dvmdb::MergeOptions;
+    using aowis::dvmdb::MergeStatus;
+    using aowis::dvmdb::ModelChange;
+    using aowis::dvmdb::ModelRecord;
     TemporaryRepo test("fast-forward-validation");
     Repository repository(test.directory);
     repository.createBranch("main");
@@ -1368,7 +1368,7 @@ void testFastForwardSemanticPreflight() {
                "fast-forward validator did not traverse source records in UUID order");
         return std::string("domain failure");
     };
-    const aowis::native::MergeResult rejected = repository.mergeBranches("main", "feature", options);
+    const aowis::dvmdb::MergeResult rejected = repository.mergeBranches("main", "feature", options);
     expect(rejected.status == MergeStatus::Conflicts && rejected.base == baseline &&
            rejected.conflicts.size() == 1 && rejected.conflicts[0].reason == "domain failure" &&
            validations == 1 && repository.head("main").id == baseline &&
@@ -1382,33 +1382,33 @@ void testFastForwardSemanticPreflight() {
     options.expectedSourceHead = baseline;
     bool stale = false;
     try { (void)repository.mergeBranches("main", "feature", options); }
-    catch (const aowis::native::StorageError&) { stale = true; }
+    catch (const aowis::dvmdb::StorageError&) { stale = true; }
     expect(stale && validations == 1 && repository.head("main").id == baseline &&
            repository.packSize() == bytes, "stale source pin reached fast-forward validator");
     options.expectedSourceHead = source;
     options.expectedTargetHead = source;
     stale = false;
     try { (void)repository.mergeBranches("main", "feature", options); }
-    catch (const aowis::native::StorageError&) { stale = true; }
+    catch (const aowis::dvmdb::StorageError&) { stale = true; }
     expect(stale && validations == 1 && repository.head("main").id == baseline &&
            repository.packSize() == bytes, "stale target pin reached fast-forward validator");
     options.expectedTargetHead = baseline;
-    const aowis::native::MergeResult accepted = repository.mergeBranches("main", "feature", options);
+    const aowis::dvmdb::MergeResult accepted = repository.mergeBranches("main", "feature", options);
     expect(accepted.status == MergeStatus::FastForward && accepted.revision.id == source &&
            accepted.revision.parents.size() == 1 && validations == 2 &&
            repository.head("main").id == source && repository.head("feature").id == source &&
            repository.packSize() == bytes,
            "valid fast-forward did not reuse the source revision without pack writes");
     options.expectedTargetHead = source;
-    const aowis::native::MergeResult same = repository.mergeBranches("main", "feature", options);
+    const aowis::dvmdb::MergeResult same = repository.mergeBranches("main", "feature", options);
     expect(same.status == MergeStatus::UpToDate && validations == 2 &&
            repository.packSize() == bytes,
            "equal-head no-op unexpectedly revalidated an existing snapshot");
     repository.commitModel("main", {{key(3), ModelRecord{1, {}, value("more")}}});
-    const aowis::native::MergeResult incorporated = repository.mergeBranches("main", "feature");
+    const aowis::dvmdb::MergeResult incorporated = repository.mergeBranches("main", "feature");
     expect(incorporated.status == MergeStatus::UpToDate, "source ancestor not up-to-date");
     options.expectedTargetHead = repository.head("main").id;
-    const aowis::native::MergeResult incorporatedValidated =
+    const aowis::dvmdb::MergeResult incorporatedValidated =
         repository.mergeBranches("main", "feature", options);
     expect(incorporatedValidated.status == MergeStatus::UpToDate && validations == 2,
            "incorporated source unexpectedly invoked validator");
@@ -1425,7 +1425,7 @@ void testFastForwardSemanticPreflight() {
     rawOptions.validate = [](const MergeCandidate&) -> std::optional<std::string> {
         throw std::runtime_error("raw snapshot must not be given to model validator");
     };
-    const aowis::native::MergeResult raw =
+    const aowis::dvmdb::MergeResult raw =
         repository.mergeBranches("raw-main", "raw-source", rawOptions);
     expect(raw.status == MergeStatus::Conflicts && !raw.conflicts.empty() &&
            repository.head("raw-main").id == rawBefore && repository.packSize() == rawBytes,
@@ -1441,7 +1441,7 @@ void testPhysicalIndexFingerprintCollision() {
     std::string second;
     for (std::uint64_t attempt = 0; attempt < 1000000; ++attempt) {
         const std::string payload = "fingerprint-collision-" + std::to_string(attempt);
-        const Hash hash = aowis::native::sha256(value(payload));
+        const Hash hash = aowis::dvmdb::sha256(value(payload));
         std::uint64_t fingerprint64 = 14695981039346656037ULL;
         for (std::uint8_t byte : hash) {
             fingerprint64 = (fingerprint64 ^ byte) * 1099511628211ULL;

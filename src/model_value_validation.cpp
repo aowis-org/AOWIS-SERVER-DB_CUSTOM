@@ -9,7 +9,7 @@
 // tools/check_model_codec.py fails the build when a numeric Model field (or a
 // struct field containing numbers) is not referenced in its check() below,
 // so a new number can never be stored without a decided range.
-#include <aowis/native/model_validation.h>
+#include <aowis/dvmdb/model_validation.h>
 
 #include <QString>
 
@@ -19,7 +19,7 @@
 #include <functional>
 #include <limits>
 
-namespace aowis::native
+namespace aowis::dvmdb
 {
 namespace
 {
@@ -776,4 +776,4 @@ ModelValidationReport validateHydraulicEntityValues(const HydraulicControlRule &
 ModelValidationReport validateHydraulicEntityValues(const HydraulicMapLabel &entity)
 { return entityReport("map_label", entity); }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

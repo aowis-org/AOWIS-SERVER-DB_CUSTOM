@@ -1,4 +1,4 @@
-#include "aowis/native/project_service.h"
+#include "aowis/dvmdb/project_service.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -18,13 +18,13 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ProjectInfo;
-using aowis::native::ProjectService;
-using aowis::native::Repository;
-using aowis::native::Revision;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ProjectInfo;
+using aowis::dvmdb::ProjectService;
+using aowis::dvmdb::Repository;
+using aowis::dvmdb::Revision;
 
 constexpr std::string_view oldMain = "7bf2c352bb7308517a3785101b1634b206a954c013549070eb4760ea52f452d1";
 constexpr std::string_view oldFeature = "4f0f347555c80634f2578dae167d80b841759511a3b891ab0045a479a8f15bb2";
@@ -148,9 +148,9 @@ void checkHistorical(const std::filesystem::path& root, const std::vector<Projec
     ProjectService service(root);
     for (int index = 0; index < 2; ++index) {
         service.withRepository(info[index].id, [&](Repository& repository) {
-            require(aowis::native::toHex(repository.head("main").id) == oldMain,
+            require(aowis::dvmdb::toHex(repository.head("main").id) == oldMain,
                     "frozen old-pack main revision changed");
-            require(aowis::native::toHex(repository.head("feature").id) == oldFeature,
+            require(aowis::dvmdb::toHex(repository.head("feature").id) == oldFeature,
                     "frozen old-pack divergent branch changed");
             require(repository.get("main", key(0x10)) == bytes("alpha-v2"),
                     "old-pack latest value incorrect");
@@ -158,7 +158,7 @@ void checkHistorical(const std::filesystem::path& root, const std::vector<Projec
                     "old-pack secondary branch value incorrect");
             require(repository.get("main", key(0x20)) == std::nullopt,
                     "old-pack deletion was lost");
-            require(repository.getAtRevision(aowis::native::fromHex(oldBase), key(0x20)) == bytes("beta-v1"),
+            require(repository.getAtRevision(aowis::dvmdb::fromHex(oldBase), key(0x20)) == bytes("beta-v1"),
                     "old-pack historic value cannot be read");
         });
     }
@@ -187,7 +187,7 @@ void exercise(const std::string& python, const std::string& script,
         for (int index = 2; index < 4; ++index) {
             service.withRepository(info[index].id, [&](Repository& repository) {
                 repository.createBranch("design", "main");
-                std::vector<aowis::native::Change> edits;
+                std::vector<aowis::dvmdb::Change> edits;
                 const int count = index == 3 ? 160 : 16;
                 for (int number = 0; number < count; ++number) {
                     Key recordKey{};
@@ -249,7 +249,7 @@ void exercise(const std::string& python, const std::string& script,
         service.withRepository(info[0].id, [&](Repository& repository) {
             repository.commit("main", {{key(0x60), bytes("post-upgrade commit")}});
             repository.verifyRepository();
-            require(repository.getAtRevision(aowis::native::fromHex(oldBase), key(0x20)) == bytes("beta-v1"),
+            require(repository.getAtRevision(aowis::dvmdb::fromHex(oldBase), key(0x20)) == bytes("beta-v1"),
                     "post-upgrade commit broke historic reads");
         });
     }

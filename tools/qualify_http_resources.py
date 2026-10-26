@@ -212,7 +212,7 @@ def execute(args):
         if observed_seconds < args.seconds * 0.95:
             raise QualificationError("server was not observed for the requested workload duration")
         report = {
-            "kind": "aowis-native-http-resource-qualification",
+            "kind": "aowis-dvmdb-http-resource-qualification",
             "version": 1,
             "recorded_utc": datetime.now(timezone.utc).isoformat(),
             "scope": "Linux procfs process samples during sustained real HTTP bundle transfers; not a production resource guarantee",
@@ -267,7 +267,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=300)
     parser.add_argument("--stress-binary", type=Path,
-                        default=Path("build-linux-tests-release/aowis-native-http-transfer-stress-tests"))
+                        default=Path("build-linux-tests-release/aowis-dvmdb-http-transfer-stress-tests"))
     parser.add_argument("--server-binary", type=Path,
                         default=Path("build-linux-tests-release/aowis-server-dvmdb"))
     parser.add_argument("--output-root", type=Path, default=Path("build-qualification"))

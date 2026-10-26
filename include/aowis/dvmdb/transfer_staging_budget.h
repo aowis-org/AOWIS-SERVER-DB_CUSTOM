@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace aowis::native::http {
+namespace aowis::dvmdb::http {
 
 // A process-local ceiling on HTTP bundle staging, shared across all projects.
 // Reservations conservatively charge the configured maximum transfer size,
@@ -85,4 +85,4 @@ private:
     std::shared_ptr<State> state_;
 };
 
-} // namespace aowis::native::http
+} // namespace aowis::dvmdb::http

@@ -4,7 +4,7 @@ These are real, immutable bytes emitted by the pre-release native pack
 implementation. They must **not** be regenerated with the executable under
 test: that would hide accidental format incompatibilities.
 
-Original creation used `Repository` from `include/aowis/native/native_store.h`:
+Original creation used the AOWIS `Repository` API (now at `include/aowis/dvmdb/native_store.h`):
 
 1. `createBranch("main")`, commit keys `10` and `20` (first byte of 16-byte
    UUID keys, remaining bytes zero), values `alpha-v1` and `beta-v1`.

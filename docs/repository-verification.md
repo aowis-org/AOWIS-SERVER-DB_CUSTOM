@@ -5,9 +5,9 @@ The AOWIS native database provides read-only physical and logical verification o
 ## Administrative commands
 
 ```bash
-./build-linux/aowis-native-verify /path/to/repository
-./build-linux/aowis-native-verify --full /path/to/repository
-./build-linux/aowis-native-verify --physical /path/to/repository
+./build-linux/aowis-dvmdb-verify /path/to/repository
+./build-linux/aowis-dvmdb-verify --full /path/to/repository
+./build-linux/aowis-dvmdb-verify --physical /path/to/repository
 ```
 
 **Full is the default.** A successful full check returns exit code 0 and prints physical object count, reachable objects, branch count, historical revision count, verified trie-node count and distinct model snapshot count. `--physical` skips logical checks and explicitly reports that they were not performed. Any failed check returns exit code 1; invalid CLI arguments return exit code 2.
@@ -24,7 +24,7 @@ The checker holds the repository's interprocess lock throughout verification so 
 ## Explicit limits
 
 - **Domain-specific hydraulic validation is not run.** A full native-storage check verifies generic typed model envelopes, dependency indexes, revision history and canonical object structure. It does not establish that complete `NetworkHydraulic` objects obey application-specific rules. The CLI states this explicitly.
-- **Physical maintenance may occur on open:** The repository constructor can rebuild the derived physical index or discard a torn, unpublished pack tail (see [architecture](architecture.md)). Discarded bytes are preserved under `recovered-pack-tails/`; `aowis-native-verify` prints a `Recovered:` line when its own open performed such a repair, and the HTTP service logs it when it opens a project. Compaction removes leftover pack generations of earlier interrupted compactions (`stale_files_removed=` in `aowis-native-compact` output). Verification itself is read-only with respect to published logical state.
+- **Physical maintenance may occur on open:** The repository constructor can rebuild the derived physical index or discard a torn, unpublished pack tail (see [architecture](architecture.md)). Discarded bytes are preserved under `recovered-pack-tails/`; `aowis-dvmdb-verify` prints a `Recovered:` line when its own open performed such a repair, and the HTTP service logs it when it opens a project. Compaction removes leftover pack generations of earlier interrupted compactions (`stale_files_removed=` in `aowis-dvmdb-compact` output). Verification itself is read-only with respect to published logical state.
 - **Unreachable valid objects:** Full verification checks their physical integrity but has no logical root from which to interpret their type. This is intentional; unreferenced objects may be left by interrupted transactions.
 - **Resource use:** A full historical check can take substantial CPU, memory and storage I/O, particularly when a repository contains many distinct model snapshots. Per-snapshot dependency edges are sorted with a bounded 8,192-entry buffer and file-backed runs rather than an unbounded in-memory map of incoming references. Revision, Merkle-subtree and snapshot tracking remain in memory, so this is not yet a bounded-memory streaming audit.
 - **No automatic repair:** If full verification fails, keep an untouched backup of the repository and investigate the reported corruption. Do not reset branch heads or regenerate model/reference objects silently: that would change published revision identities.

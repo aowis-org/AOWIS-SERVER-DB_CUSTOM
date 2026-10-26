@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <array>
 #include <chrono>
@@ -16,11 +16,11 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
 
 void expect(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -63,7 +63,7 @@ struct BundleBuilder {
     std::map<Hash, Bytes> objects;
 
     Hash add(const Bytes& payload) {
-        const Hash hash = aowis::native::sha256(payload);
+        const Hash hash = aowis::dvmdb::sha256(payload);
         this->objects.emplace(hash, payload);
         return hash;
     }
@@ -131,7 +131,7 @@ enum class Defect {
 Hash addValue(BundleBuilder& builder, TreeKind kind) {
     if (kind == TreeKind::Model) {
         const ModelRecord record{1, {}, Bytes{'m', 'o', 'd', 'e', 'l'}};
-        const Bytes encoded = aowis::native::encodeModelRecord(record);
+        const Bytes encoded = aowis::dvmdb::encodeModelRecord(record);
         Bytes object{'V'};
         object.insert(object.end(), encoded.begin(), encoded.end());
         return builder.add(object);

@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <chrono>
 #include <cstdint>
@@ -17,11 +17,11 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Key;
-using aowis::native::ModelChange;
-using aowis::native::ModelRecord;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::Repository;
 
 // Uses the UUID layout of a deterministic test fixture, not real UUIDv7.
 Key keyFor(std::uint8_t kind, std::uint64_t number) {
@@ -69,7 +69,7 @@ double elapsed(std::chrono::steady_clock::time_point start) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 5) {
-        std::cerr << "Usage: aowis-native-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10]\n"
+        std::cerr << "Usage: aowis-dvmdb-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10]\n"
                   << "Synthetic network-shaped typed-model fixture, NOT a canonical model codec benchmark.\n";
         return 2;
     }
@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point reading = std::chrono::steady_clock::now();
         std::uint64_t checked = 0;
         for (const std::pair<Key, Bytes>& entry : repository->scan("main")) {
-            const ModelRecord record = aowis::native::decodeModelRecord(entry.second);
+            const ModelRecord record = aowis::dvmdb::decodeModelRecord(entry.second);
             if (record.kind != 1 && record.kind != 4) throw std::runtime_error("unexpected model kind");
             if (record.kind == 4 && record.references.size() != 2) {
                 throw std::runtime_error("pipe lost endpoint references");
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
         }
         const double scanMs = elapsed(reading);
         if (checked != pipes * 2 + 1) throw std::runtime_error("network entity count differs");
-        const aowis::native::Revision last = repository->head("main");
+        const aowis::dvmdb::Revision last = repository->head("main");
         const std::uint64_t packBytes = repository->packSize();
         const std::uint64_t packObjects = repository->objectCount();
         repository.reset();

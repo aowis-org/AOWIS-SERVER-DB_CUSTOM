@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <chrono>
 #include <cstdint>
@@ -14,11 +14,11 @@
 
 namespace {
 
-using aowis::native::Bytes;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::MergeStatus;
-using aowis::native::Repository;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::MergeStatus;
+using aowis::dvmdb::Repository;
 
 Key key(std::uint32_t sequence) {
     Key result{};
@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
         const Hash sourceBefore = repository.head("feature").id;
         const std::chrono::steady_clock::time_point start =
             std::chrono::steady_clock::now();
-        const aowis::native::MergeResult result = repository.mergeBranches("main", "feature");
+        const aowis::dvmdb::MergeResult result = repository.mergeBranches("main", "feature");
         const std::chrono::steady_clock::time_point finish =
             std::chrono::steady_clock::now();
         if (result.status != MergeStatus::Conflicts || result.base != expectedBase ||

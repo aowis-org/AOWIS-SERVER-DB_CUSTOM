@@ -192,7 +192,7 @@ def main():
     parser.add_argument("source", type=Path, help="offline storage root / snapshot root")
     parser.add_argument("destination", type=Path, nargs="?", help="new, absent destination root")
     parser.add_argument("--verify-binary", type=Path, required=True,
-                        help="path to freshly built aowis-native-verify")
+                        help="path to freshly built aowis-dvmdb-verify")
     args = parser.parse_args()
     try:
         source = args.source.absolute()

@@ -43,6 +43,16 @@ main() {
         for path in "${entries[@]}"; do
             rm -f -- "$path"
         done
+        # Remove obsolete *empty* source directories after file deletions.
+        # Never remove the repository itself or directories containing data.
+        local directory
+        for path in "${entries[@]}"; do
+            directory="$(dirname -- "$path")"
+            while [[ "$directory" != "$project_root" ]]; do
+                rmdir -- "$directory" 2>/dev/null || break
+                directory="$(dirname -- "$directory")"
+            done
+        done
         rm -f -- "$manifest"
         printf 'Removed %d obsolete file(s) listed by patch.\n' "${#entries[@]}"
     }

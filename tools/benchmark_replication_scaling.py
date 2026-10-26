@@ -245,7 +245,7 @@ def run_imports(binary, fixtures_root, destination_root, args, kinds, backends, 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path,
-                        help="Path to aowis-native-replication-scaling-benchmark")
+                        help="Path to aowis-dvmdb-replication-scaling-benchmark")
     parser.add_argument("--objects", type=int, default=10000)
     parser.add_argument("--commits", type=int, default=20)
     parser.add_argument("--payload-bytes", type=int, default=96)

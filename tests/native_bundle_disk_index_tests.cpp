@@ -1,4 +1,4 @@
-#include "aowis/native/native_store.h"
+#include "aowis/dvmdb/native_store.h"
 
 #include <algorithm>
 #include <array>
@@ -17,15 +17,15 @@
 #include <unistd.h>
 
 namespace {
-using aowis::native::BundleImportStatus;
-using aowis::native::BundleImportResult;
-using aowis::native::Bytes;
-using aowis::native::Change;
-using aowis::native::Hash;
-using aowis::native::Key;
-using aowis::native::ModelRecord;
-using aowis::native::ModelChange;
-using aowis::native::Repository;
+using aowis::dvmdb::BundleImportStatus;
+using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::Change;
+using aowis::dvmdb::Hash;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::Repository;
 
 void check(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -113,7 +113,7 @@ void appendUnreachableObject(const std::filesystem::path& source,
     }
     check(offset == original.size(), "trailing bytes in valid bundle fixture");
     const Bytes orphan{'V', 'o', 'r', 'p', 'h', 'a', 'n', 0x7d};
-    check(objects.emplace(aowis::native::sha256(orphan), orphan).second,
+    check(objects.emplace(aowis::dvmdb::sha256(orphan), orphan).second,
           "unexpected orphan hash collision");
     Bytes output(original.begin(), original.begin() + 40);
     appendU64(output, static_cast<std::uint64_t>(objects.size()));
@@ -180,12 +180,12 @@ void exerciseSharedTreesAcrossKinds() {
     second.back() = 0x34;
     const ModelRecord one{1, {}, Bytes{'a', 'b', 'c'}};
     const ModelRecord two{2, {}, Bytes{'d', 'e', 'f'}};
-    const aowis::native::Revision raw = source.commit("main", {
-        Change{first, aowis::native::encodeModelRecord(one)},
-        Change{second, aowis::native::encodeModelRecord(two)}});
+    const aowis::dvmdb::Revision raw = source.commit("main", {
+        Change{first, aowis::dvmdb::encodeModelRecord(one)},
+        Change{second, aowis::dvmdb::encodeModelRecord(two)}});
     (void)source.commit("main", {Change{first, std::nullopt},
                                   Change{second, std::nullopt}});
-    const aowis::native::Revision model = source.commitModel("main", {
+    const aowis::dvmdb::Revision model = source.commitModel("main", {
         ModelChange{first, one}, ModelChange{second, two}});
     check(raw.root == model.root && raw.root != Hash{},
           "shared-tree fixture did not reuse identical immutable trie objects");
@@ -199,15 +199,15 @@ void exerciseSharedTreesAcrossKinds() {
     check(destination.revision(raw.id).root == destination.head("main").root,
           "imported shared trie roots differ");
     check(destination.getAtRevision(raw.id, first) ==
-          std::optional<Bytes>(aowis::native::encodeModelRecord(one)),
+          std::optional<Bytes>(aowis::dvmdb::encodeModelRecord(one)),
           "raw historical record differs after shared-tree import");
     const std::optional<ModelRecord> restored =
         destination.getModelAtRevision(model.id, second);
     check(restored.has_value() && restored->kind == two.kind &&
           restored->references == two.references && restored->payload == two.payload,
           "model historical record differs after shared-tree import");
-    const aowis::native::VerificationReport originalReport = source.verifyRepository();
-    const aowis::native::VerificationReport importedReport = destination.verifyRepository();
+    const aowis::dvmdb::VerificationReport originalReport = source.verifyRepository();
+    const aowis::dvmdb::VerificationReport importedReport = destination.verifyRepository();
     check(originalReport.revisions == importedReport.revisions &&
           originalReport.treeNodes == importedReport.treeNodes &&
           originalReport.modelSnapshots == importedReport.modelSnapshots,
@@ -258,8 +258,8 @@ void exercise() {
     check(created.status == BundleImportStatus::Created && created.head == firstTip &&
           created.objectsImported > 600, "full file-backed import was incomplete");
     temporaryIndex.checkEmpty();
-    const aowis::native::VerificationReport originalReport = source.verifyRepository();
-    const aowis::native::VerificationReport importedReport = destination.verifyRepository();
+    const aowis::dvmdb::VerificationReport originalReport = source.verifyRepository();
+    const aowis::dvmdb::VerificationReport importedReport = destination.verifyRepository();
     check(originalReport.revisions == importedReport.revisions &&
           originalReport.treeNodes == importedReport.treeNodes &&
           originalReport.modelSnapshots == importedReport.modelSnapshots,

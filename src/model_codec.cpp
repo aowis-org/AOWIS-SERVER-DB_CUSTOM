@@ -1,5 +1,5 @@
-#include <aowis/native/model_codec.h>
-#include <aowis/native/model_field_merge.h>
+#include <aowis/dvmdb/model_codec.h>
+#include <aowis/dvmdb/model_field_merge.h>
 
 #include <QDataStream>
 #include <QIODevice>
@@ -12,7 +12,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace aowis::native
+namespace aowis::dvmdb
 {
 namespace
 {
@@ -3015,4 +3015,4 @@ std::optional<ModelFieldMerge> mergeModelFields(const QUuid &object_uuid,
     return std::nullopt;
 }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

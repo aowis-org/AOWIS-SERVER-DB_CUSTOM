@@ -1,4 +1,4 @@
-#include "aowis/native/model_codec_adapter.h"
+#include "aowis/dvmdb/model_codec_adapter.h"
 
 #include <QCoreApplication>
 
@@ -19,12 +19,12 @@
 #endif
 
 namespace {
-using aowis::native::Key;
-using aowis::native::Bytes;
-using aowis::native::ModelRecord;
-using aowis::native::ModelChange;
-using aowis::native::Repository;
-namespace hydraulic = aowis::native::hydraulic;
+using aowis::dvmdb::Key;
+using aowis::dvmdb::Bytes;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::Repository;
+namespace hydraulic = aowis::dvmdb::hydraulic;
 
 QUuid uuidFor(std::uint8_t kind, std::uint64_t ordinal) {
     Key key{};
@@ -75,7 +75,7 @@ double elapsed(const std::chrono::steady_clock::time_point start) {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     if (argc < 2 || argc > 5) {
-        std::cerr << "Usage: aowis-native-hydraulic-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10]\n"
+        std::cerr << "Usage: aowis-dvmdb-hydraulic-model-benchmark <NEW_DIRECTORY> [pipes=1000] [revisions=10] [edits=10]\n"
                   << "Real native model codec bytes and content-addressed native model storage.\n";
         return 2;
     }
@@ -141,17 +141,17 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point scanning = std::chrono::steady_clock::now();
         std::uint64_t count = 0;
         for (const std::pair<Key, Bytes>& pair : store->scan("main")) {
-            const ModelRecord record = aowis::native::decodeModelRecord(pair.second);
+            const ModelRecord record = aowis::dvmdb::decodeModelRecord(pair.second);
             const QByteArray bytes = hydraulic::qByteArrayFromBytes(record.payload);
             if (record.kind == hydraulic::junctionKind) {
                 const std::optional<HydraulicNodeJunction> junction =
-                    aowis::native::ModelCodec<HydraulicNodeJunction>::decode(bytes);
+                    aowis::dvmdb::ModelCodec<HydraulicNodeJunction>::decode(bytes);
                 if (!junction || hydraulic::keyFromUuid(junction->uuid) != pair.first) {
                     throw std::runtime_error("junction model payload/key mismatch");
                 }
             } else if (record.kind == hydraulic::pipeKind) {
                 const std::optional<HydraulicLinkPipe> pipe =
-                    aowis::native::ModelCodec<HydraulicLinkPipe>::decode(bytes);
+                    aowis::dvmdb::ModelCodec<HydraulicLinkPipe>::decode(bytes);
                 if (!pipe || hydraulic::keyFromUuid(pipe->uuid) != pair.first || record.references.size() != 2) {
                     throw std::runtime_error("pipe model payload/key/reference mismatch");
                 }
@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
         }
         if (count != 2 * pipes + 1) throw std::runtime_error("incorrect record count");
         const double scanMs = elapsed(scanning);
-        const aowis::native::Revision final = store->head("main");
+        const aowis::dvmdb::Revision final = store->head("main");
         const std::uint64_t packBytes = store->packSize();
         const std::uint64_t packedObjects = store->objectCount();
         store.reset(); // Close the repository before reopening for verification.

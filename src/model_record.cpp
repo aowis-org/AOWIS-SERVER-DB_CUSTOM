@@ -1,11 +1,11 @@
-#include "aowis/native/model_record.h"
-#include "aowis/native/storage_error.h"
+#include "aowis/dvmdb/model_record.h"
+#include "aowis/dvmdb/storage_error.h"
 
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 namespace {
 
 void append16(Bytes& output, std::uint16_t value) {
@@ -91,4 +91,4 @@ ModelRecord decodeModelRecord(const Bytes& bytes) {
     return result;
 }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

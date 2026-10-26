@@ -21,7 +21,7 @@ import time
 
 MOUNT = "/mnt/aowis-powercut"
 DEVICE = "/dev/vdb"
-WORKER = "/usr/local/bin/aowis-native-vm-powercut-worker"
+WORKER = "/usr/local/bin/aowis-dvmdb-vm-powercut-worker"
 STATE = re.compile(r"^STATE ([0-9]+) ([0-9a-f]{64})$")
 ACK = re.compile(r"^ACK ([0-9]+) ([0-9a-f]{64})$")
 

@@ -124,7 +124,7 @@ def read_run(argument):
     require(argument.is_dir() or argument.name == "report.json",
             f"expected run directory or report.json: {argument}")
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    require(report.get("kind") == "aowis-native-http-resource-qualification" and
+    require(report.get("kind") == "aowis-dvmdb-http-resource-qualification" and
             report.get("version") == 1, f"unsupported resource report: {report_path}")
     soak = report["soak"]
     duration = soak["duration_s"]
@@ -257,7 +257,7 @@ def analyze(arguments):
         first_to_last = round(100 * (
             runs[-1]["operations_per_second"] / baseline["operations_per_second"] - 1), 3)
     return {
-        "kind": "aowis-native-http-resource-run-analysis", "version": 1,
+        "kind": "aowis-dvmdb-http-resource-run-analysis", "version": 1,
         "comparison": {
             "same_duration_host_kernel_and_executables": compatible,
             "same_duration_and_host": same_host_duration,

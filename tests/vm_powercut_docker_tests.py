@@ -79,12 +79,12 @@ def main():
             if "--build" in command:
                 build_dir = cache / "debian12-release-build"
                 build_dir.mkdir(parents=True, exist_ok=True)
-                (build_dir / "aowis-native-vm-powercut-worker").touch()
+                (build_dir / "aowis-dvmdb-vm-powercut-worker").touch()
         with patch.object(helper, "run", side_effect=pretend_build):
             worker = helper.build_worker(cache, source=root_path)
         check(worker.is_file(), "mock production worker build failed")
-        check(any("-DAOWIS_NATIVE_WITH_MODEL_CODEC=OFF" in entry and
-                  "-DAOWIS_NATIVE_WITH_HTTP_SERVER=OFF" in entry
+        check(any("-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF" in entry and
+                  "-DAOWIS_DVMDB_WITH_HTTP_SERVER=OFF" in entry
                   for entry in commands), "Docker worker build unexpectedly depends on Qt")
 
         mock = root_path / "fake-docker"

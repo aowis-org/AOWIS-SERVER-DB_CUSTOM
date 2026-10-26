@@ -1,4 +1,4 @@
-#include "aowis/native/project_service.h"
+#include "aowis/dvmdb/project_service.h"
 
 #include <openssl/rand.h>
 
@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <utility>
 
-namespace aowis::native {
+namespace aowis::dvmdb {
 namespace {
 
 // Catalogue metadata on disk violating its format is storage corruption.
@@ -456,4 +456,4 @@ std::size_t ProjectService::pendingOperations(std::string_view projectId) const 
     return findProject(projectId)->pending.load();
 }
 
-} // namespace aowis::native
+} // namespace aowis::dvmdb

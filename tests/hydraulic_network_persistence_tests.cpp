@@ -1,6 +1,6 @@
-#include "aowis/native/hydraulic_network_persistence.h"
+#include "aowis/dvmdb/hydraulic_network_persistence.h"
 
-#include <aowis/native/model_validation.h>
+#include <aowis/dvmdb/model_validation.h>
 
 #include <QCoreApplication>
 
@@ -23,8 +23,8 @@
 #include <unistd.h>
 
 namespace {
-namespace native = aowis::native;
-namespace hydraulic = aowis::native::hydraulic;
+namespace native = aowis::dvmdb;
+namespace hydraulic = aowis::dvmdb::hydraulic;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -122,15 +122,15 @@ void compareNetworks(const NetworkHydraulic& source, const NetworkHydraulic& res
             result.title_line_1 == source.title_line_1 &&
             result.duration_s == source.duration_s &&
             result.map_backdrop.file == source.map_backdrop.file &&
-            aowis::native::ModelCodec<NetworkMultiSpecies>::encode(result.multi_species) ==
-            aowis::native::ModelCodec<NetworkMultiSpecies>::encode(source.multi_species),
+            aowis::dvmdb::ModelCodec<NetworkMultiSpecies>::encode(result.multi_species) ==
+            aowis::dvmdb::ModelCodec<NetworkMultiSpecies>::encode(source.multi_species),
             "network metadata changed on reload");
 #define CHECK_LIST(name, type) \
     require(result.name.size() == source.name.size(), "network entity count changed: " #name); \
     for (qsizetype i = 0; i < source.name.size(); ++i) { \
         require(result.name[i].uuid == source.name[i].uuid, "network order changed: " #name); \
-        require(aowis::native::ModelCodec<type>::encode(result.name[i]) == \
-                aowis::native::ModelCodec<type>::encode(source.name[i]), \
+        require(aowis::dvmdb::ModelCodec<type>::encode(result.name[i]) == \
+                aowis::dvmdb::ModelCodec<type>::encode(source.name[i]), \
                 "canonical model payload changed: " #name); \
     }
     CHECK_LIST(pipe_materials, HydraulicPipeMaterial)
@@ -240,7 +240,7 @@ void exercise() {
     const std::filesystem::path folder = tempDir();
     try {
         const NetworkHydraulic initial = completeNetwork();
-        require(aowis::native::validateHydraulicNetwork(initial).valid(), "test network invalid");
+        require(aowis::dvmdb::validateHydraulicNetwork(initial).valid(), "test network invalid");
         // Compact persistence edges must match the detailed reference walker.
         const native::HydraulicDependencyValidation compact =
             native::validateHydraulicNetworkWithDependencies(initial);
@@ -295,8 +295,8 @@ void exercise() {
                     require(actual.has_value(), "fast entity lookup missing: " #name); \
                     const type* entity = std::get_if<type>(&*actual); \
                     require(entity != nullptr && \
-                        aowis::native::ModelCodec<type>::encode(*entity) == \
-                        aowis::native::ModelCodec<type>::encode(expected), \
+                        aowis::dvmdb::ModelCodec<type>::encode(*entity) == \
+                        aowis::dvmdb::ModelCodec<type>::encode(expected), \
                         "fast entity lookup returned wrong payload: " #name); \
                 } \
                 ++checkedCollection; \
@@ -528,7 +528,7 @@ void exercise() {
             structuralExpected.links_valves.append(newValve);
             compareNetworks(structuralExpected,
                 requiredLoad(repository, "structural-indexed", initial.uuid));
-            require(aowis::native::validateHydraulicNetwork(structuralExpected).valid(),
+            require(aowis::dvmdb::validateHydraulicNetwork(structuralExpected).valid(),
                     "indexed structural insertion bypassed canonical validator");
             const std::vector<native::Key> pumpNodeIncoming = repository.referencingModel(
                 "structural-indexed", hydraulic::keyFromUuid(newReservoir.uuid));
@@ -612,7 +612,7 @@ void exercise() {
             tankOverride.tank_uuid = newTank.uuid;
             protectedNetwork.multi_species.parameter_overrides_tanks.append(tankOverride);
             // Empty parameter UUID is legal in the canonical validator.
-            require(aowis::native::validateHydraulicNetwork(protectedNetwork).valid(),
+            require(aowis::dvmdb::validateHydraulicNetwork(protectedNetwork).valid(),
                     "structural MSX fixture invalid");
             hydraulic::saveHydraulicNetwork(repository, "structural-msx", protectedNetwork);
             rejectedStructural = false;
@@ -1269,7 +1269,7 @@ void exerciseChunkBoundaries() {
         for (int index = 0; index < 260; ++index) {
             network.map_labels.append(item<HydraulicMapLabel>(803000 + index));
         }
-        require(aowis::native::validateHydraulicNetwork(network).valid(),
+        require(aowis::dvmdb::validateHydraulicNetwork(network).valid(),
                 "chunk test fixture not valid");
         native::Hash original{};
         {
@@ -1355,7 +1355,7 @@ void exerciseDependentMembership() {
     try {
         NetworkHydraulic baseline = completeNetwork();
         baseline.nodes_junctions.append(item<HydraulicNodeJunction>(42000));
-        require(aowis::native::validateHydraulicNetwork(baseline).valid(),
+        require(aowis::dvmdb::validateHydraulicNetwork(baseline).valid(),
                 "dependent membership fixture invalid");
         {
             native::Repository repository(folder);
@@ -1405,7 +1405,7 @@ void exerciseDependentMembership() {
             expected.demand_points.append(point);
             expected.controls_simple.append(control);
             expected.controls_rules.append(rule);
-            require(aowis::native::validateHydraulicNetwork(expected).valid(),
+            require(aowis::dvmdb::validateHydraulicNetwork(expected).valid(),
                     "indexed demand and controls did not satisfy canonical validation");
             compareNetworks(expected, requiredLoad(repository, "dependent", baseline.uuid));
 
