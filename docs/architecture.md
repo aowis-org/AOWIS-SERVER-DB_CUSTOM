@@ -12,6 +12,14 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 
 ## Logical identities and history
 
+The agreed meaning of *revision/commit*, *branch*, *per-branch HEAD* and the
+GUI's complete multi-branch graph is recorded in
+[version-control semantics](version-control-semantics.md). In particular, a
+branch is a named ref, not a revision ancestry node. The repository stores
+no global checkout HEAD or original branch-creation event. Existing
+first-parent history APIs do not enumerate all merge-parent ancestry;
+a dedicated full-DAG reader is planned without changing this storage model.
+
 - Entity keys are 16-byte UUIDs. Object and revision identities are 32-byte SHA-256 hashes of canonical bytes.
 - A persistent, path-compressed 16-way radix Merkle tree maps UUIDs to immutable object hashes. Unchanged values/subtrees are reused across revisions.
 - Model-indexed revisions also publish a reverse-reference Merkle tree mapping a UUID to its incoming referencing UUIDs. Both roots belong to one revision.

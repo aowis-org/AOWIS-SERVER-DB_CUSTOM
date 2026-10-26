@@ -2,7 +2,7 @@
 
 The native database owns `aowis::dvmdb::ModelCodec<T>`, its hydraulic validator and field-aware merge helpers. Implementation is in `src/model_codec.cpp`, `src/model_validation.cpp` and `src/model_value_validation.cpp`, with public headers under `include/aowis/dvmdb/`. The codec never encodes or decodes an undeclared enum value or a non-finite number; the declared enumerators are generated from the Model headers at configure time. Physical value ranges are listed in [model value rules](model-value-rules.md). Canonical model type definitions come from the pinned `AOWIS-SERVER-MODEL` submodule. Qt6 Core is required for the typed layer; the low-level native store can build without Qt.
 
-The codec is independent of the transport and physical object-store layout. Direct library calls and the planned REST service use the same canonical model payloads.
+The codec is independent of the transport and physical object-store layout. Direct native-library calls and the implemented HTTP service use the same canonical model payloads.
 
 ## Schema contract
 
@@ -28,4 +28,4 @@ The complete hydraulic adapter stores all 18 top-level entity collections and va
 
 ## Transport independence
 
-The planned REST service must call this codec and the existing model APIs. JSON may represent request/response metadata, but it must not become a separate authoritative model serialization format. Large model and synchronization payloads need binary transfer support. [REST design](rest-api-design.md).
+The implemented REST service reuses this codec and the native model APIs. JSON carries request/response metadata; canonical model payloads are encoded as Base64 in bounded JSON envelopes for current network/entity operations, not re-serialized into a competing JSON model format. Portable synchronization uses bounded binary bundle transfers staged through repository-local scratch files. Broader end-to-end streaming remains future work. See [REST design](rest-api-design.md) and [service limits](native-database-service.md).

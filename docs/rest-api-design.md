@@ -12,11 +12,29 @@
 
 **Operational consequence:** the initial REST server is unauthenticated and unencrypted. Any client able to reach its configured listener can call its exposed operations. Deploy only on deliberately trusted/development networks and avoid sensitive content. Choosing a configurable public bind address is a feature, not a security guarantee.
 
+## Version-control semantics for REST clients
+
+The canonical [revision/branch/HEAD contract](version-control-semantics.md)
+applies identically to the native and HTTP adapters. There is no server-wide
+checkout HEAD: each branch name identifies its current tip revision; multiple
+branches can share a tip, and an individual tip can have descendants on other
+branches. `history` is currently **first-parent only**, while an immutable
+revision response carries both merge parents. Neither branch labels nor
+GUI-side server cards are additional revision-DAG objects.
+
+The next proposed read feature is a **snapshot-consistent, paginated
+full-revision DAG** with all branch heads, both parents and explicit
+incomplete-page indicators; no such REST route exists yet. If accepted, a
+candidate path is `GET /dvmdb/v1/projects/{projectId}/revision-graph`, to be
+added to OpenAPI **only once implemented and tested**. Its shape and cursor
+contract are specified as requirements in the semantics document, not as an
+unimplemented live wire schema.
+
 ## Implemented and planned routes
 
-The table distinguishes implemented routes from the remaining proposed network-enumeration endpoint; the machine-readable OpenAPI specification documents actual operations. The `/dvmdb/v1` prefix versions the HTTP interface, **not the model serialization format**.
+The table lists implemented routes plus one explicitly marked proposed network-enumeration route. The proposed full-graph endpoint appears only in the design text, not as live API. The machine-readable OpenAPI specification documents actual operations. The `/dvmdb/v1` prefix versions the HTTP interface, **not the model serialization format**.
 
-| Operation | Proposed method and route |
+| Operation | Method and route |
 |---|---|
 | Service health and readiness | `GET /dvmdb/v1/health`, `GET /dvmdb/v1/ready` |
 | List projects | `GET /dvmdb/v1/projects` |

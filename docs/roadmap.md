@@ -83,8 +83,9 @@ certification; see [engineering findings](engineering-findings.md).
   drill to larger representative service roots and actual cross-host/storage
   migrations. Online snapshots and online compaction are not implemented.
   Define retention, restore and orphan-scratch cleanup policy.
-- Evaluate optional administrative project deletion/renaming, preview-only
-  hydraulic merges and network enumeration only when demanded by clients.
+- Evaluate optional administrative project deletion/renaming and preview-only
+  hydraulic merges when demanded by clients. Network enumeration is already
+  tracked as needed for the future GUI checkout milestone below.
 
 ## Release gates
 
@@ -102,12 +103,39 @@ certification; see [engineering findings](engineering-findings.md).
 - Specify and implement the cross-AOWIS security system before exposure to
   untrusted networks; current plain HTTP does **not** enforce access rules.
 
-A new feature or major storage rewrite is **not** implied by this roadmap.
-Prefer reproducible evidence and direct changes to the single native engine.
+The graph API is a deliberate new **read** feature, not a major storage
+rewrite. Prefer reproducible evidence and direct changes to the existing
+native engine.
 
-## GUI integration contract (2026-10-25)
+## Version-control and GUI integration priorities (agreed 2026-10-27)
 
-See [GUI integration requirements](gui-integration-requirements.md) for the
-proposed project/branch CRUD, network discovery, immutable commit metadata,
-mutable annotations and labels, graph paging, dry-run merges, security and
-concurrency work. This is a design backlog, not implemented functionality.
+The core project/revision/branch/branch-HEAD semantics are now explicitly
+recorded in [version-control semantics](version-control-semantics.md). They are
+**design decisions**, not proposed changes to the persisted revision DAG.
+A branch is a movable named revision ref, each branch has a HEAD, and the GUI
+shows histories reachable from **all** HEADs. A HEAD is not necessarily a
+leaf; the GUI's selected revision or eventual working-copy base is separate.
+No branch creation-event or branch-parent object is currently persisted.
+
+**Highest priority: full-DAG graph discovery.** Current native/HTTP `history`
+is first-parent only. Add a consistent branch-name/HEAD snapshot and bounded
+all-parent revision enumeration to Repository/ProjectService, expose the same
+contract in REST, and integrate both into the GUI with explicit pagination/
+frontier state. The graph must deduplicate shared revisions, preserve both
+merge parents, and not present a partial first-parent history as complete.
+This work needs no underlying revision-format redesign. See the detailed
+[graph acceptance contract](version-control-semantics.md#5-current-read-surface-and-missing-full-graph-contract)
+and [GUI integration requirements](gui-integration-requirements.md).
+
+**Deferred by product decision: working-copy checkout and saving.** Network
+listing, revision-pinned checkout, dirty editor sessions and expected-HEAD
+commits follow the graph milestone. Project/branch rename-delete, richer
+metadata/annotations, reviews and tags are separate follow-on work, **not
+universal prerequisites** for a first trusted-development checkout/save
+workflow. The AOWIS-wide TLS/authentication/authorization design remains a
+hard prerequisite before untrusted network exposure; existing plain HTTP is
+not secured by the provisional native access policy.
+
+The remaining operational, durability and release qualification items above
+remain open; this prioritization does not cancel them. Planned endpoint names
+are **not** implemented HTTP API until code, tests and OpenAPI ship together.

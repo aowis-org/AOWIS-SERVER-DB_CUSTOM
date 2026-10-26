@@ -137,7 +137,7 @@ See the machine-readable [OpenAPI contract](dvmdb-http-api.yaml) for request/res
 | GET | `/dvmdb/v1/projects/{projectId}` | Read project metadata |
 | GET, POST | `/dvmdb/v1/projects/{projectId}/branches` | List and create/fork branches |
 | GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/head` | Read current revision |
-| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/history` | First-parent revision history (limit 1–1000, optional exclusive `after` cursor) |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/history` | **First-parent only** revision history (limit 1–1000, optional exclusive `after` cursor; **not** a complete multi-branch DAG) |
 | GET | `/dvmdb/v1/projects/{projectId}/revisions/{revisionHash}` | Read immutable revision metadata |
 | GET | `/dvmdb/v1/projects/{projectId}/diff?from={hash}&to={hash}` | Immutable object diff, up to 1000 changed UUIDs |
 | GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` | Complete revision-pinned hydraulic network |
@@ -156,6 +156,14 @@ curl -sS http://127.0.0.1:8755/dvmdb/v1/health
 curl -sS -H 'Content-Type: application/json' -d '{"name":"Water Distribution"}' \
   http://127.0.0.1:8755/dvmdb/v1/projects
 ```
+
+**Graph/HEAD semantics:** each branch has its own current HEAD (the revision
+returned by `/head`), and multiple branch refs can point to the same revision.
+The server has no global checked-out HEAD. A HEAD need not be a leaf of the
+union of all branch histories. The GUI intends to display that union; a
+snapshot-consistent full-DAG native/HTTP graph endpoint is **planned**, not
+available. See [version-control semantics](version-control-semantics.md) and
+[GUI requirements](gui-integration-requirements.md).
 
 Project creation accepts `{"name":"..."}`; any other field is rejected (400). Creating a branch accepts `{"name":"scenario"}` (new independent raw history), `{"name":"scenario","fromBranch":"main"}` (fork current head) or `{"name":"scenario","fromBranch":"main","revision":"<64-character-hash>"}` (fork a particular reachable revision). A historical fork never changes the source branch. Branch names are `[A-Za-z0-9_-]`, maximum 96 characters; project IDs are lowercase UUIDs. JSON mutation bodies are limited per route (see request limits below) before they are read. Responses use JSON and include machine-readable error codes.
 

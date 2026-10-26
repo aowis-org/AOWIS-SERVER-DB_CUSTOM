@@ -256,6 +256,7 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [Hydraulic model](docs/native-hydraulic-network.md) | Persistence, entity queries, indexed editing, validation |
 | [Canonical serialization](docs/canonical-model-codec.md) | Model codec/schema contract |
 | [Model records](docs/model-records.md) | Generic typed envelope and reference index |
+| [Version-control semantics](docs/version-control-semantics.md) | Agreed branch/HEAD/revision model, all-branches graph and API gaps |
 | [Revision history](docs/native-revision-history.md) | Historical reads and branching |
 | [Branch merging](docs/native-branch-merging.md) | Native three-way merge |
 | [Hydraulic merging](docs/native-hydraulic-merging.md) | Field and structural conflict resolution |

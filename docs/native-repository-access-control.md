@@ -14,6 +14,6 @@ Administrative provisioning is available through `./build-linux/aowis-dvmdb-acce
 
 ## Agreed direction
 
-The planned database REST server will initially have **no authentication or access-control enforcement**. The provisional policy model may be reused, redesigned or replaced only once an AOWIS-wide security architecture has been specified. Do not assume its present user UUIDs, role naming or branch grants form a stable external API.
+The implemented database REST server currently has **no authentication or access-control enforcement**. The provisional policy model may be reused, redesigned or replaced only once an AOWIS-wide security architecture has been specified. Do not assume its present user UUIDs, role naming or branch grants form a stable external API.
 
 **HTTP without security is intentionally unsafe:** access must be limited by the deployment environment during development, not by claims of application-level protection. See [service design](rest-api-design.md) and [roadmap](roadmap.md).
