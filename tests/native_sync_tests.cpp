@@ -144,7 +144,7 @@ void testPortableBundles() {
         std::filesystem::copy_file(modelBundle, tampered);
         {
             std::fstream file(tampered, std::ios::in | std::ios::out | std::ios::binary);
-            file.seekp(48 + 40);
+            file.seekp(64 + 40);
             const char corrupt = static_cast<char>(0x7f);
             file.write(&corrupt, 1);
         }
@@ -164,7 +164,7 @@ void testPortableBundles() {
             std::ifstream original(secondBundle, std::ios::binary);
             const Bytes content((std::istreambuf_iterator<char>(original)),
                                 std::istreambuf_iterator<char>());
-            expect(content.size() >= 88, "source bundle unexpectedly small");
+            expect(content.size() >= 104, "source bundle unexpectedly small");
             const std::uint64_t count = [&content]() {
                 std::uint64_t number = 0;
                 for (unsigned index = 40; index < 48; ++index) {
@@ -173,7 +173,7 @@ void testPortableBundles() {
                 return number;
             }();
             expect(count > 1, "bundle fixture requires multiple objects");
-            std::uint64_t end = 48;
+            std::uint64_t end = 64;
             std::uint64_t last = end;
             for (std::uint64_t index = 0; index < count; ++index) {
                 last = end;
@@ -227,8 +227,13 @@ void testMergeParentIncremental() {
     const Hash featureHead = source.commit("feature", {{key(3), bytes("feature")}}).id;
     const std::filesystem::path initial = temporary.path / "feature.aowbundle";
     const std::filesystem::path delta = temporary.path / "merged.aowbundle";
-    source.exportBranchBundle("feature", initial);
+    // Pin the recipient to the target branch identity. A source branch with a
+    // different UUID must not be allowed to silently replace that identity.
+    source.exportBranchBundle("main", initial);
     destination.importBranchBundle(initial, "remote_merge");
+    const std::filesystem::path featureBundle = temporary.path / "feature-base.aowbundle";
+    source.exportBranchBundle("feature", featureBundle);
+    destination.importBranchBundle(featureBundle, "remote_feature");
     const aowis::dvmdb::MergeResult merged = source.mergeBranches("main", "feature");
     expect(merged.status == aowis::dvmdb::MergeStatus::Merged &&
                merged.revision.parents.size() == 2 &&
@@ -332,7 +337,7 @@ void testIncrementalBundles() {
         std::filesystem::copy_file(incremental, damaged);
         {
             std::fstream file(damaged, std::ios::binary | std::ios::in | std::ios::out);
-            file.seekp(80 + 40);
+            file.seekp(96 + 40);
             file.put(static_cast<char>(0x7f));
         }
         const std::uint64_t beforeCorruption = destination.packSize();
@@ -349,14 +354,14 @@ void testIncrementalBundles() {
             std::ifstream sourceFile(incremental, std::ios::binary);
             const Bytes content((std::istreambuf_iterator<char>(sourceFile)),
                                 std::istreambuf_iterator<char>());
-            expect(content.size() > 120 && content[7] == '2',
+            expect(content.size() > 136 && content[7] == '4',
                    "incremental fixture was unexpectedly empty");
             std::uint64_t count = 0;
             for (unsigned index = 40; index < 48; ++index) {
                 count = (count << 8U) | content[index];
             }
             expect(count > 1, "incremental fixture needs multiple objects");
-            std::size_t end = 80;
+            std::size_t end = 96;
             std::size_t last = end;
             for (std::uint64_t index = 0; index < count; ++index) {
                 last = end;
@@ -397,7 +402,7 @@ void testIncrementalBundles() {
                    BundleImportStatus::UpToDate,
                "incremental reimport should be idempotent");
         source.exportIncrementalBranchBundle("main", tip, noChanges);
-        expect(std::filesystem::file_size(noChanges) == 80,
+        expect(std::filesystem::file_size(noChanges) == 96,
                "matching branch tip should generate header-only incremental bundle");
         expect(destination.importBranchBundle(noChanges, "remote_main").status ==
                    BundleImportStatus::UpToDate,

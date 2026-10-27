@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
+#include "aowis/dvmdb/revision_record_v2.h"
 
 #include <aowis/dvmdb/model_validation.h>
 
@@ -2509,6 +2510,208 @@ void exerciseHydraulicFastForwardValidation() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+// End-to-end UUIDv7 hydraulic workflow: one pinned model snapshot powers
+// every network, membership and indexed-ownership read. Model edits publish
+// a distinct UUID revision; historical identities are never regenerated.
+void exerciseUuidV7Hydraulic() {
+    const std::filesystem::path folder = tempDir();
+    try {
+        const native::ProjectId project = native::ProjectId::generate();
+        const NetworkHydraulic baseline = completeNetwork();
+        native::RevisionId initial = native::RevisionId::generate();
+        native::RevisionId saved = initial;
+        native::RevisionId edited = initial;
+        {
+            native::Repository repository(folder);
+            initial = repository.createBranchV2(project, "main");
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::loadHydraulicNetworkAtRevisionV2(repository, project, initial, baseline.uuid);
+            }), "initial raw UUIDv7 revision should reject model lookup");
+            saved = hydraulic::saveHydraulicNetworkV2(repository, project, "main", baseline, initial);
+            require(saved != initial && repository.headV2(project, "main") == saved,
+                    "UUIDv7 hydraulic save did not publish a fresh revision");
+            const std::optional<NetworkHydraulic> loaded =
+                hydraulic::loadHydraulicNetworkAtRevisionV2(repository, project, saved, baseline.uuid);
+            require(loaded.has_value(), "UUIDv7 hydraulic network missing after save");
+            compareNetworks(baseline, *loaded);
+            const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevisionLimitedV2(
+                repository, project, saved, baseline.uuid, hydraulic::HydraulicEntityType::Junction, 100);
+            require(ids && ids->size() == baseline.nodes_junctions.size(),
+                    "UUIDv7 membership list missing junctions");
+            require(throwsStorageError(native::StorageErrorKind::LimitExceeded, [&] {
+                (void)hydraulic::listHydraulicEntityIdsAtRevisionLimitedV2(
+                    repository, project, saved, baseline.uuid, hydraulic::HydraulicEntityType::Junction, 1);
+            }), "UUIDv7 bounded membership did not reject excess members");
+            const std::optional<hydraulic::HydraulicEntity> targeted =
+                hydraulic::loadHydraulicEntityAtRevisionV2(repository, project, saved,
+                    baseline.uuid, baseline.nodes_junctions.front().uuid);
+            require(targeted && std::holds_alternative<HydraulicNodeJunction>(*targeted),
+                    "UUIDv7 indexed ownership lookup failed");
+            require(!hydraulic::loadHydraulicEntityAtRevisionV2(
+                repository, project, saved, baseline.uuid, uuid(10000)),
+                "UUIDv7 indexed lookup found an unowned entity");
+            HydraulicNodeJunction updated = baseline.nodes_junctions.front();
+            updated.metadata.description = QStringLiteral("UUIDv7 updated junction");
+            const std::vector<hydraulic::HydraulicEntityChange> changes{
+                {updated.uuid, hydraulic::HydraulicEntity{updated}}};
+            edited = hydraulic::editHydraulicNetworkV2(
+                repository, project, "main", baseline.uuid, changes, saved);
+            require(edited != saved && repository.headV2(project, "main") == edited,
+                    "UUIDv7 hydraulic edit failed to advance HEAD");
+            require(hydraulic::editHydraulicNetworkV2(
+                repository, project, "main", baseline.uuid, changes, edited) == edited,
+                    "UUIDv7 no-op edit created a new revision");
+            NetworkHydraulic expected = baseline;
+            expected.nodes_junctions.front() = updated;
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevisionV2(
+                repository, project, edited, baseline.uuid));
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevisionV2(
+                repository, project, saved, baseline.uuid));
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetworkV2(
+                    repository, project, "main", baseline.uuid, changes, saved);
+            }), "UUIDv7 stale HEAD edit was accepted");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::saveHydraulicNetworkV2(repository, project, "main", baseline, saved);
+            }), "UUIDv7 stale full save was accepted");
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetworkV2(repository, project, "main", baseline.uuid,
+                    {{uuid(9900), std::nullopt}}, edited);
+            }), "UUIDv7 unowned deletion was accepted");
+            const native::RevisionId fork = repository.createBranchAtRevisionV2(
+                project, "history", "main", saved);
+            require(fork == saved && repository.headV2(project, "history") == saved,
+                    "historical UUIDv7 branch was not pinned to immutable revision");
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            require(reopened.headV2(project, "main") == edited &&
+                    reopened.headV2(project, "history") == saved,
+                    "UUIDv7 hydraulic HEAD identities changed after reopen/compaction");
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevisionV2(
+                reopened, project, saved, baseline.uuid));
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+void exerciseUuidV7HydraulicMerges() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    try {
+        native::RevisionId resolved = native::RevisionId::generate();
+        const NetworkHydraulic baseline = completeNetwork();
+        {
+            native::Repository repository(folder);
+            const native::RevisionId root = repository.createBranchV2(project, "main");
+            const native::RevisionId base = hydraulic::saveHydraulicNetworkV2(
+                repository, project, "main", baseline, root);
+            require(repository.createBranchV2(project, "feature", "main") == base,
+                    "UUIDv7 hydraulic fork generated an extra revision");
+            HydraulicNodeJunction targetJunction = baseline.nodes_junctions[0];
+            targetJunction.metadata.description = QStringLiteral("hydraulic-target");
+            const native::RevisionId target = hydraulic::editHydraulicNetworkV2(
+                repository, project, "main", baseline.uuid,
+                {{targetJunction.uuid, hydraulic::HydraulicEntity{targetJunction}}}, base);
+            HydraulicNodeJunction sourceJunction = baseline.nodes_junctions[0];
+            sourceJunction.metadata.description = QStringLiteral("hydraulic-source");
+            const native::RevisionId source = hydraulic::editHydraulicNetworkV2(
+                repository, project, "feature", baseline.uuid,
+                {{sourceJunction.uuid, hydraulic::HydraulicEntity{sourceJunction}}}, base);
+            hydraulic::HydraulicMergeSelectionsV2 selections{target, source, {}, {}};
+            const std::uint64_t before = repository.packSize();
+            const native::MergeResultV2 conflict = hydraulic::mergeHydraulicBranchesV2(
+                repository, project, "main", "feature", selections);
+            require(conflict.status == native::MergeStatus::Conflicts &&
+                    !conflict.conflicts.empty() && repository.headV2(project, "main") == target &&
+                    repository.headV2(project, "feature") == source &&
+                    repository.packSize() == before,
+                    "UUIDv7 hydraulic conflict changed immutable revisions");
+            selections.fields.push_back(hydraulic::HydraulicFieldChoice{
+                targetJunction.uuid, QStringLiteral("metadata.description"),
+                hydraulic::HydraulicMergeSide::Source});
+            const native::MergeResultV2 merged = hydraulic::mergeHydraulicBranchesV2(
+                repository, project, "main", "feature", selections);
+            require(merged.status == native::MergeStatus::Merged && merged.resultHead &&
+                    repository.headV2(project, "feature") == source,
+                    "UUIDv7 hydraulic explicit field choice did not produce a merge");
+            resolved = *merged.resultHead;
+            const native::RevisionRecordV2 record = native::decodeRevisionRecordV2(
+                *repository.readRevisionV2(project, resolved));
+            require(record.parents.size() == 2 && record.parents[0].id == target &&
+                    record.parents[1].id == source,
+                    "UUIDv7 resolved hydraulic merge lost its two parent identities");
+            NetworkHydraulic expected = baseline;
+            expected.nodes_junctions[0] = sourceJunction;
+            const std::optional<NetworkHydraulic> actual = hydraulic::loadHydraulicNetworkAtRevisionV2(
+                repository, project, resolved, baseline.uuid);
+            require(actual.has_value(), "resolved UUIDv7 network missing");
+            compareNetworks(expected, *actual);
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::mergeHydraulicBranchesV2(repository, project,
+                    "main", "feature", selections);
+            }), "stale UUIDv7 hydraulic merge selections were accepted");
+
+            // A chosen UUID must actually participate in the merge; silent
+            // ignored choices would apply outdated GUI decisions to new data.
+            hydraulic::HydraulicMergeSelectionsV2 unused{resolved, source, {}, {}};
+            unused.objects.push_back(hydraulic::HydraulicObjectChoice{
+                uuid(9700), hydraulic::HydraulicMergeSide::Target});
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::mergeHydraulicBranchesV2(repository, project,
+                    "main", "feature", unused);
+            }), "unused UUIDv7 hydraulic object choice was silently accepted");
+
+            // A generic model record can be valid for the native model index
+            // but invalid as a hydraulic-network member. Fast-forward must
+            // run the whole-network validator before moving the target HEAD.
+            require(repository.createBranchAtRevisionV2(project,
+                "invalid-left", "main", base) == base, "cannot create v2 invalid merge target");
+            require(repository.createBranchAtRevisionV2(project,
+                "invalid-right", "main", base) == base, "cannot create v2 invalid merge source");
+            const native::Key existingKey = hydraulic::keyFromUuid(baseline.nodes_junctions[0].uuid);
+            const std::optional<native::ModelRecord> member = repository.getModelAtRevisionV2(
+                project, base, existingKey);
+            require(member.has_value(), "missing v2 hydraulic member fixture");
+            const native::RevisionId badTip = repository.commitModelV2(
+                project, "invalid-right", {{hydraulic::keyFromUuid(uuid(9701)), *member}}, base);
+            const std::uint64_t sizeBefore = repository.packSize();
+            const native::MergeResultV2 invalid = hydraulic::mergeHydraulicBranchesV2(
+                repository, project, "invalid-left", "invalid-right",
+                hydraulic::HydraulicMergeSelectionsV2{base, badTip, {}, {}});
+            require(invalid.status == native::MergeStatus::Conflicts &&
+                    repository.headV2(project, "invalid-left") == base &&
+                    repository.headV2(project, "invalid-right") == badTip &&
+                    repository.packSize() == sizeBefore,
+                    "invalid UUIDv7 hydraulic fast-forward published a corrupt network");
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            require(reopened.headV2(project, "main") == resolved &&
+                    reopened.revisionReachableFromV2(project, resolved,
+                        reopened.headV2(project, "feature")),
+                    "resolved hydraulic UUIDv7 ancestry lost after compaction/reopen");
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2525,6 +2728,8 @@ int main(int argc, char** argv) {
         exerciseCoordinatedMembershipMerges();
         exerciseSnapshotReads();
         exerciseCallerPinnedWrites();
+        exerciseUuidV7Hydraulic();
+        exerciseUuidV7HydraulicMerges();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
     } catch (const std::exception& failure) {

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "uuid_branch_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -132,9 +133,9 @@ void inject(const std::filesystem::path& directory,
     }
 }
 void repoint(const std::filesystem::path& directory, const Hash& tip) {
-    std::ofstream output(directory / "refs" / "heads" / "stable", std::ios::binary | std::ios::trunc);
-    output << aowis::dvmdb::toHex(tip) << '\n';
-    expect(output.good(), "cannot write forged ref");
+    Repository repository(directory);
+    aowis::dvmdb::test::overwriteBranch(repository, directory, "stable",
+                                        aowis::dvmdb::toHex(tip));
 }
 
 enum class Fault {
@@ -228,10 +229,19 @@ void testCorruption(Fault fault, const std::string& reason) {
     const Hash tip = makeBadHistory(forged, fault, original);
     inject(directory, forged);
     if (fault == Fault::InvalidBranchRef) {
-        std::ofstream output(directory / "refs" / "heads" / "stable", std::ios::trunc);
-        output << "invalid-ref\n";
+        Repository live(directory);
+        aowis::dvmdb::test::overwriteBranch(live, directory, "stable", "invalid-ref");
     } else {
         repoint(directory, tip);
+    }
+    // The new UUID-only store validates the branch record on open. A broken
+    // published record is rejected earlier than full graph verification.
+    if (fault == Fault::InvalidBranchRef) {
+        bool refused = false;
+        try { Repository invalid(directory); }
+        catch (const std::exception&) { refused = true; }
+        expect(refused, "invalid UUID branch record survived repository open");
+        return;
     }
     Repository repository(directory);
     repository.verifyPack(); // Physically valid even though logically invalid
@@ -372,8 +382,8 @@ void testCli(const std::string& executable) {
     inject(directory, forged);
     // Repoint the actual branch to the forged tip; invalid content remains checksum-correct.
     {
-        std::ofstream output(directory / "refs" / "heads" / "main", std::ios::trunc);
-        output << aowis::dvmdb::toHex(bad) << '\n';
+        Repository live(directory);
+        aowis::dvmdb::test::overwriteBranch(live, directory, "main", aowis::dvmdb::toHex(bad));
     }
     expect(runCli(executable, directory, "--physical") == 0 &&
            runCli(executable, directory, "--full") == 1 &&

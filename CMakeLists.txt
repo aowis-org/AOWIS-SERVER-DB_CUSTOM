@@ -9,6 +9,9 @@ add_library(aowis-dvmdb-store STATIC
     src/native_store.cpp
     src/model_record.cpp
     src/access_policy.cpp
+    src/object_id.cpp
+    src/revision_record_v2.cpp
+    src/revision_resolver_v2.cpp
 )
 target_compile_features(aowis-dvmdb-store PUBLIC cxx_std_20)
 target_include_directories(aowis-dvmdb-store PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -77,6 +80,15 @@ if(BUILD_TESTING)
         COMMAND aowis-dvmdb-transfer-staging-budget-tests)
     set_tests_properties(aowis-dvmdb-transfer-staging-budget-tests PROPERTIES LABELS "aowis")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    # Checks that every canonical UUIDv7 HTTP route matches its OpenAPI
+    # method/path, even in native-only builds without Qt development headers.
+    add_test(NAME aowis-dvmdb-http-uuidv7-route-contract-tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/http_uuidv7_route_contract_tests.py"
+            --source "${CMAKE_CURRENT_SOURCE_DIR}/src/dvmdb_http_routes.cpp"
+            --openapi "${CMAKE_CURRENT_SOURCE_DIR}/docs/dvmdb-http-api.yaml")
+    set_tests_properties(aowis-dvmdb-http-uuidv7-route-contract-tests PROPERTIES
+        LABELS "aowis;http;qualification" TIMEOUT 30)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME aowis-dvmdb-build-launch-guard-tests
             COMMAND "${Python3_EXECUTABLE}"
@@ -156,7 +168,10 @@ if(BUILD_TESTING)
         src/native_store.cpp
         src/model_record.cpp
         src/access_policy.cpp
-            )
+        src/object_id.cpp
+        src/revision_record_v2.cpp
+    src/revision_resolver_v2.cpp
+    )
     target_compile_features(aowis-dvmdb-store-fault-tests PUBLIC cxx_std_20)
     target_include_directories(aowis-dvmdb-store-fault-tests PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_link_libraries(aowis-dvmdb-store-fault-tests PUBLIC OpenSSL::Crypto)
@@ -209,10 +224,62 @@ if(BUILD_TESTING)
         COMMAND aowis-dvmdb-sigkill-restart-tests)
     set_tests_properties(aowis-dvmdb-sigkill-restart-tests PROPERTIES
         LABELS "aowis;durability" TIMEOUT 120)
+    add_executable(aowis-dvmdb-merge-v2-tests tests/native_merge_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-merge-v2-tests PRIVATE aowis-dvmdb-project-service aowis-dvmdb-store)
+    add_test(NAME aowis-dvmdb-merge-v2-tests COMMAND aowis-dvmdb-merge-v2-tests)
+    set_tests_properties(aowis-dvmdb-merge-v2-tests PROPERTIES LABELS "aowis;identity")
+    add_executable(aowis-dvmdb-project-model-v2-tests tests/native_project_model_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-project-model-v2-tests PRIVATE aowis-dvmdb-project-service)
+    add_test(NAME aowis-dvmdb-project-model-v2-tests COMMAND aowis-dvmdb-project-model-v2-tests)
+    set_tests_properties(aowis-dvmdb-project-model-v2-tests PROPERTIES LABELS "aowis;identity;durability")
+    add_executable(aowis-dvmdb-revision-head-v2-tests tests/native_repository_revision_head_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-revision-head-v2-tests PRIVATE aowis-dvmdb-store)
+    add_test(NAME aowis-dvmdb-revision-head-v2-tests COMMAND aowis-dvmdb-revision-head-v2-tests)
+    set_tests_properties(aowis-dvmdb-revision-head-v2-tests PROPERTIES LABELS "aowis;identity;durability")
+    add_executable(aowis-dvmdb-packed-revision-v2-tests tests/native_repository_revision_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-packed-revision-v2-tests PRIVATE aowis-dvmdb-store)
+    add_test(NAME aowis-dvmdb-packed-revision-v2-tests COMMAND aowis-dvmdb-packed-revision-v2-tests)
+    set_tests_properties(aowis-dvmdb-packed-revision-v2-tests PROPERTIES LABELS "aowis;identity;durability")
+    add_executable(aowis-dvmdb-revision-resolver-v2-tests tests/revision_resolver_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-revision-resolver-v2-tests PRIVATE aowis-dvmdb-store Threads::Threads)
+    add_test(NAME aowis-dvmdb-revision-resolver-v2-tests COMMAND aowis-dvmdb-revision-resolver-v2-tests)
+    set_tests_properties(aowis-dvmdb-revision-resolver-v2-tests PROPERTIES LABELS "aowis;identity;durability")
+    add_executable(aowis-dvmdb-revision-record-v2-tests tests/revision_record_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-revision-record-v2-tests PRIVATE aowis-dvmdb-store)
+    add_test(NAME aowis-dvmdb-revision-record-v2-tests COMMAND aowis-dvmdb-revision-record-v2-tests)
+    set_tests_properties(aowis-dvmdb-revision-record-v2-tests PROPERTIES LABELS "aowis;identity")
+    add_executable(aowis-dvmdb-revision-bundle-v2-tests tests/native_revision_bundle_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-revision-bundle-v2-tests PRIVATE aowis-dvmdb-store)
+    add_test(NAME aowis-dvmdb-revision-bundle-v2-tests COMMAND aowis-dvmdb-revision-bundle-v2-tests)
+    set_tests_properties(aowis-dvmdb-revision-bundle-v2-tests PROPERTIES LABELS "aowis;identity;replication")
+    add_executable(aowis-dvmdb-revision-bundle-v2-large-tests tests/native_revision_bundle_v2_large_tests.cpp)
+    target_link_libraries(aowis-dvmdb-revision-bundle-v2-large-tests PRIVATE aowis-dvmdb-store)
+    add_test(NAME aowis-dvmdb-revision-bundle-v2-large-tests COMMAND aowis-dvmdb-revision-bundle-v2-large-tests)
+    set_tests_properties(aowis-dvmdb-revision-bundle-v2-large-tests PROPERTIES LABELS "aowis;identity;replication;stress")
+    add_executable(aowis-dvmdb-revision-graph-v2-tests tests/native_revision_graph_v2_tests.cpp)
+    target_link_libraries(aowis-dvmdb-revision-graph-v2-tests PRIVATE aowis-dvmdb-project-service)
+    add_test(NAME aowis-dvmdb-revision-graph-v2-tests COMMAND aowis-dvmdb-revision-graph-v2-tests)
+    set_tests_properties(aowis-dvmdb-revision-graph-v2-tests PROPERTIES LABELS "aowis;identity")
     add_executable(aowis-dvmdb-revision-graph-tests tests/native_revision_graph_tests.cpp)
     target_link_libraries(aowis-dvmdb-revision-graph-tests PRIVATE aowis-dvmdb-project-service)
     add_test(NAME aowis-dvmdb-revision-graph-tests COMMAND aowis-dvmdb-revision-graph-tests)
     set_tests_properties(aowis-dvmdb-revision-graph-tests PROPERTIES LABELS "aowis")
+    add_executable(aowis-dvmdb-branch-id-tests tests/native_branch_identity_tests.cpp)
+    target_link_libraries(aowis-dvmdb-branch-id-tests PRIVATE aowis-dvmdb-project-service)
+    add_test(NAME aowis-dvmdb-branch-id-tests COMMAND aowis-dvmdb-branch-id-tests)
+    set_tests_properties(aowis-dvmdb-branch-id-tests PROPERTIES LABELS "aowis;identity")
+
+    add_executable(aowis-dvmdb-object-id-tests tests/object_id_tests.cpp)
+    target_link_libraries(aowis-dvmdb-object-id-tests PRIVATE aowis-dvmdb-project-service Threads::Threads)
+    add_test(NAME aowis-dvmdb-object-id-tests COMMAND aowis-dvmdb-object-id-tests)
+    set_tests_properties(aowis-dvmdb-object-id-tests PROPERTIES LABELS "aowis;identity")
+    add_executable(aowis-dvmdb-canonical-project-service-tests
+        tests/native_canonical_project_service_tests.cpp)
+    target_link_libraries(aowis-dvmdb-canonical-project-service-tests PRIVATE aowis-dvmdb-project-service)
+    add_test(NAME aowis-dvmdb-canonical-project-service-tests
+        COMMAND aowis-dvmdb-canonical-project-service-tests)
+    set_tests_properties(aowis-dvmdb-canonical-project-service-tests PROPERTIES LABELS "aowis;identity")
+
     add_executable(aowis-dvmdb-project-service-tests tests/project_service_tests.cpp)
     target_link_libraries(aowis-dvmdb-project-service-tests PRIVATE aowis-dvmdb-project-service)
     add_test(NAME aowis-dvmdb-project-service-tests COMMAND aowis-dvmdb-project-service-tests)
@@ -228,9 +295,8 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/offline_backup.py"
             "$<TARGET_FILE:aowis-dvmdb-verify>")
     set_tests_properties(aowis-dvmdb-offline-backup-tests PROPERTIES LABELS "aowis")
-    # Complete offline server-root move/upgrade: frozen earlier-build packs,
-    # divergent branches, multi-megabyte current data and a second restore
-    # after writing under the newer executable.
+    # UUIDv7-only offline server-root move/restart: divergent project histories,
+    # large current-format model data, a commit after restore and second backup.
     add_executable(aowis-dvmdb-upgrade-restore-tests
         tests/native_upgrade_restore_tests.cpp)
     target_link_libraries(aowis-dvmdb-upgrade-restore-tests PRIVATE aowis-dvmdb-project-service)
@@ -239,10 +305,9 @@ if(BUILD_TESTING)
         COMMAND aowis-dvmdb-upgrade-restore-tests
             "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/offline_backup.py"
-            "$<TARGET_FILE:aowis-dvmdb-verify>"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/pack-20261024")
+            "$<TARGET_FILE:aowis-dvmdb-verify>")
     set_tests_properties(aowis-dvmdb-upgrade-restore-tests PROPERTIES
-        LABELS "aowis;compatibility" TIMEOUT 180)
+        LABELS "aowis;identity;durability" TIMEOUT 180)
     add_executable(aowis-dvmdb-project-concurrency-tests tests/project_concurrency_tests.cpp)
     target_link_libraries(aowis-dvmdb-project-concurrency-tests PRIVATE aowis-dvmdb-project-service Threads::Threads)
     add_test(NAME aowis-dvmdb-project-concurrency-tests COMMAND aowis-dvmdb-project-concurrency-tests)
@@ -349,7 +414,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-dvmdb-store-tests PRIVATE aowis-dvmdb-store)
     add_test(NAME aowis-dvmdb-store-tests COMMAND aowis-dvmdb-store-tests)
     set_tests_properties(aowis-dvmdb-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-dvmdb-tests DEPENDS aowis-dvmdb-revision-graph-tests aowis-dvmdb-vm-powercut-worker aowis-dvmdb-sigkill-restart-tests aowis-dvmdb-physical-enospc-tests aowis-dvmdb-offline-backup-tests aowis-dvmdb-transfer-staging-budget-tests aowis-dvmdb-index-scaling-benchmark aowis-dvmdb-pack-operational-stress-tests aowis-dvmdb-bundle-import-profile-tests aowis-dvmdb-replication-scaling-benchmark aowis-dvmdb-bundle-revision-marks-tests aowis-dvmdb-bundle-disk-index-tests aowis-dvmdb-merge-ancestry-tests aowis-dvmdb-bundle-limit-tests aowis-dvmdb-project-service-tests aowis-dvmdb-project-concurrency-tests aowis-dvmdb-recovery-tests aowis-dvmdb-scratch-tests aowis-dvmdb-error-kind-tests aowis-dvmdb-repository-verify-tests aowis-dvmdb-model-import-integrity-tests aowis-dvmdb-merkle-integrity-tests aowis-dvmdb-store-tests aowis-dvmdb-diff-scope-tests aowis-dvmdb-incremental-sync-tests aowis-dvmdb-sync-tests aowis-dvmdb-sync-cli-tests aowis-dvmdb-access-tests)
+    add_custom_target(aowis-dvmdb-tests DEPENDS aowis-dvmdb-canonical-project-service-tests aowis-dvmdb-revision-bundle-v2-large-tests aowis-dvmdb-revision-bundle-v2-tests aowis-dvmdb-revision-graph-v2-tests aowis-dvmdb-merge-v2-tests aowis-dvmdb-project-model-v2-tests aowis-dvmdb-packed-revision-v2-tests aowis-dvmdb-revision-resolver-v2-tests aowis-dvmdb-revision-record-v2-tests aowis-dvmdb-branch-id-tests aowis-dvmdb-object-id-tests aowis-dvmdb-revision-graph-tests aowis-dvmdb-vm-powercut-worker aowis-dvmdb-sigkill-restart-tests aowis-dvmdb-physical-enospc-tests aowis-dvmdb-offline-backup-tests aowis-dvmdb-transfer-staging-budget-tests aowis-dvmdb-index-scaling-benchmark aowis-dvmdb-pack-operational-stress-tests aowis-dvmdb-bundle-import-profile-tests aowis-dvmdb-replication-scaling-benchmark aowis-dvmdb-bundle-revision-marks-tests aowis-dvmdb-bundle-disk-index-tests aowis-dvmdb-merge-ancestry-tests aowis-dvmdb-bundle-limit-tests aowis-dvmdb-project-service-tests aowis-dvmdb-project-concurrency-tests aowis-dvmdb-recovery-tests aowis-dvmdb-scratch-tests aowis-dvmdb-error-kind-tests aowis-dvmdb-repository-verify-tests aowis-dvmdb-model-import-integrity-tests aowis-dvmdb-merkle-integrity-tests aowis-dvmdb-store-tests aowis-dvmdb-diff-scope-tests aowis-dvmdb-incremental-sync-tests aowis-dvmdb-sync-tests aowis-dvmdb-sync-cli-tests aowis-dvmdb-access-tests)
 endif()
 
 # Canonical AOWIS Model serialization is owned by this repository.

@@ -17,8 +17,11 @@
 #include <vector>
 
 #include "aowis/dvmdb/storage_error.h"
+#include "aowis/dvmdb/object_id.h"
 
 namespace aowis::dvmdb {
+
+struct RevisionRecordV2;
 
 using Bytes = std::vector<std::uint8_t>;
 using Hash = std::array<std::uint8_t, 32>;
@@ -165,6 +168,15 @@ struct BundleImportResult {
     std::uint64_t objectsImported = 0;
 };
 
+// Native UUIDv7 revision replication, independent of the SHA-revision
+// AOWSYNC3/4 protocol. Branch identity and project provenance are preserved.
+// v2 full and incremental bundles use verified UUIDv7 revision identities.
+struct RevisionBundleImportV2 {
+    BundleImportStatus status = BundleImportStatus::UpToDate;
+    RevisionId head;
+    std::uint64_t objectsImported = 0;
+};
+
 // Results from physical verification and validation of every revision and
 // logical index reachable from each published branch head.
 struct VerificationReport {
@@ -215,12 +227,58 @@ struct RevisionGraphPage {
     std::optional<RevisionGraphCursor> next;
 };
 
+// UUIDv7 equivalent of the full all-parent graph. IDs are domain identities;
+// recordHash and expectedRecordHash authenticate the immutable object bytes.
+// Cursor pins a complete branch HEAD snapshot, independent of moving refs.
+struct RevisionGraphParentV2 {
+    RevisionId id;
+    Hash expectedRecordHash{};
+};
+
+struct RevisionGraphRevisionV2 {
+    RevisionId id;
+    Hash recordHash{};
+    Hash root{};
+    Hash referencesRoot{};
+    bool modelIndexed = false;
+    std::vector<RevisionGraphParentV2> parents;
+};
+
+struct RevisionGraphHeadV2 {
+    BranchId branchId;
+    std::string name;
+    RevisionId revision;
+    Hash recordHash{};
+};
+
+struct RevisionGraphCursorV2 {
+    std::vector<RevisionGraphHeadV2> heads;
+    std::size_t skip = 0;
+};
+
+struct RevisionGraphPageV2 {
+    std::vector<RevisionGraphHeadV2> heads;
+    std::vector<RevisionGraphRevisionV2> revisions;
+    std::optional<RevisionGraphCursorV2> next;
+};
+
 struct MergeResult {
     MergeStatus status = MergeStatus::UpToDate;
     Hash base{};
     Hash targetBefore{};
     Hash sourceHead{};
     Revision revision; // resulting target head, also on conflict
+    std::vector<MergeConflict> conflicts;
+};
+
+// UUIDv7 merge result: the target and source branch names retain their own
+// identities; only a successful merge can advance the target HEAD.
+struct MergeResultV2 {
+    MergeStatus status = MergeStatus::UpToDate;
+    std::optional<RevisionId> base;
+    std::optional<RevisionId> targetBefore;
+    std::optional<RevisionId> sourceHead;
+    std::optional<RevisionId> resultHead;
     std::vector<MergeConflict> conflicts;
 };
 
@@ -256,12 +314,94 @@ public:
     Repository& operator=(const Repository&) = delete;
 
     void createBranch(std::string_view name, std::optional<std::string_view> from = std::nullopt);
+    // One atomically published UUIDv7 record: rename preserves ID and HEAD.
+    void renameBranch(std::string_view previous, std::string_view renamed,
+                      const Hash& expectedHead);
+    // Phase 2c-1: store actual UUIDv7 revision objects in the repository's
+    // durable SHA-addressed pack and publish verified UUID->SHA bindings.
+    // This is an internal storage building block, NOT yet a branch commit:
+    // branches still carry SHA heads until the coordinated v2 cutover.
+    // The caller supplies the owning project UUIDv7, which is pinned on the
+    // first write and cannot be changed for the lifetime of the repository.
+    // Phase 2c-2: UUIDv7 HEAD publication for native raw revisions. These
+    // cannot be mixed with SHA-based branches in one repository.
+    RevisionId createBranchV2(const ProjectId& project, std::string_view name,
+                              std::optional<std::string_view> from = std::nullopt);
+    RevisionId headV2(const ProjectId& project, std::string_view branch);
+    // First-parent UUIDv7 history, newest-first; after is an exclusive revision
+    // UUID cursor and must belong to the pinned branch's first-parent chain.
+    std::vector<RevisionGraphRevisionV2> historyV2(
+        const ProjectId& project, std::string_view branch, std::size_t maxCount = 100,
+        std::optional<RevisionId> after = std::nullopt);
+    // Stateless all-parent pagination across all UUIDv7 branch HEADs.
+    // Cursor freezes branch ID/name/HEAD/digest; never reads moving refs on
+    // continuation. Missing snapshot revisions fail, never truncate history.
+    RevisionGraphPageV2 revisionGraphV2(
+        const ProjectId& project, std::size_t maxCount = 100,
+        std::optional<RevisionGraphCursorV2> cursor = std::nullopt);
+    void renameBranchV2(const ProjectId& project, std::string_view previous,
+                        std::string_view renamed, const RevisionId& expectedHead);
+    RevisionId commitV2(const ProjectId& project, std::string_view branch,
+                        const std::vector<Change>& changes,
+                        std::optional<RevisionId> expectedHead = std::nullopt);
+    // Native UUIDv7 model-indexed commit, including reverse-reference checks.
+    // A failed preflight never advances HEAD or publishes a revision.
+    RevisionId commitModelV2(const ProjectId& project, std::string_view branch,
+                             std::vector<ModelChange> changes,
+                             std::optional<RevisionId> expectedHead = std::nullopt);
+    // Read a model object by a pinned UUIDv7 revision, not a moving branch ref.
+    std::optional<ModelRecord> getModelAtRevisionV2(const ProjectId& project,
+                                                   const RevisionId& revisionId, const Key& key);
+    // Reverse-reference lookup at an immutable UUIDv7 revision. The returned
+    // keys belong to the same model-indexed snapshot as getModelAtRevisionV2().
+    std::vector<Key> referencingModelAtRevisionV2(const ProjectId& project,
+                                                   const RevisionId& revisionId, const Key& key);
+    // All-parent ancestry; historical branches keep the source HEAD unchanged.
+    bool revisionReachableFromV2(const ProjectId& project, const RevisionId& tip,
+                                 const RevisionId& candidate);
+    RevisionId createBranchAtRevisionV2(const ProjectId& project, std::string_view name,
+                                        std::string_view sourceBranch, const RevisionId& revision);
+    // UUIDv7 three-way merge. Domain callbacks are pure and execute under the
+    // repository lock; both explicit UUIDv7 HEAD pins are checked atomically.
+    // Empty options retains the conservative native merge behavior.
+    MergeResultV2 mergeBranchesV2(const ProjectId& project, std::string_view target,
+                                  std::string_view source,
+                                  std::optional<RevisionId> expectedTarget = std::nullopt,
+                                  std::optional<RevisionId> expectedSource = std::nullopt,
+                                  const MergeOptions& options = {});
+    RevisionId writeRevisionV2(const ProjectId& project, const Hash& root,
+                               const Hash& referencesRoot, bool modelIndexed,
+                               const std::vector<RevisionId>& parents = {});
+    // Verifies SHA integrity, project binding and the complete parent DAG.
+    // Returns canonical v2 bytes, or nullopt for an unknown UUID.
+    std::optional<Bytes> readRevisionV2(const ProjectId& project, const RevisionId& id);
+    // Complete full-ancestry, identity-preserving v2 bundle over a caller-owned
+    // empty regular-file descriptor. Never uses a user-derived storage filename.
+    // Exports and imports are serialized with the repository lock; caller
+    // handles publication/transport of the resulting file descriptor.
+    void exportRevisionBundleV2(const ProjectId& project, std::string_view branch,
+                                int fd, BundleLimits limits = {});
+    // Incremental transfer pins the recipient's known base UUID/SHA. It does
+    // not derive any path from the user-controlled branch display name.
+    void exportIncrementalRevisionBundleV2(const ProjectId& project, std::string_view branch,
+                                           const RevisionId& recipientBase, int fd,
+                                           BundleLimits limits = {});
+    RevisionBundleImportV2 importRevisionBundleV2(const ProjectId& expectedProject, int fd,
+                                                  std::string_view localBranch,
+                                                  BundleLimits limits = {});
     Revision head(std::string_view branch);
     // A single validated branch-file lookup, independent of how many other
     // branches are present. A symlink or a non-regular ref is never a branch.
     bool hasBranch(std::string_view branch);
     // Sorted branch names, independent of authorization. Filter at the service boundary.
     std::vector<std::string> listBranches();
+    // Every published branch has a durable UUIDv7 name-independent ID.
+    // Reading an ID never generates a replacement or derives it from the name.
+    std::optional<BranchId> branchId(std::string_view name);
+    // Pre-release UUID-only identity check for a SHA-based branch.
+    // This does not mutate UUID-named branch records or migrate older stores.
+    void adoptBranchId(std::string_view name, const BranchId& identity,
+                       const Hash& expectedHead);
     // Immutable history: newest first along the first-parent chain. `after`
     // is an exclusive pagination cursor and must belong to this branch's
     // first-parent history. A branch advancing between pages is harmless.
@@ -310,6 +450,11 @@ public:
     // StorageError(LimitExceeded) before the full difference is materialized.
     std::vector<Difference> diffRevisions(const Hash& fromRevision, const Hash& toRevision,
                                           std::size_t maxDifferences);
+    // UUIDv7 revision comparison; verifies both project-bound immutable records.
+    // The caller bounds materialization of changed trie keys.
+    std::vector<Difference> diffRevisionsV2(const ProjectId& project,
+            const RevisionId& fromRevision, const RevisionId& toRevision,
+            std::size_t maxDifferences);
     // True when revisionId is the head of `branch` or any ancestor of it
     // (through either merge parent). Unknown or non-revision ids: NotFound.
     bool revisionOnBranch(std::string_view branch, const Hash& revisionId);
@@ -318,6 +463,22 @@ public:
     // Export refuses to replace an existing bundle file.
     void exportBranchBundle(std::string_view branch, const std::filesystem::path& bundlePath,
                             BundleLimits limits = {});
+    // Opt-in identity-bearing bundles (AOWSYNC3/AOWSYNC4). V1 export methods
+    // above and below remain wire-compatible with frozen fixtures. Import
+    // accepts both formats and preserves the embedded branch UUIDv7; it
+    // rejects attempts to rebind a different existing branch identity.
+    void exportIdentifiedBranchBundle(std::string_view branch,
+                                      const std::filesystem::path& bundlePath,
+                                      BundleLimits limits = {});
+    void exportIdentifiedBranchBundle(std::string_view branch, int fd,
+                                      BundleLimits limits = {});
+    void exportIdentifiedIncrementalBranchBundle(std::string_view branch,
+                                                 const Hash& recipientBase,
+                                                 const std::filesystem::path& bundlePath,
+                                                 BundleLimits limits = {});
+    void exportIdentifiedIncrementalBranchBundle(std::string_view branch,
+                                                 const Hash& recipientBase, int fd,
+                                                 BundleLimits limits = {});
     // Delta relative to a revision already present at the recipient. The base
     // must be an ancestor (through either merge parent) of the exported head.
     // Carries the revisions not reachable from the base and, per revision, the
@@ -424,7 +585,8 @@ private:
     Bytes pendingIndex_;
 
     void exportBundleLocked(std::string_view branch, const std::filesystem::path* bundlePath,
-                            int targetFd, std::optional<Hash> recipientBase, BundleLimits limits);
+                            int targetFd, std::optional<Hash> recipientBase, BundleLimits limits,
+                            bool includeBranchIdentity = true);
     void prepareScratchDirectory();
     void scanPackTail();
     void discardTornPackTail(std::uint64_t position, std::uint64_t size);
@@ -440,8 +602,18 @@ private:
     Revision readRevision(const Hash& hash);
     Revision clientRevision(const Hash& revisionId);
     bool revisionReachableFrom(const Hash& tip, const Hash& candidate);
+    RevisionId writeRevisionV2Locked(const ProjectId& project, const Hash& root,
+                                     const Hash& referencesRoot, bool modelIndexed,
+                                     const std::vector<RevisionId>& parents);
+    void exportRevisionBundleV2Locked(const ProjectId& project, std::string_view branch,
+                                      std::optional<RevisionId> base, int fd,
+                                      BundleLimits limits);
+    struct RevisionRecordV2 branchRevisionV2Locked(const ProjectId& project,
+                                                   std::string_view branch);
     Hash branchHead(std::string_view name);
-    void publishRef(std::string_view branch, const Hash& commitHash, bool mustBeAbsent);
+    std::optional<BranchId> branchIdLocked(std::string_view name);
+    void publishRef(std::string_view branch, const Hash& commitHash, bool mustBeAbsent,
+                    std::optional<BranchId> requestedId = std::nullopt);
     TreeNode readNode(const Hash& hash);
     Hash storeNode(const TreeNode& node);
     using TreeUpdate = std::pair<Key, std::optional<Hash>>;
@@ -463,6 +635,13 @@ private:
     Revision commitLocked(std::string_view branch, const std::vector<Change>& changes,
                           std::optional<Hash> referencesRoot = std::nullopt,
                           std::optional<Hash> mergeParent = std::nullopt);
+    struct PreparedModelCommit {
+        std::vector<Change> encoded;
+        Hash referencesRoot{};
+    };
+    PreparedModelCommit prepareModelCommitLocked(const Hash& root, const Hash& referencesRoot,
+                                                  std::vector<ModelChange> changes);
+    Hash applyEncodedChangesLocked(const Hash& original, const std::vector<Change>& changes);
     Revision commitModelLocked(std::string_view branch, std::vector<ModelChange> changes,
                                std::optional<Hash> expectedHead,
                                std::optional<Hash> mergeParent);

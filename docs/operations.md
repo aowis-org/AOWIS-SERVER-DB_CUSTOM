@@ -78,6 +78,15 @@ service instance and compare expected heads.
 
 ### Verified offline backup and restore utility
 
+The full native verifier used by backup/restore also validates UUIDv7 branch
+identity sidecars, including uniqueness, regular-file type and canonical
+encoding. Invalid or duplicated branch identities prevent publication of a
+verified restored repository. Valid legacy branches without IDs remain
+supported; valid reserved IDs without published HEADs can survive an
+interrupted branch creation. Revisions still use SHA-256 IDs until the v2
+identity migration. This verification does **not** implement transactional
+branch rename; rename remains deferred pending an atomic name/ID/HEAD design.
+
 `tools/offline_backup.py` provides a **cold**, whole-service backup/restore
 workflow for Linux. Stop the server and every direct-library user first. It
 refuses a live catalogue or any independently open repository using the

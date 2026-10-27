@@ -22,9 +22,10 @@ import sys
 import tempfile
 
 
-PROJECT_ID = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z")
-BRANCH = re.compile(r"[a-zA-Z0-9_-]{1,96}\Z")
-HEAD = re.compile(rb"[0-9a-f]{64}\n\Z")
+PROJECT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+BRANCH = re.compile(rb"[a-zA-Z0-9_-]{1,96}\Z")
+UUID7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+HEAD = re.compile(rb"(?!0{64}\n)[0-9a-f]{64}\n\Z")
 
 
 class BackupError(Exception):
@@ -68,14 +69,25 @@ def branch_heads(root):
         safe_directory(branch_dir)
         values = {}
         for entry in branch_dir.iterdir():
-            # Temporary ref files from a crash are not published branches.
-            if entry.name.startswith("."):
+            # Only canonical, unpublished UUIDv7 staging files may be skipped.
+            # All other entries (including dotfiles) are corruption, not branches.
+            if entry.name.startswith(".stage-"):
+                require(UUID7.fullmatch(entry.name[7:]) is not None
+                        and entry.is_file() and not entry.is_symlink(),
+                        f"invalid branch staging file: {entry}")
                 continue
-            require(BRANCH.fullmatch(entry.name) is not None
+            require(UUID7.fullmatch(entry.name) is not None
                     and entry.is_file() and not entry.is_symlink(),
-                    f"invalid branch entry: {entry}")
+                    f"invalid UUIDv7 branch filename: {entry}")
             content = entry.read_bytes()
-            require(HEAD.fullmatch(content) is not None, f"invalid branch head: {entry}")
+            parts = content.splitlines(keepends=True)
+            require(len(parts) == 4 and parts[0] == b"AOWIS-BRANCH-2\n"
+                    and BRANCH.fullmatch(parts[1][:-1]) is not None
+                    and parts[1].endswith(b"\n")
+                    and parts[2].endswith(b"\n")
+                    and UUID7.fullmatch(parts[2][:-1].decode("ascii", errors="replace")) is not None
+                    and HEAD.fullmatch(parts[3]) is not None,
+                    f"invalid UUIDv7 revision branch record: {entry}")
             values[entry.name] = content
         require(values, f"project has no published branches: {project.name}")
         heads[project.name] = (project.joinpath("project.meta").read_bytes(), values)

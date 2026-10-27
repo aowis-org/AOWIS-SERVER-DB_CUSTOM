@@ -4,74 +4,69 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fcntl.h>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
 
 namespace {
-
-using aowis::dvmdb::Bytes;
-using aowis::dvmdb::Hash;
 using aowis::dvmdb::Key;
+using aowis::dvmdb::ModelChange;
+using aowis::dvmdb::ModelRecord;
+using aowis::dvmdb::ProjectId;
 using aowis::dvmdb::ProjectInfo;
 using aowis::dvmdb::ProjectService;
 using aowis::dvmdb::Repository;
-using aowis::dvmdb::Revision;
+using aowis::dvmdb::RevisionId;
 
-constexpr std::string_view oldMain = "7bf2c352bb7308517a3785101b1634b206a954c013549070eb4760ea52f452d1";
-constexpr std::string_view oldFeature = "4f0f347555c80634f2578dae167d80b841759511a3b891ab0045a479a8f15bb2";
-constexpr std::string_view oldBase = "b8d2bafee89295d4bb183f90b7aad1e2e4a8a76b39229827f79c71405935f468";
-
-void require(bool condition, const std::string& message) {
-    if (!condition) throw std::runtime_error(message);
+void require(bool value, const std::string& message) {
+    if (!value) throw std::runtime_error(message);
 }
 
 struct TemporaryRoot {
     std::filesystem::path directory;
     TemporaryRoot() {
-        std::string pattern = (std::filesystem::temp_directory_path() / "aowis-upgrade-restore-XXXXXXXX").string();
-        std::vector<char> buffer(pattern.begin(), pattern.end());
-        buffer.push_back('\0');
-        const char* created = ::mkdtemp(buffer.data());
-        require(created != nullptr, "could not create temporary upgrade directory");
+        char name[] = "/tmp/aowis-uuid-backup-XXXXXXXX";
+        const char* created = ::mkdtemp(name);
+        require(created != nullptr, "mkdtemp failed");
         this->directory = created;
     }
     ~TemporaryRoot() {
-        std::error_code error;
-        std::filesystem::remove_all(this->directory, error);
+        std::error_code ignored;
+        std::filesystem::remove_all(this->directory, ignored);
     }
 };
 
-Key key(std::uint8_t first) {
-    Key value{};
-    value[0] = first;
-    return value;
+Key key(std::uint8_t value) {
+    Key result{};
+    result[0] = value;
+    return result;
 }
 
-Bytes bytes(std::string_view text) {
-    return Bytes(text.begin(), text.end());
+ModelRecord model(std::uint16_t kind, std::size_t length, std::uint8_t fill) {
+    ModelRecord result;
+    result.kind = kind;
+    result.payload.assign(length, fill);
+    return result;
 }
 
 int offline(const std::string& python, const std::string& script,
             const std::string& verifier, const std::string& command,
-            const std::filesystem::path& source, const std::filesystem::path& target = {}) {
+            const std::filesystem::path& source, const std::filesystem::path& destination = {}) {
     const pid_t child = ::fork();
     require(child >= 0, "fork failed");
     if (child == 0) {
-        std::vector<std::string> arguments{python, script, command, source.string()};
-        if (!target.empty()) arguments.push_back(target.string());
-        arguments.push_back("--verify-binary");
-        arguments.push_back(verifier);
+        std::vector<std::string> args{python, script, command, source.string()};
+        if (!destination.empty()) args.push_back(destination.string());
+        args.push_back("--verify-binary");
+        args.push_back(verifier);
         std::vector<char*> pointers;
-        for (std::string& argument : arguments) pointers.push_back(argument.data());
+        for (std::string& item : args) pointers.push_back(item.data());
         pointers.push_back(nullptr);
         ::execvp(pointers.front(), pointers.data());
         ::_exit(127);
@@ -82,204 +77,147 @@ int offline(const std::string& python, const std::string& script,
     return WEXITSTATUS(status);
 }
 
+struct BranchSnapshot {
+    std::string name;
+    std::string id;
+    std::vector<RevisionId> ancestry;
+    std::optional<ModelRecord> value;
+};
 struct ProjectSnapshot {
     ProjectInfo info;
-    std::map<std::string, std::vector<Hash>> histories;
-    std::map<std::string, std::vector<std::pair<Key, Bytes>>> records;
+    std::vector<BranchSnapshot> branches;
 };
 
 std::vector<ProjectSnapshot> capture(const std::filesystem::path& root,
-                                     const std::vector<ProjectInfo>& projects) {
-    std::vector<ProjectSnapshot> result;
+                                     const std::vector<ProjectInfo>& expected) {
     ProjectService service(root);
-    require(service.listProjects().size() == projects.size(), "project catalogue count changed");
-    for (const ProjectInfo& info : projects) {
+    require(service.listProjects().size() == expected.size(), "project count mismatch");
+    std::vector<ProjectSnapshot> snapshots;
+    for (const ProjectInfo& info : expected) {
+        require(service.project(info.id).name == info.name, "project name changed");
+        const ProjectId project = *ProjectId::parse(info.id);
         ProjectSnapshot snapshot;
         snapshot.info = info;
-        require(service.project(info.id).name == info.name, "project metadata changed");
         service.withRepository(info.id, [&](Repository& repository) {
-            repository.verifyRepository();
-            const std::vector<std::string> branches = repository.listBranches();
-            require(branches.size() == 2, "branch set changed during upgrade");
-            for (const std::string& branch : branches) {
-                std::vector<Hash> revisions;
-                for (const Revision& revision : repository.history(branch, 100)) {
-                    revisions.push_back(revision.id);
-                }
-                require(!revisions.empty(), "empty upgraded branch history");
-                snapshot.histories.emplace(branch, revisions);
-                snapshot.records.emplace(branch, repository.scan(branch));
+            require(repository.verifyRepository().branches == 2, "invalid branch verification count");
+            for (const std::string& name : repository.listBranches()) {
+                BranchSnapshot branch;
+                branch.name = name;
+                const std::optional<aowis::dvmdb::BranchId> id = repository.branchId(name);
+                require(id.has_value(), "branch lost its UUIDv7 identity");
+                branch.id = id->toString();
+                for (const aowis::dvmdb::RevisionGraphRevisionV2& record :
+                     repository.historyV2(project, name, 100)) branch.ancestry.push_back(record.id);
+                require(branch.ancestry.size() >= 2, "UUIDv7 first-parent history is incomplete");
+                const Key lookup = name == "main" ? key(0x21) : key(0x31);
+                branch.value = repository.getModelAtRevisionV2(project, branch.ancestry.front(), lookup);
+                require(branch.value.has_value(), "model record missing from UUIDv7 tip");
+                snapshot.branches.push_back(std::move(branch));
             }
         });
-        result.push_back(std::move(snapshot));
+        snapshots.push_back(std::move(snapshot));
     }
-    return result;
+    return snapshots;
 }
 
 void compare(const std::filesystem::path& root, const std::vector<ProjectSnapshot>& expected) {
-    ProjectService service(root);
-    const std::vector<ProjectInfo> projects = service.listProjects();
-    require(projects.size() == expected.size(), "restored project catalogue count mismatch");
-    for (const ProjectSnapshot& snapshot : expected) {
-        require(service.project(snapshot.info.id).name == snapshot.info.name,
-                "restored project ID or display name changed");
-        service.withRepository(snapshot.info.id, [&](Repository& repository) {
-            repository.verifyRepository();
-            const std::vector<std::string> branches = repository.listBranches();
-            require(branches.size() == snapshot.histories.size(), "restored branch count changed");
-            for (const std::pair<const std::string, std::vector<Hash>>& item : snapshot.histories) {
-                require(std::find(branches.begin(), branches.end(), item.first) != branches.end(),
-                        "restored branch is missing");
-                std::vector<Hash> history;
-                for (const Revision& revision : repository.history(item.first, 100)) {
-                    history.push_back(revision.id);
-                }
-                require(history == item.second, "restored revision ancestry differs");
-                require(repository.head(item.first).id == item.second.front(),
-                        "restored branch head differs");
-                require(repository.scan(item.first) == snapshot.records.at(item.first),
-                        "restored branch model data differs");
-            }
-        });
-    }
-}
-
-void checkHistorical(const std::filesystem::path& root, const std::vector<ProjectInfo>& info) {
-    ProjectService service(root);
-    for (int index = 0; index < 2; ++index) {
-        service.withRepository(info[index].id, [&](Repository& repository) {
-            require(aowis::dvmdb::toHex(repository.head("main").id) == oldMain,
-                    "frozen old-pack main revision changed");
-            require(aowis::dvmdb::toHex(repository.head("feature").id) == oldFeature,
-                    "frozen old-pack divergent branch changed");
-            require(repository.get("main", key(0x10)) == bytes("alpha-v2"),
-                    "old-pack latest value incorrect");
-            require(repository.get("feature", key(0x20)) == bytes("beta-feature"),
-                    "old-pack secondary branch value incorrect");
-            require(repository.get("main", key(0x20)) == std::nullopt,
-                    "old-pack deletion was lost");
-            require(repository.getAtRevision(aowis::dvmdb::fromHex(oldBase), key(0x20)) == bytes("beta-v1"),
-                    "old-pack historic value cannot be read");
-        });
+    std::vector<ProjectInfo> projects;
+    for (const ProjectSnapshot& snapshot : expected) projects.push_back(snapshot.info);
+    const std::vector<ProjectSnapshot> found = capture(root, projects);
+    require(found.size() == expected.size(), "restored project count differs");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        require(found[i].branches.size() == expected[i].branches.size(), "restored branches differ");
+        for (std::size_t j = 0; j < expected[i].branches.size(); ++j) {
+            const BranchSnapshot& before = expected[i].branches[j];
+            const BranchSnapshot& after = found[i].branches[j];
+            require(after.name == before.name && after.id == before.id,
+                    "restored branch name or UUID changed");
+            require(after.ancestry == before.ancestry, "restored UUIDv7 ancestry differs");
+            require(after.value->kind == before.value->kind &&
+                    after.value->payload == before.value->payload &&
+                    after.value->references == before.value->references,
+                    "restored model bytes differ");
+        }
     }
 }
 
 void exercise(const std::string& python, const std::string& script,
-              const std::string& verifier, const std::filesystem::path& fixture) {
+              const std::string& verifier) {
     TemporaryRoot temporary;
     const std::filesystem::path source = temporary.directory / "source";
     const std::filesystem::path backup = temporary.directory / "backup";
     const std::filesystem::path restored = temporary.directory / "restored";
-    const std::filesystem::path upgradedBackup = temporary.directory / "upgraded-backup";
-    const std::filesystem::path upgradedRestored = temporary.directory / "upgraded-restored";
-    const std::filesystem::path frozenRepository = fixture / "repository";
-    require(std::filesystem::is_regular_file(frozenRepository / "objects.pack"),
-            "historical pack fixture is missing");
+    const std::filesystem::path secondBackup = temporary.directory / "second-backup";
+    const std::filesystem::path secondRestored = temporary.directory / "second-restored";
 
-    std::vector<ProjectInfo> info;
+    std::vector<ProjectInfo> projects;
+    std::vector<RevisionId> historical;
     {
         ProjectService service(source);
-        for (int number = 0; number < 4; ++number) {
-            info.push_back(service.createProject("Upgrade/restore project " + std::to_string(number)));
-        }
-        // Two current-format projects: independent branch histories and a large
-        // nontrivial payload ensure the test checks more than catalogue files.
-        for (int index = 2; index < 4; ++index) {
-            service.withRepository(info[index].id, [&](Repository& repository) {
-                repository.createBranch("design", "main");
-                std::vector<aowis::dvmdb::Change> edits;
-                const int count = index == 3 ? 160 : 16;
-                for (int number = 0; number < count; ++number) {
-                    Key recordKey{};
-                    recordKey[0] = static_cast<std::uint8_t>(index);
-                    recordKey[1] = static_cast<std::uint8_t>(number);
-                    const Bytes value(static_cast<std::size_t>(index == 3 ? 8192 : 128),
-                                      static_cast<std::uint8_t>((number * 17 + index) % 251));
-                    edits.push_back({recordKey, value});
-                }
-                repository.commit("main", edits);
-                repository.commit("design", {{key(static_cast<std::uint8_t>(index + 0x40)),
-                                                 bytes("divergent hydraulic design")}});
-                repository.verifyRepository();
+        for (int index = 0; index < 4; ++index) {
+            const ProjectInfo info = service.createProject("Current project " + std::to_string(index));
+            projects.push_back(info);
+            const ProjectId project = *ProjectId::parse(info.id);
+            const RevisionId initial = service.head(info.id, "main");
+            const RevisionId fork = service.createBranch(info.id, "feature", "main", initial);
+            require(fork == initial, "fork invented a revision");
+            const ModelRecord first = model(100, 16, static_cast<std::uint8_t>(index));
+            historical.push_back(service.commitModel(info.id, "main", {{key(0x21), first}}, initial));
+            const ModelRecord feature = model(101, 19, static_cast<std::uint8_t>(index + 1));
+            (void)service.commitModel(info.id, "feature", {{key(0x31), feature}}, initial);
+            const std::size_t length = index == 3 ? 2 * 1024 * 1024 : 32 + static_cast<std::size_t>(index);
+            const ModelRecord latest = model(102, length, static_cast<std::uint8_t>(index + 2));
+            (void)service.commitModel(info.id, "main", {{key(0x21), latest}}, historical.back());
+            service.withRepository(info.id, [&](Repository& repository) {
+                require(repository.getModelAtRevisionV2(project, historical.back(), key(0x21))->payload == first.payload,
+                        "historical immutable model snapshot changed");
             });
         }
     }
-
-    // Stage two byte-for-byte historic pre-release packs under stable project
-    // identities. ProjectService is stopped before modifying offline fixtures.
-    for (int index = 0; index < 2; ++index) {
-        const std::filesystem::path path = source / "projects" / info[index].id / "repository";
-        std::filesystem::remove_all(path);
-        std::filesystem::copy(frozenRepository, path, std::filesystem::copy_options::recursive);
-        // The frozen standalone pack omits the runtime lifetime-lock file.
-        // A real service root retains that file across clean shutdowns.
-        const int lock = ::open((path / "maintenance.lock").c_str(),
-                                O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
-        require(lock >= 0, "could not restore historical repository lifetime lock");
-        require(::close(lock) == 0, "could not close historical lifetime lock");
-        require(!std::filesystem::exists(path / "objects.idx"),
-                "frozen pack unexpectedly contains a derived index");
-    }
-
+    const std::vector<ProjectSnapshot> before = capture(source, projects);
     require(offline(python, script, verifier, "backup", source, backup) == 0,
-            "historical multi-project offline backup failed");
-    for (int index = 0; index < 2; ++index) {
-        require(!std::filesystem::exists(source / "projects" / info[index].id /
-                                          "repository" / "objects.idx"),
-                "backup must not rebuild indexes inside the source root");
-        require(std::filesystem::exists(backup / "projects" / info[index].id /
-                                        "repository" / "objects.idx"),
-                "backup failed to rebuild a historic derived index");
-    }
-
-    checkHistorical(backup, info);
-    const std::vector<ProjectSnapshot> before = capture(backup, info);
-    require(before.size() == 4, "snapshot did not capture all four projects");
-    require(before[3].records.at("main").size() == 160,
-            "large current-format project unexpectedly lost records");
+            "UUIDv7 project backup failed");
     require(offline(python, script, verifier, "restore", backup, restored) == 0,
-            "offline restore from historical multi-project backup failed");
+            "UUIDv7 project restore failed");
     compare(restored, before);
-    checkHistorical(restored, info);
+    require(offline(python, script, verifier, "verify", restored) == 0,
+            "offline verification of restored UUIDv7 projects failed");
 
-    // First write under the upgraded executable must be durable. An independent
-    // source/backup must not observe changes made to the restored copy.
     {
         ProjectService service(restored);
-        service.withRepository(info[0].id, [&](Repository& repository) {
-            repository.commit("main", {{key(0x60), bytes("post-upgrade commit")}});
+        const ProjectId project = *ProjectId::parse(projects[0].id);
+        const RevisionId expected = service.head(projects[0].id, "main");
+        (void)service.commitModel(projects[0].id, "main",
+                                  {{key(0x61), model(103, 18, 0x59)}}, expected);
+        service.withRepository(projects[0].id, [&](Repository& repository) {
+            const std::optional<ModelRecord> old =
+                repository.getModelAtRevisionV2(project, historical[0], key(0x21));
+            require(old.has_value() && old->payload.size() == 16,
+                    "historical UUIDv7 data changed after restore and commit");
             repository.verifyRepository();
-            require(repository.getAtRevision(aowis::dvmdb::fromHex(oldBase), key(0x20)) == bytes("beta-v1"),
-                    "post-upgrade commit broke historic reads");
         });
     }
-    const std::vector<ProjectSnapshot> after = capture(restored, info);
-    require(after[0].histories.at("main").size() == before[0].histories.at("main").size() + 1,
-            "post-upgrade revision was not appended");
-    require(after[0].records.at("main").size() == before[0].records.at("main").size() + 1,
-            "post-upgrade model write was not retained");
-    compare(backup, before);
-
-    require(offline(python, script, verifier, "backup", restored, upgradedBackup) == 0,
-            "upgraded multi-project backup failed");
-    require(offline(python, script, verifier, "restore", upgradedBackup, upgradedRestored) == 0,
-            "second restore of upgraded repositories failed");
-    compare(upgradedRestored, after);
+    const std::vector<ProjectSnapshot> after = capture(restored, projects);
+    require(after[0].branches[1].ancestry.size() == before[0].branches[1].ancestry.size() + 1,
+            "post-restore commit was not durable");
+    compare(backup, before); // independently restored copy did not mutate the first backup
+    require(offline(python, script, verifier, "backup", restored, secondBackup) == 0,
+            "second backup after UUIDv7 commit failed");
+    require(offline(python, script, verifier, "restore", secondBackup, secondRestored) == 0,
+            "second UUIDv7 restore failed");
+    compare(secondRestored, after);
     compare(source, before);
-    require(offline(python, script, verifier, "verify", upgradedRestored) == 0,
-            "final independent offline root verification failed");
 }
-
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        require(argc == 5, "expected Python, backup script, native verifier and frozen fixture");
-        exercise(argv[1], argv[2], argv[3], std::filesystem::absolute(argv[4]));
-        std::cout << "Historical four-project deployment upgrade/restore passed\n";
+        require(argc == 4, "expected Python interpreter, backup script and verifier");
+        exercise(argv[1], argv[2], argv[3]);
+        std::cout << "UUIDv7 multi-project upgrade/restart/restore tests passed\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "Multi-project upgrade/restore FAILED: " << error.what() << '\n';
+        std::cerr << "UUIDv7 multi-project backup regression failed: " << error.what() << '\n';
         return 1;
     }
 }

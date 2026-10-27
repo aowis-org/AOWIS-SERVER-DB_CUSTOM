@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -58,58 +59,91 @@ int run(const std::filesystem::path& cli, const std::vector<std::string>& argume
     return WEXITSTATUS(status);
 }
 
-void exercise(const std::filesystem::path& cli) {
+void exerciseRevisionV2(const std::filesystem::path& cli) {
+    using aowis::dvmdb::ProjectId;
+    using aowis::dvmdb::RevisionId;
     TemporaryDirectory temp;
-    const std::filesystem::path sourcePath = temp.path / "source";
-    const std::filesystem::path destinationPath = temp.path / "destination";
-    const std::filesystem::path bundle = temp.path / "full.aowbundle";
-    const std::filesystem::path delta = temp.path / "incremental.aowbundle";
-    aowis::dvmdb::Hash base{};
-    aowis::dvmdb::Hash tip{};
+    const std::filesystem::path source = temp.path / "source-v2";
+    const std::filesystem::path destination = temp.path / "replica-v2";
+    const std::filesystem::path full = temp.path / "revision-full.aowbundle";
+    const std::filesystem::path delta = temp.path / "revision-incremental.aowbundle";
+    const ProjectId project = ProjectId::generate();
     aowis::dvmdb::Key key{};
-    key[0] = 73;
+    key[15] = 99;
+    RevisionId base = RevisionId::generate();
+    RevisionId tip = RevisionId::generate();
+    std::optional<aowis::dvmdb::BranchId> identity;
     {
-        Repository source(sourcePath);
-        source.createBranch("main");
-        base = source.commit("main", {{key, Bytes{4, 5, 6}}}).id;
+        Repository repository(source);
+        (void)repository.createBranchV2(project, "main");
+        base = repository.headV2(project, "main");
+        identity = repository.branchId("main");
     }
-    expect(run(cli, {"export", sourcePath.string(), "main", bundle.string()}) == 0,
-           "offline full export failed");
-    expect(run(cli, {"import", destinationPath.string(),
-                     bundle.string(), "incoming"}) == 0,
-           "offline full import failed");
+    expect(run(cli, {"export", source.string(), project.toString(), "main", full.string()}) == 0,
+           "v2 full CLI export failed");
     {
-        Repository destination(destinationPath);
-        expect(destination.head("incoming").id == base, "full CLI sync lost revision ID");
+        std::ifstream file(full, std::ios::binary);
+        char header[8]{};
+        file.read(header, sizeof(header));
+        expect(file && std::string(header, sizeof(header)) == "AOWREV21",
+               "v2 CLI full transfer used the wrong wire format");
+    }
+    expect(run(cli, {"export", source.string(), project.toString(), "main", full.string()}) == 1,
+           "v2 CLI export overwrote existing bundle");
+    expect(run(cli, {"import", destination.string(), project.toString(), full.string(), "incoming"}) == 0,
+           "v2 full CLI import failed");
+    expect(run(cli, {"import", destination.string(), project.toString(), full.string(), "incoming"}) == 0,
+           "v2 full CLI replay failed");
+    expect(run(cli, {"head", destination.string(), project.toString(), "incoming"}) == 0,
+           "v2 HEAD CLI lookup failed");
+    {
+        Repository repository(destination);
+        expect(repository.headV2(project, "incoming") == base &&
+               repository.branchId("incoming") == identity,
+               "v2 CLI round trip lost revision or branch identity");
     }
     {
-        Repository source(sourcePath);
-        tip = source.commit("main", {{key, Bytes{9, 8, 7}}}).id;
+        Repository repository(source);
+        tip = repository.commitV2(project, "main", {{key, Bytes{7, 8, 9}}}, base);
     }
-    expect(run(cli, {"export-incremental", sourcePath.string(), "main",
-                     aowis::dvmdb::toHex(base), delta.string()}) == 0,
-           "offline incremental export failed");
-    expect(run(cli, {"import", destinationPath.string(),
-                     delta.string(), "incoming"}) == 0,
-           "offline incremental import failed");
-    expect(run(cli, {"import", destinationPath.string(),
-                     delta.string(), "incoming"}) == 0,
-           "offline incremental reimport should be idempotent");
+    expect(run(cli, {"export-incremental", source.string(), project.toString(), "main",
+                     base.toString(), delta.string()}) == 0,
+           "v2 incremental CLI export failed");
     {
-        Repository destination(destinationPath);
-        expect(destination.head("incoming").id == tip, "incremental CLI sync lost revision ID");
-        expect(destination.get("incoming", key) == Bytes({9, 8, 7}),
-               "incremental CLI sync lost payload");
+        std::ifstream file(delta, std::ios::binary);
+        char header[8]{};
+        file.read(header, sizeof(header));
+        expect(file && std::string(header, sizeof(header)) == "AOWREV22",
+               "v2 CLI delta transfer used the wrong wire format");
     }
-    // The former storage-mode argument ("pack") is no longer accepted.
-    expect(run(cli, {"head", destinationPath.string(), "pack", "incoming"}) == 2,
-           "obsolete storage-mode argument accepted");
-    expect(run(cli, {"head", destinationPath.string(), "incoming"}) == 0, "head command failed");
-    expect(run(cli, {"fetch", destinationPath.string(),
-                     "example.org", "repo", "main", "incoming"}) == 2,
-           "removed remote fetch command must not be accepted");
-    expect(run(cli, {"remote-head", destinationPath.string(), "incoming"}) == 2,
-           "removed remote helper command must not be accepted");
+    expect(run(cli, {"import", destination.string(), project.toString(), delta.string(), "incoming"}) == 0,
+           "v2 incremental CLI import failed");
+    {
+        Repository repository(destination);
+        expect(repository.headV2(project, "incoming") == tip &&
+               repository.branchId("incoming") == identity,
+               "v2 incremental CLI import lost revision or branch identity");
+    }
+    expect(run(cli, {"import", destination.string(), ProjectId::generate().toString(),
+                     full.string(), "other"}) == 1,
+           "cross-project CLI v2 import was accepted");
+    expect(run(cli, {"export-incremental", source.string(), project.toString(), "main",
+                     "invalid-uuid", (temp.path / "bad.aowbundle").string()}) == 1,
+           "invalid UUIDv7 base was accepted");
+    expect(!std::filesystem::exists(temp.path / "bad.aowbundle"),
+           "invalid input published an output bundle");
+    expect(run(cli, {"export-v2", source.string(), project.toString(),
+                     "main", (temp.path / "obsolete.aowbundle").string()}) == 2,
+           "old -v2 CLI alias was accepted");
+    expect(run(cli, {"manifest-export", source.string(), "main",
+                     (temp.path / "obsolete.manifest").string()}) == 2,
+           "removed SHA identity-manifest command was accepted");
+    expect(run(cli, {"head", source.string(), "main"}) == 2,
+           "project-less SHA head command was accepted");
+    expect(run(cli, {"head", source.string(), "not-a-uuid", "main"}) == 1,
+           "invalid project UUIDv7 was accepted");
+    expect(run(cli, {"branch-id", source.string(), project.toString(), "main"}) == 0,
+           "canonical branch identity CLI lookup failed");
 }
 
 } // namespace
@@ -118,7 +152,7 @@ int main(int argc, char** argv) {
     try {
         expect(argc == 2, "usage: native_sync_cli_tests SYNC_CLI");
         const std::filesystem::path cli = std::filesystem::absolute(argv[1]);
-        exercise(cli);
+        exerciseRevisionV2(cli);
         std::cout << "Offline synchronization CLI tests passed\n";
         return 0;
     } catch (const std::exception& error) {

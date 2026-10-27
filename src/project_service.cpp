@@ -1,6 +1,6 @@
 #include "aowis/dvmdb/project_service.h"
-
-#include <openssl/rand.h>
+#include "aowis/dvmdb/object_id.h"
+#include "aowis/dvmdb/revision_record_v2.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -26,22 +26,6 @@ void check(bool ok, const std::string& message,
 
 void syscallChecked(bool ok, const char* action) {
     if (!ok) throwSystemError(action);
-}
-
-std::string randomId() {
-    std::array<unsigned char, 16> bytes{};
-    check(RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) == 1,
-          "failed to generate secure project ID", StorageErrorKind::Internal);
-    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0fU) | 0x40U);
-    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3fU) | 0x80U);
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result;
-    for (std::size_t i = 0; i < bytes.size(); ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) result.push_back('-');
-        result.push_back(digits[bytes[i] >> 4]);
-        result.push_back(digits[bytes[i] & 15U]);
-    }
-    return result;
 }
 
 bool validName(std::string_view name) {
@@ -276,13 +260,31 @@ std::size_t ProjectService::maxPendingOperations() const noexcept {
 }
 
 ProjectInfo ProjectService::createProject(std::string_view name) {
+    return createProjectImpl(name, true);
+}
+
+ProjectInfo ProjectService::createProjectShaFixture(std::string_view name) {
+    return createProjectImpl(name, false);
+}
+
+ProjectInfo ProjectService::createProjectV2(std::string_view name) {
+    return createProjectImpl(name, true);
+}
+
+ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
     if (!validName(name)) throw ProjectError(ProjectErrorKind::InvalidInput,
                                             "project name must contain 1..200 non-control bytes");
     ProjectInfo info;
     info.name = std::string(name);
-    do { info.id = randomId(); }
+    do {
+        try { info.id = ProjectId::generate().toString(); }
+        catch (const std::runtime_error& error) {
+            throw StorageError(StorageErrorKind::Internal,
+                               std::string("failed to generate secure UUIDv7 project ID: ") + error.what());
+        }
+    }
     while (std::filesystem::exists(this->projects_ / info.id) ||
            std::filesystem::exists(this->projects_ / (".creating-" + info.id)));
     const std::filesystem::path staging = this->projects_ / (".creating-" + info.id);
@@ -293,7 +295,14 @@ ProjectInfo ProjectService::createProject(std::string_view name) {
         writeManifest(staging / "project.meta", info);
         {
             Repository repository(staging / "repository");
-            repository.createBranch("main");
+            if (v2) {
+                const std::optional<ProjectId> project = ProjectId::parse(info.id);
+                if (!project) throw StorageError(StorageErrorKind::Internal,
+                                                 "new project UUIDv7 did not validate");
+                (void)repository.createBranchV2(*project, "main");
+            } else {
+                repository.createBranch("main");
+            }
         }
         syncDirectory(staging / "repository" / "refs" / "heads");
         syncDirectory(staging / "repository" / "refs");
@@ -367,7 +376,26 @@ std::vector<std::string> ProjectService::listBranches(std::string_view projectId
     });
 }
 
-Revision ProjectService::createBranch(std::string_view projectId, std::string_view name,
+std::optional<BranchId> ProjectService::branchId(std::string_view projectId,
+                                                  std::string_view branch) {
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::shared_ptr<Project> found = findProject(projectId);
+    return translated<std::optional<BranchId>>([&] {
+        return openRepository(*found)->branchId(branch);
+    });
+}
+
+void ProjectService::adoptBranchIdShaFixture(std::string_view projectId, std::string_view branch,
+                                   const BranchId& identity, const Hash& expectedHead) {
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    withRepository(projectId, [&](Repository& repository) {
+        repository.adoptBranchId(branch, identity, expectedHead);
+    });
+}
+
+Revision ProjectService::createBranchShaFixture(std::string_view projectId, std::string_view name,
                                       std::optional<std::string_view> fromBranch,
                                       std::optional<Hash> fromRevision) {
     if (!validBranchName(name) || (fromBranch && !validBranchName(*fromBranch)) ||
@@ -390,7 +418,202 @@ Revision ProjectService::createBranch(std::string_view projectId, std::string_vi
     return created;
 }
 
-Revision ProjectService::head(std::string_view projectId, std::string_view branch) {
+RevisionId ProjectService::createBranchV2(std::string_view projectId,
+              std::string_view name, std::optional<std::string_view> source) {
+    if (!validBranchName(name) || (source && !validBranchName(*source)))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    RevisionId created = RevisionId::generate();
+    withRepository(projectId, [&](Repository& repository) {
+        created = translated<RevisionId>([&]() {
+            return repository.createBranchV2(*project, name, source);
+        });
+    });
+    return created;
+}
+
+RevisionId ProjectService::createBranchAtRevisionV2(std::string_view projectId,
+                std::string_view name, std::string_view sourceBranch, const RevisionId& revision) {
+    if (!validBranchName(name) || !validBranchName(sourceBranch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    RevisionId created = RevisionId::generate();
+    withRepository(projectId, [&](Repository& repository) {
+        created = translated<RevisionId>([&]() {
+            return repository.createBranchAtRevisionV2(*project, name, sourceBranch, revision);
+        });
+    });
+    return created;
+}
+
+MergeResultV2 ProjectService::mergeBranchesV2(std::string_view projectId,
+                std::string_view target, std::string_view source,
+                std::optional<RevisionId> expectedTarget,
+                std::optional<RevisionId> expectedSource) {
+    if (!validBranchName(target) || !validBranchName(source))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    MergeResultV2 result;
+    withRepository(projectId, [&](Repository& repository) {
+        result = translated<MergeResultV2>([&]() {
+            return repository.mergeBranchesV2(*project, target, source,
+                                               expectedTarget, expectedSource);
+        });
+    });
+    return result;
+}
+
+RevisionId ProjectService::headV2(std::string_view projectId, std::string_view branch) {
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    const std::shared_ptr<Project> entry = findProject(projectId);
+    return translated<RevisionId>([&]() { return openRepository(*entry)->headV2(*project, branch); });
+}
+
+std::vector<RevisionGraphRevisionV2> ProjectService::historyV2(
+        std::string_view projectId, std::string_view branch, std::size_t maxCount,
+        std::optional<RevisionId> after) {
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    const std::shared_ptr<Project> entry = findProject(projectId);
+    return translated<std::vector<RevisionGraphRevisionV2>>([&]() {
+        return openRepository(*entry)->historyV2(*project, branch, maxCount, after);
+    });
+}
+
+RevisionGraphPageV2 ProjectService::revisionGraphV2(
+        std::string_view projectId, std::size_t maxCount,
+        std::optional<RevisionGraphCursorV2> cursor) {
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    const std::shared_ptr<Project> entry = findProject(projectId);
+    return translated<RevisionGraphPageV2>([&]() {
+        return openRepository(*entry)->revisionGraphV2(*project, maxCount, std::move(cursor));
+    });
+}
+
+RevisionId ProjectService::commitModelV2(std::string_view projectId,
+                          std::string_view branch, std::vector<ModelChange> changes,
+                          std::optional<RevisionId> expectedHead) {
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    RevisionId committed = RevisionId::generate();
+    withRepository(projectId, [&](Repository& repository) {
+        committed = translated<RevisionId>([&]() {
+            return repository.commitModelV2(*project, branch, std::move(changes), expectedHead);
+        });
+    });
+    return committed;
+}
+
+std::optional<ModelRecord> ProjectService::getModelAtRevisionV2(
+        std::string_view projectId, const RevisionId& revisionId, const Key& key) {
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    const std::shared_ptr<Project> entry = findProject(projectId);
+    return translated<std::optional<ModelRecord>>([&]() {
+        return openRepository(*entry)->getModelAtRevisionV2(*project, revisionId, key);
+    });
+}
+
+RevisionId ProjectService::createBranch(std::string_view projectId, std::string_view name,
+          std::optional<std::string_view> source, std::optional<RevisionId> fromRevision) {
+    if (fromRevision) {
+        if (!source)
+            throw ProjectError(ProjectErrorKind::InvalidInput,
+                               "historical branch source requires a source branch");
+        return createBranchAtRevisionV2(projectId, name, *source, *fromRevision);
+    }
+    return createBranchV2(projectId, name, source);
+}
+
+RevisionId ProjectService::head(std::string_view projectId, std::string_view branch) {
+    return headV2(projectId, branch);
+}
+
+std::vector<RevisionGraphRevisionV2> ProjectService::history(
+        std::string_view projectId, std::string_view branch, std::size_t maxCount,
+        std::optional<RevisionId> after) {
+    if (maxCount == 0 || maxCount > 1000)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid history limit");
+    return historyV2(projectId, branch, maxCount, after);
+}
+
+RevisionGraphPageV2 ProjectService::revisionGraph(
+        std::string_view projectId, std::size_t maxCount,
+        std::optional<RevisionGraphCursorV2> cursor) {
+    if (maxCount == 0 || maxCount > 1000)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid revision graph limit");
+    return revisionGraphV2(projectId, maxCount, std::move(cursor));
+}
+
+RevisionGraphRevisionV2 ProjectService::revision(std::string_view projectId, const RevisionId& id) {
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    const std::shared_ptr<Project> found = findProject(projectId);
+    return translated<RevisionGraphRevisionV2>([&]() {
+        const std::optional<Bytes> bytes = openRepository(*found)->readRevisionV2(*project, id);
+        if (!bytes) throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
+        const RevisionRecordV2 record = decodeRevisionRecordV2(*bytes);
+        RevisionGraphRevisionV2 result{record.id, hashRevisionRecordV2(record),
+                                      record.root, record.referencesRoot, record.modelIndexed, {}};
+        result.parents.reserve(record.parents.size());
+        for (const RevisionParentV2& parent : record.parents)
+            result.parents.push_back(RevisionGraphParentV2{parent.id, parent.expectedRecordHash});
+        return result;
+    });
+}
+
+void ProjectService::renameBranch(std::string_view projectId, std::string_view previous,
+                                  std::string_view renamed, const RevisionId& expectedHead) {
+    if (!validBranchName(previous) || !validBranchName(renamed))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    withRepository(projectId, [&](Repository& repository) {
+        translated<int>([&]() {
+            repository.renameBranchV2(*project, previous, renamed, expectedHead);
+            return 0;
+        });
+    });
+}
+
+RevisionId ProjectService::commitModel(std::string_view projectId, std::string_view branch,
+                  std::vector<ModelChange> changes, std::optional<RevisionId> expectedHead) {
+    return commitModelV2(projectId, branch, std::move(changes), expectedHead);
+}
+
+MergeResultV2 ProjectService::mergeBranches(std::string_view projectId,
+                  std::string_view target, std::string_view source,
+                  std::optional<RevisionId> expectedTarget,
+                  std::optional<RevisionId> expectedSource) {
+    return mergeBranchesV2(projectId, target, source, expectedTarget, expectedSource);
+}
+
+std::optional<ModelRecord> ProjectService::getModelAtRevision(
+                  std::string_view projectId, const RevisionId& revision, const Key& key) {
+    return getModelAtRevisionV2(projectId, revision, key);
+}
+
+void ProjectService::renameBranchShaFixture(std::string_view projectId, std::string_view previous,
+                                  std::string_view renamed, const Hash& expectedHead) {
+    if (!validBranchName(previous) || !validBranchName(renamed))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    withRepository(projectId, [&](Repository& repository) {
+        translated<int>([&]() { repository.renameBranch(previous, renamed, expectedHead); return 0; });
+    });
+}
+
+Revision ProjectService::headShaFixture(std::string_view projectId, std::string_view branch) {
     if (!validBranchName(branch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::shared_ptr<Project> found = findProject(projectId);
@@ -402,7 +625,7 @@ Revision ProjectService::head(std::string_view projectId, std::string_view branc
     });
 }
 
-std::vector<Revision> ProjectService::history(std::string_view projectId,
+std::vector<Revision> ProjectService::historyShaFixture(std::string_view projectId,
                     std::string_view branch, std::size_t maxCount, std::optional<Hash> after) {
     if (!validBranchName(branch) || maxCount == 0 || maxCount > 1000)
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch or history limit");
@@ -415,7 +638,7 @@ std::vector<Revision> ProjectService::history(std::string_view projectId,
     });
 }
 
-RevisionGraphPage ProjectService::revisionGraph(std::string_view projectId,
+RevisionGraphPage ProjectService::revisionGraphShaFixture(std::string_view projectId,
                                                     std::size_t maxCount,
                                                     std::optional<RevisionGraphCursor> cursor) {
     const std::shared_ptr<Project> found = findProject(projectId);
@@ -424,7 +647,7 @@ RevisionGraphPage ProjectService::revisionGraph(std::string_view projectId,
     });
 }
 
-Revision ProjectService::revision(std::string_view projectId, const Hash& id) {
+Revision ProjectService::revisionShaFixture(std::string_view projectId, const Hash& id) {
     const std::shared_ptr<Project> found = findProject(projectId);
     return translated<Revision>([&]() { return openRepository(*found)->revision(id); });
 }

@@ -102,12 +102,16 @@ struct BundleBuilder {
     }
 
     void write(const std::filesystem::path& path, const Hash& tip,
-               const std::optional<Hash>& base = std::nullopt) const {
+               const std::optional<Hash>& base = std::nullopt,
+               const std::optional<aowis::dvmdb::BranchId>& branchId = std::nullopt) const {
         Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C',
-                     static_cast<std::uint8_t>(base ? '2' : '1')};
+                     static_cast<std::uint8_t>(base ? '4' : '3')};
         appendHash(bundle, tip);
         appendU64(bundle, static_cast<std::uint64_t>(this->objects.size()));
         if (base) appendHash(bundle, *base);
+        const aowis::dvmdb::BranchId id = branchId.value_or(aowis::dvmdb::BranchId::generate());
+        const std::array<std::uint8_t, 16>& uuid = id.uuid().bytes;
+        bundle.insert(bundle.end(), uuid.begin(), uuid.end());
         for (const std::pair<const Hash, Bytes>& entry : this->objects) {
             appendHash(bundle, entry.first);
             appendU64(bundle, static_cast<std::uint64_t>(entry.second.size()));
@@ -353,7 +357,7 @@ void testMalformedIncremental() {
     const Hash root = makeTree(builder, TreeKind::Raw, Defect::DuplicateUuid);
     const Hash incoming = builder.revision(root, Hash{}, false, base);
     const std::filesystem::path delta = temporary.path / "bad-delta.aowbundle";
-    builder.write(delta, incoming, base);
+    builder.write(delta, incoming, base, source.branchId("stable"));
     const std::uint64_t objects = target.objectCount();
     const std::uint64_t pack = target.packSize();
     bool failed = false;

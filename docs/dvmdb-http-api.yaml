@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: AOWIS DVMDB Service API
-  version: 1.0.0
-  description: Project/catalogue, revision, hydraulic persistence, entity edits, diffs, semantic merging and bounded binary full/incremental bundle synchronization.
+  version: 2.0.0
+  description: UUIDv7-only HTTP project, branch, revision, hydraulic persistence, semantic merging, and AOWREV21/22 full/incremental bundle transfer.
 servers:
   - url: http://127.0.0.1:8755/dvmdb/v1
 paths:
@@ -56,61 +56,51 @@ paths:
       - {$ref: '#/components/parameters/ProjectId'}
       - {$ref: '#/components/parameters/Branch'}
     get:
-      operationId: exportBranchBundle
+      operationId: exportRevisionBundleV2
       description: |
-        Export the full portable immutable revision graph or an incremental
-        delta relative to a base ancestor. The binary result is capped by
-        configured transfer size, object-count and individual-object limits.
-        The response is streamed in chunks from a nameless scratch file in the project repository, which is released when the response ends.
-        A server-wide HTTP transfer staging budget reserves the configured maximum transfer size until the response ends. Saturation returns 503 staging_busy with Retry-After: 1. Native internal scratch has a separate process-wide logical extent ceiling (`storage/max_internal_scratch_mib`); when busy it returns 503 scratch_busy with Retry-After: 1.
+        UUIDv7 revision-graph transfer, separate from SHA revision bundles.
+        AOWREV21 full bundle or AOWREV22 incremental from the specified
+        recipient-base revision UUIDv7. Uses project-scoped scratch files,
+        chunked HTTP streaming and the global transfer staging quota. Does
+        not support network resumption or authentication.
       parameters:
         - name: base
           in: query
           required: false
-          schema: {$ref: '#/components/schemas/RevisionHash'}
+          schema: {type: string, format: uuid, description: UUIDv7 revision ID}
       responses:
         '200':
-          description: Full or incremental portable AOWIS bundle
+          description: Verified full or incremental UUIDv7 revision bundle
           content:
-            application/vnd.aowis.bundle:
+            application/vnd.aowis.revision-bundle-v2:
               schema: {type: string, format: binary}
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
-        '413': {description: Export exceeds configured transfer limit}
-        '503': {description: Global HTTP staging budget full (staging_busy; Retry-After 1)}
+        '413': {description: Export exceeds configured limit}
+        '503': {description: Staging quota or repository queue exhausted}
         '507': {description: Scratch storage exhausted}
     post:
-      operationId: importBranchBundle
+      operationId: importRevisionBundleV2
       description: |
-        Validate a complete binary bundle and create or fast-forward the
-        destination branch atomically. Repeated imports return up_to_date.
-        Divergent history is never overwritten. The body is streamed into a
-        project scratch file; a declared or received size above the transfer
-        limit returns 413 before (or while) reading it. A full server-wide
-        transfer staging budget returns 503 staging_busy with Retry-After: 1
-        and closes the connection without accepting a body.
+        Bounded disk-backed UUIDv7 revision import. The project ID in the URL
+        must equal the imported bundle's project UUID. Preserves both branch
+        and revision UUIDs; rejects divergent/stale bases. Imports commit the
+        verified immutable closure before atomically publishing the HEAD.
+        The server currently provides no caller authentication.
       requestBody:
         required: true
         content:
-          application/vnd.aowis.bundle:
+          application/vnd.aowis.revision-bundle-v2:
             schema: {type: string, format: binary}
       responses:
-        '200':
-          description: Existing branch fast-forwarded or already up-to-date
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/BundleImportResult'}
-        '201':
-          description: Destination branch created
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/BundleImportResult'}
+        '200': {description: Fast-forward or idempotent replay, including head UUIDv7 and objectsImported}
+        '201': {description: Destination branch created with the replicated branch UUIDv7}
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
-        '413': {description: Upload exceeds configured transfer limit}
-        '503': {description: Global HTTP staging budget full (staging_busy; Retry-After 1), or project busy}
+        '413': {description: Upload exceeds configured limit}
+        '503': {description: Staging quota or repository queue exhausted}
         '507': {description: Scratch storage exhausted}
   /projects/{projectId}:
     parameters:
@@ -142,8 +132,8 @@ paths:
                     type: array
                     items: {type: string}
     post:
-      operationId: createBranch
-      description: Creates an empty branch, forks the current head of fromBranch, or forks a specified reachable immutable revision.
+      operationId: createUuidv7Branch
+      description: Create a UUIDv7 branch reference. No revision is created when forking from a branch or historical revision. A source-less branch is only permitted on an empty project.
       requestBody:
         required: true
         content:
@@ -153,149 +143,20 @@ paths:
               additionalProperties: false
               required: [name]
               properties:
-                name: {type: string, pattern: '^[a-zA-Z0-9_-]{1,96}$'}
-                fromBranch: {type: string, pattern: '^[a-zA-Z0-9_-]{1,96}$'}
-                revision: {$ref: '#/components/schemas/RevisionHash'}
+                name: {type: string}
+                fromBranch: {type: string}
+                revision: {type: string, format: uuid, description: Historical revision UUIDv7; requires fromBranch}
       responses:
-        '201':
-          description: New branch head
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Revision'}
+        '201': {description: UUIDv7 revision ID, branch name and branch UUIDv7}
         '400': {$ref: '#/components/responses/BadRequest'}
-        '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
-  /projects/{projectId}/branches/{branch}/head:
+  /projects/{projectId}/branches/{branch}:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
       - {$ref: '#/components/parameters/Branch'}
-    get:
-      operationId: getBranchHead
-      responses:
-        '200':
-          description: Current branch revision
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Revision'}
-        '404': {$ref: '#/components/responses/NotFound'}
-  /projects/{projectId}/branches/{branch}/history:
-    parameters:
-      - {$ref: '#/components/parameters/ProjectId'}
-      - {$ref: '#/components/parameters/Branch'}
-      - name: limit
-        in: query
-        schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
-      - name: after
-        in: query
-        schema: {$ref: '#/components/schemas/RevisionHash'}
-    get:
-      operationId: getHistory
-      description: First-parent chain, newest first. Cursor exclusive and must belong to this branch's first-parent chain.
-      responses:
-        '200':
-          description: Revision page
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [revisions]
-                properties:
-                  revisions:
-                    type: array
-                    items: {$ref: '#/components/schemas/Revision'}
-        '400': {$ref: '#/components/responses/BadRequest'}
-  /projects/{projectId}/revision-graph:
-    parameters:
-      - {$ref: '#/components/parameters/ProjectId'}
-    get:
-      operationId: getRevisionGraph
-      description: |
-        Enumerate the union of immutable revision ancestry reachable from ALL
-        branch HEADs captured atomically within one project. Both merge parents
-        are traversed, with every revision returned once across pages. The
-        deterministic traversal is depth-first, not a global time/topological
-        sort; clients arrange revisions using their parent IDs. HEAD mappings
-        are repeated unchanged on each page. A cursor pins the original HEAD
-        set even if branches advance. Signed, project-scoped continuation tokens
-        become invalid after server restart; restart pagination with no cursor.
-        Native and HTTP readers share the same 1..1000 page bound, 1024-branch
-        snapshot bound, and 250000-revision replay/traversal budget. Excessive
-        graphs return 413 limit_exceeded, never a falsely complete page.
-        Replay from immutable pinned HEADs bounds server state, but late pages
-        cost O(revisions already traversed) rather than O(page size). Cursor
-        tokens can be long with very many branches; a reverse proxy may impose
-        a smaller URI limit. Existing first-parent /history is unchanged.
-      parameters:
-        - name: limit
-          in: query
-          required: false
-          schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
-        - name: cursor
-          in: query
-          required: false
-          schema: {type: string, description: Opaque signed graph continuation token}
-      responses:
-        '200':
-          description: One page from a consistent immutable revision graph snapshot
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/RevisionGraphPage'}
-        '400': {$ref: '#/components/responses/BadRequest'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '413': {description: Branch or revision traversal budget exceeded (limit_exceeded)}
-  /projects/{projectId}/revisions/{revisionHash}:
-    parameters:
-      - {$ref: '#/components/parameters/ProjectId'}
-      - name: revisionHash
-        in: path
-        required: true
-        schema: {$ref: '#/components/schemas/RevisionHash'}
-    get:
-      operationId: getRevision
-      responses:
-        '200':
-          description: Immutable revision metadata
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Revision'}
-        '400': {$ref: '#/components/responses/BadRequest'}
-        '404': {$ref: '#/components/responses/NotFound'}
-  /projects/{projectId}/diff:
-    parameters:
-      - {$ref: '#/components/parameters/ProjectId'}
-      - {name: from, in: query, required: true, schema: {$ref: '#/components/schemas/RevisionHash'}}
-      - {name: to, in: query, required: true, schema: {$ref: '#/components/schemas/RevisionHash'}}
-    get:
-      operationId: diffImmutableRevisions
-      description: Compare two immutable revision roots. At most 1000 changed records; larger differences return 413 limit_exceeded, detected without materializing the full difference. No pagination.
-      responses:
-        '200':
-          description: Changed UUIDs and before/after value hashes
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [from, to, changes]
-                properties:
-                  from: {$ref: '#/components/schemas/RevisionHash'}
-                  to: {$ref: '#/components/schemas/RevisionHash'}
-                  changes:
-                    type: array
-                    items:
-                      type: object
-                      required: [uuid, before, after]
-                      properties:
-                        uuid: {type: string, format: uuid}
-                        before: {oneOf: [{$ref: '#/components/schemas/RevisionHash'}, {type: 'null'}]}
-                        after: {oneOf: [{$ref: '#/components/schemas/RevisionHash'}, {type: 'null'}]}
-        '400': {$ref: '#/components/responses/BadRequest'}
-  /projects/{projectId}/branches/{branch}/networks:
-    parameters:
-      - {$ref: '#/components/parameters/ProjectId'}
-      - {$ref: '#/components/parameters/Branch'}
-    post:
-      operationId: saveHydraulicNetwork
-      description: Atomically create or replace a complete validated network. Requires the exact expected branch head; no implicit retry.
+    patch:
+      operationId: renameUuidv7Branch
+      description: Atomically change the user-chosen name, preserving branch UUID and revision HEAD. Requires exact expected UUIDv7 HEAD.
       requestBody:
         required: true
         content:
@@ -303,80 +164,80 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [expectedHead, payloadBase64]
+              required: [name, expectedHead]
               properties:
-                expectedHead: {$ref: '#/components/schemas/RevisionHash'}
-                payloadBase64: {type: string, contentEncoding: base64, description: Canonical ModelCodec<NetworkHydraulic> bytes}
+                name: {type: string}
+                expectedHead: {type: string, format: uuid}
       responses:
-        '201':
-          description: Published revision
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Revision'}
-        '400': {$ref: '#/components/responses/BadRequest'}
+        '200': {description: Renamed branch and unchanged HEAD}
         '409': {$ref: '#/components/responses/Conflict'}
-  /projects/{projectId}/branches/{branch}/networks/{networkId}:
+  /projects/{projectId}/branches/{branch}/head:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
       - {$ref: '#/components/parameters/Branch'}
-      - {$ref: '#/components/parameters/NetworkId'}
-      - {$ref: '#/components/parameters/OptionalRevision'}
     get:
-      operationId: getHydraulicNetwork
+      operationId: getUuidv7BranchHead
       responses:
-        '200':
-          description: Snapshot-pinned complete hydraulic network
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/CanonicalPayload'}
+        '200': {description: Current immutable revision UUIDv7 in the id field}
         '404': {$ref: '#/components/responses/NotFound'}
-  /projects/{projectId}/branches/{branch}/networks/{networkId}/entities:
+  /projects/{projectId}/branches/{branch}/history:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
       - {$ref: '#/components/parameters/Branch'}
-      - {$ref: '#/components/parameters/NetworkId'}
-      - {$ref: '#/components/parameters/OptionalRevision'}
-      - {name: type, in: query, required: true, schema: {type: integer, minimum: 0, maximum: 17}}
+      - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      - {name: after, in: query, schema: {type: string, format: uuid}}
     get:
-      operationId: listHydraulicEntities
-      description: Ordered UUIDs for one network collection; at most 10000 UUIDs, larger collections return 413 limit_exceeded.
+      operationId: getUuidv7History
+      description: First-parent history, newest-first, using an exclusive UUIDv7 revision cursor.
       responses:
-        '200':
-          description: Entity UUIDs and pinned revision
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [revision, type, uuids]
-                properties:
-                  revision: {$ref: '#/components/schemas/RevisionHash'}
-                  type: {type: integer, minimum: 0, maximum: 17}
-                  uuids: {type: array, items: {type: string, format: uuid}}
-        '404': {$ref: '#/components/responses/NotFound'}
-  /projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}:
+        '200': {description: Revision objects with UUIDv7 IDs, ordered parent UUIDs, integrity hashes}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/{projectId}/revisions/{revision}:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
-      - {$ref: '#/components/parameters/Branch'}
-      - {$ref: '#/components/parameters/NetworkId'}
-      - {$ref: '#/components/parameters/OptionalRevision'}
-      - {name: entityId, in: path, required: true, schema: {type: string, format: uuid}}
+      - {name: revision, in: path, required: true, schema: {type: string, format: uuid}}
     get:
-      operationId: getHydraulicEntity
+      operationId: getUuidv7Revision
+      description: Immutable revision UUIDv7 lookup authenticated against its canonical record SHA-256 and parent ancestry.
       responses:
-        '200':
-          description: Canonical entity payload and enum ordinal type
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/CanonicalPayload'}
+        '200': {description: UUIDv7 revision, recordHash and ordered parent UUID/hash pairs}
         '404': {$ref: '#/components/responses/NotFound'}
-  /projects/{projectId}/branches/{branch}/networks/{networkId}/edits:
+  /projects/{projectId}/revision-graph:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      - {name: cursor, in: query, schema: {type: string, description: Opaque, HMAC-signed, project-scoped and process-local continuation token}}
+    get:
+      operationId: getUuidv7RevisionGraph
+      description: |
+        Native v2 graph semantics: union of all branch HEAD ancestry, both merge
+        parents and deduplicated revisions. HEADs include branch UUIDv7,
+        branch name, revision UUIDv7 and record SHA-256. Revisions contain id,
+        recordHash, snapshot roots, modelIndexed, parents (revision UUID array),
+        and parentRecordHashes (corresponding SHA-256 array).
+        HEAD snapshots are pinned into authenticated cursors across refreshes.
+        Cursors are invalid after server restart or when used for another project.
+        Pagination bounds are 1..1000 items, up to 1024 branch HEADs and
+        250000 traversed revisions. The complete boolean and nextCursor are
+        always explicit. No SHA-only revision identity fallback.
+      responses:
+        '200': {description: Pinned, paginated UUIDv7 revision DAG with heads, revisions, complete and nextCursor}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '413': {description: Graph traversal or response budget exceeded}
+  /projects/{projectId}/branches/{branch}/model-commits:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
       - {$ref: '#/components/parameters/Branch'}
-      - {$ref: '#/components/parameters/NetworkId'}
     post:
-      operationId: editHydraulicNetwork
-      description: One atomic batch of at most 128 changes validated by native hydraulic persistence.
+      operationId: commitModelRevisionV2
+      description: >-
+        Atomically create a UUIDv7 model-indexed revision on an exact expected
+        branch HEAD. The model record payload is opaque binary data encoded
+        as Base64; hydraulic clients must encode it with the existing
+        ModelCodec. This generic native-record operation enforces reference
+        integrity, not hydraulic field-level semantic validation. Rejects
+        duplicate keys, invalid references, stale heads and batches
+        exceeding 128 changes. This is the canonical model-commit route.
       requestBody:
         required: true
         content:
@@ -386,33 +247,37 @@ paths:
               additionalProperties: false
               required: [expectedHead, changes]
               properties:
-                expectedHead: {$ref: '#/components/schemas/RevisionHash'}
+                expectedHead: {type: string, format: uuid, description: Revision UUIDv7}
                 changes:
                   type: array
+                  minItems: 1
                   maxItems: 128
                   items:
-                    oneOf:
-                      - {type: object, additionalProperties: false, required: [uuid, delete], properties: {uuid: {type: string, format: uuid}, delete: {const: true}}}
-                      - {type: object, additionalProperties: false, required: [uuid, type, payloadBase64], properties: {uuid: {type: string, format: uuid}, type: {type: integer, minimum: 0, maximum: 17}, payloadBase64: {type: string, contentEncoding: base64}}}
+                    type: object
+                    description: >-
+                      uuid plus delete:true, or uuid, kind (uint16), references
+                      (array of canonical UUIDs), payloadBase64 (canonical bytes).
+                    properties:
+                      uuid: {type: string, format: uuid}
+                      delete: {type: boolean, enum: [true]}
+                      kind: {type: integer, minimum: 0, maximum: 65535}
+                      references: {type: array, items: {type: string, format: uuid}}
+                      payloadBase64: {type: string, format: byte}
       responses:
-        '200':
-          description: New revision and edit diagnostics
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [revision, diagnostics]
-                properties:
-                  revision: {$ref: '#/components/schemas/Revision'}
-                  diagnostics: {type: object}
+        '201': {description: New revision UUIDv7 in `id` field}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
+        '413': {description: Request exceeds bounded resource limits}
   /projects/{projectId}/merges:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
     post:
-      operationId: mergeHydraulicBranches
-      description: Validated hydraulic three-way merge. Conflicts return 409 and do not publish; explicit field/object choices must be pinned to the exact branch tips.
+      operationId: mergeBranchesV2
+      description: >-
+        Generic UUIDv7 three-way merge. Always requires both exact expected
+        HEAD UUIDs. Domain-specific hydraulic field and object resolution is
+        exposed separately via /hydraulic-merges.
       requestBody:
         required: true
         content:
@@ -424,17 +289,179 @@ paths:
               properties:
                 target: {type: string}
                 source: {type: string}
-                expectedTargetHead: {$ref: '#/components/schemas/RevisionHash'}
-                expectedSourceHead: {$ref: '#/components/schemas/RevisionHash'}
+                expectedTargetHead: {type: string, format: uuid}
+                expectedSourceHead: {type: string, format: uuid}
+      responses:
+        '200': {description: Merge status, resulting target UUIDv7 HEAD, and conflicts}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/hydraulic-merges:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    post:
+      operationId: mergeHydraulicBranchesV2
+      description: >-
+        UUIDv7-only, domain-validated hydraulic branch merge. Both expected
+        HEAD UUIDs are mandatory, even when no conflict choices are supplied.
+        Reconciles canonical typed fields and membership chunks and validates
+        the entire candidate hydraulic network before publication, including
+        fast-forward merges. A 409 conflict leaves both branch HEADs intact.
+        Field/object choices may target only actual conflicts; unknown,
+        duplicated, unused or stale choices are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target, source, expectedTargetHead, expectedSourceHead]
+              properties:
+                target: {type: string}
+                source: {type: string}
+                expectedTargetHead: {type: string, format: uuid}
+                expectedSourceHead: {type: string, format: uuid}
                 fieldChoices:
                   type: array
-                  items: {type: object, required: [entityUuid, field, side], properties: {entityUuid: {type: string, format: uuid}, field: {type: string}, side: {type: string, enum: [target, source]}}}
+                  maxItems: 128
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [entityUuid, field, side]
+                    properties:
+                      entityUuid: {type: string, format: uuid}
+                      field: {type: string}
+                      side: {type: string, enum: [target, source]}
                 objectChoices:
                   type: array
-                  items: {type: object, required: [entityUuid, side], properties: {entityUuid: {type: string, format: uuid}, side: {type: string, enum: [target, source]}}}
+                  maxItems: 128
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [entityUuid, side]
+                    properties:
+                      entityUuid: {type: string, format: uuid}
+                      side: {type: string, enum: [target, source]}
       responses:
-        '200': {description: Up-to-date, fast-forward or merged revision with conflict list}
-        '409': {description: Unpublished conflicts or changed expected heads}
+        '200': {description: Merge status, UUIDv7 target HEAD and any conflicts}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {description: Exceeds bounded request size or 128 total choices}
+  /projects/{projectId}/diff:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {name: from, in: query, required: true, schema: {type: string, format: uuid}}
+      - {name: to, in: query, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: diffImmutableRevisionsV2
+      description: >-
+        Compare two immutable, project-owned UUIDv7 revision snapshots.
+        Returns at most 1000 changed model/object keys, otherwise HTTP 413.
+        SHA-256 values are integrity hashes, not revision identities.
+      responses:
+        '200': {description: Changed UUIDs, with before/after content SHA-256 hashes}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {description: Difference count exceeds 1000}
+  /projects/{projectId}/branches/{branch}/networks:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+    post:
+      operationId: saveUuidv7HydraulicNetwork
+      description: |
+        Create/replace a complete, canonically validated hydraulic network on
+        a UUIDv7 project and branch. The exact expected revision HEAD must
+        match at atomic publication. Revision UUID and content SHA are separate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedHead, payloadBase64]
+              properties:
+                expectedHead: {type: string, format: uuid, description: UUIDv7 revision}
+                payloadBase64: {type: string, contentEncoding: base64, description: Canonical NetworkHydraulic model bytes}
+      responses:
+        '201': {description: '{"id":"<new UUIDv7 revision>"}'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+      - {name: revision, in: query, required: false, schema: {type: string, format: uuid}, description: UUIDv7 revision in this branch ancestry; omitted selects current HEAD}
+    get:
+      operationId: getUuidv7HydraulicNetwork
+      description: Pin one UUIDv7 revision, verify hydraulic metadata and all member references, then load the complete canonical payload.
+      responses:
+        '200': {description: Canonical network payload with UUIDv7 revision}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}/entities:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+      - {name: revision, in: query, required: false, schema: {type: string, format: uuid}}
+      - {name: type, in: query, required: true, schema: {type: integer, minimum: 0, maximum: 17}}
+    get:
+      operationId: listUuidv7HydraulicEntities
+      description: List one collection's ordered UUIDs at a pinned UUIDv7 revision; 10000 maximum.
+      responses:
+        '200': {description: Entity UUID list with UUIDv7 revision}
+        '413': {description: Requested collection exceeds limit}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+      - {name: revision, in: query, required: false, schema: {type: string, format: uuid}}
+      - {name: entityId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: getUuidv7HydraulicEntity
+      description: Index-backed, ownership-checked canonical entity read at one immutable revision UUID.
+      responses:
+        '200': {description: Entity UUID, collection ordinal, canonical payload and UUIDv7 revision}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /projects/{projectId}/branches/{branch}/networks/{networkId}/edits:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {$ref: '#/components/parameters/Branch'}
+      - {$ref: '#/components/parameters/NetworkId'}
+    post:
+      operationId: editUuidv7HydraulicNetwork
+      description: |
+        Apply at most 128 entity changes to one UUIDv7 branch HEAD. This
+        V2 path uses the full canonical hydraulic validator; indexed edit
+        fast paths and interactive hydraulic merge choices are not yet V2.
+        Identical batches do not create a revision. Requires exact expectedHead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedHead, changes]
+              properties:
+                expectedHead: {type: string, format: uuid}
+                changes:
+                  type: array
+                  maxItems: 128
+                  items:
+                    oneOf:
+                      - {type: object, additionalProperties: false, required: [uuid, delete], properties: {uuid: {type: string, format: uuid}, delete: {const: true}}}
+                      - {type: object, additionalProperties: false, required: [uuid, type, payloadBase64], properties: {uuid: {type: string, format: uuid}, type: {type: integer, minimum: 0, maximum: 17}, payloadBase64: {type: string, contentEncoding: base64}}}
+      responses:
+        '200': {description: '{"id":"<new or unchanged UUIDv7 revision>"}'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+
 components:
   schemas:
     CanonicalPayload:

@@ -93,11 +93,11 @@ void appendUnreachableObject(const std::filesystem::path& source,
     check(input.good(), "open valid bundle for orphan injection");
     const Bytes original((std::istreambuf_iterator<char>(input)),
                          std::istreambuf_iterator<char>());
-    check(original.size() >= 48 && original[0] == 'A' && original[7] == '1',
+    check(original.size() >= 64 && original[0] == 'A' && original[7] == '3',
           "expected full bundle fixture");
     const std::uint64_t count = readU64(original, 40);
     std::map<Hash, Bytes> objects;
-    std::size_t offset = 48;
+    std::size_t offset = 64;
     for (std::uint64_t index = 0; index < count; ++index) {
         check(offset <= original.size() && original.size() - offset >= 40,
               "truncated valid bundle fixture");
@@ -117,6 +117,8 @@ void appendUnreachableObject(const std::filesystem::path& source,
           "unexpected orphan hash collision");
     Bytes output(original.begin(), original.begin() + 40);
     appendU64(output, static_cast<std::uint64_t>(objects.size()));
+    // Preserve the immutable UUIDv7 branch identity after the object count.
+    output.insert(output.end(), original.begin() + 48, original.begin() + 64);
     for (const std::pair<const Hash, Bytes>& entry : objects) {
         output.insert(output.end(), entry.first.begin(), entry.first.end());
         appendU64(output, entry.second.size());
@@ -154,7 +156,7 @@ void rejectWithoutPublication(Repository& receiver, const std::filesystem::path&
     } catch (const std::runtime_error& error) {
         check(expectedReason.empty() ||
               std::string_view(error.what()).find(expectedReason) != std::string_view::npos,
-              "forged bundle rejected for an unexpected reason");
+              "forged bundle rejected for an unexpected reason: " + std::string(error.what()));
         check(receiver.objectCount() == objectsBefore,
               "invalid transfer wrote objects before passing preflight");
         check(receiver.listBranches().empty(),

@@ -95,3 +95,29 @@ Hydraulic branches should use `mergeHydraulicBranches()` rather than the generic
 The serializer, ordered membership and persistent reference-index formats are part of the pack repository format. Indexed entity reads and suitable edits avoid decoding the whole network, while full saves, fallbacks and merged-snapshot validation still work over the whole aggregate. Solver feasibility and arbitrary conflicting membership reorder resolution remain separate work. The REST service also exposes canonical complete-network reads/saves, revision-pinned targeted entity reads, atomic validated edits and semantic merges, reusing this native library. See [REST design](rest-api-design.md) for HTTP request envelopes, size limits and operations still planned.
 
 Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-dvmdb-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency.
+
+## UUIDv7 hydraulic workflow (Phase 2g-3a)
+
+The parallel `saveHydraulicNetworkV2()`, `editHydraulicNetworkV2()`,
+`loadHydraulicNetworkAtRevisionV2()`, `listHydraulicEntityIdsAtRevisionLimitedV2()`
+and `loadHydraulicEntityAtRevisionV2()` APIs use a project-scoped UUIDv7
+revision identity, **not** a SHA revision hash. The reference-index lookup
+`Repository::referencingModelAtRevisionV2()` reads the same immutable snapshot
+as the model and manifest lookups. Whole-network save and edit reuse the exact
+same canonical codec, 18 collection kinds, membership-chunk layout, typed
+references and physical/network validation as the existing hydraulic APIs.
+
+New HTTP routes are `/branches/{branch}/networks-v2`,
+`/branches/{branch}/networks-v2/{networkId}` and their `/entities`,
+`/entities/{entityId}` and `/edits` subroutes. A historical read's optional
+`revision` is checked against both-parent ancestry of the selected branch.
+`expectedHead` is an exact UUIDv7 required for every write. HTTP limits remain
+10000 list members and 128 edit changes; size limits use the same hydraulic
+request ceiling as the earlier routes.
+
+V2 edits deliberately use the full canonical validator and full-network
+publication, not the optimized indexed edit fast paths. This is correct but
+O(network size); large-network edit performance is a later migration slice.
+V2 hydraulic interactive conflict-resolution/semantic merge is **not** yet
+available; the generic UUIDv7 merge is conservative. The existing SHA-based
+HTTP routes have not been made the default, and no legacy migration exists.

@@ -219,7 +219,7 @@ void testDiskBackedFullExport() {
     // hash-table slots or the order in which graph traversal discovered them.
     std::ifstream input(first, std::ios::binary);
     check(input.good(), "cannot inspect disk-backed export");
-    input.seekg(48);
+    input.seekg(64);
     Hash previous{};
     for (std::uint64_t ordinal = 0; ordinal < count; ++ordinal) {
         Hash hash{};

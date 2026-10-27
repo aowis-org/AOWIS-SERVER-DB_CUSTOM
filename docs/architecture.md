@@ -20,10 +20,13 @@ no global checkout HEAD or original branch-creation event. Existing
 first-parent history APIs do not enumerate all merge-parent ancestry;
 a separate full-DAG reader is already implemented in Repository,
 ProjectService and HTTP. The [UUIDv7 identity migration
-roadmap](uuidv7-identity-migration-roadmap.md) proposes a future revision-ID
-format change, not a change to the revision DAG semantics.
+roadmap](uuidv7-identity-migration-roadmap.md) and [v2 format
+contract](uuidv7-identity-format-v2.md) specify a future revision-ID
+format change, not a change to revision DAG semantics. New project creation
+now uses UUIDv7, while existing UUIDv4 projects remain readable; revision
+and branch identity/storage still use legacy SHA-based references.
 
-- **Current implementation:** entity keys are 16-byte UUIDs; pack object and revision IDs are 32-byte SHA-256 hashes of canonical bytes. **Proposed target:** first-class project, branch and revision identities are distinct UUIDv7 values, with immutable object hashes retained for integrity and Merkle deduplication.
+- **Current implementation:** new project IDs are UUIDv7; old project UUIDv4 IDs remain readable. Entity keys are 16-byte UUIDs; pack object and revision IDs remain 32-byte SHA-256 hashes of canonical bytes. **Proposed target:** branch and revision identities also become distinct UUIDv7 values, with immutable object hashes retained for integrity and Merkle deduplication.
 - A persistent, path-compressed 16-way radix Merkle tree maps UUIDs to immutable object hashes. Unchanged values/subtrees are reused across revisions.
 - Model-indexed revisions also publish a reverse-reference Merkle tree mapping a UUID to its incoming referencing UUIDs. Both roots belong to one revision.
 - Each revision holds zero, one or two parent revision hashes. Branch names resolve to mutable refs pointing at immutable revision objects. Changes to one branch do not modify other branches.

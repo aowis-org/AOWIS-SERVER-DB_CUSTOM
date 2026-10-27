@@ -1,3 +1,5 @@
+> **Current pre-release branch storage:** [BRANCH-1](uuidv7-branch-ref-format.md) uses UUIDv7 filenames and identity-bearing transfers. Old name-keyed branch refs and SHA-only bundles are explicitly unsupported. Native-only test fixtures have been converted; HTTP and qualification test gates remain to be run.
+
 # Remaining development and release qualification
 
 This document records **unfinished work only**. Current features are described
@@ -79,7 +81,7 @@ certification; see [engineering findings](engineering-findings.md).
   limits; profile disk space, wall time and cancellation behavior. The
   incremental path still collects a sorted in-memory set for emitted delta
   hashes; bound it if measurements show an actual need.
-- Extend the existing historical-format, four-project cold-upgrade/restore
+- Extend the current-format four-project cold-backup/restore
   drill to larger representative service roots and actual cross-host/storage
   migrations. Online snapshots and online compaction are not implemented.
   Define retention, restore and orphan-scratch cleanup policy.
@@ -94,8 +96,8 @@ certification; see [engineering findings](engineering-findings.md).
   interleavings. No known critical integrity regression may remain open.
 - Define supported platforms/filesystems and explicitly freeze the pack,
   sidecar and portable bundle compatibility policy before a stable release.
-  Frozen pre-release pack/bundle fixtures and a multi-project restore/upgrade
-  drill protect historical read/import and new-write compatibility; see
+  Older pack/bundle fixtures are negative rejection tests under BRANCH-1;
+  current-format native multi-project backup/restore protects new writes; see
   [format compatibility](format-compatibility.md).
 - Publish a measurable resource envelope, backup/restore procedure, version
   migration guide and operational troubleshooting guide. Validate field
@@ -110,7 +112,37 @@ direct changes to the existing native engine.
 
 ## P-ID — UUIDv7 object identity and verified SHA-256 history (new prerequisite)
 
-**Approved direction, implementation pending.** Give every new first-class
+**Current pre-release checkpoint:** New projects use UUIDv7. Branches use
+UUIDv7-named atomic `AOWIS-BRANCH-1` records, supporting stable renaming.
+All native and REST/CLI transfers now export `AOWSYNC3/4` with branch UUIDv7;
+old name-keyed repositories and `AOWSYNC1/2` imports are rejected outright,
+with no migration compatibility. Current-format native identity, recovery,
+replication, backup and corruption tests have been updated. The next storage
+milestone is revision UUIDv7 v2 and its verified UUID-to-SHA resolver.
+**Phase 2d native checkpoint:** UUIDv7 first-parent `historyV2` and
+all-parent `revisionGraphV2` are now available in Repository/ProjectService,
+with pinned branch UUID/name/HEAD snapshots and verified UUID/SHA ancestry.
+**REST, ordinary service routes, CLI and GUI have not switched**; bundle,
+verifier and compaction conversion is still pending. See
+[native history](native-revision-history.md).
+
+**Phase 2c-3a native checkpoint:** opt-in `ProjectService::createProjectV2`
+and native UUIDv7 model-indexed commit/read/fork APIs are implemented and
+covered by integration tests. The default `createProject()` and REST contracts
+remain SHA-based until the coordinated cutover. V2 merges, P0 graph reading,
+transfers, verification, and compaction are still pending. See the
+[v2 identity contract](uuidv7-identity-format-v2.md) for precise status.
+**Phase 2a implemented:** canonical `T/02` record encoding/decoding,
+SHA-256 integrity, parent UUID/hash graph verifier and frozen golden-vector
+regression tests. **Phase 2b implemented as isolated infrastructure:** a
+project-pinned UUIDv7→SHA resolver with fsynced/no-replace publication,
+full-ancestry verification, reopen/corruption/concurrency tests, and UUID-only
+filenames. **Not yet live:** resolver wiring into the actual repository object
+pack and commits, UUID-based HEAD publication, revision commits/merges,
+bundle/API/GUI cutover. Current live revisions remain
+SHA-keyed. No compatibility reader for obsolete pre-release repositories is
+planned; development data must be recreated at the cutover.
+Give every new first-class
 project, branch and revision a distinct UUIDv7 identity; use SHA-256 to verify
 the **complete canonical immutable revision record** and its transitive Merkle
 snapshot. Keep branch HEADs as references, not revision objects: new branch
@@ -119,16 +151,25 @@ empty root SHA sharing is not cryptographic corruption; it reflects identical
 content, while current revisions lack a separate logical identity.
 
 This migration affects the native `S` revision record, SHA parent links,
-branch files, catalogue (currently UUIDv4), P0 graph API, `expectedHead`,
+branch files, catalogue/project provenance, P0 graph API, `expectedHead`,
 replication bundles, native/HTTP clients, verifier, fixtures and the GUI.
-Migrate on verified copies with an authoritative, replica-stable mapping of
-legacy SHA IDs to new revision UUIDs; never generate divergent mappings on
-independent replicas. Do not rekey immutable Merkle data unnecessarily. The
+For this pre-release breaking change, **recreate** old SHA-based development
+repositories; do not add transparent read compatibility or generate
+independent replica-specific mappings. Do not rekey immutable Merkle data
+unnecessarily. The
 [UUIDv7 identity migration roadmap](uuidv7-identity-migration-roadmap.md)
-defines six delivery phases, compatibility and rollback gates, and design
-questions requiring sign-off. **Complete P-ID before introducing P1 checkout
+and [v2 identity contract](uuidv7-identity-format-v2.md) define the delivery
+phases, compatibility and rollback gates, and frozen record-byte examples. **Complete P-ID before introducing P1 checkout
 and save.** Routine P0 graphical rendering can still be tested against the
 existing backend while P-ID is designed.
+
+## UUIDv7 revision replication checkpoint (2026-10-27)
+
+Native full and pinned-base incremental revision transfers are implemented as
+`AOWREV21`/`AOWREV22`. The pack verification/import path uses disk-backed
+staging and UUIDv7/SHA ancestry validation; the remaining milestone is
+v2-aware HTTP/CLI transport and coordinated REST/GUI identity cutover.
+See [the native wire contract](uuidv7-revision-replication-v2.md).
 
 ## Version-control and GUI integration priorities (agreed 2026-10-27)
 
@@ -147,9 +188,8 @@ branch HEADs and bounded, deduplicated all-parent revision enumeration,
 without changing storage format. See [native revision history](native-revision-history.md)
 and the [live OpenAPI route](dvmdb-http-api.yaml). The first implementation
 uses stateless DFS replay and has documented traversal limits; indexed scalable
-pagination is a later optimization. **Next P0 task:** wire the GUI's embedded
-and REST readers to these pages and preserve partial/full graph state in the
-renderer. The old `history` endpoint remains intentionally first-parent.
+pagination is a later optimization. **P0 GUI reader integration is implemented** in the GUI project; end-to-end
+visual/Qt acceptance remains an independent release gate. The old `history` endpoint remains intentionally first-parent.
 See the [graph acceptance contract](version-control-semantics.md#5-current-read-surface-and-missing-full-graph-contract)
 and [GUI requirements](gui-integration-requirements.md).
 
@@ -166,3 +206,20 @@ not secured by the provisional native access policy.
 The remaining operational, durability and release qualification items above
 remain open; this prioritization does not cancel them. Planned endpoint names
 are **not** implemented HTTP API until code, tests and OpenAPI ship together.
+
+## Phase 2f transport checkpoint (2026-10-27)
+
+Explicit CLI UUIDv7 revision commands and the separate HTTP
+`revision-bundle` endpoint expose the native `AOWREV21` and `AOWREV22`
+protocols without reinterpreting the existing SHA-based branch-bundle
+operations. The HTTP transport uses the same bounded upload scratch files,
+streaming download providers and global staging reservation as existing bundle
+transfers. No incoming bundle filename comes from the user-controlled branch
+name. Native CLI tests cover full, incremental, replay and rejection cases;
+HTTP loopback tests require the Qt-enabled full build.
+
+**Not yet complete:** ordinary REST project creation and graph/history APIs
+remain SHA-facing, and network transport still has no authentication,
+resume support or bandwidth throttling. The next coherent milestone is the
+**default ProjectService/REST identity cutover** plus GUI adoption and complete
+HTTP qualification; do not retire the old route until all callers switch.

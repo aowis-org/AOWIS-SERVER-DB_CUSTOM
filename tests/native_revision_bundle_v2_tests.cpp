@@ -1,0 +1,319 @@
+#include "aowis/dvmdb/native_store.h"
+#include "aowis/dvmdb/storage_error.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+namespace {
+namespace fs = std::filesystem;
+using namespace aowis::dvmdb;
+
+void check(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+template <typename Function>
+void expectError(Function execute, StorageErrorKind kind, const char* message) {
+    try { execute(); }
+    catch (const StorageError& error) {
+        if (error.kind() == kind) return;
+        throw std::runtime_error(std::string(message) + ": wrong error category: " + error.what());
+    }
+    throw std::runtime_error(message);
+}
+
+struct Temporary {
+    fs::path path = fs::temp_directory_path() / ("aowis-v2-sync-" + UuidV7::generate().toString());
+    Temporary() { fs::create_directories(this->path); }
+    ~Temporary() { std::error_code ec; fs::remove_all(this->path, ec); }
+    fs::path bundle() const { return this->path / (UuidV7::generate().toString() + ".bundle"); }
+};
+
+struct File {
+    int fd = -1;
+    File(const fs::path& path, int flags)
+        : fd(::open(path.c_str(), flags | O_CLOEXEC | O_NOFOLLOW, 0600)) {
+        if (this->fd < 0) throw std::runtime_error("unable to open v2 test bundle");
+    }
+    ~File() { if (this->fd >= 0) (void)::close(this->fd); }
+    File(const File&) = delete;
+    File& operator=(const File&) = delete;
+};
+
+Key key(unsigned suffix) {
+    Key value{};
+    value[15] = static_cast<std::uint8_t>(suffix);
+    return value;
+}
+
+void checkGraph(Repository& repo, const ProjectId& project, std::size_t expectedCount,
+                std::size_t expectedBranches = 1) {
+    const RevisionGraphPageV2 graph = repo.revisionGraphV2(project, 100);
+    check(!graph.next && graph.revisions.size() == expectedCount, "v2 transfer graph is incomplete");
+    check(graph.heads.size() == expectedBranches, "imported branch count is wrong");
+}
+
+void run() {
+    Temporary files;
+    const ProjectId project = ProjectId::generate();
+    Repository source(files.path / "source");
+    const RevisionId root = source.createBranchV2(project, "main");
+    const RevisionId base = source.commitV2(project, "main", {{key(1), Bytes{10}}}, root);
+    check(source.createBranchV2(project, "feature", "main") == base, "branch must share the same revision");
+    const RevisionId main = source.commitV2(project, "main", {{key(2), Bytes{20}}}, base);
+    const RevisionId feature = source.commitV2(project, "feature", {{key(3), Bytes{30}}}, base);
+    const MergeResultV2 merge = source.mergeBranchesV2(project, "main", "feature", main, feature);
+    check(merge.status == MergeStatus::Merged && merge.resultHead, "missing two-parent merge");
+    const RevisionId merged = *merge.resultHead;
+    const std::optional<BranchId> branchId = source.branchId("main");
+    check(branchId.has_value(), "source branch UUID missing");
+
+    const fs::path path = files.bundle();
+    {
+        File transfer(path, O_RDWR | O_CREAT | O_EXCL);
+        source.exportRevisionBundleV2(project, "main", transfer.fd);
+    }
+    Repository target(files.path / "target");
+    {
+        File transfer(path, O_RDONLY);
+        const RevisionBundleImportV2 result = target.importRevisionBundleV2(project, transfer.fd, "main");
+        check(result.status == BundleImportStatus::Created && result.head == merged &&
+              result.objectsImported > 0, "initial full v2 transfer not published");
+    }
+    check(target.headV2(project, "main") == merged && target.branchId("main") == branchId,
+          "revision or branch identity changed on replica");
+    checkGraph(target, project, 5);
+    {
+        File transfer(path, O_RDONLY);
+        const RevisionBundleImportV2 replay = target.importRevisionBundleV2(project, transfer.fd, "main");
+        check(replay.status == BundleImportStatus::UpToDate && replay.objectsImported == 0,
+              "idempotent replay is not a no-op");
+    }
+    {
+        Repository reopened(files.path / "target");
+        checkGraph(reopened, project, 5);
+        check(reopened.verifyRepository().revisions >= 5, "imported repository did not verify");
+    }
+
+    (void)target.compact();
+    check(target.headV2(project, "main") == merged && target.branchId("main") == branchId,
+          "compaction changed imported branch UUID or HEAD");
+
+    const RevisionId advanced = source.commitV2(project, "main", {{key(4), Bytes{40}}}, merged);
+    const fs::path later = files.bundle();
+    {
+        File transfer(later, O_RDWR | O_CREAT | O_EXCL);
+        source.exportRevisionBundleV2(project, "main", transfer.fd);
+        File read(later, O_RDONLY);
+        const RevisionBundleImportV2 result = target.importRevisionBundleV2(project, read.fd, "main");
+        check(result.status == BundleImportStatus::FastForward && result.head == advanced,
+              "v2 transfer did not fast-forward HEAD");
+    }
+    checkGraph(target, project, 6);
+    // Another branch of the same project transports a distinct stable branch
+    // UUID while sharing already-received ancestry through the merge.
+    const fs::path featureBundle = files.bundle();
+    {
+        File file(featureBundle, O_RDWR | O_CREAT | O_EXCL);
+        source.exportRevisionBundleV2(project, "feature", file.fd);
+        File read(featureBundle, O_RDONLY);
+        const RevisionBundleImportV2 result = target.importRevisionBundleV2(project, read.fd, "feature");
+        check(result.status == BundleImportStatus::Created && result.head == feature,
+              "feature identity was not imported");
+    }
+    check(target.headV2(project, "feature") == feature &&
+          target.branchId("feature") == source.branchId("feature") &&
+          target.branchId("feature") != branchId,
+          "second branch UUID or shared ancestry was corrupted");
+    checkGraph(target, project, 6, 2);
+
+    // AOWREV22 carries only the objects missing from a pinned recipient
+    // base, not another copy of the entire merge ancestry. Same UUID and
+    // parent hashes must survive an incremental round trip and replay.
+    const RevisionId deltaHead = source.commitV2(project, "main", {{key(5), Bytes{50}}}, advanced);
+    const fs::path deltaPath = files.bundle();
+    {
+        File delta(deltaPath, O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "main", advanced, delta.fd);
+        std::array<char, 8> magic{};
+        check(::pread(delta.fd, magic.data(), magic.size(), 0) == 8 &&
+              std::string(magic.data(), magic.size()) == "AOWREV22",
+              "v2 incremental bundle header was not emitted");
+        check(fs::file_size(deltaPath) < fs::file_size(later),
+              "incremental bundle did not omit old immutable ancestry");
+        File incoming(deltaPath, O_RDONLY);
+        const RevisionBundleImportV2 imported =
+            target.importRevisionBundleV2(project, incoming.fd, "main");
+        check(imported.status == BundleImportStatus::FastForward &&
+              imported.head == deltaHead && imported.objectsImported > 0,
+              "incremental v2 transfer failed to fast-forward the branch");
+        check(target.importRevisionBundleV2(project, incoming.fd, "main").status ==
+              BundleImportStatus::UpToDate, "incremental v2 replay moved the branch");
+    }
+    check(target.headV2(project, "main") == deltaHead &&
+          target.branchId("main") == branchId,
+          "incremental v2 import changed the branch's UUID");
+    checkGraph(target, project, 7, 2);
+    {
+        const fs::path emptyDelta = files.bundle();
+        File output(emptyDelta, O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "main", deltaHead, output.fd);
+        check(fs::file_size(emptyDelta) == 144,
+              "same-revision incremental replay included redundant objects");
+        File input(emptyDelta, O_RDONLY);
+        check(target.importRevisionBundleV2(project, input.fd, "main").status ==
+              BundleImportStatus::UpToDate,
+              "zero-object same-HEAD incremental replay failed");
+    }
+    // No source revision mutation or HEAD publication is allowed if the
+    // recipient is not at the exact base recorded in the delta.
+    {
+        const RevisionId future = source.commitV2(project, "main", {{key(6), Bytes{60}}}, deltaHead);
+        check(future != deltaHead, "stale-delta test did not advance source");
+        const fs::path stalePath = files.bundle();
+        File stale(stalePath, O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "main", merged, stale.fd);
+        File input(stalePath, O_RDONLY);
+        expectError([&] { (void)target.importRevisionBundleV2(project, input.fd, "main"); },
+                    StorageErrorKind::Conflict, "stale v2 incremental base accepted");
+        check(target.headV2(project, "main") == deltaHead,
+              "rejected incremental bundle mutated branch HEAD");
+    }
+    expectError([&] {
+        File output(files.bundle(), O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "main", RevisionId::generate(), output.fd);
+    }, StorageErrorKind::NotFound, "unknown incremental base exported");
+    {
+        const fs::path tampered = files.bundle();
+        fs::copy_file(deltaPath, tampered);
+        File output(tampered, O_RDWR);
+        std::uint8_t value = 0;
+        check(::pread(output.fd, &value, 1, 144 + 40) == 1,
+              "failed to read incremental corruption byte");
+        value ^= 0x40;
+        check(::pwrite(output.fd, &value, 1, 144 + 40) == 1,
+              "failed to write incremental corruption byte");
+        File input(tampered, O_RDONLY);
+        expectError([&] { (void)target.importRevisionBundleV2(project, input.fd, "main"); },
+                    StorageErrorKind::InvalidInput, "tampered incremental payload accepted");
+    }
+    // An incremental merge can contain a whole new side of the DAG, not
+    // merely the new first-parent chain. Neither side gets a cloned UUID.
+    const RevisionId side = source.commitV2(project, "feature", {{key(8), Bytes{80}}}, feature);
+    const MergeResultV2 sideMerge = source.mergeBranchesV2(
+        project, "main", "feature", source.headV2(project, "main"), side);
+    check(sideMerge.status == MergeStatus::Merged && sideMerge.resultHead,
+          "incremental merge fixture was not divergent");
+    const fs::path mergeDelta = files.bundle();
+    {
+        File output(mergeDelta, O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "main", deltaHead, output.fd);
+        File input(mergeDelta, O_RDONLY);
+        const RevisionBundleImportV2 result =
+            target.importRevisionBundleV2(project, input.fd, "main");
+        check(result.status == BundleImportStatus::FastForward &&
+              result.head == *sideMerge.resultHead && result.objectsImported > 0,
+              "incremental two-parent merge was not replicated");
+    }
+    checkGraph(target, project, 10, 2);
+    check(target.headV2(project, "feature") == feature &&
+          target.headV2(project, "main") == *sideMerge.resultHead,
+          "merge delta incorrectly advanced source branch");
+    {
+        File transfer(path, O_RDONLY);
+        check(target.importRevisionBundleV2(project, transfer.fd, "main").status == BundleImportStatus::UpToDate,
+              "older v2 bundle should not rewind the target");
+    }
+    // A new branch, with the old shared root, receives a different UUID; it
+    // cannot overwrite the imported main identity simply because the HEADs share ancestry.
+    {
+        File transfer(path, O_RDONLY);
+        expectError([&] { (void)target.importRevisionBundleV2(project, transfer.fd, "renamed"); },
+                    StorageErrorKind::Conflict, "one branch UUID imported under two names");
+    }
+    const fs::path corrupt = files.bundle();
+    fs::copy_file(later, corrupt);
+    {
+        File file(corrupt, O_RDWR);
+        std::uint8_t changed = 0;
+        check(::pread(file.fd, &changed, 1, 96 + 40) == 1, "cannot read corruption test byte");
+        changed ^= 0xff;
+        check(::pwrite(file.fd, &changed, 1, 96 + 40) == 1, "cannot write corruption test byte");
+    }
+    {
+        Repository clean(files.path / "clean");
+        File transfer(corrupt, O_RDONLY);
+        expectError([&] { (void)clean.importRevisionBundleV2(project, transfer.fd, "main"); },
+                    StorageErrorKind::InvalidInput, "corrupted v2 bundle accepted");
+        check(!clean.hasBranch("main"), "corrupt transfer published branch HEAD");
+    }
+    {
+        Repository untouched(files.path / "wrong-expected");
+        File transfer(path, O_RDONLY);
+        expectError([&] {
+            (void)untouched.importRevisionBundleV2(ProjectId::generate(), transfer.fd, "main");
+        }, StorageErrorKind::Conflict, "unexpected project accepted into fresh repository");
+        check(!untouched.hasBranch("main") &&
+              !fs::exists(files.path / "wrong-expected" / "revision-v2"),
+              "project mismatch pinned an incorrect target identity");
+    }
+    {
+        Repository wrong(files.path / "wrong");
+        (void)wrong.createBranchV2(ProjectId::generate(), "other");
+        File transfer(path, O_RDONLY);
+        expectError([&] { (void)wrong.importRevisionBundleV2(project, transfer.fd, "main"); },
+                    StorageErrorKind::Conflict, "cross-project v2 transfer was accepted");
+    }
+    // Full v2 bundles also contain model-indexed state and reverse-reference
+    // trees, not just raw byte revisions. Exercise complete semantic transfer.
+    {
+        const ProjectId modelProject = ProjectId::generate();
+        Repository modelSource(files.path / "model-source");
+        const RevisionId initial = modelSource.createBranchV2(modelProject, "main");
+        ModelRecord firstModel;
+        firstModel.kind = 31;
+        firstModel.payload = {7, 8};
+        const RevisionId modelHead = modelSource.commitModelV2(
+            modelProject, "main", {{key(7), firstModel}}, initial);
+        const fs::path modelBundle = files.bundle();
+        File output(modelBundle, O_RDWR | O_CREAT | O_EXCL);
+        modelSource.exportRevisionBundleV2(modelProject, "main", output.fd);
+        Repository modelTarget(files.path / "model-target");
+        File input(modelBundle, O_RDONLY);
+        check(modelTarget.importRevisionBundleV2(modelProject, input.fd, "main").head == modelHead,
+              "model-indexed bundle HEAD mismatch");
+        check(modelTarget.getModelAtRevisionV2(modelProject, modelHead, key(7))->payload == Bytes({7, 8}),
+              "model payload was lost in v2 replication");
+        check(modelTarget.verifyRepository().modelSnapshots > 0,
+              "model/reverse-reference integrity failed after import");
+    }
+    {
+        File transfer(later, O_RDONLY);
+        expectError([&] {
+            (void)target.importRevisionBundleV2(project, transfer.fd, "main", BundleLimits{256, 100, 0});
+        }, StorageErrorKind::LimitExceeded, "import byte limit not enforced");
+    }
+    {
+        File transfer(files.bundle(), O_RDWR | O_CREAT | O_EXCL);
+        // A configured small output limit must reject before exposing any bytes.
+        expectError([&] {
+            source.exportRevisionBundleV2(project, "main", transfer.fd, BundleLimits{256, 100, 0});
+        }, StorageErrorKind::LimitExceeded, "export byte limit not enforced");
+    }
+}
+} // namespace
+
+int main() {
+    try {
+        run();
+        std::cout << "UUIDv7 full-revision bundle replication passed\n";
+    } catch (const std::exception& error) {
+        std::cerr << "UUIDv7 full-revision bundle replication FAILED: " << error.what() << '\n';
+        return 1;
+    }
+}

@@ -15,8 +15,9 @@
 ## Pending revision identity contract upgrade
 
 The current HTTP endpoints use SHA-256 revision hashes as public identities,
-branch names as ref identifiers, and UUIDv4 project IDs. The approved target
-uses UUIDv7 project/branch/revision IDs with separate SHA-256 integrity
+branch names as ref identifiers, and UUIDv7 IDs for **new** projects
+(legacy UUIDv4 project IDs remain readable). The full target uses UUIDv7
+project/branch/revision IDs with separate SHA-256 integrity
 fields. The [UUIDv7 migration roadmap](uuidv7-identity-migration-roadmap.md)
 requires new versioned API contracts and backwards-compatibility decisions;
 **none of these wire changes is implemented or part of the live OpenAPI yet**.

@@ -152,23 +152,23 @@ void expectProjectError(ProjectErrorKind kind, const std::string& label, const s
 void testProjectsIndependent() {
     TestDirectory directory("independent");
     ProjectService service(directory.path, 4);
-    const std::string a = service.createProject("A").id;
-    const std::string b = service.createProject("B").id;
+    const std::string a = service.createProjectShaFixture("A").id;
+    const std::string b = service.createProjectShaFixture("B").id;
     Holder held(service, a);
     completesWithin(std::chrono::milliseconds(2000), "other project and catalogue", [&] {
         const Clock::time_point start = Clock::now();
         expect(service.listProjects().size() == 2, "catalogue listing failed");
         expect(service.project(a).name == "A", "project lookup failed");
-        (void)service.createProject("C");
+        (void)service.createProjectShaFixture("C");
         service.withRepository(b, [](Repository& repository) {
             repository.commit("main", {Change{key(1), Bytes{1}}});
         });
-        expect(service.createBranch(b, "feature", std::string_view("main")).id == service.head(b, "main").id,
+        expect(service.createBranchShaFixture(b, "feature", std::string_view("main")).id == service.headShaFixture(b, "main").id,
                "branch of the other project failed");
         // Single reads of the held project take no operation lock.
-        expect(service.listBranches(a).size() == 1 && service.history(a, "main", 10).size() == 1,
+        expect(service.listBranches(a).size() == 1 && service.historyShaFixture(a, "main", 10).size() == 1,
                "reads of the held project failed");
-        (void)service.revision(a, service.head(a, "main").id);
+        (void)service.revisionShaFixture(a, service.headShaFixture(a, "main").id);
         (void)service.createScratchFile(a);
         expect(Clock::now() - start < std::chrono::milliseconds(1000), "independent operations were slow");
     });
@@ -177,7 +177,7 @@ void testProjectsIndependent() {
 void testSameProjectSerialized() {
     TestDirectory directory("serialized");
     ProjectService service(directory.path, 4);
-    const std::string a = service.createProject("A").id;
+    const std::string a = service.createProjectShaFixture("A").id;
     std::atomic<bool> entered{false};
     bool enteredWhileHeld = false;
     std::thread second;
@@ -202,8 +202,8 @@ void testQueueLimit() {
                        [&] { ProjectService invalid(directory.path / "zero", 0); });
     ProjectService service(directory.path / "root", 2);
     expect(service.maxPendingOperations() == 2, "limit not stored");
-    const std::string a = service.createProject("A").id;
-    const std::string b = service.createProject("B").id;
+    const std::string a = service.createProjectShaFixture("A").id;
+    const std::string b = service.createProjectShaFixture("B").id;
     std::thread waiting;
     const Joiner joinWaiting(waiting);
     {
@@ -214,14 +214,14 @@ void testQueueLimit() {
         completesWithin(std::chrono::milliseconds(2000), "full queue", [&] {
             expectProjectError(ProjectErrorKind::Busy, "third operation",
                                [&] { service.withRepository(a, [](Repository&) {}); });
-            expectProjectError(ProjectErrorKind::Busy, "branch creation", [&] { service.createBranch(a, "x"); });
+            expectProjectError(ProjectErrorKind::Busy, "branch creation", [&] { service.createBranchShaFixture(a, "x"); });
             expectProjectError(ProjectErrorKind::Busy, "reservation", [&] { (void)service.reserveOperation(a); });
         });
         expect(service.pendingOperations(a) == 2, "rejected requests changed the queue");
         // The other project's queue is separate; reads are never queued.
         ProjectService::Operation other = service.reserveOperation(b);
         expect(service.pendingOperations(b) == 1, "reservation not counted");
-        (void)service.head(a, "main");
+        (void)service.headShaFixture(a, "main");
     }
     waiting.join();
     expect(service.pendingOperations(a) == 0 && service.pendingOperations(b) == 0,
@@ -248,11 +248,11 @@ void testQueueLimit() {
 void testExpectedHeadRace() {
     TestDirectory directory("race");
     ProjectService service(directory.path, 16);
-    const std::string a = service.createProject("A").id;
+    const std::string a = service.createProjectShaFixture("A").id;
     service.withRepository(a, [](Repository& repository) {
         repository.commitModel("main", {ModelChange{key(1), ModelRecord{1, {}, Bytes{1}}}});
     });
-    const Hash expected = service.head(a, "main").id;
+    const Hash expected = service.headShaFixture(a, "main").id;
     std::atomic<unsigned> succeeded{0};
     std::atomic<unsigned> conflicts{0};
     std::atomic<unsigned> other{0};
@@ -281,7 +281,7 @@ void testExpectedHeadRace() {
     for (unsigned i = 0; i < 8; ++i) {
         threads.emplace_back([&] {
             try {
-                (void)service.createBranch(a, "same");
+                (void)service.createBranchShaFixture(a, "same");
                 ++succeeded;
             } catch (const ProjectError& error) {
                 if (error.kind() == ProjectErrorKind::Conflict) ++conflicts; else ++other;
@@ -300,8 +300,8 @@ void testConcurrentOpenAndImport() {
     std::string b;
     {
         ProjectService service(directory.path / "root");
-        a = service.createProject("A").id;
-        b = service.createProject("B").id;
+        a = service.createProjectShaFixture("A").id;
+        b = service.createProjectShaFixture("B").id;
     }
     Repository source(directory.path / "source");
     source.createBranch("main");
@@ -329,7 +329,7 @@ void testConcurrentOpenAndImport() {
                                "parallel import failed");
                     });
                 } else {
-                    (void)service.head(id, "main");
+                    (void)service.headShaFixture(id, "main");
                     (void)service.listBranches(id);
                 }
             } catch (...) {
@@ -340,7 +340,7 @@ void testConcurrentOpenAndImport() {
     for (std::thread& thread : threads) thread.join();
     expect(failures == 0, "concurrent open or import failed");
     for (const std::string& id : {a, b}) {
-        expect(service.head(id, "imported").id == head, "imported branch missing");
+        expect(service.headShaFixture(id, "imported").id == head, "imported branch missing");
         service.withRepository(id, [](Repository& repository) { (void)repository.verifyRepository(); });
     }
 }

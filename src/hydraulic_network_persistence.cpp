@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
+#include "aowis/dvmdb/revision_record_v2.h"
 #include "aowis/dvmdb/storage_error.h"
 
 #include <aowis/dvmdb/model_validation.h>
@@ -224,6 +225,15 @@ void loadMembersAtRevision(Repository& repository, const Hash& revisionId, Manif
     }, manifest, onlyCollection, maxMembers);
 }
 
+void loadMembersAtRevisionV2(Repository& repository, const ProjectId& project,
+                             const RevisionId& revisionId, Manifest& manifest,
+                             std::optional<std::size_t> onlyCollection = std::nullopt,
+                             std::size_t maxMembers = std::numeric_limits<std::size_t>::max()) {
+    loadMembersUsing([&repository, &project, &revisionId](const Key& key) {
+        return repository.getModelAtRevisionV2(project, revisionId, key);
+    }, manifest, onlyCollection, maxMembers);
+}
+
 std::set<Key> memberKeys(const Manifest& manifest) {
     std::set<Key> keys;
     for (const QList<QUuid>& group : manifest.members) {
@@ -281,6 +291,16 @@ std::optional<Key> ownerChunkAtRevision(Repository& repository, const Hash& revi
         return repository.getModelAtRevision(revisionId, key);
     }, [&repository, &revisionId](const Key& key) {
         return repository.referencingModelAtRevision(revisionId, key);
+    }, network, member);
+}
+
+std::optional<Key> ownerChunkAtRevisionV2(Repository& repository, const ProjectId& project,
+                                          const RevisionId& revisionId,
+                                          const QUuid& network, const Key& member) {
+    return ownerChunkUsing([&repository, &project, &revisionId](const Key& key) {
+        return repository.getModelAtRevisionV2(project, revisionId, key);
+    }, [&repository, &project, &revisionId](const Key& key) {
+        return repository.referencingModelAtRevisionV2(project, revisionId, key);
     }, network, member);
 }
 
@@ -367,6 +387,27 @@ void restoreEntities(Repository& repository, const Hash& revisionId,
             throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic entity payload: " + uuid.toString().toStdString() +
                                      " " + error.toStdString());
         }
+        for (const Key& target : record->references)
+            storedReferences.emplace_back(keyFromUuid(uuid), target);
+        output.append(std::move(*entity));
+    }
+}
+
+template<typename T>
+void restoreEntitiesV2(Repository& repository, const ProjectId& project,
+                       const RevisionId& revisionId, const QList<QUuid>& ids,
+                       std::uint16_t kind, QList<T>& output,
+                       std::vector<std::pair<Key, Key>>& storedReferences) {
+    for (const QUuid& uuid : ids) {
+        const std::optional<ModelRecord> record =
+            repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(uuid));
+        if (!record || record->kind != kind)
+            throw StorageError(StorageErrorKind::Corruption, "missing or wrong-type hydraulic entity");
+        QString error;
+        std::optional<T> entity = ModelCodec<T>::decode(qByteArrayFromBytes(record->payload), &error);
+        if (!entity || entity->uuid != uuid)
+            throw StorageError(StorageErrorKind::Corruption,
+                               "invalid hydraulic entity payload: " + error.toStdString());
         for (const Key& target : record->references)
             storedReferences.emplace_back(keyFromUuid(uuid), target);
         output.append(std::move(*entity));
@@ -1861,17 +1902,18 @@ MergeResolution resolveHydraulicRecord(const Key& key, const ModelRecord& base,
     return MergeResolution{std::move(record), {}};
 }
 
-MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,
-                                   std::string_view source,
-                                   const HydraulicMergeSelections& selections) {
-    if ((!selections.fields.empty() || !selections.objects.empty()) &&
-        (!selections.expectedTargetHead || !selections.expectedSourceHead))
-        throw StorageError(StorageErrorKind::InvalidInput, "explicit merge choices require both previewed branch heads");
+// Shared canonical hydraulic merge machinery: identical behavior for SHA and
+// UUIDv7 revision identities. All captured selection state remains live until
+// the repository finishes invoking the pure resolution callbacks.
+template<typename Callback>
+std::invoke_result_t<Callback, const MergeOptions&> mergeHydraulicWithChoices(
+        const std::vector<HydraulicFieldChoice>& fields,
+        const std::vector<HydraulicObjectChoice>& objects, Callback invoke) {
     // Build an immutable lookup before entering the Repository's merge lock.
     // A duplicate (UUID, field) is rejected rather than choosing an arbitrary
     // last-write-wins interpretation of the user's instructions.
     std::map<Key, QMap<QString, bool>> choices;
-    for (const HydraulicFieldChoice& choice : selections.fields) {
+    for (const HydraulicFieldChoice& choice : fields) {
         if (choice.entityUuid.isNull() || choice.field.isEmpty())
             throw StorageError(StorageErrorKind::InvalidInput, "merge choice needs a non-null UUID and field name");
         const Key key = keyFromUuid(choice.entityUuid);
@@ -1881,7 +1923,7 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
         perEntity.insert(choice.field, choice.side == HydraulicMergeSide::Source);
     }
     std::map<Key, MergeChoiceSide> objectChoices;
-    for (const HydraulicObjectChoice& choice : selections.objects) {
+    for (const HydraulicObjectChoice& choice : objects) {
         if (choice.entityUuid.isNull())
             throw StorageError(StorageErrorKind::InvalidInput, "merge object choice needs a non-null UUID");
         const Key key = keyFromUuid(choice.entityUuid);
@@ -1894,8 +1936,6 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
     std::set<Key> consumed;
     std::set<Key> consumedObjects;
     MergeOptions options;
-    options.expectedTargetHead = selections.expectedTargetHead;
-    options.expectedSourceHead = selections.expectedSourceHead;
     options.chooseConflict = [&objectChoices, &consumedObjects](const MergeConflict& conflict)
         -> std::optional<MergeChoiceSide> {
         const std::map<Key, MergeChoiceSide>::const_iterator choice =
@@ -1940,7 +1980,34 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
                                                     sourceReader, objectChoices);
     };
     options.validate = validateMergedHydraulicSnapshot;
-    return repository.mergeBranches(target, source, options);
+    return invoke(options);
+}
+
+
+MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,
+                                   std::string_view source,
+                                   const HydraulicMergeSelections& selections) {
+    if ((!selections.fields.empty() || !selections.objects.empty()) &&
+        (!selections.expectedTargetHead || !selections.expectedSourceHead))
+        throw StorageError(StorageErrorKind::InvalidInput,
+                           "explicit merge choices require both previewed branch heads");
+    return mergeHydraulicWithChoices(selections.fields, selections.objects,
+        [&](const MergeOptions& original) {
+            MergeOptions pinned = original;
+            pinned.expectedTargetHead = selections.expectedTargetHead;
+            pinned.expectedSourceHead = selections.expectedSourceHead;
+            return repository.mergeBranches(target, source, pinned);
+        });
+}
+
+MergeResultV2 mergeHydraulicBranchesV2(Repository& repository, const ProjectId& project,
+                                       std::string_view target, std::string_view source,
+                                       const HydraulicMergeSelectionsV2& selections) {
+    return mergeHydraulicWithChoices(selections.fields, selections.objects,
+        [&](const MergeOptions& options) {
+            return repository.mergeBranchesV2(project, target, source,
+                selections.expectedTargetHead, selections.expectedSourceHead, options);
+        });
 }
 
 Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
@@ -2216,6 +2283,209 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
         return std::nullopt;
     }
     return loadHydraulicNetworkAtRevision(repository, snapshot.id, networkUuid);
+}
+
+// UUIDv7 hydraulic operations deliberately use the same manifest codec,
+// membership chunks, canonical entity payloads and semantic validator as V1.
+// There is no translation of revision UUIDs into content-address identities.
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedV2(
+    Repository& repository, const ProjectId& project, const RevisionId& revisionId,
+    const QUuid& networkUuid, HydraulicEntityType type, std::size_t maxCount) {
+    const std::size_t index = static_cast<std::size_t>(type);
+    if (index >= collectionCount)
+        throw StorageError(StorageErrorKind::InvalidInput, "unknown hydraulic entity collection");
+    const std::optional<ModelRecord> root =
+        repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(networkUuid));
+    if (!root || root->kind != hydraulicNetworkKind) return std::nullopt;
+    Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
+    if (manifest.metadata.uuid != networkUuid)
+        throw StorageError(StorageErrorKind::Corruption, "hydraulic network root UUID mismatch");
+    checkRoot(manifest, *root);
+    loadMembersAtRevisionV2(repository, project, revisionId, manifest, index, maxCount);
+    return manifest.members[index];
+}
+
+std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionV2(
+    Repository& repository, const ProjectId& project, const RevisionId& revisionId,
+    const QUuid& networkUuid, const QUuid& entityUuid) {
+    if (networkUuid.isNull() || entityUuid.isNull() || networkUuid == entityUuid)
+        return std::nullopt;
+    if (!ownerChunkAtRevisionV2(repository, project, revisionId, networkUuid, keyFromUuid(entityUuid)))
+        return std::nullopt;
+    const std::optional<ModelRecord> record =
+        repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(entityUuid));
+    if (!record) throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity payload is missing");
+    std::optional<HydraulicEntity> decoded;
+    switch (record->kind) {
+#define LOAD_ONE_V2(name, type, kind) \
+    case static_cast<std::uint16_t>(kind): { \
+        QString error; \
+        std::optional<type> item = ModelCodec<type>::decode(qByteArrayFromBytes(record->payload), &error); \
+        if (!item || item->uuid != entityUuid) \
+            throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic entity payload: " + error.toStdString()); \
+        decoded.emplace(std::move(*item)); \
+        break; \
+    }
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(LOAD_ONE_V2)
+#undef LOAD_ONE_V2
+    default:
+        throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity has unknown storage kind");
+    }
+    return decoded;
+}
+
+std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionV2(
+    Repository& repository, const ProjectId& project, const RevisionId& revisionId,
+    const QUuid& networkUuid) {
+    const std::optional<ModelRecord> root =
+        repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(networkUuid));
+    if (!root || root->kind != hydraulicNetworkKind) return std::nullopt;
+    Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
+    if (manifest.metadata.uuid != networkUuid)
+        throw StorageError(StorageErrorKind::Corruption, "hydraulic network root UUID mismatch");
+    checkRoot(manifest, *root);
+    loadMembersAtRevisionV2(repository, project, revisionId, manifest);
+    const std::set<Key> members = memberKeys(manifest);
+    NetworkHydraulic network = std::move(manifest.metadata);
+    DependencyIndex storedReferences;
+    std::size_t ordinal = 0;
+#define RESTORE_V2(name, type, kind) \
+    restoreEntitiesV2(repository, project, revisionId, manifest.members[ordinal], \
+                      static_cast<std::uint16_t>(kind), network.name, storedReferences); \
+    ++ordinal;
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE_V2)
+#undef RESTORE_V2
+    const aowis::dvmdb::HydraulicDependencyValidation validated =
+        aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
+    if (!validated.report.valid())
+        throw StorageError(StorageErrorKind::Corruption,
+                           "loaded network invalid: " + validated.report.summary().toStdString());
+    const DependencyIndex canonicalReferences = indexedDependencies(validated.dependencies, members);
+    std::sort(storedReferences.begin(), storedReferences.end());
+    storedReferences.erase(std::unique(storedReferences.begin(), storedReferences.end()),
+                           storedReferences.end());
+    if (storedReferences != canonicalReferences)
+        throw StorageError(StorageErrorKind::Corruption,
+                           "stored hydraulic references differ from canonical model payload");
+    return network;
+}
+
+RevisionId saveHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+                                  std::string_view branch, const NetworkHydraulic& network,
+                                  const RevisionId& expectedHead) {
+    if (network.uuid.isNull())
+        throw StorageError(StorageErrorKind::InvalidInput, "hydraulic network UUID is null");
+    // Pin one immutable starting point. Native commitModelV2() rechecks the
+    // expected HEAD under the writer lock before publishing any new revision.
+    if (repository.headV2(project, branch) != expectedHead)
+        throw StorageError(StorageErrorKind::Conflict, "branch head changed since hydraulic save was prepared");
+    const std::optional<Bytes> startingBytes = repository.readRevisionV2(project, expectedHead);
+    if (!startingBytes) throw StorageError(StorageErrorKind::NotFound, "revision UUID not found");
+    const RevisionRecordV2 starting = decodeRevisionRecordV2(*startingBytes);
+    if (!starting.modelIndexed && starting.root != Hash{})
+        throw StorageError(StorageErrorKind::InvalidInput, "cannot save a hydraulic network to a populated raw branch");
+    Manifest next = manifestFor(network);
+    const std::set<Key> newMembers = memberKeys(next);
+    const aowis::dvmdb::HydraulicDependencyValidation validated =
+        aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
+    if (!validated.report.valid())
+        throw StorageError(StorageErrorKind::InvalidInput,
+                           "invalid hydraulic network: " + validated.report.summary().toStdString());
+    const DependencyIndex references = indexedDependencies(validated.dependencies, newMembers);
+    const Key networkKey = keyFromUuid(network.uuid);
+    std::optional<ModelRecord> currentRoot;
+    if (starting.modelIndexed)
+        currentRoot = repository.getModelAtRevisionV2(project, expectedHead, networkKey);
+    std::set<Key> oldMembers;
+    if (currentRoot) {
+        if (currentRoot->kind != hydraulicNetworkKind)
+            throw StorageError(StorageErrorKind::Conflict, "network UUID already used by another entity");
+        Manifest previous = decodeManifest(qByteArrayFromBytes(currentRoot->payload));
+        if (previous.metadata.uuid != network.uuid)
+            throw StorageError(StorageErrorKind::Corruption, "network root identity mismatch");
+        checkRoot(previous, *currentRoot);
+        loadMembersAtRevisionV2(repository, project, expectedHead, previous);
+        oldMembers = memberKeys(previous);
+    }
+    for (const Key& key : newMembers) {
+        if (starting.modelIndexed && !oldMembers.contains(key) &&
+            repository.getModelAtRevisionV2(project, expectedHead, key))
+            throw StorageError(StorageErrorKind::Conflict, "hydraulic entity UUID already exists outside network");
+    }
+    std::vector<ModelChange> changes;
+    changes.reserve(newMembers.size() + oldMembers.size() + 1);
+#define APPEND_V2(name, type, kind) \
+    addEntities(network.name, static_cast<std::uint16_t>(kind), references, changes);
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(APPEND_V2)
+#undef APPEND_V2
+    for (const Key& key : oldMembers)
+        if (!newMembers.contains(key)) changes.push_back(ModelChange{key, std::nullopt});
+    buildChunks(next, changes);
+    if (currentRoot) {
+        const Manifest previous = decodeManifest(qByteArrayFromBytes(currentRoot->payload));
+        const std::vector<Key> newChunks = chunkKeys(next);
+        for (const Key& oldChunk : chunkKeys(previous))
+            if (!std::binary_search(newChunks.begin(), newChunks.end(), oldChunk))
+                changes.push_back(ModelChange{oldChunk, std::nullopt});
+    }
+    ModelRecord root;
+    root.kind = hydraulicNetworkKind;
+    root.payload = bytesFromQByteArray(encodeManifest(next));
+    root.references = chunkKeys(next);
+    changes.push_back(ModelChange{networkKey, std::move(root)});
+    return repository.commitModelV2(project, branch, std::move(changes), expectedHead);
+}
+
+RevisionId editHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+                                  std::string_view branch, const QUuid& networkUuid,
+                                  const std::vector<HydraulicEntityChange>& changes,
+                                  const RevisionId& expectedHead) {
+    if (networkUuid.isNull())
+        throw StorageError(StorageErrorKind::InvalidInput, "hydraulic network UUID is null");
+    if (changes.size() > 128)
+        throw StorageError(StorageErrorKind::LimitExceeded, "hydraulic edit exceeds 128 changes");
+    if (repository.headV2(project, branch) != expectedHead)
+        throw StorageError(StorageErrorKind::Conflict, "branch head changed since edit was prepared");
+    std::optional<NetworkHydraulic> network =
+        loadHydraulicNetworkAtRevisionV2(repository, project, expectedHead, networkUuid);
+    if (!network) throw StorageError(StorageErrorKind::NotFound, "hydraulic network not found");
+    const Manifest previous = manifestFor(*network);
+    const std::map<Key, std::size_t> owners = collectionOwners(previous);
+    std::set<Key> seen;
+    const QByteArray before = ModelCodec<NetworkHydraulic>::encode(*network);
+    for (const HydraulicEntityChange& change : changes) {
+        const Key key = keyFromUuid(change.uuid);
+        if (change.uuid.isNull() || change.uuid == networkUuid || !seen.insert(key).second)
+            throw StorageError(StorageErrorKind::InvalidInput, "invalid or duplicate edit UUID");
+        const std::map<Key, std::size_t>::const_iterator existing = owners.find(key);
+        std::size_t collection = 0;
+        if (change.value) {
+            if (change.value->valueless_by_exception())
+                throw StorageError(StorageErrorKind::InvalidInput, "invalid hydraulic entity variant");
+            const QUuid payloadId = std::visit([](const auto& entity) { return entity.uuid; }, *change.value);
+            if (payloadId != change.uuid)
+                throw StorageError(StorageErrorKind::InvalidInput, "hydraulic payload UUID disagrees with edit UUID");
+            collection = change.value->index();
+            if (existing != owners.end() && existing->second != collection)
+                throw StorageError(StorageErrorKind::InvalidInput, "cannot change hydraulic entity type");
+            if (existing == owners.end() &&
+                repository.getModelAtRevisionV2(project, expectedHead, key))
+                throw StorageError(StorageErrorKind::Conflict, "entity UUID owned outside network");
+        } else {
+            if (existing == owners.end())
+                throw StorageError(StorageErrorKind::InvalidInput, "cannot delete an unowned entity");
+            collection = existing->second;
+        }
+        applyEntityChange(*network, change, collection);
+    }
+    // The save below checks every hydraulic reference and physical rule.
+    // No-op edits still verify the pinned HEAD, without creating a revision.
+    if (ModelCodec<NetworkHydraulic>::encode(*network) == before) {
+        if (repository.headV2(project, branch) != expectedHead)
+            throw StorageError(StorageErrorKind::Conflict, "branch head changed during hydraulic edit");
+        return expectedHead;
+    }
+    return saveHydraulicNetworkV2(repository, project, branch, *network, expectedHead);
 }
 
 } // namespace aowis::dvmdb::hydraulic

@@ -107,8 +107,8 @@ void run() {
     // The public service exposes the same native graph model.
     TemporaryDirectory projects;
     ProjectService service(projects.path);
-    const std::string projectId = service.createProject("Sample").id;
-    const RevisionGraphPage catalogue = service.revisionGraph(projectId, 100);
+    const std::string projectId = service.createProjectShaFixture("Sample").id;
+    const RevisionGraphPage catalogue = service.revisionGraphShaFixture(projectId, 100);
     check(catalogue.heads.size() == 1 && catalogue.revisions.size() == 1 && !catalogue.next,
           "project service graph adapter failed");
 }

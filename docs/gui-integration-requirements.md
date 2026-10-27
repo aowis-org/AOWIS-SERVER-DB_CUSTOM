@@ -10,11 +10,12 @@ Use [OpenAPI](dvmdb-http-api.yaml) and the
 [native database service](native-database-service.md) for **implemented** HTTP
 operations. Do not add hypothetical resources to live OpenAPI.
 
-## Identity migration dependency (P-ID; not implemented)
+## Identity migration dependency (P-ID; project UUIDv7 only implemented)
 
 Before P1 save/checkout, follow the [UUIDv7 identity migration
 roadmap](uuidv7-identity-migration-roadmap.md). The current SHA revision IDs,
-branch-name identifiers and UUIDv4 project IDs are **legacy implementation**;
+branch-name identifiers and existing UUIDv4 project IDs are **legacy implementation**;
+new project IDs already use UUIDv7;
 the target is UUIDv7 per project/branch/revision with separate verified SHA
 integrity. All source/graph/selection/inspector/`expectedHead` paths will
 need new typed IDs after the native/REST schema and data migration. This

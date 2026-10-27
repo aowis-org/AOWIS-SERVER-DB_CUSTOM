@@ -4,10 +4,11 @@
 
 **AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
-This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-dvmdb` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md). The pending
-[UUIDv7 identity migration](docs/uuidv7-identity-migration-roadmap.md) will
-separate logical revision/branch/project IDs from SHA-256 integrity hashes;
-**the present binary still uses SHA for revision IDs and UUIDv4 for projects**.
+This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-dvmdb` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md). The [UUIDv7 identity migration](docs/uuidv7-identity-migration-roadmap.md)
+now includes the [frozen v2 record contract](docs/uuidv7-identity-format-v2.md)
+and its first implementation slice: **new projects receive UUIDv7 IDs**;
+legacy UUIDv4 projects remain readable. Revisions and branch HEADs still use
+SHA-256 revision addresses until the later storage/replication migration.
 
 > **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
@@ -194,20 +195,27 @@ The `aowis-dvmdb-upgrade-restore-tests` drill additionally checks a complete
 cold relocation containing frozen historical packs, divergent branches and
 post-upgrade writes, including a second backup/restore cycle.
 
-The binary repository format is not yet frozen for the first public release. A frozen pre-release pack/bundle fixture protects historical readability in CTest; see [format compatibility](docs/format-compatibility.md). Back up important repositories separately; online backup, physical-controller power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
+The binary repository format is not yet frozen for the first public release. An old pre-release pack/bundle fixture is retained only to test explicit rejection of unsupported branch formats; see [format compatibility](docs/format-compatibility.md). Back up important repositories separately; online backup, physical-controller power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
 
 ## Offline repository synchronization
 
 Portable bundles exchange immutable branches between independent repositories, without transferring physical storage pages. Import verifies the graph before creating or fast-forwarding a branch and **never silently overwrites divergent work**.
 
 ```bash
+project_uuid="<project-uuidv7>"
 ./build-linux/aowis-dvmdb-sync export \
-  /path/to/source main /tmp/main.aowbundle
+  /path/to/source "$project_uuid" main /tmp/main.aowbundle
 ./build-linux/aowis-dvmdb-sync import \
-  /path/to/destination /tmp/main.aowbundle remote_main
+  /path/to/destination "$project_uuid" /tmp/main.aowbundle remote_main
 ```
 
-A subsequent bundle can contain only objects missing relative to a shared base revision. The native importer uses private, nameless scratch files in the repository's own `tmp/` directory (never `TMPDIR`) for its hash-to-offset index, one-byte-per-imported-object logical visitation marks, and per-kind Merkle-tree summaries, and checks bundle SHA-256 with a 64 KiB scratch buffer. These files are unlinked immediately, preallocated before writable mapping, and their mappings are evictable. Imported revision membership and semantic-scan enumeration reuse the file-backed visitation marks, without a second in-memory revision set. Objects already stored locally form trusted verification boundaries, avoiding rechecking their entire history during small incremental imports; model-reference edges are sorted with bounded in-memory runs. The same bundle format works through the bounded HTTP synchronization endpoints; downloads and uploads are streamed through project scratch files, without a full-size buffer in memory. Details: [portable synchronization](docs/offline-repository-synchronization.md).
+An incremental bundle supplies an authenticated UUIDv7 base revision:
+`aowis-dvmdb-sync export-incremental REPOSITORY PROJECT_UUID BRANCH BASE_UUID BUNDLE`.
+Full bundles use `AOWREV21`, incremental bundles use `AOWREV22`; neither accepts
+SHA-256 revision IDs or SHA-era `AOWSYNC3/4` on this canonical CLI. SHA-256
+still authenticates immutable records and content. See
+[portable synchronization](docs/offline-repository-synchronization.md) and
+[UUIDv7 transfer contract](docs/uuidv7-revision-replication-v2.md).
 
 ## Benchmarking
 
@@ -244,7 +252,7 @@ The chosen server design is:
 - **No authentication or authorization enforcement in the initial REST server.** An AOWIS-wide security concept will be designed and introduced later. Existing provisional policy code is not the REST security design.
 - File-based synchronization and direct native C++ library access remain supported alongside the HTTP project service.
 
-The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for incremental download); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/dvmdb-http-api.yaml) and the [roadmap](docs/roadmap.md).
+The project/branch/revision, hydraulic edit/merge and bounded binary synchronization APIs are implemented. Bundle transfer endpoints use `GET` and `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` (optional `?base={revision}` for an incremental download; every export already carries UUIDv7 branch identity); use the offline CLI for transfers beyond configured HTTP limits. See [service documentation](docs/native-database-service.md), [OpenAPI](docs/dvmdb-http-api.yaml) and the [roadmap](docs/roadmap.md).
 
 ## Documentation
 

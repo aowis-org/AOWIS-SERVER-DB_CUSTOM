@@ -146,7 +146,9 @@ See the machine-readable [OpenAPI contract](dvmdb-http-api.yaml) for request/res
 | GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` | Revision-pinned targeted entity |
 | POST | `/dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` | Atomic validated entity edits, up to 128 changes |
 | POST | `/dvmdb/v1/projects/{projectId}/merges` | Semantic hydraulic three-way merge and explicit conflict choices |
-| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/bundle[?base={revisionHash}]` | Binary full or incremental snapshot export |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/bundle[?base={revisionHash}]` | UUIDv7 identity-bearing full or incremental export (AOWSYNC3/4; optional identity=1 is redundant) |
+| GET | `/dvmdb/v1/projects/{projectId}/branches/{branch}/revision-bundle[?base={revisionUuidV7}]` | Explicit `AOWREV21` full / `AOWREV22` incremental transfer of UUIDv7 revision history; no legacy fallback |
+| POST | `/dvmdb/v1/projects/{projectId}/branches/{branch}/revision-bundle` | Verified UUIDv7 revision import; project UUID and stable branch UUID enforced, full/incremental replay and fast-forward |
 | POST | `/dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` | Binary branch import; fast-forward or idempotent retry |
 
 Example:
@@ -202,7 +204,19 @@ The service does not yet provide network enumeration, a dry-run merge preview, p
 
 ### Portable bundle replication over HTTP
 
-`GET /dvmdb/v1/projects/{id}/branches/{branch}/bundle` exports the same validated `.aowbundle` format used by `aowis-dvmdb-sync`. Add `?base=<64-character-revision-hash>` to omit immutable objects already reachable from that ancestor. `POST` the binary bundle to the corresponding endpoint on a destination project, choosing a tracking branch if you wish to preserve independent work; import never overwrites divergent history. The response is `{"status":"created|fast_forward|up_to_date","head":"...","objectsImported":N}`. Errors are JSON with 400 for malformed transfer, 409 for divergent history or invalid incremental base, and 413 for transfer ceilings.
+`GET /dvmdb/v1/projects/{id}/branches/{branch}/bundle` exports the same
+verified identity-bearing `.aowbundle` as the native API and CLI. All full
+exports use `AOWSYNC3`; adding `?base=<64-character-SHA-256>` produces the
+`AOWSYNC4` delta format. Both carry the source branch's UUIDv7 by default;
+`identity=1` remains a redundant accepted query value, **not** an opt-in to
+new semantics. Old `AOWSYNC1/2` imports are rejected. POST validates SHA
+content, reachable ancestry and UUIDv7 identity; it rejects identity
+collisions/rebindings, divergent heads, incomplete objects and resource limit
+violations. HTTP has no authentication or authorization: incoming identity
+claims must come from trusted sources. Response fields remain
+`{"status":"created|fast_forward|up_to_date","head":"...","objectsImported":N}`.
+The HEAD is still SHA-256 until the separately planned UUIDv7 revision-v2
+format is implemented.
 
 The `[storage]` INI section also sets `max_internal_scratch_mib` (default 1024 MiB, range 1–16384; command-line `--max-internal-scratch-mib`). It limits the combined logical extent of the native engine's export visited tables, export/reference sort runs, import location indices, verification marks and trie summaries across all projects served by this process. Saturation returns 503 `scratch_busy` with `Retry-After: 1`. Unlike physical ENOSPC (507), quota saturation is transient and releases its reservations when operations finish. This cap does not cover HTTP spools, pack growth, compaction, or other processes and is not a filesystem quota. See [operations](operations.md).
 

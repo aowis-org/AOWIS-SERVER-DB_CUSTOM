@@ -68,20 +68,75 @@ public:
     ProjectService(const ProjectService&) = delete;
     ProjectService& operator=(const ProjectService&) = delete;
 
+    // Canonical native service API: revision IDs are UUIDv7, never SHA-256.
     ProjectInfo createProject(std::string_view name);
+    RevisionId createBranch(std::string_view projectId, std::string_view name,
+                            std::optional<std::string_view> source = std::nullopt,
+                            std::optional<RevisionId> fromRevision = std::nullopt);
+    RevisionId head(std::string_view projectId, std::string_view branch);
+    std::vector<RevisionGraphRevisionV2> history(
+        std::string_view projectId, std::string_view branch, std::size_t maxCount = 100,
+        std::optional<RevisionId> after = std::nullopt);
+    RevisionGraphPageV2 revisionGraph(
+        std::string_view projectId, std::size_t maxCount = 100,
+        std::optional<RevisionGraphCursorV2> cursor = std::nullopt);
+    RevisionGraphRevisionV2 revision(std::string_view projectId, const RevisionId& id);
+    void renameBranch(std::string_view projectId, std::string_view previous,
+                      std::string_view renamed, const RevisionId& expectedHead);
+    RevisionId commitModel(std::string_view projectId, std::string_view branch,
+                           std::vector<ModelChange> changes,
+                           std::optional<RevisionId> expectedHead = std::nullopt);
+    MergeResultV2 mergeBranches(std::string_view projectId, std::string_view target,
+                                std::string_view source,
+                                std::optional<RevisionId> expectedTarget = std::nullopt,
+                                std::optional<RevisionId> expectedSource = std::nullopt);
+    std::optional<ModelRecord> getModelAtRevision(std::string_view projectId,
+                                                  const RevisionId& revision, const Key& key);
+    // Transitional UUIDv7 aliases for existing HTTP consumers.
+    ProjectInfo createProjectV2(std::string_view name);
+    RevisionId createBranchV2(std::string_view projectId, std::string_view name,
+                              std::optional<std::string_view> source = std::nullopt);
+    RevisionId headV2(std::string_view projectId, std::string_view branch);
+    std::vector<RevisionGraphRevisionV2> historyV2(
+        std::string_view projectId, std::string_view branch, std::size_t maxCount = 100,
+        std::optional<RevisionId> after = std::nullopt);
+    RevisionGraphPageV2 revisionGraphV2(
+        std::string_view projectId, std::size_t maxCount = 100,
+        std::optional<RevisionGraphCursorV2> cursor = std::nullopt);
+    RevisionId createBranchAtRevisionV2(std::string_view projectId, std::string_view name,
+                                        std::string_view sourceBranch, const RevisionId& revision);
+    MergeResultV2 mergeBranchesV2(std::string_view projectId, std::string_view target,
+                                  std::string_view source,
+                                  std::optional<RevisionId> expectedTarget = std::nullopt,
+                                  std::optional<RevisionId> expectedSource = std::nullopt);
+    RevisionId commitModelV2(std::string_view projectId, std::string_view branch,
+                             std::vector<ModelChange> changes,
+                             std::optional<RevisionId> expectedHead = std::nullopt);
+    std::optional<ModelRecord> getModelAtRevisionV2(std::string_view projectId,
+                                                   const RevisionId& revision, const Key& key);
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);
-    Revision createBranch(std::string_view projectId, std::string_view name,
-                          std::optional<std::string_view> fromBranch = std::nullopt,
-                          std::optional<Hash> fromRevision = std::nullopt);
-    Revision head(std::string_view projectId, std::string_view branch);
-    std::vector<Revision> history(std::string_view projectId, std::string_view branch,
-                                  std::size_t maxCount,
-                                  std::optional<Hash> after = std::nullopt);
-    Revision revision(std::string_view projectId, const Hash& id);
-    RevisionGraphPage revisionGraph(std::string_view projectId, std::size_t maxCount = 100,
-                                    std::optional<RevisionGraphCursor> cursor = std::nullopt);
+    // Unconverted legacy and v1-imported branch references return nullopt.
+    std::optional<BranchId> branchId(std::string_view projectId, std::string_view branch);
+    // SHA-based native fixtures are retained until old pack/storage tests are
+    // migrated. They are NOT the canonical application interface and must
+    // never be invoked on a UUIDv7 project's repository.
+    ProjectInfo createProjectShaFixture(std::string_view name);
+    void adoptBranchIdShaFixture(std::string_view projectId, std::string_view branch,
+                                 const BranchId& identity, const Hash& expectedHead);
+    Revision createBranchShaFixture(std::string_view projectId, std::string_view name,
+                                    std::optional<std::string_view> fromBranch = std::nullopt,
+                                    std::optional<Hash> fromRevision = std::nullopt);
+    void renameBranchShaFixture(std::string_view projectId, std::string_view previous,
+                                std::string_view renamed, const Hash& expectedHead);
+    Revision headShaFixture(std::string_view projectId, std::string_view branch);
+    std::vector<Revision> historyShaFixture(std::string_view projectId, std::string_view branch,
+                                           std::size_t maxCount,
+                                           std::optional<Hash> after = std::nullopt);
+    Revision revisionShaFixture(std::string_view projectId, const Hash& id);
+    RevisionGraphPage revisionGraphShaFixture(std::string_view projectId, std::size_t maxCount = 100,
+                                              std::optional<RevisionGraphCursor> cursor = std::nullopt);
 
     // Execute a scoped operation with this project's repository and its
     // operation mutex held (other projects are not blocked). Callbacks must
@@ -114,6 +169,7 @@ private:
     std::shared_ptr<Project> findProject(std::string_view id) const;
     std::shared_ptr<Repository> openRepository(Project& project) const;
     void ensureHealthy() const;
+    ProjectInfo createProjectImpl(std::string_view name, bool v2);
 
     std::filesystem::path root_;
     std::filesystem::path projects_;

@@ -176,13 +176,14 @@ unsigned nibble(const Key& value, unsigned position) {
 
 // An incremental bundle with arbitrary (hash-valid) objects.
 void writeBundle(const std::filesystem::path& path, const Hash& tip, const Hash& base,
-                 const std::vector<Bytes>& objects) {
+                 const std::vector<Bytes>& objects, const aowis::dvmdb::BranchId& branchId) {
     std::map<Hash, Bytes> sorted;
     for (const Bytes& object : objects) sorted.emplace(aowis::dvmdb::sha256(object), object);
-    Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C', '2'};
+    Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C', '4'};
     bundle.insert(bundle.end(), tip.begin(), tip.end());
     appendU64(bundle, sorted.size());
     bundle.insert(bundle.end(), base.begin(), base.end());
+    bundle.insert(bundle.end(), branchId.uuid().bytes.begin(), branchId.uuid().bytes.end());
     for (const std::pair<const Hash, Bytes>& entry : sorted) {
         bundle.insert(bundle.end(), entry.first.begin(), entry.first.end());
         appendU64(bundle, entry.second.size());
@@ -437,8 +438,9 @@ void expectForgedRejected(const ForgeFixture& fixture, const std::filesystem::pa
                           std::vector<Bytes> objects,
                           StorageErrorKind expected = StorageErrorKind::InvalidInput) {
     objects.push_back(tipRevision);
-    writeBundle(bundle, aowis::dvmdb::sha256(tipRevision), base, objects);
     Repository recipient(fixture.directory);
+    writeBundle(bundle, aowis::dvmdb::sha256(tipRevision), base, objects,
+                *recipient.branchId("main"));
     const std::uint64_t before = recipient.objectCount();
     expectKind(expected, label, [&] { (void)recipient.importBranchBundle(bundle, "main"); });
     expect(recipient.objectCount() == before && recipient.head("main").id == fixture.b.id,
@@ -522,8 +524,9 @@ void testForgedBoundaryGrafts() {
     // (raw values are any 'V' objects), and the import is complete.
     {
         const Bytes revision = revisionObject(b.root, Hash{}, false, {b.id});
-        writeBundle(bundle, aowis::dvmdb::sha256(revision), b.id, {revision});
         Repository recipient(fixture.directory);
+        writeBundle(bundle, aowis::dvmdb::sha256(revision), b.id, {revision},
+                    *recipient.branchId("main"));
         const BundleImportResult result = recipient.importBranchBundle(bundle, "main");
         expect(result.status == BundleImportStatus::FastForward && result.objectsImported == 1,
                "valid graft of a local raw-compatible trie rejected");
@@ -547,8 +550,16 @@ void testBranchRelations() {
     // although B is no boundary of that bundle (found below boundary C).
     Repository recipient(directory.path / "recipient");
     recipient.importBranchBundle(directory.path / "b.bundle", "main");
-    recipient.importBranchBundle(directory.path / "b.bundle", "other");
-    expect(recipient.importBranchBundle(directory.path / "c.bundle", "other").head == c, "C not imported");
+    // The same UUIDv7 cannot be imported as an alias under another name.
+    expectKind(StorageErrorKind::Conflict, "duplicate branch UUID alias", [&] {
+        (void)recipient.importBranchBundle(directory.path / "b.bundle", "other");
+    });
+    // Import C through its own independently named source branch, so the
+    // recipient knows that immutable revision without advancing main from B.
+    source.createBranchAtRevision("side", "main", c);
+    source.exportBranchBundle("side", directory.path / "side.bundle");
+    expect(recipient.importBranchBundle(directory.path / "side.bundle", "side").head == c,
+           "side branch did not transfer boundary C");
     const BundleImportResult forward = recipient.importBranchBundle(directory.path / "d.bundle", "main");
     expect(forward.status == BundleImportStatus::FastForward && forward.head == d &&
            recipient.head("main").id == d, "fast-forward below a boundary failed");

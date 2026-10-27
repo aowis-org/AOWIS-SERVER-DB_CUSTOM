@@ -24,3 +24,21 @@ Generic reference existence is **not** sufficient for hydraulic integrity. A pip
 ## Boundaries
 
 No implicit overwrite policy resolves conflicts. Complex semantic conflicts, incompatible membership order and arbitrary multi-object topology may still require explicit review; recursive ancestry does not silently resolve conflicting edits. The implemented HTTP merge endpoint uses hydraulic-aware validation; see [service API](native-database-service.md) and [OpenAPI](dvmdb-http-api.yaml).
+
+## Explicit UUIDv7 revision merges (Phase 2c-3b)
+
+For UUIDv7 projects, `Repository::mergeBranchesV2(project, target, source,
+expectedTarget, expectedSource)` and the equivalent `ProjectService` wrapper
+provide a **separate** native merge path. It uses verified UUIDv7 revision
+ancestry, optional optimistic HEAD pins, fast-forward/up-to-date detection,
+and conservative divergent three-way merging. A successful divergent merge
+creates a fresh revision UUIDv7 with **two parents**, while the source HEAD
+and branch identities remain unchanged. Rejected concurrent changes and
+invalid model references do not move either HEAD. Historical revision forks
+use `createBranchAtRevisionV2()` and do not create a new revision.
+
+Unlike the SHA-based merge operation described above, the new v2 API does
+**not yet** offer custom conflict resolvers, candidate reconciliation or
+semantic validation callbacks. See
+[UUIDv7 migration roadmap](uuidv7-identity-migration-roadmap.md) for status.
+This operation is currently **native only**, not a live HTTP endpoint.

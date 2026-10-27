@@ -170,6 +170,19 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
                                    std::string_view source,
                                    const HydraulicMergeSelections& selections = {});
 
+// UUIDv7-only hydraulic merge; both immutable branch-tip UUIDs pin every
+// interactive selection. The same canonical field/membership reconciliation
+// and whole-network preflight are used as in the native SHA merge.
+struct HydraulicMergeSelectionsV2 {
+    RevisionId expectedTargetHead;
+    RevisionId expectedSourceHead;
+    std::vector<HydraulicFieldChoice> fields;
+    std::vector<HydraulicObjectChoice> objects;
+};
+MergeResultV2 mergeHydraulicBranchesV2(Repository& repository, const ProjectId& project,
+                                       std::string_view target, std::string_view source,
+                                       const HydraulicMergeSelectionsV2& selections);
+
 // Incremental *write* path for one existing network. Each change is encoded
 // individually; unchanged entities and membership chunks are not rewritten.
 // Existing scalar-only edits, eligible pipe rewires, whitelisted
@@ -191,5 +204,25 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
                               const std::vector<HydraulicEntityChange>& changes,
                               HydraulicEditDiagnostics* diagnostics = nullptr,
                               std::optional<Hash> expectedHead = std::nullopt);
+
+// UUIDv7 revision-aware hydraulic operations. All reads pin a project-scoped
+// immutable snapshot; saves/edits compare their expected HEAD again during
+// the native atomic model commit. No SHA-revision fallback is permitted.
+RevisionId saveHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+                                  std::string_view branch, const NetworkHydraulic& network,
+                                  const RevisionId& expectedHead);
+RevisionId editHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+                                  std::string_view branch, const QUuid& networkUuid,
+                                  const std::vector<HydraulicEntityChange>& changes,
+                                  const RevisionId& expectedHead);
+std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionV2(
+    Repository& repository, const ProjectId& project, const RevisionId& revisionId,
+    const QUuid& networkUuid);
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedV2(
+    Repository& repository, const ProjectId& project, const RevisionId& revisionId,
+    const QUuid& networkUuid, HydraulicEntityType type, std::size_t maxCount);
+std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionV2(
+    Repository& repository, const ProjectId& project, const RevisionId& revisionId,
+    const QUuid& networkUuid, const QUuid& entityUuid);
 
 } // namespace aowis::dvmdb::hydraulic

@@ -6,8 +6,9 @@ AOWIS. It distinguishes **agreed semantics**, **implemented DVMDB behavior**,
 and **work not yet implemented**. The all-parent graph API is now implemented
 in DVMDB; the separate [UUIDv7 identity migration
 roadmap](uuidv7-identity-migration-roadmap.md) records the agreed transition to
-UUIDv7 **logical identities** plus SHA-256 **integrity**, which is **not yet
-implemented**. Current references to revision `Hash` and branch names below
+UUIDv7 **logical identities** plus SHA-256 **integrity**. New project IDs
+already use UUIDv7; branch/revision UUID persistence remains **unimplemented**.
+Current references to revision `Hash` and branch names below
 describe the **legacy implemented representation**, not the target ID scheme.
 
 Related documents: [native architecture](architecture.md),
@@ -22,7 +23,7 @@ implemented HTTP endpoints only.
 | Concept | Contract | Where it lives |
 |---|---|---|
 | Server/database source | A GUI representation of a remote DVMDB service or embedded local database. It is **not a revision-graph object**. | GUI connection/profile layer |
-| Project | A named, UUID-identified entity with its own independent versioned repository. Multiple projects may be hosted by one service. **New IDs target UUIDv7 (currently UUIDv4).** | DVMDB `ProjectService` |
+| Project | A named, UUID-identified entity with its own independent versioned repository. Multiple projects may be hosted by one service. **New IDs use UUIDv7; existing UUIDv4 projects remain readable.** | DVMDB `ProjectService` |
 | Revision / commit | The **same concept**: an immutable revision with ordered parent revision IDs, bound cryptographically to a complete snapshot. **Target: UUIDv7 identity and separate SHA-256 content hash; today SHA is also the ID.** | DVMDB repository |
 | Branch | A user-named, movable reference to **one** revision; not a revision and not an immutable ancestry node. **Target: stable branch UUIDv7 independent of its name.** | DVMDB repository refs |
 | Branch HEAD | The immutable revision **currently referenced by a particular branch**. Each branch has exactly one current HEAD. | DVMDB branch ref |
