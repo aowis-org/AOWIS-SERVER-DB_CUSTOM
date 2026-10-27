@@ -75,6 +75,19 @@ application-level model semantics. The source reference bytes remain fixed;
 operator migration still requires a separately verified backup and a planned
 rollback window (see [operations](operations.md)).
 
+## Pending UUIDv7 identity-format migration
+
+[UUIDv7 identity migration roadmap](uuidv7-identity-migration-roadmap.md)
+proposes a new versioned revision record with UUIDv7 logical revision IDs and
+separate SHA-256 integrity addresses, stable branch UUIDs and project UUIDv7.
+This changes canonical revision bytes, parent references, branch HEADs, native
+and HTTP APIs, replication bundles and upgrade behavior. **Not implemented.**
+No existing fixture is to be rewritten or used as a surrogate new-format
+golden sample. Before any code: approve dual-format support and legacy
+SHA→UUID maps, cross-replica identity preservation and rollback boundaries.
+An offline, verified, crash-safe conversion on copies is the default candidate
+until an alternate rollout mode is explicitly approved.
+
 ## Upgrades and format changes
 
 1. **Back up** and independently verify important service roots before

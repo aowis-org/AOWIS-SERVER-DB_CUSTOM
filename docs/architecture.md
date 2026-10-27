@@ -18,9 +18,12 @@ GUI's complete multi-branch graph is recorded in
 branch is a named ref, not a revision ancestry node. The repository stores
 no global checkout HEAD or original branch-creation event. Existing
 first-parent history APIs do not enumerate all merge-parent ancestry;
-a dedicated full-DAG reader is planned without changing this storage model.
+a separate full-DAG reader is already implemented in Repository,
+ProjectService and HTTP. The [UUIDv7 identity migration
+roadmap](uuidv7-identity-migration-roadmap.md) proposes a future revision-ID
+format change, not a change to the revision DAG semantics.
 
-- Entity keys are 16-byte UUIDs. Object and revision identities are 32-byte SHA-256 hashes of canonical bytes.
+- **Current implementation:** entity keys are 16-byte UUIDs; pack object and revision IDs are 32-byte SHA-256 hashes of canonical bytes. **Proposed target:** first-class project, branch and revision identities are distinct UUIDv7 values, with immutable object hashes retained for integrity and Merkle deduplication.
 - A persistent, path-compressed 16-way radix Merkle tree maps UUIDs to immutable object hashes. Unchanged values/subtrees are reused across revisions.
 - Model-indexed revisions also publish a reverse-reference Merkle tree mapping a UUID to its incoming referencing UUIDs. Both roots belong to one revision.
 - Each revision holds zero, one or two parent revision hashes. Branch names resolve to mutable refs pointing at immutable revision objects. Changes to one branch do not modify other branches.
@@ -39,7 +42,7 @@ repository/
 ├── repo.lock               # repository operation locking
 ├── recovered-pack-tails/   # copies of discarded torn pack tails (if any)
 ├── tmp/                    # scratch space, mode 0700 (see below)
-└── refs/heads/             # branch -> immutable revision hash
+└── refs/heads/             # current: branch name -> immutable revision hash; planned: branch UUID + revision UUID mapping
 ```
 
 **Scratch space.** Import/verification tables (bundle location index, visit marks, trie summaries, external reference sort) and HTTP bundle spools/exports are nameless files in `tmp/`, created with `O_TMPFILE`; on filesystems without it, `aowis-scratch-*` files are created and unlinked immediately, and any such leftover from a crash is removed on open. Scratch space is therefore on the pack's own filesystem: never in `TMPDIR`, which is often a RAM-backed tmpfs (Fedora, Arch, Debian 13), so "file-backed, evictable" really means disk. A symlinked or non-directory `tmp` is refused. C++ callers can use `Repository::createScratchFile()` together with the descriptor overloads of `importBranchBundle` / `export…BranchBundle`.

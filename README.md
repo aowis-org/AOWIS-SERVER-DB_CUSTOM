@@ -4,22 +4,27 @@
 
 **AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
-This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-dvmdb` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md).
+This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-dvmdb` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md). The pending
+[UUIDv7 identity migration](docs/uuidv7-identity-migration-roadmap.md) will
+separate logical revision/branch/project IDs from SHA-256 integrity hashes;
+**the present binary still uses SHA for revision IDs and UUIDv4 for projects**.
 
 > **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
 
 ## GUI integration status
 
-The GUI can already discover projects, branches and limited first-parent
-first-parent revision history from this server, create projects and branches, and aggregate
-several checked databases in its navigator. A separate standalone build
-can use DVMDB directly as a C++ library. **The GUI does not yet check out
-hydraulic networks or save network revisions**, even though some underlying
-DVMDB read/write API operations already exist.
+The server exposes complete paginated all-parent revision history to both
+native and REST clients. Recent GUI builds integrate that P0 graph reader;
+older GUI versions may still use first-parent history. The GUI can discover
+projects and branches, create projects/branches, and aggregate several
+checked databases. A separate standalone build can use DVMDB directly as a
+C++ library. **The GUI does not yet check out hydraulic networks or save
+network revisions**, even though some underlying DVMDB read/write APIs exist.
 
-Project/branch rename/delete, network enumeration, GUI adoption of full revision-DAG paging,
-editable annotations, authentication and release-tag workflows remain
-unimplemented contracts. See the [GUI contract and remaining gaps](docs/gui-integration-requirements.md) and the GUI's
+Project/branch rename/delete, network enumeration, editable annotations,
+authentication and release-tag workflows remain unimplemented contracts.
+The next identity migration must be implemented across both GUI readers,
+not merely as a displayed UUID field. See the [GUI contract and remaining gaps](docs/gui-integration-requirements.md) and the GUI's
 `docs/dvmdb-integration-roadmap.md`. The
 [OpenAPI definition](docs/dvmdb-http-api.yaml) describes implemented server
 routes, not proposed GUI capabilities.

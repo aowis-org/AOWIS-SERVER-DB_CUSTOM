@@ -12,6 +12,15 @@
 
 **Operational consequence:** the initial REST server is unauthenticated and unencrypted. Any client able to reach its configured listener can call its exposed operations. Deploy only on deliberately trusted/development networks and avoid sensitive content. Choosing a configurable public bind address is a feature, not a security guarantee.
 
+## Pending revision identity contract upgrade
+
+The current HTTP endpoints use SHA-256 revision hashes as public identities,
+branch names as ref identifiers, and UUIDv4 project IDs. The approved target
+uses UUIDv7 project/branch/revision IDs with separate SHA-256 integrity
+fields. The [UUIDv7 migration roadmap](uuidv7-identity-migration-roadmap.md)
+requires new versioned API contracts and backwards-compatibility decisions;
+**none of these wire changes is implemented or part of the live OpenAPI yet**.
+
 ## Version-control semantics for REST clients
 
 The canonical [revision/branch/HEAD contract](version-control-semantics.md)

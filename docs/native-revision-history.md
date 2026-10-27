@@ -7,7 +7,7 @@ Every branch has its own HEAD; one revision can be the HEAD of several branches,
 and a HEAD need not be a leaf of the combined project DAG. There is no
 repository-wide checked-out HEAD or persistent branch-parent relationship.
 
-Every native revision is identified by SHA-256 and stores the immutable model Merkle root, reverse-reference root (for model-indexed revisions) and ordered parent revision IDs. Normal commits have one parent; divergent merges can have two. Older revisions remain readable while retained by reachable history.
+**Currently** every native revision is identified by SHA-256 and stores the immutable model Merkle root, reverse-reference root (for model-indexed revisions) and ordered parent revision IDs. A future [UUIDv7 migration](uuidv7-identity-migration-roadmap.md) separates logical revision identity from immutable SHA-256 record and snapshot integrity; it is not implemented yet. Normal commits have one parent; divergent merges can have two. Older revisions remain readable while retained by reachable history.
 
 ## History and immutable lookup
 

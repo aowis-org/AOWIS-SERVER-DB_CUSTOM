@@ -10,6 +10,18 @@ Use [OpenAPI](dvmdb-http-api.yaml) and the
 [native database service](native-database-service.md) for **implemented** HTTP
 operations. Do not add hypothetical resources to live OpenAPI.
 
+## Identity migration dependency (P-ID; not implemented)
+
+Before P1 save/checkout, follow the [UUIDv7 identity migration
+roadmap](uuidv7-identity-migration-roadmap.md). The current SHA revision IDs,
+branch-name identifiers and UUIDv4 project IDs are **legacy implementation**;
+the target is UUIDv7 per project/branch/revision with separate verified SHA
+integrity. All source/graph/selection/inspector/`expectedHead` paths will
+need new typed IDs after the native/REST schema and data migration. This
+requires **no change to the agreed branch-local HEAD behavior**: multiple
+branch UUIDs may share one revision UUID, and no revision is created merely
+by naming a branch. Do not present a SHA digest as the new revision UUID.
+
 ## Current implementation
 
 **DVMDB native and HTTP already provide:** project create/list/get;
@@ -72,7 +84,7 @@ branch-creation node is required**. A clickable branch reference decoration
 may be rendered at the revision it currently references. It must not masquerade
 as a historical fork event or an ancestor edge.
 
-## P1 — network discovery, checkout and optimistic saving (deferred by decision)
+## P1 — network discovery, checkout and optimistic saving (after P-ID)
 
 The GUI's future working-copy/session tracks **selected revision**, **pinned
 base revision**, **branch and its observed HEAD**, and **dirty local model** as

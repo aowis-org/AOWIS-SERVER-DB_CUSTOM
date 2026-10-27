@@ -103,15 +103,39 @@ certification; see [engineering findings](engineering-findings.md).
 - Specify and implement the cross-AOWIS security system before exposure to
   untrusted networks; current plain HTTP does **not** enforce access rules.
 
-The graph API is a deliberate new **read** feature, not a major storage
-rewrite. Prefer reproducible evidence and direct changes to the existing
-native engine.
+The P0 full-DAG graph reader is implemented in DVMDB. The next architectural
+work **is** a versioned identity/storage migration, specified below; do not
+treat it as a cosmetic graph/API change. Prefer reproducible evidence and
+direct changes to the existing native engine.
+
+## P-ID — UUIDv7 object identity and verified SHA-256 history (new prerequisite)
+
+**Approved direction, implementation pending.** Give every new first-class
+project, branch and revision a distinct UUIDv7 identity; use SHA-256 to verify
+the **complete canonical immutable revision record** and its transitive Merkle
+snapshot. Keep branch HEADs as references, not revision objects: new branch
+creation allocates a branch UUID but **does not** make a revision. Existing
+empty root SHA sharing is not cryptographic corruption; it reflects identical
+content, while current revisions lack a separate logical identity.
+
+This migration affects the native `S` revision record, SHA parent links,
+branch files, catalogue (currently UUIDv4), P0 graph API, `expectedHead`,
+replication bundles, native/HTTP clients, verifier, fixtures and the GUI.
+Migrate on verified copies with an authoritative, replica-stable mapping of
+legacy SHA IDs to new revision UUIDs; never generate divergent mappings on
+independent replicas. Do not rekey immutable Merkle data unnecessarily. The
+[UUIDv7 identity migration roadmap](uuidv7-identity-migration-roadmap.md)
+defines six delivery phases, compatibility and rollback gates, and design
+questions requiring sign-off. **Complete P-ID before introducing P1 checkout
+and save.** Routine P0 graphical rendering can still be tested against the
+existing backend while P-ID is designed.
 
 ## Version-control and GUI integration priorities (agreed 2026-10-27)
 
 The core project/revision/branch/branch-HEAD semantics are now explicitly
-recorded in [version-control semantics](version-control-semantics.md). They are
-**design decisions**, not proposed changes to the persisted revision DAG.
+recorded in [version-control semantics](version-control-semantics.md). The
+revision **topology and branch-ref semantics** remain agreed; the separate
+UUIDv7 milestone changes how their identities are persisted and transported.
 A branch is a movable named revision ref, each branch has a HEAD, and the GUI
 shows histories reachable from **all** HEADs. A HEAD is not necessarily a
 leaf; the GUI's selected revision or eventual working-copy base is separate.
@@ -131,7 +155,8 @@ and [GUI requirements](gui-integration-requirements.md).
 
 **Deferred by product decision: working-copy checkout and saving.** Network
 listing, revision-pinned checkout, dirty editor sessions and expected-HEAD
-commits follow the graph milestone. Project/branch rename-delete, richer
+commits follow both the graph integration milestone and **P-ID identity
+migration**. Project/branch rename-delete, richer
 metadata/annotations, reviews and tags are separate follow-on work, **not
 universal prerequisites** for a first trusted-development checkout/save
 workflow. The AOWIS-wide TLS/authentication/authorization design remains a
