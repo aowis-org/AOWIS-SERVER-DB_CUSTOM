@@ -247,7 +247,7 @@ struct RevisionGraphRevisionV2 {
 struct RevisionGraphHeadV2 {
     BranchId branchId;
     std::string name;
-    RevisionId revision;
+    std::optional<RevisionId> revision;
     Hash recordHash{};
     std::optional<BranchId> originBranchId; // Immutable creation provenance.
 };

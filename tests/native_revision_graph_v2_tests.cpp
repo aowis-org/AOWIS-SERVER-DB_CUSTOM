@@ -32,6 +32,25 @@ Key key(unsigned value) {
     return result;
 }
 
+void runUnbornGraph() {
+    Temporary tmp;
+    const ProjectId project = ProjectId::generate();
+    Repository repo(tmp.path / "unborn");
+    repo.createUnbornBranchV2(project, "main");
+    const RevisionGraphPageV2 graph = repo.revisionGraphV2(project);
+    check(graph.heads.size() == 1 && graph.heads[0].name == "main" &&
+          !graph.heads[0].revision && graph.heads[0].recordHash == Hash{} &&
+          graph.revisions.empty() && !graph.next,
+          "unborn graph must contain a null HEAD and no revisions");
+    Repository reopened(tmp.path / "unborn");
+    const RevisionGraphPageV2 persisted = reopened.revisionGraphV2(project);
+    check(persisted.heads.size() == 1 && !persisted.heads[0].revision &&
+          persisted.revisions.empty(), "unborn graph did not survive reopen");
+    RevisionGraphCursorV2 forged{{graph.heads.front()}, 1};
+    invalid([&] { (void)repo.revisionGraphV2(project, 1, forged); },
+            StorageErrorKind::InvalidInput, "unborn graph cursor beyond history accepted");
+}
+
 void runRepository() {
     Temporary tmp;
     const ProjectId project = ProjectId::generate();
@@ -202,6 +221,7 @@ void runService() {
 
 int main() {
     try {
+        runUnbornGraph();
         runRepository();
         runBranchOriginsAndNames();
         runService();

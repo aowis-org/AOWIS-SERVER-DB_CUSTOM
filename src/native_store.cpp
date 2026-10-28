@@ -3600,15 +3600,16 @@ RevisionGraphPageV2 Repository::revisionGraphV2(
         for (const RevisionGraphHeadV2& head : page.heads) {
             checkBranch(head.name);
             require(Err::InvalidInput, (previous.empty() || previous < head.name) &&
-                    head.recordHash != Hash{} && identities.insert(head.branchId).second,
+                    (head.revision.has_value() == (head.recordHash != Hash{})) &&
+                    identities.insert(head.branchId).second,
                     "invalid v2 graph cursor heads");
             previous = head.name;
         }
     } else {
         for (const StoredBranch& branch : readStoredBranches(this->directory_)) {
-            require(Err::Unavailable, branch.revisionV2.has_value(),
+            require(Err::Unavailable, branch.revisionV2.has_value() || isZero(branch.head),
                     "v2 graph requires UUIDv7 revision HEADs");
-            page.heads.push_back({branch.id, branch.name, *branch.revisionV2,
+            page.heads.push_back({branch.id, branch.name, branch.revisionV2,
                                   branch.head, branch.originBranchId});
             require(Err::LimitExceeded, page.heads.size() <= maxBranches,
                     "v2 graph exceeds branch snapshot limit");
@@ -3631,13 +3632,16 @@ RevisionGraphPageV2 Repository::revisionGraphV2(
         require(Err::Corruption, value.has_value(), "missing v2 graph revision");
         return cached.emplace(id, *value).first->second;
     };
-    for (const RevisionGraphHeadV2& head : page.heads)
-        require(Err::Corruption, get(head.revision).recordHash == head.recordHash,
-                "v2 graph HEAD UUID/SHA mismatch");
+    for (const RevisionGraphHeadV2& head : page.heads) {
+        if (head.revision)
+            require(Err::Corruption, get(*head.revision).recordHash == head.recordHash,
+                    "v2 graph HEAD UUID/SHA mismatch");
+    }
     std::vector<RevisionId> pending;
     pending.reserve(page.heads.size());
-    for (auto it = page.heads.rbegin(); it != page.heads.rend(); ++it)
-        pending.push_back(it->revision);
+    for (auto it = page.heads.rbegin(); it != page.heads.rend(); ++it) {
+        if (it->revision) pending.push_back(*it->revision);
+    }
     std::set<RevisionId> seen;
     std::size_t visited = 0;
     while (!pending.empty()) {

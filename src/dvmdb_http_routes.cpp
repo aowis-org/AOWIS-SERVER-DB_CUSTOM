@@ -339,7 +339,10 @@ QString graphTokenV2(const RevisionGraphCursorV2& cursor, const std::string& pro
     for (const RevisionGraphHeadV2& head : cursor.heads) {
         heads.append(QJsonArray{QString::fromStdString(head.branchId.toString()),
                                 QString::fromStdString(head.name),
-                                revisionIdStringV2(head.revision), hashString(head.recordHash),
+                                head.revision ? QJsonValue(revisionIdStringV2(*head.revision))
+                                              : QJsonValue(QJsonValue::Null),
+                                head.revision ? QJsonValue(hashString(head.recordHash))
+                                              : QJsonValue(QJsonValue::Null),
                                 head.originBranchId
                                     ? QJsonValue(QString::fromStdString(head.originBranchId->toString()))
                                     : QJsonValue(QJsonValue::Null)});
@@ -391,8 +394,10 @@ RevisionGraphCursorV2 readGraphTokenV2(const std::string& encoded,
         requireInput(value.isArray(), "invalid UUIDv7 graph head");
         const QJsonArray head = value.toArray();
         requireInput(head.size() == 5 && head.at(0).isString() &&
-                     head.at(1).isString() && head.at(2).isString() &&
-                     head.at(3).isString() && (head.at(4).isNull() || head.at(4).isString()),
+                     head.at(1).isString() &&
+                     ((head.at(2).isString() && head.at(3).isString()) ||
+                      (head.at(2).isNull() && head.at(3).isNull())) &&
+                     (head.at(4).isNull() || head.at(4).isString()),
                      "invalid UUIDv7 graph head fields");
         const std::optional<BranchId> branch = BranchId::parse(head.at(0).toString().toStdString());
         requireInput(branch.has_value(), "invalid graph branch UUIDv7");
@@ -402,8 +407,11 @@ RevisionGraphCursorV2 readGraphTokenV2(const std::string& encoded,
             requireInput(origin && *origin != *branch, "invalid branch creation origin");
         }
         cursor.heads.push_back({*branch, head.at(1).toString().toStdString(),
-              parseRevisionIdV2(head.at(2).toString().toStdString()),
-              parseHash(head.at(3).toString().toStdString()), origin});
+              head.at(2).isString()
+                  ? std::optional<RevisionId>(parseRevisionIdV2(head.at(2).toString().toStdString()))
+                  : std::nullopt,
+              head.at(3).isString() ? parseHash(head.at(3).toString().toStdString()) : Hash{},
+              origin});
     }
     return cursor;
 }
@@ -1092,8 +1100,10 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             for (const RevisionGraphHeadV2& head : page.heads)
                 heads.append(QJsonObject{{"branch", QString::fromStdString(head.name)},
                     {"branchId", QString::fromStdString(head.branchId.toString())},
-                    {"revision", revisionIdStringV2(head.revision)},
-                    {"recordHash", hashString(head.recordHash)},
+                    {"revision", head.revision
+                        ? QJsonValue(revisionIdStringV2(*head.revision)) : QJsonValue(QJsonValue::Null)},
+                    {"recordHash", head.revision
+                        ? QJsonValue(hashString(head.recordHash)) : QJsonValue(QJsonValue::Null)},
                     {"originBranchId", head.originBranchId
                         ? QJsonValue(QString::fromStdString(head.originBranchId->toString()))
                         : QJsonValue(QJsonValue::Null)}});
