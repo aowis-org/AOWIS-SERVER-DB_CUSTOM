@@ -20,8 +20,11 @@ It has a UUIDv7, base committed revision (nullable for the initial unborn
 `main`), target local branch UUID, dirty state, and recovery information.
 Two editor sessions—even for the same user—must not silently edit the same
 working-copy object concurrently. Create distinct working copies by default;
-if reopening a saved copy, coordinate edits using an exclusive session lease
-or version-checked updates so stale requests cannot overwrite saved drafts.
+if reopening a saved copy, allow multiple readers but **one active writer**.
+Every Save must atomically verify an unexpired exclusive writer lease,
+**fencing token and expected persisted generation**; stale writers must not
+overwrite a recovered draft. Expired leases permit explicit recovery/takeover
+without deleting content; acknowledged Save is durable.
 
 ## Deployment modes
 
@@ -49,20 +52,26 @@ Offline edits on an HTTP-only client are not promised by this architecture.
 
 ## Clone/checkout and branch tracking
 
-A project has stable UUIDv7 identity across repositories. All immutable
-revision UUIDs and canonical SHA-256 hashes survive synchronization unchanged.
-A user's local **branch reference** and the shared server's branch reference
-are separate movable refs, even when both represent `main`. They must be
-identified and qualified by the repository they belong to. The private repo
-stores a remote-tracking record containing the remote repository identity,
-project UUIDv7, remote branch UUIDv7, last fetched/published revision UUID
-(or null), and local tracking branch UUID. A local branch gets its own
-UUIDv7 if it is a distinct branch ref; importing a remote branch does not
-manufacture new revision UUIDs or rewrite historical ancestry.
+A project and its logical branches keep their UUIDv7 identities across clone,
+fetch and publication; immutable revision UUIDs and canonical SHA-256 hashes
+also survive unchanged. When cloning `main` from shared repository S into
+personal repository A, its logical branch ID is the **same** `main` UUIDv7 in
+both stores. Crucially, the mutable HEADs are *not shared memory*: the
+repository-qualified ref key `(repositoryId, projectId, branchId)` makes
+A's local HEAD and S's published HEAD independent.
 
-The source/fork provenance of a *newly created branch* is kept in branch
-metadata. Remote-tracking relationships are separate: a tracking link does
-not imply a new branch fork or a revision-parent edge.
+A local branch created as a **new** logical branch receives a new UUIDv7,
+which is used on first explicit provisioning on the selected remote.
+Remote-tracking metadata stores remote repository UUID, project UUID,
+branch UUID, observed remote HEAD/null, and source connection. A tracking
+record is not a fork or a revision-parent edge. Reject repository/project
+mismatch, ID collision and ambiguous name-based matching.
+
+For a new remote branch, **absence and unborn null HEAD are distinct**:
+provision the new branch explicitly and idempotently with the same UUIDv7,
+then conditionally Publish. For an already existing unborn remote branch,
+first Commit publication compares against `expectedRemoteHead: null`.
+Neither operation silently creates an unrelated remote branch after failure.
 
 1. Fetch or initialize the selected project in the personal repository.
    For an unborn project, track `main` with a null committed HEAD.
@@ -83,8 +92,9 @@ not imply a new branch fork or a revision-parent edge.
    otherwise return an explicit stale-remote/non-fast-forward conflict.
    A failed publish keeps successful local commits and the user's drafts.
 7. **Reconcile** explicitly incorporates new remote commits by fast-forward,
-   merge or user-approved rebase/replay; validate hydraulic semantics of the
-   resulting whole model. Re-attempt Publish with a fresh expected remote
+   explicit fast-forward or validated three-way merge; do not automatically
+   rebase/replay in the initial implementation. Preserve the private draft
+   when hydraulic or structural conflicts remain. Re-attempt Publish with a fresh expected remote
    HEAD; never silently force the shared branch.
 
 The first project commit requires the local unborn HEAD to be null. Its
@@ -95,7 +105,11 @@ branch from an unborn HEAD is rejected; make the first commit first.
 ## Atomicity, recovery and duplicate requests
 
 Local commits and remote publications are **two different transactions**.
-Each mutating operation uses an idempotency key and a durable status query.
+Commit and Publish each use a caller-generated UUIDv7 operation ID,
+repository/operation scope, canonical request-payload digest and durable
+`pending`, `succeeded` or `rejected` outcome lookup. Replays with the same
+ID/payload return the original outcome; changed payload under an existing ID
+is rejected. An unresolved operation is never discarded by retention cleanup.
 A timed-out local commit may already exist; a timed-out Publish may have
 moved the shared HEAD. Resolve both by checking the authoritative repository
 and operation status before retrying. Transport failure must never imply
@@ -105,7 +119,11 @@ A personal repository must provide durable autosave and restart recovery
 for its own drafts, transactional local branch updates, and consistent
 snapshots across multi-entity hydraulic edits. Backup of private draft
 state is separate from committed-revision replication bundles. Retention,
-quota and draft-recovery policies require explicit user-facing controls.
+quota, lease TTL/renewal and draft-recovery policies require explicit
+user-facing controls and a documented operational policy at VC-04/VC-05.
+Existing repository history is preserved through versioned transactional
+metadata migrations, with verification and backup/rollback; new projects
+alone adopt unborn `main`. No historical R0 is silently deleted.
 
 ## Acceptance scenarios
 
@@ -121,7 +139,15 @@ quota and draft-recovery policies require explicit user-facing controls.
 - A missing private HTTP DVMDB disables editing; public history is still
   readable when its source remains reachable, without unsafe fallback.
 - Project/branch/revision UUIDs and canonical hashes retain their meanings
-  across repositories; remote-tracking identifiers do not become ancestry.
+  across repositories; local and shared branch HEADs advance independently
+  even while both use the same logical branch UUIDv7.
+- Two sessions reopen one saved draft: only the live leased/fenced writer
+  with the expected generation can Save; expiration/takeover invalidates
+  stale writes without losing the last durable content.
+- A Publish response is lost after success: status lookup by original
+  operation UUID reports the single successful remote HEAD advancement.
+- Existing projects with previously committed initial R0 retain R0 after
+  upgrade; newly created projects start with unborn `main` and no R0.
 
 **Security limit:** Selecting a private HTTP repository in configuration
 is not access control. Until the dedicated [security plan](security-permissions-design.md)

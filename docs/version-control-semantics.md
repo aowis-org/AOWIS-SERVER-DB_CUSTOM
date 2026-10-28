@@ -128,7 +128,11 @@ The **shared project repository** remains authoritative for published
 branches and their committed HEADs. A personal local branch HEAD may advance
 without advancing the corresponding shared branch HEAD. Remote-tracking
 state identifies the shared source/repository, project and branch UUIDs plus
-its last fetched HEAD. Distinct local and remote refs must not be confused.
+its last fetched HEAD. A logical branch keeps its UUIDv7 when replicated to
+another repository, while each repository's HEAD is an independently mutable
+ref addressed by `(repositoryId, projectId, branchId)`. A newly created
+logical branch gets a fresh UUIDv7, reused on its first explicit remote
+provisioning. Distinct local and remote **ref states** must not be confused.
 Private working repositories must not be silently substituted with a shared
 source, and their absence disables editing rather than risking data loss.
 See [private working repositories](private-working-repositories.md) for the
@@ -138,8 +142,10 @@ Each working copy has its own UUIDv7, owner/session, project UUID, local
 branch UUID, pinned committed base UUID/null, durable model changes and
 validation/dirty status. Alice and Bob may edit from the same shared R7
 in separate personal repositories; multiple sessions of one user should
-also use distinct drafts unless explicit session locking/version checking
-prevents concurrent overwrite. No working copy can mutate a committed
+also use distinct drafts by default. Reopening the same draft requires an
+exclusive expiring writer lease, a fencing token and an optimistic saved-state
+generation on every write. Read-only sessions may share the draft; stale
+writers cannot overwrite a recovered draft. No working copy can mutate a committed
 revision or either local/shared HEAD as a side effect of ordinary Save.
 
 ## 6. Local Commit and shared Publish (optimistic concurrency)
@@ -163,14 +169,18 @@ publication). The shared server verifies identities, ancestry, hashes,
 model semantics and fast-forward/merge rules before durable publication.
 The remote update is atomic and idempotent; a rejected or timed-out publish
 **never erases the already successful local commit**. Query the shared
-operation status before retrying an ambiguous response.
+operation status before retrying an ambiguous response. Every Commit and
+Publish carries a UUIDv7 operation ID and immutable payload digest; a replay
+with the same ID and payload yields the recorded result, not another commit
+or remote advancement. A changed payload under the same ID is invalid.
 
 **Fetch** only adds/validates immutable history and updates remote-tracking
 refs; it never overwrites private working copies or silently resets local
 branch HEADs. On shared HEAD advance, use an explicit compare/reconcile or
-merge/rebase operation. Overlapping entity edits and non-overlapping but
-hydraulically incompatible changes both require resolution/validation;
-no last-writer-wins or force update occurs during ordinary Publish.
+explicit fast-forward or three-way merge operation. Overlapping entity
+edits and non-overlapping but hydraulically incompatible changes both require
+resolution/validation. The initial implementation does not automatically
+rebase/replay, force-push, perform octopus merges or silently choose a winner.
 
 Example:
 
@@ -306,27 +316,38 @@ a distinct explicitly authorized backup/synchronization protocol.
 10. Failed, cancelled or ambiguous Save, Commit or Publish operations never
     move the wrong branch HEAD or silently discard local committed/draft work.
 
-## 11. Implementation details requiring dedicated design
+## 11. Approved delivery defaults and implementation parameters
 
-The **architectural decisions are fixed**: one personal durable DVMDB per
-user, local commits distinct from remote publication, Git-style immutable
-commit DAG, no branching from unborn `main`, and deferred AOWIS-wide
-permissions. The following remain detailed implementation work:
+The architectural and delivery defaults are **approved**, not open questions.
+The definitive DG-01–DG-06 rules are in the
+[implementation roadmap](roadmap.md), and the persistent-working-copy design
+is in [private working repositories](private-working-repositories.md):
 
-- Durable draft transaction format, explicit session coordination,
-  backup/retention quotas and recovery UX; see
-  [private working repositories](private-working-repositories.md).
-- Exact local branch / remote-tracking record representation, creation
-  of tracking refs on clone, and synchronization transport/API schemas.
-- Idempotency key/result retention and ambiguous-outcome query endpoints
-  for personal Commit and shared Publish separately.
-- Merge/rebase resolution UX and full hydraulic validation requirements.
-- Readable placement of many branch labels pointing to a common revision,
-  stable optional DAG lanes and routing of merge-parent edges.
-- Future account/permission/security rules in the dedicated
-  [security backlog](security-permissions-design.md). Until deployed,
-  unauthenticated HTTP editing must not be exposed to multiple users.
+- One logical branch UUIDv7 across repositories; separate repository-qualified
+  mutable HEAD states and explicit remote-tracking records.
+- A private durable working copy per editor session by default; reopening one
+  draft uses exclusive writer lease, fencing and version-checked durable Save.
+- UUIDv7 idempotency keys, payload digest and recoverable authoritative
+  pending/success/rejection outcomes for local Commit and remote Publish.
+- Preserve existing committed history and UUIDv7 records. Apply unborn branch
+  and private draft lifecycle rules to **new** operations; migrate metadata
+  explicitly, transactionally and with verified backup/rollback.
+- Initially, Fetch, fast-forward and explicit hydraulic-validated three-way
+  merge. No automatic rebase/force-push/silent merge.
+- New local branches retain their UUIDv7 at first explicit remote publication;
+  a missing remote branch and a null-HEAD remote branch are different cases.
+
+Still to define per milestone are *engineering parameters*: exact record and
+HTTP schemas, lease TTL/renewal, fencing-token encoding, draft quota and
+retention, durable operation-status retention, merge-conflict payloads, and
+SQLite/PostgreSQL transaction implementations with identical externally
+visible semantics. Git-style lane placement and legibility are GUI layout
+work, not a change to ancestry.
+
+Authentication, authorization, audit and permissions remain explicitly
+separate [security backlog](security-permissions-design.md) work at VC-12.
+Until then, unauthenticated HTTP editing must not be exposed across users.
 
 **This contract overrides convenience assumptions in any API or GUI design.**
-A feature is complete only when its storage, service, replication and GUI
-behavior agree with the invariants above.
+A feature is complete only when storage, service, replication and GUI
+behavior agree with these invariants.

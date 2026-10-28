@@ -46,25 +46,31 @@ revision, writable HEAD, or branch-provenance graph-edge model.**
 Normative changes to this section require an explicit cross-repository design
 review and coordinated edits to both roadmaps and the version-control contract.
 
-## B. Remaining decision gates — defaults proposed, not yet approved
+## B. Approved implementation decisions — DG-01 through DG-06
 
-These are **narrow implementation contracts**, not unresolved fundamentals.
-Record the agreed choice in both project roadmaps before the indicated
-milestone begins; then update the API/schema docs and tests in that milestone.
+**All six gates are decided.** These are binding defaults for VC-01 through
+VC-08, not options to vote on again. Milestone work must still specify exact
+wire formats, transaction boundaries and operational parameters before
+persisting them. Changes to the decisions require an explicit coordinated
+DVMDB/GUI specification update.
 
-| Gate | Must resolve before | Precise decision and recommended default |
+| Gate | Required by | Approved rule |
 |---|---|---|
-| **DG-01: repository-qualified references** | VC-03, VC-06 | A private repo and a shared repo have distinct repository UUIDs; a locally created tracking branch may have its **own** branch UUID. Persist mapping `(remoteRepositoryId, projectId, remoteBranchId) -> localBranchId`, exact observed remote HEAD/null, and source connection. Never assume same branch UUID means same mutable ref on two servers; preserve immutable commit UUIDs. Confirm repository identity across service restart and relocation. |
-| **DG-02: private draft coordination** | VC-04 | Persist draft UUID, owner/session metadata, exact base revision/null, target local branch, model state, dirty/version counter. Give each session its own working copy by default; reopening the *same* draft uses version-checked writes (or a lease with crash expiry). Save must be durable before acknowledgement. Choose quota, recovery and retention defaults before shipping. |
-| **DG-03: idempotent operation identity** | VC-05, VC-07 | Caller-supplied UUIDv7 operation ID plus request-payload digest, scoped to target repository/operation; persist `pending/succeeded/rejected` and immutable result. Replays of same ID+digest return the same result; same ID+different payload is rejected. Define status retention and crash-recovery boundaries, and distinguish timeout from known failure. |
-| **DG-04: repository transition policy** | VC-01, VC-11 | Existing project stores may contain a fabricated root commit and non-null HEADs. Default: **never rewrite IDs or delete history silently**. Decide between explicit verified migration with backup and fail-closed fresh repository initialization for development fixtures. Migration must preserve project, branch and revision UUIDs when possible and never guess missing fork provenance. |
-| **DG-05: reconciliation scope and initial UX** | VC-08 | Start with explicit fetch + fast-forward, committed three-way merge with ordered parents, and manual resolution of conflicts. Do not automatically rebase, force-push or publish partial hydraulic models; validate merged complete snapshots. Decide whether replay/rebase is in a later iteration. |
-| **DG-06: first remote publication and branch provisioning** | VC-06, VC-07 | Define how a newly created local branch is mapped to/created on the shared repository, including `expectedRemoteHead: null`, fork provenance and idempotent branch creation. Never invent a remote ref on a failed Publish. Require an exact target repository/project/branch identity and explicit user choice where several remotes match. |
+| **DG-01: repository-qualified branch references** | VC-03, VC-06 | Each repository has its own UUIDv7. A *logical* project and branch keep the **same UUIDv7** when cloned/fetched into another repository; a genuinely new branch gets a fresh UUIDv7. Each repository maintains an **independent mutable HEAD** under `(repositoryId, projectId, branchId)`. Store explicit tracking of remote repository/project/branch identity and observed HEAD/null; never infer correspondence from a name or accidentally share a mutable ref across repositories. Reject identity collisions and wrong-repository/project targets. |
+| **DG-02: durable drafts and session concurrency** | VC-04 | One private DVMDB per intended user; independent draft UUIDv7 per editing session by default. Multiple sessions can read one draft but only **one active writer** may modify it. Use an expiring exclusive writer lease with **fencing token AND optimistic generation/version check**, verified atomically on every save. On expiration, permit explicit recovery/takeover, never deletion or stale overwrites. A successful Save is durable before acknowledgement. |
+| **DG-03: idempotent operations and recovery** | VC-05, VC-07 | Every Commit and Publish carries a caller-generated UUIDv7 operation ID, a request-payload digest and target-repository/operation scope. Record pending/succeeded/rejected durably with the immutable outcome; identical retries return the same outcome, a reused ID with a different payload is rejected. On timeout query authoritative status under the **same ID**, never issue a fresh write blindly. Status retention and crash recovery must keep results queryable for the documented supported recovery window; do not expire unresolved operations. |
+| **DG-04: existing-repository transition** | VC-01, VC-11 | Preserve all existing commits, UUIDv7s, hashes, parents, refs and provenance *as recorded*. Do not erase a previously created R0 to imitate an unborn branch or fabricate missing provenance. Introduce unborn project creation and drafts **prospectively**; use explicit, versioned, verified transactional metadata migration with backup/rollback and fail closed if unsafe. Test fixtures may be freshly initialized only by an explicit test action. |
+| **DG-05: initial reconciliation support** | VC-08 | Support explicit Fetch, safe fast-forward and **three-way merge** using a committed common ancestor and two ordered parents, with model-entity UUID comparisons, manual conflict resolution and whole hydraulic-model validation. Detect delete/edit, simultaneous edits and domain-invalid combinations. An unresolved merge stays a private draft. No automatic rebase/replay, force Push, octopus merges, silent last-writer-wins or implicit Publish in the initial release. |
+| **DG-06: initial remote publication** | VC-06, VC-07 | Clone keeps logical branch UUIDs. A locally created branch receives a new UUIDv7 and is explicitly provisioned on the selected remote **with that same UUIDv7**, using its verified project/source/fork identity and a durable idempotency key. First publication of an unborn branch uses `expectedRemoteHead: null`; branch absence is distinct from a branch whose HEAD is null. Reject UUID collisions, wrong target or stale HEAD atomically; do not synthesize remote branches after a failed Publish. |
 
-**Review rule:** An implementation thread may propose and implement the
-recommended default, but must record the decision and acceptance test before
-changing persistent formats or wire schemas. Deferred permissions are tracked
-under VC-12, not silently treated as solved.
+**Operational parameters still to specify in their implementation milestones:**
+lease duration/renewal and fencing-token encoding; draft quotas, backup and
+retention; completed operation-result retention and status API; SQLite and
+PostgreSQL transaction details; and model conflict reporting. These are
+implementation parameters, **not reopened architectural decisions**.
+Permissions remain deferred to VC-12; until then personal HTTP repositories
+require actual deployment isolation, never an assertion of security based
+only on their configured URL.
 
 ## C. Required implementation sequence
 
@@ -86,11 +92,13 @@ changed files only, a fresh timestamp and reproducible tests per checkpoint.
   explicit DVMDB API baseline for coordinated integration.
 - Create a failing acceptance matrix for unborn `main`, first commit,
   shared HEADs, two-user concurrency, reload, restore and cross-repo sync.
-- Classify existing test repositories and format versions: convertible,
-  read-only, or explicit fresh initialization (see DG-04).
+- Classify existing repositories by verified metadata-migration readiness,
+  read-only fallback or explicit test-only fresh initialization (DG-04).
+  Existing committed R0 and branch UUIDs are never silently rewritten.
 
 **Done when:** current implementation gaps are listed against exact APIs and
-fixtures; both teams agree on the baseline, DG-04 direction, and test commands.
+fixtures; both teams agree on the baseline, approved DG-04 migration policy,
+and test commands.
 
 ### VC-01 — Unborn projects, nullable committed HEADs and graph API
 
@@ -136,9 +144,10 @@ HEAD, and a later source commit cannot change the recorded fork point.
 
 - Define the durable **repository identity** for both private and shared
   DVMDBs, independent of project UUIDs and GUI connection profile names.
-- Implement explicit local/remote branch-ref namespaces and
-  repository-qualified tracking records. Avoid rewriting imported revision
-  UUIDs; map local and remote branch ref IDs explicitly.
+- Implement repository-qualified branch-HEAD ref namespaces and tracking
+  records. Preserve the **same logical branch UUID** on clone/fetch; each
+  repository moves its own HEAD independently. Independently created branches
+  get fresh UUIDs, preserved on first Publish. Never rewrite revision UUIDs.
 - Define fetch/checkout targeting metadata, a local repo's remote registry,
   and stable detection of wrong-repo or wrong-project endpoints.
 - Expose identity and tracking through native service/REST without treating
@@ -156,8 +165,10 @@ branch without sharing writable refs or confusing repository identity.
   candidate model changes, validation state and last persisted generation.
 - Implement create/checkout, read/list/reopen, edit/save/autosave, validate,
   discard and recovery APIs in native core and private HTTP service.
-- Use transactional multi-entity saves and optimistic draft-generation
-  checks (or explicitly specified lease model). Draft save never commits.
+- Use transactional multi-entity saves requiring a live exclusive writer
+  lease **and** its fencing token **and** the expected draft generation. A
+  later session can take over an expired lease without permitting a stale
+  writer to overwrite that draft. Draft Save never commits.
 - Make first checkout from unborn `main` an empty editable model. Checkouts
   from committed revisions verify snapshot/Merkle integrity first.
 - Preserve drafts through process death, network disconnect, refresh and
@@ -180,8 +191,10 @@ overwrite another session; committed history never changes on Save.
   swap and durable status result; first commit has zero parents.
 - On local HEAD race, return explicit conflict and current local HEAD,
   retaining draft and any already stored immutable objects. No blind replay.
-- Persist idempotency status and result; retry with same operation UUID and
-  payload returns original outcome. A timeout triggers status lookup.
+- Persist idempotency status, request-payload digest and final result; retry
+  with the same operation UUID and same payload returns its original outcome.
+  Same UUID with changed payload fails. A timeout triggers authoritative
+  status lookup; pending outcomes remain recoverable across restart.
 - Document post-commit draft handling: success does not implicitly delete
   the user's working copy; rebasing/continuing edits is explicit.
 
@@ -215,7 +228,8 @@ local branches/drafts remain isolated and tracking state is reproducible.
 - Enforce fast-forward against the target ref, project ownership, integrity
   closure and hydraulic validation before exposing the new shared HEAD.
 - Make branch creation/provisioning on first publish a separate explicit,
-  idempotent operation when required; never guess target branch names/IDs.
+  idempotent operation, preserving the new branch UUIDv7 across repositories;
+  never guess target branch names/IDs. Check absence separately from null HEAD.
 - Persist per-operation UUID, payload digest and authoritative result in
   shared DVMDB. Resolve ambiguous HTTP timeouts by status lookup.
 - On stale expected HEAD, return conflict/current remote HEAD. Do not roll
@@ -370,6 +384,22 @@ should state its prerequisite milestone(s) and test status.
 11. Backup, recovery, compaction and full/incremental sync retain all UUIDv7
     identities, SHA integrity bindings, fork metadata, nullable HEADs and
     meaningful remote-tracking state.
+12. Clone `main` from shared S into private A/B: each branch retains the
+    **same logical UUIDv7**, while all three repository-qualified HEADs can
+    differ. First Publish of a newly created branch preserves its new UUID,
+    refuses collisions, and distinguishes absent branch from null HEAD.
+13. Two sessions reopen the same private draft: the exclusive lease holder
+    can Save with the correct fencing token and generation; stale saves
+    after expiry/takeover fail without losing durable data.
+14. Commit/Publish succeed but their responses are lost; lookup using the
+    original operation UUID reports one durable result, replays do not create
+    duplicates, and mismatched payloads are rejected.
+15. Existing committed R0 remains valid after upgrade; new project creation
+    produces an unborn `main`. Unsupported migrations fail closed with
+    recoverable original records and an explicit backup.
+16. Two branches change the same hydraulic model from a common ancestor:
+    manual three-way conflict resolution and whole-model validation are
+    required, with no automatic rebase or premature Publish.
 12. Private HTTP deployment remains isolated until VC-12 security sign-off.
 
 ## F. Starting another implementation thread
@@ -398,6 +428,7 @@ thread, follow this handoff template:
    progress`, `Blocked` or `Verified` **and the evidence**. Never mark a
    milestone complete based on ZIP packaging or syntax checks alone.
 
-**Next recommended thread:** VC-00 and DG-04 baseline/format audit, then
+**Next recommended thread:** VC-00 baseline/format audit using the approved
+DG-04 migration policy, then
 VC-01 unborn projects with nullable committed HEAD across storage, service,
 REST, replication and GUI read-only display.

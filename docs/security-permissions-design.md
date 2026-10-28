@@ -71,3 +71,25 @@ integration are stable. Refer to [repository access-control findings](native-rep
 **Schedule:** complete the core lifecycle first, but treat unauthenticated
 remote editing as development-only and do not ship it for shared/public
 exposure before these requirements are enforced.
+
+## Interim constraints for the approved private-repository design
+
+- One intended user has a separate DVMDB working repository, but multiple
+  devices/sessions may reach it. Until VC-12 identity enforcement, these
+  must be isolated operationally and **not exposed as unauthenticated
+  multi-user services**.
+- Draft writer leases, fencing tokens and version checks prevent accidental
+  concurrent overwrites; they **are not authorization**. Future policy must
+  bind lease issuance, takeover and recovery to authenticated ownership.
+- UUIDv7 operation IDs and idempotency payload digests prevent duplicate
+  logical operations; they **do not authenticate** the caller. Status-lookup
+  visibility must be access-controlled before multi-user deployment.
+- Shared branch UUID preservation does not grant access to its ref: the
+  repository-qualified target and authenticated project/branch rights must
+  be checked before Fetch, provisioning or Publish.
+- Explicit three-way merge needs audit provenance for source parents, human
+  conflict resolutions, model validation and publication authorization.
+
+Exact roles, credential storage, authentication, revocation, tenancy, quotas,
+and security-test gates remain part of dedicated VC-12 work, not prerequisites
+for isolated developer test deployments.

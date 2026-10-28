@@ -112,3 +112,27 @@ refs without destroying local commits or private drafts. See
 [private working repositories](private-working-repositories.md) for the
 full two-stage lifecycle. Existing bundle import commands do not by
 themselves implement the entire private working-copy or publication UX.
+
+## Accepted identity and publication semantics for the new working-repo API
+
+For the VC-03 through VC-07 target design, **a logical branch UUIDv7 is
+preserved across repositories**, even while their independently movable HEAD
+refs are keyed by repository UUID + project UUID + branch UUID. An imported
+remote-tracking ref must not overwrite a local development ref. Names such as
+`remote_main` in existing CLI examples represent *storage/selection aliases*;
+they do not authorize inventing another logical branch identity. Current
+bundle CLI behavior is not itself the complete future private Commit/Publish
+protocol.
+
+A genuinely new locally authored branch receives a new UUIDv7 that is reused
+when explicitly provisioned on the selected shared repository. Provisioning
+is idempotent and collision-checked, then Publish uses expected remote HEAD
+(including explicit `null` for unborn refs) and verified fast-forward ancestry.
+An absent branch is **not** the same as an existing unborn branch. Both
+Commit and Publish require recoverable operation UUIDs and cannot discard
+successful local history when remote publication fails.
+
+Existing committed revision UUIDs and previously recorded branch histories
+are never erased to simulate an unborn repository. New project creation
+alone starts with an unborn `main`; existing data requires explicit verified
+metadata transition where applicable.
