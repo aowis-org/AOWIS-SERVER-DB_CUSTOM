@@ -1,225 +1,66 @@
-> **Current pre-release branch storage:** [BRANCH-1](uuidv7-branch-ref-format.md) uses UUIDv7 filenames and identity-bearing transfers. Old name-keyed branch refs and SHA-only bundles are explicitly unsupported. Native-only test fixtures have been converted; HTTP and qualification test gates remain to be run.
+# DVMDB engineering and delivery plan
 
-# Remaining development and release qualification
+The [version-control contract](version-control-semantics.md) is the
+normative definition of project, branch, revision, working-copy and HEAD
+semantics. No feature is complete if it violates those invariants. This
+roadmap describes implementation and qualification work; it does not alter
+the agreed model.
 
-This document records **unfinished work only**. Current features are described
-in [architecture](architecture.md), [service](native-database-service.md),
-[merging](native-branch-merging.md), [replication](offline-repository-synchronization.md)
-and [operations](operations.md). Verified measurements and design tradeoffs
-are preserved in [engineering findings](engineering-findings.md).
+## Version-control lifecycle
 
-## Current baseline
+1. **Unborn projects:** project creation generates project UUIDv7 and an
+   empty `main` branch UUIDv7 with **null committed HEAD** and no fabricated
+   revision. Verify atomic creation and recovery.
+2. **Private workspaces:** support independent UUIDv7 working copies per
+   editor/session, pinned to a committed base UUID or explicit null, with
+   draft recovery and ownership.
+3. **Conditional commits:** validate the complete candidate model, generate
+   one immutable committed revision UUIDv7 and canonical SHA-256, then
+   atomically advance the chosen branch only when its expected committed
+   HEAD/null matches. Provide idempotent operation status.
+4. **Branch provenance:** record immutable source branch UUIDv7 and exact
+   committed fork revision UUIDv7. Creating a branch from a committed
+   snapshot never creates a revision. Creating it from uncommitted edits
+   requires an explicit user choice.
+5. **Merge and reconcile:** compare stale working-copy bases with the current
+   committed tip, resolve field/object and hydraulic-domain conflicts, then
+   publish only validated one-/two-parent immutable revisions.
+6. **Full history and replication:** expose UUIDv7 identities and distinct
+   SHA-256 hashes, nullable HEADs, immutable branch provenance, both merge
+   parents, and consistent paginated graph snapshots on native and REST.
+7. **GUI integration:** branch-oriented lanes, immutable revision cards,
+   separate private working copies, clear conflict recovery and no fake
+   branch-origin ancestry edges. See [GUI contract](gui-integration-requirements.md).
 
-AOWIS-SERVER-DVMDB is one native C++ versioned model database using a
-content-addressed pack, durable branch references, Merkle indexes, distributed
-full/incremental bundles and recursive merge bases. Canonical hydraulic
-persistence/validation and the multi-project HTTP service are implemented.
-The server has separate aggregate HTTP-staging and internal-scratch budgets,
-per-project operation control, atomic named-bundle exports, full repository
-verification and offline backup/restore. The executable can also be embedded
-as native libraries. Authentication and TLS are reserved for the future
-AOWIS-wide security design, not to be improvised here.
+## Integrity and fault tolerance
 
-Existing tests include process crash/restart, native fault injection, a
-private-tmpfs physical ENOSPC drill, real-process concurrent HTTP transfers,
-and a whole-service offline restore drill. On October 26, 2026, after the
-AOWIS-SERVER-DVMDB C++/HTTP naming cleanup, **51/51 CTest tests passed
-in both Debug and Release** on an operator's clean Linux rebuild. The
-standalone Release server also built successfully. Two 300-second Linux
-HTTP resource soaks and the earlier uninstrumented
-3,600-second run established initial resource evidence. Following removal
-of full catalogue scans for single-branch lookups, an **instrumented
-3,600-second** run completed **110,733 imports and 110,733 exports**,
-**61.52 transfers/s** overall, zero admission 503s, a **28.0 MiB**
-sampled RSS peak, 37 peak descriptors and 10 ms worst health latency.
-The four 15-minute interval averages were **62.01, 58.70, 61.56 and
-63.81 transfers/s**. The optimized run did not exhibit sustained throughput
-loss as more than 110,000 branches accumulated. It used a different binary
-from the previous one-hour run and does not establish a portable throughput
-SLA or a representative model-workload envelope. Separately, an **actual
-QEMU/KVM Debian 12 guest** passed four whole-VM cuts on ext4 and four on XFS, each with
-full repository verification and no acknowledged commit lost. These are
-operator-reported measurements, not automatic CI or hardware-level durability
-certification; see [engineering findings](engineering-findings.md).
+- Ensure snapshot Merkle closure, canonical revision hashes, cross-reference
+  indexes, branch-origin metadata and null HEADs survive crash/reopen,
+  online service operations, export/import and compaction.
+- A branch HEAD must never reference an incompletely persisted revision.
+  Ambiguous write results are resolved through idempotency/authoritative
+  state, not blind replay.
+- Exercise fault injection at immutable object append, revision publication,
+  branch ref compare-and-swap, bundle import and compaction.
+- Continue qualified ext4/XFS/POSIX storage fault testing, ENOSPC and
+  quota drills, long-running resource tests and full backup/restore.
 
-## Durability and failure qualification
+## Scalability and security
 
-- Repeat the now-proven QEMU ext4/XFS guest-cache-loss drill with many more
-  rounds, wider commit timings, new guest/kernel/QEMU versions, and automated
-  retention of machine, disk-cache and JSON evidence. Four rounds per
-  filesystem establish a useful initial result, not exhaustive coverage.
-- Repeat on deployment filesystems, hardware and storage stacks. VM-kill
-  tests do not simulate loss of the host/controller's volatile cache; document
-  exactly which guarantees are supported by the target filesystem and device.
-- Repeat kernel ENOSPC tests for deployed ext4/XFS and the HTTP staging path;
-  exercise filesystem quota, inode exhaustion, and crash during compaction.
-- Confirm recovery of branch heads, pack generations and export publication
-  after abnormal process shutdowns and across version upgrades.
+- Validate deep/multi-branch DAGs, numerous concurrent private working
+  copies, multi-project service load, large hydraulic networks and bounded
+  graph/bundle pagination with measured CPU, memory, I/O and latency.
+- Define owner/session access to working copies, project/branch write
+  permissions, API authentication, transport encryption and audit events.
+- Keep native C++ core independent from Qt and SQL backends; native and
+  REST entry points must expose consistent commit and conflict rules.
 
-## Scalability and operations
+## Release acceptance
 
-- The canonical hydraulic workload has now passed three operator-run
-  repetitions each at **10K, 50K and 100K pipes**. Reconstruction, validated
-  merge, fresh-process verification and pack size grew roughly proportionally
-  to pipe count in this generated chain fixture (see engineering findings).
-  The remaining work is to compare the saved full evidence (same-binary
-  verification, indexed edit/targeted-read/diff latencies, index size and
-  peak RSS), define application latency budgets, and extend the workload with
-  realistic network topology, deep revision histories and concurrent clients.
-  The small CTest smoke and deterministic chain fixture are not
-  production-scale evidence. The synthetic six-client/three-project bundle workload has passed
-  an instrumented one-hour, >221K-transfer run with stable quarter-hour
-  throughput after the branch-lookup fix; a further identical branch-growth
-  soak is not the highest-priority evidence gap. Track actual pack/index
-  size, scratch and disk I/O, per-project fairness, queue saturation and
-  slow-client latency. Repeat the longer run on production storage stacks or
-  other hardware if a deployment envelope requires it.
-- Record 100K/1M/10M cold-cache and repeated cache-warm index measurements,
-  including sidecar regeneration and compaction. Re-evaluate the compact
-  lookup only if representative regressions justify it.
-- Test much larger full-history exports and incremental deltas under scratch
-  limits; profile disk space, wall time and cancellation behavior. The
-  incremental path still collects a sorted in-memory set for emitted delta
-  hashes; bound it if measurements show an actual need.
-- Extend the current-format four-project cold-backup/restore
-  drill to larger representative service roots and actual cross-host/storage
-  migrations. Online snapshots and online compaction are not implemented.
-  Define retention, restore and orphan-scratch cleanup policy.
-- Evaluate optional administrative project deletion/renaming and preview-only
-  hydraulic merges when demanded by clients. Network enumeration is already
-  tracked as needed for the future GUI checkout milestone below.
-
-## Release gates
-
-- Run native-only, Qt/model, HTTP, Debug and Release CI on supported targets;
-  add fuzz/property testing for malformed bundles, merge DAGs and failure
-  interleavings. No known critical integrity regression may remain open.
-- Define supported platforms/filesystems and explicitly freeze the pack,
-  sidecar and portable bundle compatibility policy before a stable release.
-  Older pack/bundle fixtures are negative rejection tests under BRANCH-1;
-  current-format native multi-project backup/restore protects new writes; see
-  [format compatibility](format-compatibility.md).
-- Publish a measurable resource envelope, backup/restore procedure, version
-  migration guide and operational troubleshooting guide. Validate field
-  deployment/upgrade on disposable representative datasets.
-- Specify and implement the cross-AOWIS security system before exposure to
-  untrusted networks; current plain HTTP does **not** enforce access rules.
-
-The P0 full-DAG graph reader is implemented in DVMDB. The next architectural
-work **is** a versioned identity/storage migration, specified below; do not
-treat it as a cosmetic graph/API change. Prefer reproducible evidence and
-direct changes to the existing native engine.
-
-## P-ID — UUIDv7 object identity and verified SHA-256 history (new prerequisite)
-
-**Current pre-release checkpoint:** New projects use UUIDv7. Branches use
-UUIDv7-named atomic `AOWIS-BRANCH-1` records, supporting stable renaming.
-All native and REST/CLI transfers now export `AOWSYNC3/4` with branch UUIDv7;
-old name-keyed repositories and `AOWSYNC1/2` imports are rejected outright,
-with no migration compatibility. Current-format native identity, recovery,
-replication, backup and corruption tests have been updated. The next storage
-milestone is revision UUIDv7 v2 and its verified UUID-to-SHA resolver.
-**Phase 2d native checkpoint:** UUIDv7 first-parent `historyV2` and
-all-parent `revisionGraphV2` are now available in Repository/ProjectService,
-with pinned branch UUID/name/HEAD snapshots and verified UUID/SHA ancestry.
-**REST, ordinary service routes, CLI and GUI have not switched**; bundle,
-verifier and compaction conversion is still pending. See
-[native history](native-revision-history.md).
-
-**Phase 2c-3a native checkpoint:** opt-in `ProjectService::createProjectV2`
-and native UUIDv7 model-indexed commit/read/fork APIs are implemented and
-covered by integration tests. The default `createProject()` and REST contracts
-remain SHA-based until the coordinated cutover. V2 merges, P0 graph reading,
-transfers, verification, and compaction are still pending. See the
-[v2 identity contract](uuidv7-identity-format-v2.md) for precise status.
-**Phase 2a implemented:** canonical `T/02` record encoding/decoding,
-SHA-256 integrity, parent UUID/hash graph verifier and frozen golden-vector
-regression tests. **Phase 2b implemented as isolated infrastructure:** a
-project-pinned UUIDv7→SHA resolver with fsynced/no-replace publication,
-full-ancestry verification, reopen/corruption/concurrency tests, and UUID-only
-filenames. **Not yet live:** resolver wiring into the actual repository object
-pack and commits, UUID-based HEAD publication, revision commits/merges,
-bundle/API/GUI cutover. Current live revisions remain
-SHA-keyed. No compatibility reader for obsolete pre-release repositories is
-planned; development data must be recreated at the cutover.
-Give every new first-class
-project, branch and revision a distinct UUIDv7 identity; use SHA-256 to verify
-the **complete canonical immutable revision record** and its transitive Merkle
-snapshot. Keep branch HEADs as references, not revision objects: new branch
-creation allocates a branch UUID but **does not** make a revision. Existing
-empty root SHA sharing is not cryptographic corruption; it reflects identical
-content, while current revisions lack a separate logical identity.
-
-This migration affects the native `S` revision record, SHA parent links,
-branch files, catalogue/project provenance, P0 graph API, `expectedHead`,
-replication bundles, native/HTTP clients, verifier, fixtures and the GUI.
-For this pre-release breaking change, **recreate** old SHA-based development
-repositories; do not add transparent read compatibility or generate
-independent replica-specific mappings. Do not rekey immutable Merkle data
-unnecessarily. The
-[UUIDv7 identity migration roadmap](uuidv7-identity-migration-roadmap.md)
-and [v2 identity contract](uuidv7-identity-format-v2.md) define the delivery
-phases, compatibility and rollback gates, and frozen record-byte examples. **Complete P-ID before introducing P1 checkout
-and save.** Routine P0 graphical rendering can still be tested against the
-existing backend while P-ID is designed.
-
-## UUIDv7 revision replication checkpoint (2026-10-27)
-
-Native full and pinned-base incremental revision transfers are implemented as
-`AOWREV21`/`AOWREV22`. The pack verification/import path uses disk-backed
-staging and UUIDv7/SHA ancestry validation; the remaining milestone is
-v2-aware HTTP/CLI transport and coordinated REST/GUI identity cutover.
-See [the native wire contract](uuidv7-revision-replication-v2.md).
-
-## Version-control and GUI integration priorities (agreed 2026-10-27)
-
-The core project/revision/branch/branch-HEAD semantics are now explicitly
-recorded in [version-control semantics](version-control-semantics.md). The
-revision **topology and branch-ref semantics** remain agreed; the separate
-UUIDv7 milestone changes how their identities are persisted and transported.
-A branch is a movable named revision ref, each branch has a HEAD, and the GUI
-shows histories reachable from **all** HEADs. A HEAD is not necessarily a
-leaf; the GUI's selected revision or eventual working-copy base is separate.
-No branch creation-event or branch-parent object is currently persisted.
-
-**P0 backend implemented: full-DAG graph discovery.** Native
-`Repository`/`ProjectService` and REST now provide a coherent snapshot of all
-branch HEADs and bounded, deduplicated all-parent revision enumeration,
-without changing storage format. See [native revision history](native-revision-history.md)
-and the [live OpenAPI route](dvmdb-http-api.yaml). The first implementation
-uses stateless DFS replay and has documented traversal limits; indexed scalable
-pagination is a later optimization. **P0 GUI reader integration is implemented** in the GUI project; end-to-end
-visual/Qt acceptance remains an independent release gate. The old `history` endpoint remains intentionally first-parent.
-See the [graph acceptance contract](version-control-semantics.md#5-current-read-surface-and-missing-full-graph-contract)
-and [GUI requirements](gui-integration-requirements.md).
-
-**Deferred by product decision: working-copy checkout and saving.** Network
-listing, revision-pinned checkout, dirty editor sessions and expected-HEAD
-commits follow both the graph integration milestone and **P-ID identity
-migration**. Project/branch rename-delete, richer
-metadata/annotations, reviews and tags are separate follow-on work, **not
-universal prerequisites** for a first trusted-development checkout/save
-workflow. The AOWIS-wide TLS/authentication/authorization design remains a
-hard prerequisite before untrusted network exposure; existing plain HTTP is
-not secured by the provisional native access policy.
-
-The remaining operational, durability and release qualification items above
-remain open; this prioritization does not cancel them. Planned endpoint names
-are **not** implemented HTTP API until code, tests and OpenAPI ship together.
-
-## Phase 2f transport checkpoint (2026-10-27)
-
-Explicit CLI UUIDv7 revision commands and the separate HTTP
-`revision-bundle` endpoint expose the native `AOWREV21` and `AOWREV22`
-protocols without reinterpreting the existing SHA-based branch-bundle
-operations. The HTTP transport uses the same bounded upload scratch files,
-streaming download providers and global staging reservation as existing bundle
-transfers. No incoming bundle filename comes from the user-controlled branch
-name. Native CLI tests cover full, incremental, replay and rejection cases;
-HTTP loopback tests require the Qt-enabled full build.
-
-**Not yet complete:** ordinary REST project creation and graph/history APIs
-remain SHA-facing, and network transport still has no authentication,
-resume support or bandwidth throttling. The next coherent milestone is the
-**default ProjectService/REST identity cutover** plus GUI adoption and complete
-HTTP qualification; do not retire the old route until all callers switch.
+A successful release must pass the scenario set in
+[version-control semantics](version-control-semantics.md#10-required-acceptance-scenarios):
+empty project, first commit, exact historical branching, two-editor conflict,
+safe reconciliation, true divergent commits, two-parent merge,
+identity/provenance survival across restart/replication, and GUI/native/REST
+parity. Functional UI tests must exercise the real data lifecycle, not only
+static graph layout.

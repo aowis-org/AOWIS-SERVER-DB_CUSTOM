@@ -56,6 +56,10 @@ void runRepository() {
     check(start.heads[0].branchId != start.heads[1].branchId &&
           start.heads[1].branchId != start.heads[2].branchId,
           "branch UUIDs were duplicated");
+    check(start.heads[0].originBranchId == start.heads[2].branchId &&
+          start.heads[1].originBranchId == start.heads[2].branchId &&
+          !start.heads[2].originBranchId,
+          "creation provenance does not point at main's branch UUID");
     check(start.revisions[0].id == first || start.revisions[0].id == feature ||
           start.revisions[0].id == merge, "unexpected first v2 graph node");
     // After first page, HEAD moves; the old cursor still represents the
@@ -123,6 +127,58 @@ void runRepository() {
           "v2 graph lost revisions after reopening");
 }
 
+void runBranchOriginsAndNames() {
+    Temporary temp;
+    const ProjectId project = ProjectId::generate();
+    const std::string unicodeLabel = "Feature Branch – Süd";
+    BranchId mainId = BranchId::generate();
+    BranchId featureId = BranchId::generate();
+    RevisionId featureRevision = RevisionId::generate();
+    {
+        Repository repository(temp.path / "repository");
+        const RevisionId root = repository.createBranchV2(project, "main");
+        mainId = *repository.branchId("main");
+        check(repository.createBranchV2(project, unicodeLabel, "main") == root,
+              "branch names with spaces and UTF-8 were rejected");
+        featureId = *repository.branchId(unicodeLabel);
+        check(repository.createBranchV2(project, "Feature Follow Up", unicodeLabel) == root,
+              "second-level branch creation failed");
+        (void)repository.commitV2(project, "main", {{key(10), Bytes{10}}}, root);
+        const RevisionGraphPageV2 initial = repository.revisionGraphV2(project, 1);
+        check(initial.heads.size() == 3 && initial.next.has_value(),
+              "branch ancestry fixture did not produce a pinned cursor");
+        check(initial.heads[0].originBranchId == mainId &&
+              initial.heads[1].originBranchId == featureId &&
+              !initial.heads[2].originBranchId,
+              "branch creation origins were not persisted in the first graph page");
+        check(repository.revisionGraphV2(project, 1, initial.next).heads[1].originBranchId == featureId,
+              "pinned pagination lost branch origin");
+        repository.renameBranchV2(project, unicodeLabel, "Renamed Feature Branch", root);
+        featureRevision = repository.commitV2(project, "Renamed Feature Branch",
+                                               {{key(11), Bytes{11}}}, root);
+        const RevisionGraphPageV2 changed = repository.revisionGraphV2(project, 100);
+        check(changed.heads[1].name == "Renamed Feature Branch" &&
+              changed.heads[1].branchId == featureId &&
+              changed.heads[1].originBranchId == mainId &&
+              changed.heads[0].originBranchId == featureId,
+              "rename or commit destroyed immutable branch creation provenance");
+        invalid([&] { repository.createBranchV2(project, " bad", "main"); },
+                StorageErrorKind::InvalidInput, "leading spaces accepted");
+        invalid([&] { repository.createBranchV2(project, "bad\nname", "main"); },
+                StorageErrorKind::InvalidInput, "embedded newline accepted");
+        invalid([&] { repository.createBranchV2(project, "bad/name", "main"); },
+                StorageErrorKind::InvalidInput, "unsafe route separators accepted");
+    }
+    {
+        Repository reopened(temp.path / "repository");
+        const RevisionGraphPageV2 persisted = reopened.revisionGraphV2(project, 100);
+        check(persisted.heads.size() == 3 && persisted.heads[0].originBranchId == featureId
+              && persisted.heads[1].originBranchId == mainId
+              && persisted.heads[1].revision == featureRevision,
+              "reopen lost branch provenance or renamed UTF-8 branch");
+    }
+}
+
 void runService() {
     Temporary tmp;
     ProjectService service(tmp.path);
@@ -147,6 +203,7 @@ void runService() {
 int main() {
     try {
         runRepository();
+        runBranchOriginsAndNames();
         runService();
         std::cout << "UUIDv7 first-parent history and pinned all-parent graph passed\n";
         return 0;

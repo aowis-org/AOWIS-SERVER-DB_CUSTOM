@@ -86,3 +86,17 @@ invalid. This is conservative retention, not a revision garbage collector.
 
 For the complete frozen bundle wire format and resource limits, see
 [UUIDv7 revision replication](uuidv7-revision-replication-v2.md).
+
+### Branch creation provenance and unborn branches
+
+Every full/incremental transfer preserves the UUIDv7 identity of a branch,
+its nullable committed HEAD, immutable `originBranchId` and exact
+`forkRevisionId` together with all committed revisions and SHA-256 integrity
+bindings. A branch whose HEAD is `null` has no committed revision objects.
+An imported branch must not acquire a guessed fork point or synthetic R0.
+
+Private user working copies are not part of committed revision replication;
+they require a distinct explicitly authorized draft backup/sync facility.
+Conflicting target HEAD updates are rejected unless an explicit validated
+fast-forward or merge policy applies. See
+[replication contract](uuidv7-revision-replication-v2.md).

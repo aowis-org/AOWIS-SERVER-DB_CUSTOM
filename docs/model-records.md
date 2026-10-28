@@ -1,25 +1,57 @@
-# Native model records and reference indexes
+# Model-record persistence, working copies and reference indexes
 
-The generic model-record layer stores a canonical model payload without interpreting domain-specific fields. It is used by the hydraulic persistence adapter and other potential AOWIS model domains.
+The generic model-record layer uses canonical `ModelCodec<T>` payloads and
+UUID-keyed references without interpreting every hydraulic-domain field.
+The authoritative commit/working-copy lifecycle is
+[version-control semantics](version-control-semantics.md).
 
-`ModelRecord` contains a nonzero numeric kind, a canonical payload and required referenced entity UUIDs; `ModelChange` pairs the record (or deletion) with a 16-byte UUID key. The model codec owns the payload bytes; the native store owns immutable storage, SHA-256 objects and revision publication.
+## Canonical entity records
 
-## Deterministic envelope
+A `ModelRecord` contains a nonzero kind, canonical payload and required
+referenced entity UUIDs. A `ModelChange` addresses a record (or deletion) by
+its stable UUID. `encodeModelRecord()` uses the canonical `AOMD` envelope,
+including version, kind, sorted/deduplicated required references and
+length-prefixed payload. The native store owns immutable object storage,
+SHA-256 hashing and revision publication.
 
-`encodeModelRecord()` uses the `AOMD` envelope: version byte, big-endian kind, sorted/deduplicated required references, and length-prefixed canonical payload. Canonical reference ordering avoids hash differences caused only by caller order. Numeric kind IDs are current native storage details, not a stable external REST entity enumeration.
+## Editing and publication
 
-## Atomic commits
+An editor changes a **private mutable working copy**, pinned to an immutable
+base revision UUID or explicit null for an unborn branch. The server
+prepares the candidate complete snapshot from its model changes. No write
+modifies an already committed revision.
 
-`Repository::commitModel(branch, changes, expectedHead)` validates that required references exist in the resulting snapshot, including entities created in the same batch, and rejects deletion of still-referenced entities. It verifies the expected branch head under the repository lock before publication. On success it atomically publishes both the primary UUID-to-model index and the reverse-reference UUID-to-referrers index in a new immutable revision.
+Before the user commits, validate every required reference in the resulting
+snapshot, including entities created in the same batch; reject deletion of
+still-referenced entities. Maintain the primary UUID-to-model index and
+reverse-reference UUID-to-referrers index consistently.
 
-`Repository::getModel()`, `getModelAtRevision()`, `referencingModel()` and `referencingModelAtRevision()` provide direct and historical reads. Generic `Repository::commit()` is a lower-level raw-object operation and must not modify populated model-indexed branches.
+The commit request must specify target branch UUIDv7, exact
+`expectedHeadRevisionId` (including explicit null for first commit) and a
+working-copy/idempotency identity. The repository compares the expected
+HEAD under its publication lock, durably stores immutable candidate objects
+and a new UUIDv7 revision record with canonical SHA-256 integrity, and
+atomically publishes the new branch HEAD only if the pin is still current.
+Stale commits are rejected without losing the private edits.
 
-## Scope of validation
+## Historical reads and imported data
 
-Normal model commits enforce **UUID existence and reference-index integrity**. Portable model-bundle imports recompute all incoming edges from the canonical model records at each reachable historical revision, verify targets exist, and require an exact match with the separately stored reverse index. These validations run before any imported object is written. An on-disk physical and logical checker **is implemented** as `aowis-dvmdb-verify`; its default full mode traverses published branch histories, checks all reachable model-indexed revisions and verifies reverse-reference consistency. See [repository verification](repository-verification.md). Generic reference validation does not know whether a reference points to the correct type of hydraulic node or whether a demand-point assignment matches a pipe endpoint. Use `aowis::dvmdb::hydraulic` for real hydraulic network editing, validation and merging. Domain-specific relationships and network membership are described in [hydraulic persistence](native-hydraulic-network.md).
+Read APIs resolving more than one entity pin a single immutable revision.
+Explicit historical reads use a committed revision UUIDv7 and never follow
+moving branch HEADs. Reference-index queries return the incoming UUIDs
+corresponding to the same pinned state.
 
-## Synthetic performance tool
+Portable imports recalculate incoming references from canonical model
+records and check the reverse index exactly before publication. Malformed,
+missing, extra or dangling references fail verification. A full storage
+verifier checks immutable Merkle closure, ancestry and reference indexes;
+application-specific hydraulic semantics require the domain adapter.
+See [hydraulic persistence](native-hydraulic-network.md) and
+[repository verification](repository-verification.md).
 
-`aowis-dvmdb-model-benchmark` uses synthetic hydraulic-shaped payloads to isolate model-envelope, reference-index and Merkle costs. It does **not** exercise full ModelCodec or complete hydraulic validation. For real typed junction/pipe data use `aowis-dvmdb-hydraulic-model-benchmark`; for network-wide editing use `aowis-dvmdb-hydraulic-edit-benchmark`.
+## Validation boundaries
 
-The native record format is not yet frozen for a public release.
+Reference existence does **not** prove a hydraulic topology is valid. All
+complete-model semantic constraints must be verified before the commit or
+merge becomes visible. Indexing and immutable-subtree reuse may optimize
+preparation without weakening that requirement.

@@ -1,3 +1,4 @@
+#include "branch_name_validation.h"
 #include "aowis/dvmdb/native_store.h"
 #include "aowis/dvmdb/revision_resolver_v2.h"
 #include "aowis/dvmdb/revision_record_v2.h"
@@ -1057,13 +1058,8 @@ std::filesystem::path packPath(const std::filesystem::path& directory,
 }
 
 void checkBranch(std::string_view name) {
-    require(Err::InvalidInput, !name.empty() && name.size() <= 96, "branch name must contain 1..96 characters");
-    for (char character : name) {
-        require(Err::InvalidInput, (character >= 'a' && character <= 'z') ||
-                (character >= 'A' && character <= 'Z') ||
-                (character >= '0' && character <= '9') ||
-                character == '-' || character == '_', "invalid branch name");
-    }
+    require(Err::InvalidInput, detail::validBranchLabel(name),
+            "invalid branch name");
 }
 
 int nibbleHex(char character) {
@@ -1080,6 +1076,7 @@ struct StoredBranch {
     std::string name;
     Hash head{}; // SHA HEAD for BRANCH-1, integrity digest for BRANCH-2
     std::optional<RevisionId> revisionV2;
+    std::optional<BranchId> originBranchId; // Immutable creation provenance, not a revision parent.
 };
 
 std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& repository) {
@@ -1103,7 +1100,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         try {
             struct stat st{};
             systemCall(::fstat(fd, &st) == 0, "stat UUID branch record");
-            require(Err::Corruption, S_ISREG(st.st_mode) && st.st_size >= 82 && st.st_size <= 240,
+            require(Err::Corruption, S_ISREG(st.st_mode) && st.st_size >= 82 && st.st_size <= 320,
                     "invalid UUID branch record file type or length");
             bytes.resize(static_cast<std::size_t>(st.st_size));
             std::size_t offset = 0;
@@ -1118,10 +1115,13 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         } catch (...) { ::close(fd); throw; }
         constexpr std::string_view prefixV1 = "AOWIS-BRANCH-1\n";
         constexpr std::string_view prefixV2 = "AOWIS-BRANCH-2\n";
-        const bool revisionV2 = bytes.starts_with(prefixV2);
+        constexpr std::string_view prefixV3 = "AOWIS-BRANCH-3\n";
+        const bool originV3 = bytes.starts_with(prefixV3);
+        const bool revisionV2 = originV3 || bytes.starts_with(prefixV2);
         require(Err::Corruption, revisionV2 || bytes.starts_with(prefixV1),
                 "invalid UUID branch record marker");
-        const std::size_t prefixSize = revisionV2 ? prefixV2.size() : prefixV1.size();
+        const std::size_t prefixSize = originV3 ? prefixV3.size()
+            : revisionV2 ? prefixV2.size() : prefixV1.size();
         const std::size_t split = bytes.find('\n', prefixSize);
         require(Err::Corruption, split != std::string::npos, "invalid UUID branch record name");
         const std::string name = bytes.substr(prefixSize, split - prefixSize);
@@ -1138,6 +1138,19 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
                     "noncanonical UUIDv7 branch HEAD");
             hashOffset = uuidEnd + 1;
         }
+        std::optional<BranchId> origin;
+        if (originV3) {
+            const std::size_t originEnd = bytes.find('\n', hashOffset);
+            require(Err::Corruption, originEnd != std::string::npos,
+                    "missing creation origin in UUID branch record");
+            const std::string_view text(bytes.data() + hashOffset, originEnd - hashOffset);
+            if (text != "-") {
+                origin = BranchId::parse(text);
+                require(Err::Corruption, origin && text == origin->toString() && *origin != *parsed,
+                        "invalid or self-referential creation origin");
+            }
+            hashOffset = originEnd + 1;
+        }
         require(Err::Corruption, bytes.size() == hashOffset + 65 && bytes.back() == '\n',
                 "invalid UUID branch record HEAD");
         Hash head{};
@@ -1145,7 +1158,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         catch (const StorageError&) { throw StorageError(Err::Corruption, "invalid UUID branch HEAD hash"); }
         require(Err::Corruption, !isZero(head) && names.insert(name).second,
                 "zero HEAD or duplicate branch name");
-        result.push_back(StoredBranch{*parsed, name, head, revisionId});
+        result.push_back(StoredBranch{*parsed, name, head, revisionId, origin});
     }
     std::sort(result.begin(), result.end(), [](const StoredBranch& a, const StoredBranch& b) {
         return a.name < b.name;
@@ -1170,9 +1183,15 @@ void publishStoredBranch(const std::filesystem::path& repository,
                          const StoredBranch& branch, bool create) {
     const std::filesystem::path heads = repository / "refs" / "heads";
     const std::filesystem::path destination = heads / branch.id.toString();
+    // Keep the historical BRANCH-2 encoding for branches without creation
+    // provenance. Newly forked branches use BRANCH-3 and preserve it forever.
     const std::string payload = branch.revisionV2
-        ? std::string("AOWIS-BRANCH-2\n") + branch.name + "\n" +
-            branch.revisionV2->toString() + "\n" + toHex(branch.head) + "\n"
+        ? (branch.originBranchId
+            ? std::string("AOWIS-BRANCH-3\n") + branch.name + "\n" +
+                branch.revisionV2->toString() + "\n" +
+                branch.originBranchId->toString() + "\n" + toHex(branch.head) + "\n"
+            : std::string("AOWIS-BRANCH-2\n") + branch.name + "\n" +
+                branch.revisionV2->toString() + "\n" + toHex(branch.head) + "\n")
         : std::string("AOWIS-BRANCH-1\n") + branch.name + "\n" +
             toHex(branch.head) + "\n";
     const BranchId stagingId = BranchId::generate();
@@ -2893,7 +2912,8 @@ RevisionId Repository::createBranchAtRevisionV2(const ProjectId& project,
     require(Err::InvalidInput, selectedHash.has_value(),
             "revision is not reachable from source branch");
     publishStoredBranch(this->directory_, StoredBranch{BranchId::generate(),
-            std::string(name), *selectedHash, revision}, true);
+            std::string(name), *selectedHash, revision,
+            findStoredBranch(this->directory_, sourceBranch)->id}, true);
     return revision;
 }
 
@@ -3012,7 +3032,7 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
         require(Err::Internal, stored && stored->revisionV2 == result.targetBefore,
                 "v2 target branch disappeared before fast forward");
         publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
-                hashRevisionRecordV2(sourceHead), sourceHead.id}, false);
+                hashRevisionRecordV2(sourceHead), sourceHead.id, stored->originBranchId}, false);
         result.status = MergeStatus::FastForward;
         result.resultHead = sourceHead.id;
         return result;
@@ -3362,7 +3382,8 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
     require(Err::Internal, stored && stored->revisionV2 == result.targetBefore,
             "v2 target branch disappeared before merge publication");
     publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
-                                                        saved->recordHash, merged}, false);
+                                                        saved->recordHash, merged,
+                                                        stored->originBranchId}, false);
     result.status = MergeStatus::Merged;
     result.resultHead = merged;
     return result;
@@ -3543,7 +3564,8 @@ RevisionGraphPageV2 Repository::revisionGraphV2(
         for (const StoredBranch& branch : readStoredBranches(this->directory_)) {
             require(Err::Unavailable, branch.revisionV2.has_value(),
                     "v2 graph requires UUIDv7 revision HEADs");
-            page.heads.push_back({branch.id, branch.name, *branch.revisionV2, branch.head});
+            page.heads.push_back({branch.id, branch.name, *branch.revisionV2,
+                                  branch.head, branch.originBranchId});
             require(Err::LimitExceeded, page.heads.size() <= maxBranches,
                     "v2 graph exceeds branch snapshot limit");
         }
@@ -3610,7 +3632,7 @@ void Repository::renameBranchV2(const ProjectId& project, std::string_view previ
     const std::optional<StoredBranch> existing = findStoredBranch(this->directory_, previous);
     require(Err::Internal, existing && existing->revisionV2, "v2 branch disappeared");
     publishStoredBranch(this->directory_, StoredBranch{existing->id, std::string(renamed),
-                                 existing->head, existing->revisionV2}, false);
+                                 existing->head, existing->revisionV2, existing->originBranchId}, false);
 }
 
 RevisionId Repository::createBranchV2(const ProjectId& project, std::string_view name,
@@ -3643,7 +3665,10 @@ RevisionId Repository::createBranchV2(const ProjectId& project, std::string_view
         checksum = root->recordHash;
     }
     publishStoredBranch(this->directory_, StoredBranch{BranchId::generate(), std::string(name),
-                                                        checksum, id}, true);
+                                                        checksum, id,
+                                                        from ? std::optional<BranchId>(
+                                                            findStoredBranch(this->directory_, *from)->id)
+                                                             : std::nullopt}, true);
     return id;
 }
 
@@ -4352,7 +4377,7 @@ RevisionId Repository::commitV2(const ProjectId& project, std::string_view branc
     require(Err::Internal, stored && stored->revisionV2 == std::optional<RevisionId>(previous.id),
             "branch changed during v2 commit");
     publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
-                            updated->recordHash, newId}, false);
+                            updated->recordHash, newId, stored->originBranchId}, false);
     return newId;
 }
 
@@ -4398,7 +4423,8 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
             branchRecord->revisionV2 == std::optional<RevisionId>(previous.id),
             "model branch HEAD changed during commit");
     publishStoredBranch(this->directory_, StoredBranch{
-        branchRecord->id, branchRecord->name, saved->recordHash, revisionId}, false);
+        branchRecord->id, branchRecord->name, saved->recordHash, revisionId,
+        branchRecord->originBranchId}, false);
     return revisionId;
 }
 
@@ -5476,7 +5502,9 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
         }
     }
     publishStoredBranch(this->directory_, StoredBranch{*branchId, std::string(localBranch),
-                                                        tipHash, *incoming}, !existing);
+                                                        tipHash, *incoming,
+                                                        existing ? findStoredBranch(this->directory_, localBranch)->originBranchId
+                                                                 : std::nullopt}, !existing);
     return RevisionBundleImportV2{status, *incoming, imported};
 }
 

@@ -212,7 +212,9 @@ paths:
       description: |
         Native v2 graph semantics: union of all branch HEAD ancestry, both merge
         parents and deduplicated revisions. HEADs include branch UUIDv7,
-        branch name, revision UUIDv7 and record SHA-256. Revisions contain id,
+        branch name, revision UUIDv7 and record SHA-256. HEADs additionally
+        include `originBranchId` (UUIDv7 or null), an immutable creation-source
+        branch reference that is distinct from revision ancestry. Revisions contain id,
         recordHash, snapshot roots, modelIndexed, parents (revision UUID array),
         and parentRecordHashes (corresponding SHA-256 array).
         HEAD snapshots are pinned into authenticated cursors across refreshes.

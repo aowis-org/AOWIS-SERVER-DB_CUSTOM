@@ -4,31 +4,37 @@
 
 **AOWIS's native C++ database engine for versioned engineering models.** It stores canonical AOWIS model data in immutable, content-addressed objects, supports branches and merges, and can exchange complete or incremental repository histories between independent installations. It is AOWIS's native database backend and is usable directly as a C++ library.
 
-This repository contains the **native storage engine**, canonical hydraulic-model persistence, revision and merge APIs, portable synchronization, and a standalone access-policy library. The `aowis-server-dvmdb` service provides **REST over HTTP/TCP** and manages multiple projects with a durable on-disk catalogue. See [service design](docs/rest-api-design.md) and [implementation roadmap](docs/roadmap.md). The [UUIDv7 identity migration](docs/uuidv7-identity-migration-roadmap.md)
-now includes the [frozen v2 record contract](docs/uuidv7-identity-format-v2.md)
-and its first implementation slice: **new projects receive UUIDv7 IDs**;
-legacy UUIDv4 projects remain readable. Revisions and branch HEADs still use
-SHA-256 revision addresses until the later storage/replication migration.
+This repository contains the native storage engine, canonical hydraulic-model
+persistence, immutable revision history, private working-copy and optimistic
+concurrency contracts, replication, and the multi-project HTTP service.
 
-> **Service status:** The multi-project HTTP server implements project/branch/history, revision diffs, canonical hydraulic reads/writes, atomic entity edits and validated merges. Bounded binary full/incremental HTTP bundle synchronization is available. Bundle downloads and uploads stream through project scratch files. Projects are served concurrently. Preview-only merges remain future work. HTTP currently has no authentication, authorization or TLS; restrict it to controlled development networks.
+## Version-control model
 
-## GUI integration status
+The authoritative design is
+[**AOWIS / DVMDB version-control contract**](docs/version-control-semantics.md).
 
-The server exposes complete paginated all-parent revision history to both
-native and REST clients. Recent GUI builds integrate that P0 graph reader;
-older GUI versions may still use first-parent history. The GUI can discover
-projects and branches, create projects/branches, and aggregate several
-checked databases. A separate standalone build can use DVMDB directly as a
-C++ library. **The GUI does not yet check out hydraulic networks or save
-network revisions**, even though some underlying DVMDB read/write APIs exist.
+- Every project, branch, committed revision and private working copy has
+  its own UUIDv7 identity. SHA-256 verifies immutable records and the full
+  Merkle-backed model state rather than serving as revision identity.
+- A new project starts with **unborn `main`** and **no committed revision**.
+- A branch is a named development line with a **movable committed HEAD**;
+  its origin branch and exact immutable fork revision are retained.
+- Editors use **independent private working copies**. A successful commit
+  creates a new immutable revision and moves the chosen branch HEAD only
+  if the submitted expected HEAD still matches.
+- A stale concurrent commit is rejected and the editor's draft is preserved
+  for explicit comparison/reconciliation. Creating a branch from a committed
+  revision never manufactures another revision.
+- The GUI shows branch-oriented committed revision histories, not a tree
+  of branch-creation events. Working copies are separate editor state.
 
-Project/branch rename/delete, network enumeration, editable annotations,
-authentication and release-tag workflows remain unimplemented contracts.
-The next identity migration must be implemented across both GUI readers,
-not merely as a displayed UUID field. See the [GUI contract and remaining gaps](docs/gui-integration-requirements.md) and the GUI's
-`docs/dvmdb-integration-roadmap.md`. The
-[OpenAPI definition](docs/dvmdb-http-api.yaml) describes implemented server
-routes, not proposed GUI capabilities.
+Implementation must conform in **native storage, REST, replication, and GUI**.
+The normative documents specify required behavior; the existence of a
+particular API or GUI control must be verified against its implemented code.
+See [GUI integration requirements](docs/gui-integration-requirements.md),
+[REST contract](docs/rest-api-design.md),
+[revision format](docs/uuidv7-identity-format-v2.md) and
+[engineering plan](docs/roadmap.md).
 
 ## System overview
 
@@ -139,7 +145,7 @@ Existing clients must change their URLs and C++ API references accordingly.
 **Storage is still AOWIS storage.** The immutable object bytes, model type
 identifiers, pack/index markers, project manifests and replication bundle
 framing remain in their original AOWIS formats. Renaming these would change
-content-derived revision IDs and corrupt access to existing AOWIS histories;
+canonical content hashes and corrupt access to existing AOWIS histories;
 they are not `DB_CUSTOM` branding. The DVMDB rename is an API and deployment
 migration, not an on-disk rewrite.
 

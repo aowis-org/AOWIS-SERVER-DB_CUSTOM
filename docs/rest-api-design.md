@@ -1,101 +1,62 @@
-# AOWIS database REST API — design and implemented interface
+# DVMDB REST API design contract
 
-**Status:** Project/catalogue, branch, head, history, immutable revisions, revision diffs, canonical hydraulic network reads/writes, indexed entity reads/edits and semantic merges are implemented in the `aowis-server-dvmdb` executable (when the model codec is enabled). The machine-readable [OpenAPI contract](dvmdb-http-api.yaml) describes these routes. Hydraulic preview-only merging, network enumeration and end-to-end zero-staging streaming bundles remain planned; bounded file-staged, chunk-transferred full/incremental bundles are implemented.
+The HTTP service is a transport for the same project/history semantics as
+the embedded native API. See
+[version-control semantics](version-control-semantics.md),
+[branch records](uuidv7-branch-ref-format.md) and
+[revision integrity](uuidv7-identity-format-v2.md).
 
-## Goals and deployment
+## Identity and representation
 
-- One `aowis-server-dvmdb` process serves **multiple independent AOWIS projects**. A project has a stable UUID, descriptive metadata and one native repository with its own branch/revision history.
-- Expose **RESTful HTTP over TCP**, with a configurable listen address and port. Use the vendored, pinned **cpp-httplib** (decision 2026-10-23: QHttpServer cannot bound requests before Qt 6.11 and buffers whole bodies) and the existing Qt/C++ model types internally. Do not develop another HTTP parser.
-- **HTTP only, no TLS/HTTPS in this implementation.** Authentication, authorization, sessions, keys and identities are intentionally **not implemented or enforced** in the initial REST service. These will be defined by a future AOWIS-wide security system, not separately for database storage.
-- The native database and hydraulic APIs remain usable directly as libraries by AOWIS standalone and in-process services. REST is an adapter, not a second storage implementation.
-- Keep a clear service boundary between request parsing, project lookup, native storage operations, domain validation and response encoding.
+Project, branch, committed revision and private working-copy resource IDs
+are UUIDv7. Human names are UTF-8 metadata; hashes are SHA-256 integrity
+fields. REST must not use branch names as permanent IDs or hashes as
+revision IDs. Branch responses include `headRevisionId` (nullable),
+`originBranchId` and `forkRevisionId`. Commit responses include immutable
+revision UUID, parent UUIDs, record hash and committed snapshot identity.
 
-**Operational consequence:** the initial REST server is unauthenticated and unencrypted. Any client able to reach its configured listener can call its exposed operations. Deploy only on deliberately trusted/development networks and avoid sensitive content. Choosing a configurable public bind address is a feature, not a security guarantee.
+## Operations
 
-## Pending revision identity contract upgrade
+- List/create projects. New project creates an unborn `main` branch and
+  zero committed revisions.
+- List/get branches, creation provenance and committed HEADs, including
+  explicit null HEADs.
+- Create branch from a finalized revision with exact source branch/fork
+  UUIDs. Creation itself must not create a revision.
+- Read immutable revisions, snapshots, diffs and a pinned paginated full
+  project history including both parents of merge revisions.
+- Create/open a private working copy for a user/session, pinned to a
+  committed base UUID or explicit null for the unborn initial state.
+- Edit/validate that private working state without changing a committed HEAD.
+- Commit with target branch UUID, exact `expectedHeadRevisionId` (nullable
+  but **required**), canonical model delta/state and an idempotency key.
+- Compare/reconcile stale working copies; merge branches using explicit
+  expected source and target heads.
 
-The current HTTP endpoints use SHA-256 revision hashes as public identities,
-branch names as ref identifiers, and UUIDv7 IDs for **new** projects
-(legacy UUIDv4 project IDs remain readable). The full target uses UUIDv7
-project/branch/revision IDs with separate SHA-256 integrity
-fields. The [UUIDv7 migration roadmap](uuidv7-identity-migration-roadmap.md)
-requires new versioned API contracts and backwards-compatibility decisions;
-**none of these wire changes is implemented or part of the live OpenAPI yet**.
+## Errors and concurrency
 
-## Version-control semantics for REST clients
+A concurrent advance of the target branch returns **409 Conflict** with
+current committed HEAD details. The draft stays intact; no implicit retry,
+rebase or overwrite occurs. Validation failures, missing identities,
+permission failures, unavailable source state and ambiguous transport
+failures have distinct machine-readable outcomes. An omitted expected
+HEAD field is an invalid request, not a synonym for a first commit with
+expected null. A timed-out commit must be safely queryable by operation ID
+or idempotency key before retry.
 
-The canonical [revision/branch/HEAD contract](version-control-semantics.md)
-applies identically to the native and HTTP adapters. There is no server-wide
-checkout HEAD: each branch name identifies its current tip revision; multiple
-branches can share a tip, and an individual tip can have descendants on other
-branches. `history` is currently **first-parent only**, while an immutable
-revision response carries both merge parents. Neither branch labels nor
-GUI-side server cards are additional revision-DAG objects.
+The server validates canonical UUIDs, hashes, complete model references,
+all ancestry edges and branch fork metadata before durable ref publication.
+Native and REST publish equivalent outcomes and verification fields.
 
-**Implemented full-DAG read:** `GET /dvmdb/v1/projects/{projectId}/revision-graph`
-returns a coherent branch-name → HEAD snapshot and pages of all revisions
-reachable through either parent, deduplicated per project. A signed,
-project-scoped cursor pins the HEAD snapshot across calls even if branches
-advance. `complete` and `nextCursor` mark partial pages explicitly. Traversal
-order is deterministic DFS, not chronological order; use parent IDs to lay
-out the GUI graph. The existing first-parent `history` remains unchanged.
-See the [OpenAPI contract](dvmdb-http-api.yaml) for the limits and cursor
-behavior. **The current GUI still consumes first-parent history**; upgrading
-its native and REST readers is the next integration step.
+## Replication and security
 
-## Implemented and planned routes
+Full/incremental transfers preserve UUIDv7 identity, nullable HEADs,
+immutable branch provenance, parent bindings and SHA-256 hashes. Private
+uncommitted working copies are not automatically exported as history.
+Authentication/authorization must restrict draft access by owner/session
+and protect commit/branch mutations; transport security is separate from
+revision integrity. Neither UUIDv7 nor SHA-256 is a permission mechanism.
 
-The table lists implemented routes plus one explicitly marked proposed network-enumeration route. The machine-readable OpenAPI specification documents actual operations. The `/dvmdb/v1` prefix versions the HTTP interface, **not the model serialization format**.
-
-| Operation | Method and route |
-|---|---|
-| Service health and readiness | `GET /dvmdb/v1/health`, `GET /dvmdb/v1/ready` |
-| List projects | `GET /dvmdb/v1/projects` |
-| Create project | `POST /dvmdb/v1/projects` |
-| Read project details | `GET /dvmdb/v1/projects/{projectId}` |
-| List project branches | `GET /dvmdb/v1/projects/{projectId}/branches` |
-| Create/fork branch | `POST /dvmdb/v1/projects/{projectId}/branches` |
-| Read branch head | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/head` |
-| Browse complete project revision graph | `GET /dvmdb/v1/projects/{projectId}/revision-graph?limit=&cursor=` |
-| Browse branch history | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/history` |
-| Inspect immutable revision | `GET /dvmdb/v1/projects/{projectId}/revisions/{revisionHash}` |
-| Compare revisions | `GET /dvmdb/v1/projects/{projectId}/diff?from={hash}&to={hash}` (implemented) |
-| List hydraulic networks | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks` (planned) |
-| Read network | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}` (implemented) |
-| List a network's entities | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities?type=9` (implemented, ordinal type) |
-| Read one entity | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/entities/{entityId}` (implemented) |
-| Edit entities atomically | `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/networks/{networkId}/edits` (implemented) |
-| Perform merge | `POST /dvmdb/v1/projects/{projectId}/merges` (implemented; conflicts returned without publication) |
-| Export branch bundle | `GET /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` |
-| Import branch bundle | `POST /dvmdb/v1/projects/{projectId}/branches/{branch}/bundle` |
-
-An implemented incremental export supplies a known base revision as a `base` query parameter; the native exporter verifies it is an ancestor of the requested branch head. We should avoid shipping full bundles where a correct delta is possible. The project ID is a UUID from the server catalogue, **never a client-provided filesystem path**.
-
-## Response and request principles
-
-- **JSON** for project metadata, branch/head/history, small model edits, merge options, diagnostics and error envelopes. **Bounded file-staged, chunk-transferred binary bundles** for synchronization; true streaming remains future work. The current HTTP model API uses canonical ModelCodec bytes encoded as `payloadBase64` in JSON; this is a deliberately simple initial format, not streaming, and is limited to 8 MiB per mutation request.
-- Use appropriate HTTP status codes (`400` malformed input, `404` unknown resource, `409` revision conflict or divergence, `413` size limit, `422` semantic validation failure where appropriate, `5xx` internal/server errors). Provide stable machine-readable error codes and useful human-readable descriptions.
-- Pagination and limits for large collections/history. Use immutable revision IDs for reproducible historical reads, with explicit semantics when a branch moves.
-- **Revision-mutating** network saves/edits and merges use the implemented expected-head / pinned-revision contract to guard publication under the repository lock. Creation of a *new* project or independent branch instead follows the documented create/uniqueness rules and does not require an existing branch HEAD. Future mutable metadata writes will need their own concurrency tokens. Never silently retry a stale revision save against a different model.
-- One HTTP edit request maps to **one atomic native model commit**, not multiple independent partial commits. Domain validation stays in the model/storage layer.
-- Merges report conflict information and support explicit field/record choices using the existing native hydraulic merge APIs. Candidate merged networks must undergo semantic validation before publishing divergent merges.
-- Synchronization import must verify object hashes, complete Merkle/revision graphs and branch fast-forward semantics before publishing. Never overwrite a divergent branch automatically. Fetch to a separate tracking branch and merge explicitly when required.
-- Return canonical model/entity identifiers consistently; do not confuse `NetworkHydraulic`, project UUIDs, revision hashes or serializer format versions.
-
-## Repository and server lifecycle
-
-- Persist a server-side **project catalogue** mapping UUIDs to administrator-controlled repository directories. The project catalogue uses durable UUID-named directories with atomic project publication and tested restart recovery.
-- The implemented service manages repository handles per project, bounds concurrent operations per project, performs graceful shutdown and requires offline maintenance. Never promise online compaction before it is implemented.
-- Use configuration for bind address, port, project data root and logging; align with other AOWIS servers' conventions rather than invent per-request filesystem routing.
-- Maintain the [OpenAPI specification](dvmdb-http-api.yaml) alongside implemented endpoints and test them over real local TCP.
-- Keep a storage-agnostic native C++ façade so embedding the database in the AOWIS standalone build does not require TCP/HTTP.
-
-## Deferred security
-
-The initial REST service intentionally has **no authentication, authorization enforcement, TLS or HTTPS**. This is an explicit development-stage constraint, **not** an assertion that plain HTTP is secure. The separately persisted provisional `access-policy.bin` format is not the future REST identity system. Do not transport or trust user UUIDs, credential headers or proxy-auth claims as if a secure boundary already existed.
-
-An AOWIS-wide security design will later specify identity/session lifecycle, trust across the GUI and all AOWIS services, project and branch permissions, service-to-service access, TLS/reverse proxies, and audit requirements. Only then should the REST service enforce those decisions.
-
-## Remaining interface work
-
-The implemented surface is specified in [OpenAPI](dvmdb-http-api.yaml) and exercised by HTTP integration tests. Preview-only merges, network enumeration and optional deeper transfer streaming are possible extensions, not promised existing endpoints. Remaining release qualification is tracked in the [roadmap](roadmap.md).
+The machine-readable OpenAPI file must be kept synchronized with this
+contract when implementing the corresponding endpoints; never claim an
+unimplemented route exists solely because it is specified here.

@@ -1,3 +1,4 @@
+#include "branch_name_validation.h"
 #include "aowis/dvmdb/access_policy.h"
 
 #include <algorithm>
@@ -238,12 +239,15 @@ private:
 
 bool validBranch(std::string_view branch) {
     if (branch == "*") return true;
+    // Exact ACL scopes use the same human-readable names as branch records.
+    // Retain the historical hierarchical scope syntax below.
+    if (detail::validBranchLabel(branch)) return true;
     if (branch.empty() || branch.size() > 255 || branch == "." || branch == "..") return false;
     for (char character : branch) {
         const bool ok = (character >= 'a' && character <= 'z') ||
             (character >= 'A' && character <= 'Z') ||
             (character >= '0' && character <= '9') || character == '_' ||
-            character == '-' || character == '.' || character == '/';
+            character == '-' || character == '.' || character == '/' || character == ' ';
         if (!ok) return false;
     }
     return branch.front() != '/' && branch.back() != '/' &&

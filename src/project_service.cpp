@@ -1,3 +1,4 @@
+#include "branch_name_validation.h"
 #include "aowis/dvmdb/project_service.h"
 #include "aowis/dvmdb/object_id.h"
 #include "aowis/dvmdb/revision_record_v2.h"
@@ -185,12 +186,7 @@ bool ProjectService::validProjectId(std::string_view id) {
 }
 
 bool ProjectService::validBranchName(std::string_view name) {
-    if (name.empty() || name.size() > 96) return false;
-    for (char ch : name) {
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-              (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')) return false;
-    }
-    return true;
+    return detail::validBranchLabel(name);
 }
 
 ProjectService::Project::Project(ProjectInfo value) : info(std::move(value)) {}

@@ -1,44 +1,44 @@
-# Native three-way branch merging
+# Branch merging and reconciliation
 
-`Repository::mergeBranches(target, source, options)` merges two named branches using their immutable revision ancestry and the UUID-keyed Merkle state. It is the **generic storage-level** merge, independent of hydraulic model semantics.
+Merge behavior follows [version-control semantics](version-control-semantics.md).
+It operates on immutable **committed** revision snapshots, not on the
+uncommitted changes of arbitrary editor sessions.
 
-## Results
+## Required inputs
 
-- `MergeStatus::UpToDate`: source already incorporated; no branch change.
-- `MergeStatus::FastForward`: target is an ancestor of source; target head moves to source revision without creating a new revision.
-- `MergeStatus::Merged`: divergent compatible changes produce one new two-parent revision (`previous target head`, `source head`), preserving both histories.
-- `MergeStatus::Conflicts`: conflicting UUID updates/deletions are returned with hashes and reasons; no branch head is moved.
+A merge specifies project UUIDv7, target branch UUIDv7, source branch UUIDv7,
+**expected target HEAD** and **expected source HEAD**, both potentially null
+only where the particular operation explicitly permits an unborn branch.
+The merge engine validates revision ownership and complete two-parent ancestry.
 
-Both parents are traversed to determine ancestry. When there are multiple independent lowest common ancestors (criss-cross histories), deterministic in-memory recursive virtual merge bases are constructed; genuine conflicts in the virtual base are reported, not guessed. The virtual bases are not written as repository revisions. When `MergeOptions::validate` is provided, a model-indexed fast-forward candidate is validated before publishing the source tip as the target. A rejected validation returns `Conflicts` without writing or advancing either branch; a non-model-indexed fast-forward cannot satisfy a model validator. `UpToDate` does not invoke the validator because it does not publish a new snapshot. Optimistic head pins and unused-selection checks still apply in all cases.
+## Outcomes
 
-## Generic merge rules
+| Outcome | Semantics |
+|---|---|
+| Up to date | Source already incorporated; do not publish or move a ref |
+| Fast-forward | Target can advance to an existing committed descendant after pinned-head and domain validation |
+| Merged | Divergent compatible histories yield **one** new UUIDv7 immutable revision with ordered `(target, source)` parents |
+| Stale | One or both expected HEADs changed; reject without modifying either ref |
+| Conflict | Unresolvable record or hydraulic-domain conflict; preserve both branches and all private working copies |
 
-Changes to different UUIDs merge automatically, as do identical final changes to one UUID. Distinct changes to the same UUID conflict by default. Model-indexed merges also verify required UUID references in the complete proposed result and publish a matching reverse-reference index atomically. An optional `MergeOptions` callback can reconcile or explicitly select records; callbacks must obey the documented locking and purity requirements.
+A successful merge updates only the **target** branch's committed HEAD;
+the source remains unchanged. The merge base comes from actual revision
+ancestry, not branch creation provenance or UUIDv7 time order. Recursive
+virtual merge bases may be computed without creating published revisions.
 
-The source branch remains unchanged. If a divergent merge succeeds, publication flushes objects before atomically moving the target ref. Raw and model-indexed histories cannot be mixed indiscriminately.
+## Hydraulic-domain safety
 
-## Domain-specific safety
+Distinct record-UUID edits are not automatically a safe hydraulic merge.
+Validate entity kinds, reference closure, membership order, connectivity and
+all application model invariants on the **whole proposed merged snapshot**.
+Overlapping changes require explicit conflict resolution. No last-writer-wins
+fallback or silent force-overwrite is permissible.
 
-Generic reference existence is **not** sufficient for hydraulic integrity. A pipe might refer to an existing UUID of the wrong kind, or a demand-point attachment may violate endpoint constraints. Use `aowis::dvmdb::hydraulic::mergeHydraulicBranches()` for hydraulic networks. That API can reconcile fields and coordinated membership, and validates the complete resulting network before publication. See [hydraulic merging](native-hydraulic-merging.md).
+An editor with a private working copy may reconcile it against the newly
+committed target HEAD; this does not by itself publish a new revision. The
+user must explicitly commit the reconciled model under a fresh expected-HEAD
+check. A timeout or ambiguous response requires authoritative verification
+before retrying.
 
-## Boundaries
-
-No implicit overwrite policy resolves conflicts. Complex semantic conflicts, incompatible membership order and arbitrary multi-object topology may still require explicit review; recursive ancestry does not silently resolve conflicting edits. The implemented HTTP merge endpoint uses hydraulic-aware validation; see [service API](native-database-service.md) and [OpenAPI](dvmdb-http-api.yaml).
-
-## Explicit UUIDv7 revision merges (Phase 2c-3b)
-
-For UUIDv7 projects, `Repository::mergeBranchesV2(project, target, source,
-expectedTarget, expectedSource)` and the equivalent `ProjectService` wrapper
-provide a **separate** native merge path. It uses verified UUIDv7 revision
-ancestry, optional optimistic HEAD pins, fast-forward/up-to-date detection,
-and conservative divergent three-way merging. A successful divergent merge
-creates a fresh revision UUIDv7 with **two parents**, while the source HEAD
-and branch identities remain unchanged. Rejected concurrent changes and
-invalid model references do not move either HEAD. Historical revision forks
-use `createBranchAtRevisionV2()` and do not create a new revision.
-
-Unlike the SHA-based merge operation described above, the new v2 API does
-**not yet** offer custom conflict resolvers, candidate reconciliation or
-semantic validation callbacks. See
-[UUIDv7 migration roadmap](uuidv7-identity-migration-roadmap.md) for status.
-This operation is currently **native only**, not a live HTTP endpoint.
+Both native and REST frontends must implement equivalent validation,
+concurrency checks, immutable revision records and durable publication.

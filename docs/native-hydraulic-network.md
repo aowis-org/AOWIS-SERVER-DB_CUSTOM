@@ -1,123 +1,78 @@
-# Hydraulic network persistence and indexed editing
+# Hydraulic network storage, checkout and validated commits
 
-`aowis::dvmdb::hydraulic` stores complete `NetworkHydraulic` objects using this repository's canonical `ModelCodec<T>` and native reference validator. It can be called directly from C++ without a database service or HTTP.
+`aowis::dvmdb::hydraulic` persists canonical AOWIS `NetworkHydraulic`
+models, indexed entities and ordered membership. Its editor lifecycle
+follows [version-control semantics](version-control-semantics.md): editing
+occurs in private working copies, while committed revisions are immutable.
 
-Public API: `include/aowis/dvmdb/hydraulic_network_persistence.h`.
+## Canonical model structure
 
-## Model structure and storage
+A network root is one versioned model record with metadata and an ordered
+manifest of membership-chunk UUIDs. Chunks hold at most 256 ordered member
+UUIDs. Each top-level entity is an independently addressed canonical model
+record; a reverse-reference index supports ownership and deletion checks.
 
-A network root is one versioned `ModelRecord` (current kind `100`), containing network metadata and a manifest of ordered membership-chunk UUIDs. Each membership chunk holds at most **256 ordered member UUIDs** and references the member objects. Every top-level member is a separate canonical model record, rather than a copy of the full network aggregate.
+The 18 top-level collections are pipe materials; time patterns; tank volume,
+pump head, pump efficiency, valve headloss, valve characteristic and general
+curves; reservoirs, junctions, tanks; demand points; pipes, pumps, valves;
+simple controls, rule controls and map labels. Nested MSX settings and map
+backdrop data belong to the appropriate network/model records, not
+invented top-level entities.
 
-The **18 top-level collections** are: pipe materials; time patterns; tank volume, pump head, pump efficiency, valve headloss, valve characteristic and generic curves; reservoirs, junctions and tanks; demand points; pipes, pumps and valves; simple controls, rule controls and map labels.
+Canonical encoding validates UUID kind, uniqueness, finite numeric values,
+reference closure, membership order and applicable domain constraints. A
+change to an existing UUID must not silently change its entity kind.
 
-- Root -> membership chunks -> entity records preserves membership and reference ownership.
-- Individual entity UUIDs must be non-null and unique on the branch, across networks and entity types.
-- Collection order is preserved. Existing UUIDs cannot silently change collection kind.
-- Network metadata (solver/options, map backdrop and nested MSX data) remains in the root; MSX-internal data is **not** represented as fictional top-level entity records.
-- A persisted reverse-reference index records required UUID dependencies and enables bounded ownership and deletion checks.
-- The network membership manifest has an internal binary format marker (`ANX5`); it is **not** an API namespace or user-facing name. Formats are still pre-release.
+## Immutable reads
 
-`validateHydraulicNetworkWithDependencies()` extracts compact UUID dependency pairs while validating model semantics, without constructing a large per-entity hash-of-sets graph. The detailed diagnostic reference API remains available. Whole-network loading checks membership, object kinds and UUIDs, canonical outgoing references, and semantic consistency. Each complete load pins one immutable revision before reading the root, membership chunks or any entity, so concurrent commits cannot produce a mixed-generation aggregate.
+Reading a complete network or a targeted entity must pin one **committed
+revision UUIDv7** (or access a user's own working-copy model explicitly).
+Across several API calls, clients must specify the same committed revision
+UUID to avoid mixing generations while a branch HEAD moves.
 
-## Complete network operations
+Historical reads are read-only. A historical revision cannot be edited in
+place or implicitly selected as a branch's new HEAD. Opening the most recent
+committed branch HEAD creates a **separate** private mutable working copy.
 
-```cpp
-#include <aowis/dvmdb/hydraulic_network_persistence.h>
+## Private checkout and editing
 
-// repository and NetworkHydraulic network are already initialized.
-const aowis::dvmdb::Revision revision =
-    aowis::dvmdb::hydraulic::saveHydraulicNetwork(repository, "main", network);
+Checkout pins project UUIDv7, branch UUIDv7, committed base revision UUIDv7
+(or explicit null for an unborn project), and working-copy UUIDv7 with
+owner/session. Multiple users may base independent working copies on the
+same committed revision. Each editor's edits change only their own copy.
 
-// nullopt: no such network. Failures throw StorageError with their kind.
-const std::optional<NetworkHydraulic> loaded =
-    aowis::dvmdb::hydraulic::loadHydraulicNetwork(repository, "main", network.uuid);
+An implementation may perform efficient UUID-indexed entity editing,
+copy-on-write membership updates and Merkle-subtree reuse. A full-network
+save may re-encode the whole aggregate, while targeted edits reuse unchanged
+records. Both paths must produce a complete, deterministically validated
+candidate state, not partially publish independent entity mutations.
 
-// Explicit, reproducible historical read (does not follow a moving branch).
-const std::optional<NetworkHydraulic> historical =
-    aowis::dvmdb::hydraulic::loadHydraulicNetworkAtRevision(
-        repository, revision.id, network.uuid);
-```
+## Commit and concurrency
 
-`saveHydraulicNetwork()` validates and replaces one complete network atomically, without changing other networks on the branch. It encodes all incoming top-level entities and is therefore a **full-network operation**. The native store performs reference and expected-head checks before publishing one new revision. Whole-network operations still require substantial work and memory proportional to the network size.
+Committing a hydraulic working copy requires exact target branch UUID and
+`expectedHeadRevisionId` from checkout. The full candidate network must
+pass canonical reference and hydraulic-domain validation. Only then may
+the service create a fresh immutable revision UUIDv7, persist its SHA-256
+record/snapshot roots, and atomically move the branch's committed HEAD.
 
-## Indexed entity queries
+When another client has advanced HEAD, the stale commit fails. The working
+copy remains available for compare/reconcile, and model-wide validation
+runs again before any subsequent commit. Two edits to different UUIDs may
+still conflict semantically (connectivity, endpoint type, membership
+constraints). No silent overwrite is allowed.
 
-```cpp
-const std::optional<aowis::dvmdb::hydraulic::HydraulicEntity> pipe =
-    aowis::dvmdb::hydraulic::loadHydraulicEntity(repository, "main", networkUuid, pipeUuid);
-const std::optional<QList<QUuid>> pipeIds = aowis::dvmdb::hydraulic::listHydraulicEntityIds(
-    repository, "main", networkUuid, aowis::dvmdb::hydraulic::HydraulicEntityType::Pipe);
-```
+## Branch merge and versioned model state
 
-`loadHydraulicEntity()` uses the reverse-reference membership index to find a single entity without reconstructing the network. It validates the requested record's type and canonical UUID; it does not perform a full network semantic audit on each read. `listHydraulicEntityIds()` returns one selected collection in its original order, without decoding every entity payload. A missing network/member returns `std::nullopt`; a corrupt or inconsistent stored object throws `StorageError(Corruption)`, and I/O or full-disk failures keep their own kind (HTTP 500/507). Branch-oriented queries pin a revision on entry; they never combine records from different branch heads. The corresponding `loadHydraulicEntityAtRevision()` and `listHydraulicEntityIdsAtRevision()` APIs accept an explicit revision hash, so several separate queries can be made against the same historical snapshot. A branch may advance between two *different* branch-oriented calls; clients requiring a consistent multi-call view must obtain the branch head once and pass its revision ID to each call.
+A merge pins both source and target committed HEADs, computes an ancestry-
+based three-way candidate and validates the entire resulting hydraulic
+network. A successful divergent merge publishes one immutable two-parent
+revision. The source branch remains unchanged; outstanding private working
+copies are never implicitly consumed. See [hydraulic merging](native-hydraulic-merging.md)
+and [REST contract](rest-api-design.md).
 
-## Atomic indexed editing
+## Verification
 
-```cpp
-HydraulicLinkPipe editedPipe = existingPipe; // supplied by the calling application
-const std::vector<aowis::dvmdb::hydraulic::HydraulicEntityChange> changes = {
-    {editedPipe.uuid, aowis::dvmdb::hydraulic::HydraulicEntity{editedPipe}}
-};
-aowis::dvmdb::hydraulic::HydraulicEditDiagnostics diagnostics;
-const auto revision = aowis::dvmdb::hydraulic::editHydraulicNetwork(
-    repository, "main", networkUuid, changes, &diagnostics);
-```
-
-`HydraulicEntity` is a variant of exactly those 18 persisted top-level types. An upsert supplies an object whose embedded UUID matches the change key. A deletion supplies `std::nullopt`. New members append to their collection; updates preserve the prior position. An atomic batch may include interdependent additions/deletions, and an identical/empty batch does not advance history.
-
-Full saves and full-validation edit fallbacks read their starting membership and models at an immutable expected-head revision, then reject stale publication with the existing atomic compare-and-commit check. Indexed edit preparation continues using optimistic expected-head protection.
-
-The editor re-encodes only changed entities when its indexed rules can prove validity. It reuses unchanged membership chunks, rewriting affected chunks (and the root only when chunk-descriptor membership changes). It also updates outgoing/incoming reference edges atomically. It verifies the expected branch head so a concurrent change cannot silently be overwritten.
-
-### Indexed validation coverage
-
-| Operation | Current behavior |
-|---|---|
-| Pipe dimensions/roughness, junction elevations, map-label text | Indexed existing-entity updates |
-| Independent pipe endpoint rewiring | Indexed when no dependent incoming references require global checks |
-| Materials, time patterns and curves | Indexed updates and safe insertion/deletion; referenced catalogue entries are protected |
-| Reservoir/tank/pump/valve physical operating fields | Indexed updates for reviewed scalar fields with unchanged structural references |
-| Reservoirs, tanks, pumps, valves, junctions and pipes | Indexed type-checked insertion and dependency-safe deletion, including related changes in one batch |
-| Demand points and simple/rule controls | Indexed insertion/deletion and reviewed reference-changing updates |
-| Map labels | Indexed insertion/deletion and supported scalar updates |
-| Other edits, unsupported structural/metadata changes | Full canonical network loading and validation fallback |
-
-Examples of enforced domain constraints include valid node types for pipe/pump/valve endpoints; curve/pattern types; assigned demand-point junctions being actual pipe endpoints; typed rule premises and actions; surviving inbound references; and network metadata/MSX dependencies. Safe deletion may remove a pipe and its otherwise-unreferenced junction in one transaction. Cross-network UUID ownership is checked.
-
-`HydraulicEditDiagnostics` reports whether indexed scalar, topology, membership, catalogue, physical or dependent-update validation was used, and how many changed entity payloads the fast path validated. Physical value rules ([model value rules](model-value-rules.md)) are checked for every edited entity before any path, fast or full, may store it. **Fast-path availability is deliberately conservative**: it is not a guarantee that any arbitrary model edit is O(1). Full-model fallback is authoritative where local validation cannot establish safety.
-
-## Whole-network merging
-
-Hydraulic branches should use `mergeHydraulicBranches()` rather than the generic record merge. The hydraulic API can reconcile non-overlapping fields, accept explicit field/whole-object conflict choices, and coordinate compatible chunk append/deletion changes. Every newly combined divergent model is validated before publication. See [hydraulic merging](native-hydraulic-merging.md).
-
-## Format, performance and limitations
-
-The serializer, ordered membership and persistent reference-index formats are part of the pack repository format. Indexed entity reads and suitable edits avoid decoding the whole network, while full saves, fallbacks and merged-snapshot validation still work over the whole aggregate. Solver feasibility and arbitrary conflicting membership reorder resolution remain separate work. The REST service also exposes canonical complete-network reads/saves, revision-pinned targeted entity reads, atomic validated edits and semantic merges, reusing this native library. See [REST design](rest-api-design.md) for HTTP request envelopes, size limits and operations still planned.
-
-Run `./compile_linux_tests.sh --both`; the Qt-dependent `aowis-dvmdb-hydraulic-network-tests` checks serialization, edits, ownership, branch behavior, integrity, validated merging, historical revision reads and concurrent read/write snapshot consistency.
-
-## UUIDv7 hydraulic workflow (Phase 2g-3a)
-
-The parallel `saveHydraulicNetworkV2()`, `editHydraulicNetworkV2()`,
-`loadHydraulicNetworkAtRevisionV2()`, `listHydraulicEntityIdsAtRevisionLimitedV2()`
-and `loadHydraulicEntityAtRevisionV2()` APIs use a project-scoped UUIDv7
-revision identity, **not** a SHA revision hash. The reference-index lookup
-`Repository::referencingModelAtRevisionV2()` reads the same immutable snapshot
-as the model and manifest lookups. Whole-network save and edit reuse the exact
-same canonical codec, 18 collection kinds, membership-chunk layout, typed
-references and physical/network validation as the existing hydraulic APIs.
-
-New HTTP routes are `/branches/{branch}/networks-v2`,
-`/branches/{branch}/networks-v2/{networkId}` and their `/entities`,
-`/entities/{entityId}` and `/edits` subroutes. A historical read's optional
-`revision` is checked against both-parent ancestry of the selected branch.
-`expectedHead` is an exact UUIDv7 required for every write. HTTP limits remain
-10000 list members and 128 edit changes; size limits use the same hydraulic
-request ceiling as the earlier routes.
-
-V2 edits deliberately use the full canonical validator and full-network
-publication, not the optimized indexed edit fast paths. This is correct but
-O(network size); large-network edit performance is a later migration slice.
-V2 hydraulic interactive conflict-resolution/semantic merge is **not** yet
-available; the generic UUIDv7 merge is conservative. The existing SHA-based
-HTTP routes have not been made the default, and no legacy migration exists.
+Tests cover canonical encoding/decoding, branch-local immutable reads,
+private checkout ownership, concurrent edits against one base, stale-HEAD
+rejection, complete-domain merge validation, canonical SHA-256, UUIDv7
+identity preservation, and crash-safe HEAD publication.

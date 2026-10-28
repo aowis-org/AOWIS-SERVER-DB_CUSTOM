@@ -1,61 +1,47 @@
-# Repository and bundle format policy (pre-release)
+# Repository format and compatibility contract
 
-The native store is still pre-release. **Backward compatibility for the
-previous experimental name-keyed branch layout and SHA-only bundles has been
-explicitly dropped.** This is not a stable-format upgrade path. Recreate old
-development repositories or start from a backup written by the current format;
-do not attempt an automatic conversion. See the
-[BRANCH-1 record contract](uuidv7-branch-ref-format.md).
+The native on-disk and portable transfer formats must preserve the AOWIS
+[version-control lifecycle](version-control-semantics.md). UUIDv7 identifies
+logical projects, branches, immutable revisions and private working copies;
+SHA-256 verifies canonical committed records and Merkle snapshots.
 
-## Current format
+## Storage invariants
 
-- Immutable objects, revisions, and Merkle trees remain SHA-256
-  content-addressed; `objects.idx` is a rebuildable derived index.
-- Every project newly created by DVMDB has a UUIDv7 identity.
-- Every branch is a single atomic `AOWIS-BRANCH-1` record at
-  `repository/refs/heads/<canonical-uuidv7>`; the name and SHA-256 HEAD
-  are **inside** the record, not filenames. Branch renaming retains UUID and
-  HEAD. Duplicate IDs/names and malformed records are rejected.
-- Native, HTTP, and CLI **full** exports use `AOWSYNC3`, a 64-byte header
-  containing the stable 16-byte branch UUIDv7. **Incremental** exports use
-  `AOWSYNC4`, a 96-byte header. The importer rejects `AOWSYNC1/2`.
-  The `identity=1` HTTP query and explicit `export-identified*` native/CLI
-  forms are accepted aliases, not an opt-in to a newer format.
-- Revision identities and their parent links remain SHA-256 until the
-  independently specified UUIDv7 revision-v2 milestone.
+- A project includes a UUIDv7 identity and a `main` branch UUIDv7 even
+  before its first commit. An unborn branch has **null committed HEAD** and
+  zero committed revisions; no empty-root revision is manufactured.
+- Branch records are addressed by UUIDv7, not human-readable names, and
+  bind nullable committed HEAD and immutable origin-branch/fork-revision UUIDs.
+- Committed revisions have fresh UUIDv7 IDs, canonical versioned records,
+  ordered parent IDs and SHA-256 integrity hashes. Immutable model records
+  and Merkle subtrees remain content-addressed and deduplicable.
+- Working copies are mutable, session-owned data and are never silently
+  serialized as immutable committed revisions.
+- Update publication is atomic and uses exact expected-HEAD checks;
+  cross-process readers must not see partially published branch records.
 
-## Acceptance tests and deliberately rejected fixtures
+## Export and import
 
-`tests/fixtures/pack-20261024/` contains an obsolete name-keyed repository
-and `AOWSYNC1/2` bundles. The immutable fixture bytes are retained as
-**negative tests only**. `native_format_compatibility_tests.cpp` asserts
-that old repositories and old bundles are refused, and then constructs fresh
-UUIDv7-only repositories to verify full/incremental export and import,
-identity consistency, ancestry, restart, and revision integrity.
+Native, CLI and HTTP bundle transfer must preserve logical UUIDv7 IDs,
+nullable unborn HEADs, branch names and origin UUIDs, fork point UUIDs,
+ordered revision parent IDs and complete canonical hash bindings. All
+transport implementations must reject missing, duplicate, noncanonical,
+corrupt or cross-project identity references.
 
-`native_upgrade_restore_tests.cpp` creates a new-format four-project root
-including divergent histories and large model values. It exercises the real
-offline backup/restore flow, missing derived index reconstruction, stable
-branch UUIDv7s, historical reads, and successful post-restore writes. It
-**does not** claim an older name-keyed repository can be upgraded.
+Incremental transfers name their exact immutable base UUID and integrity
+hash. Import refuses divergent HEADs or asks for an explicit validated
+merge; it never silently resets history or assigns new IDs to make a bundle
+appear compatible. See [replication](uuidv7-revision-replication-v2.md).
 
-The current native-only suite covers additional corruption, recovery,
-compaction and sync cases. Full HTTP/Qt, physical failure and qualification
-coverage must be executed separately before release.
+## Versioning and recovery
 
-## Future revision-ID cutover
+On-disk record and bundle schemas carry explicit format versions. Any format
+upgrade must have one documented atomic/recoverable transition, or fail
+closed when it encounters an unsupported schema. Integrity verification,
+backup, restore and compaction are required to preserve UUIDv7 identity,
+Merkle closure and committed parent ancestry.
 
-[UUIDv7 revision v2](uuidv7-identity-format-v2.md) specifies a separate
-UUIDv7 logical identity with SHA-256 immutable-record verification. Its
-original migration-plan notes still discuss legacy conversion and
-compatibility; **those notes are superseded for this pre-release product**.
-No compatibility mapping or dual-format decoder should be implemented just
-for those old development repositories. New revision-format tests must
-assert the new canonical bytes, stable IDs, both merge parents, replica
-consistency, corruption rejection, backup/restore and transport consistency.
-
-Nothing in this decision weakens SHA-256 integrity checks, structured
-validation, or the need to back up irreplaceable data before format changes.
-The first stable release will need an explicit, published format-support
-policy. See [identity roadmap](uuidv7-identity-migration-roadmap.md) and
-[operations](operations.md).
+Validation includes an empty project, initial commit, shared committed
+history, divergent/two-parent merge, branch rename, fork provenance,
+concurrent HEAD updates and complete restore. A storage-format release is
+not complete until these invariants pass on native and REST paths.

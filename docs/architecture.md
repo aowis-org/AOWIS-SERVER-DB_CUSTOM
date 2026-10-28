@@ -12,25 +12,34 @@ AOWIS uses a content-addressed C++ model database. Its core is a reusable librar
 
 ## Logical identities and history
 
-The agreed meaning of *revision/commit*, *branch*, *per-branch HEAD* and the
-GUI's complete multi-branch graph is recorded in
-[version-control semantics](version-control-semantics.md). In particular, a
-branch is a named ref, not a revision ancestry node. The repository stores
-no global checkout HEAD or original branch-creation event. Existing
-first-parent history APIs do not enumerate all merge-parent ancestry;
-a separate full-DAG reader is already implemented in Repository,
-ProjectService and HTTP. The [UUIDv7 identity migration
-roadmap](uuidv7-identity-migration-roadmap.md) and [v2 format
-contract](uuidv7-identity-format-v2.md) specify a future revision-ID
-format change, not a change to revision DAG semantics. New project creation
-now uses UUIDv7, while existing UUIDv4 projects remain readable; revision
-and branch identity/storage still use legacy SHA-based references.
+[Version-control semantics](version-control-semantics.md) defines the
+normative lifecycle. A project UUIDv7 owns branches identified by UUIDv7;
+committed revisions have distinct UUIDv7 identities and separately verified
+canonical SHA-256 hashes. An individual branch HEAD points to its latest
+**committed immutable revision**, or is **null** for an unborn branch.
 
-- **Current implementation:** new project IDs are UUIDv7; old project UUIDv4 IDs remain readable. Entity keys are 16-byte UUIDs; pack object and revision IDs remain 32-byte SHA-256 hashes of canonical bytes. **Proposed target:** branch and revision identities also become distinct UUIDv7 values, with immutable object hashes retained for integrity and Merkle deduplication.
-- A persistent, path-compressed 16-way radix Merkle tree maps UUIDs to immutable object hashes. Unchanged values/subtrees are reused across revisions.
-- Model-indexed revisions also publish a reverse-reference Merkle tree mapping a UUID to its incoming referencing UUIDs. Both roots belong to one revision.
-- Each revision holds zero, one or two parent revision hashes. Branch names resolve to mutable refs pointing at immutable revision objects. Changes to one branch do not modify other branches.
-- Generic model commits validate required UUID references atomically. The hydraulic layer adds typed reference and model-level validation. Generic merges do **not** replace hydraulic semantic validation.
+A project starts with an unborn `main` and **no committed revision**.
+Editors use separate UUIDv7 working copies, each with a private model state
+and exact committed base UUID/null. Successful commits create one immutable
+revision and atomically advance a branch under an expected-HEAD check.
+Branch creation preserves immutable source branch UUID and fork revision UUID;
+it does **not** create a revision. Fork points never move when HEADs advance.
+
+The revision DAG has zero/one/two ordered parent revision UUIDs. Shared
+immutable ancestors may be reached by several branches; branch creation
+provenance is metadata, not an ancestry edge. The Merkle model-object tree
+and reverse-reference tree form part of the complete committed snapshot.
+SHA-256 verifies canonical immutable content; UUIDv7 is logical identity.
+
+- A path-compressed 16-way radix Merkle tree maps entity UUIDs to immutable
+  content-addressed records; unchanged records/subtrees are reused.
+- Each committed model snapshot includes a reverse-reference root for exact
+  incoming UUID references.
+- A draft is not an immutable revision and cannot be exported as committed
+  history until explicitly committed under optimistic concurrency control.
+- Generic reference validation and hydraulic semantic validation both apply
+  before publication. See [merges](native-branch-merging.md) and
+  [native history](native-revision-history.md).
 
 ## Default pack layout
 
@@ -45,7 +54,7 @@ repository/
 ├── repo.lock               # repository operation locking
 ├── recovered-pack-tails/   # copies of discarded torn pack tails (if any)
 ├── tmp/                    # scratch space, mode 0700 (see below)
-└── refs/heads/             # current: branch name -> immutable revision hash; planned: branch UUID + revision UUID mapping
+└── refs/heads/             # UUIDv7 branch records: nullable committed HEAD, provenance
 ```
 
 **Scratch space.** Import/verification tables (bundle location index, visit marks, trie summaries, external reference sort) and HTTP bundle spools/exports are nameless files in `tmp/`, created with `O_TMPFILE`; on filesystems without it, `aowis-scratch-*` files are created and unlinked immediately, and any such leftover from a crash is removed on open. Scratch space is therefore on the pack's own filesystem: never in `TMPDIR`, which is often a RAM-backed tmpfs (Fedora, Arch, Debian 13), so "file-backed, evictable" really means disk. A symlinked or non-directory `tmp` is refused. C++ callers can use `Repository::createScratchFile()` together with the descriptor overloads of `importBranchBundle` / `export…BranchBundle`.

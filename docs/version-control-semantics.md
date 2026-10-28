@@ -1,277 +1,326 @@
-# DVMDB version-control semantics and full-history graph contract
+# AOWIS / DVMDB version-control contract
 
-**Decision record — agreed 2026-10-27.** This document is the canonical
-product/engineering contract for projects, revisions, branches and HEADs in
-AOWIS. It distinguishes **agreed semantics**, **implemented DVMDB behavior**,
-and **work not yet implemented**. The all-parent graph API is now implemented
-in DVMDB; the separate [UUIDv7 identity migration
-roadmap](uuidv7-identity-migration-roadmap.md) records the agreed transition to
-UUIDv7 **logical identities** plus SHA-256 **integrity**. New project IDs
-already use UUIDv7; branch/revision UUID persistence remains **unimplemented**.
-Current references to revision `Hash` and branch names below
-describe the **legacy implemented representation**, not the target ID scheme.
+**Normative product and system-design specification.** All native storage,
+service, REST, replication and GUI behavior must conform to this contract.
+This document defines behavior; it does not claim that every operation is
+already implemented. [Native architecture](architecture.md),
+[revision API](native-revision-history.md),
+[merge semantics](native-branch-merging.md), and
+[GUI integration](gui-integration-requirements.md) elaborate the same model.
 
-Related documents: [native architecture](architecture.md),
-[revision-history API](native-revision-history.md),
-[merges](native-branch-merging.md),
-[GUI/API backlog](gui-integration-requirements.md), and
-[roadmap](roadmap.md). The [OpenAPI file](dvmdb-http-api.yaml) documents
-implemented HTTP endpoints only.
+## 1. Concepts and terminology
 
-## 1. Vocabulary and ownership — agreed
+| Concept | Meaning | UUIDv7 | Mutability |
+|---|---|---|---|
+| Database/source | Server or embedded store hosting independent projects; a GUI connection may represent it | Connection/profile identity where applicable | Connection details, catalogue |
+| Project | Container for one model history, branches, snapshots, and permissions | Project ID | Metadata and refs, not committed content |
+| Branch | Persistent, named line of development with a movable pointer to the latest committed revision | Branch ID | Name/HEAD can change; creation provenance cannot |
+| Revision / commit | One **finalized immutable** whole-model snapshot, with ordered revision parents | Revision ID | **Never** |
+| Branch HEAD | The **latest committed revision referenced by that branch**; nullable for an unborn branch | The referenced revision's ID, not another object | Ref moves atomically |
+| Working copy | A **private, mutable editor state** checked out from a committed revision (or the initial empty project state) | Working-copy ID | Editable by its owner/session |
+| Base revision | Exact committed revision on which a working copy's current edits were based; nullable for an unborn branch | Revision ID or null | Pinned until explicit reconcile/rebase |
+| Fork point | Exact immutable source revision from which a new branch was created | Revision ID or null | Immutable creation metadata |
+| Record hash | SHA-256 commitment to a canonical immutable revision record | Not an identity | Never changes for a given revision |
+| Snapshot root | Content-addressed Merkle root recursively committing to all persisted model records, references and index roots | Not an identity | Immutable for committed revisions |
 
-| Concept | Contract | Where it lives |
-|---|---|---|
-| Server/database source | A GUI representation of a remote DVMDB service or embedded local database. It is **not a revision-graph object**. | GUI connection/profile layer |
-| Project | A named, UUID-identified entity with its own independent versioned repository. Multiple projects may be hosted by one service. **New IDs use UUIDv7; existing UUIDv4 projects remain readable.** | DVMDB `ProjectService` |
-| Revision / commit | The **same concept**: an immutable revision with ordered parent revision IDs, bound cryptographically to a complete snapshot. **Target: UUIDv7 identity and separate SHA-256 content hash; today SHA is also the ID.** | DVMDB repository |
-| Branch | A user-named, movable reference to **one** revision; not a revision and not an immutable ancestry node. **Target: stable branch UUIDv7 independent of its name.** | DVMDB repository refs |
-| Branch HEAD | The immutable revision **currently referenced by a particular branch**. Each branch has exactly one current HEAD. | DVMDB branch ref |
-| Selected revision | The object the user highlights or inspects; selection must not move any HEAD. | GUI |
-| Working-copy base | Immutable revision from which a future editor session loads. Different from both the current branch HEAD and the highlighted revision. | Future GUI session |
+**Do not call an uncommitted working copy a revision or HEAD.** A revision is
+created **only** when a commit succeeds. A branch can have no committed HEAD
+(`null`) before its first commit. `HEAD` is AOWIS shorthand for the tip of a
+*specified branch*, not the editable state of a particular user. There is no
+server-wide checked-out branch or single global HEAD.
 
-AOWIS deliberately shows **all reachable history from every branch of every
-visible project**, rather than implicitly hiding all branches except one
-selected branch. The GUI may draw server and project cards above revision
-history. Neither card becomes a revision or a parent edge in storage.
+A branch's history consists of the committed revisions reachable from its
+HEAD, including shared ancestors and both parents of merge commits. This
+is the meaning of *a branch is made of revisions*: the branch identifies a
+line of development, but **does not exclusively own** any immutable ancestor.
+Two branches can legitimately reference the same revision as HEAD; their
+identities and working copies remain independent. A branch HEAD does not
+need to be a leaf in the project-wide ancestry graph.
 
-### Branch-local HEAD rather than Git's single checked-out HEAD
+## 2. Identity and integrity
 
-AOWIS uses `HEAD` to mean **branch tip** (`head(branch)`), so `main HEAD` and
-`feature HEAD` may exist simultaneously. DVMDB has no repository-wide
-checked-out HEAD and no server-global currently editable revision. That is
-intentional for a multi-user service. A branch name is chosen by the user;
-`HEAD` is the role of the revision to which that name currently points.
+- Give every first-class project, branch, committed revision and working copy
+  its own **UUIDv7**. Model entities likewise use their model-defined UUIDv7
+  identities, never a SHA-256 hash as a logical object ID. Names are
+  user-visible labels, never storage keys.
+- Generate fresh IDs for new objects; reject accidental ID collisions. Keep
+  identities stable across rename, export/import, server transport and
+  repository reopening. UUIDv7 ordering is **not** commit ancestry.
+- Compute SHA-256 over a **canonical, versioned, immutable revision record**
+  that binds revision UUID, project UUID, ordered parent revision UUIDs,
+  immutable metadata, snapshot root and relevant integrity roots. Include
+  parent record-hash bindings, or verify them through a canonical parent map,
+  so changing an ancestor cannot pass verification unnoticed.
+- The snapshot's Merkle roots recursively bind **all** committed hydraulic
+  and model objects; the complete model need not be copied into one flat hash
+  input for each commit. Shared immutable subtrees may be deduplicated.
+- Working copies may have transient checksums, but do not receive a committed
+  `recordHash` and cannot be addressed as finalized revisions.
+- Verify canonical hashes, ancestry closure, project ownership, parent
+  ordering, UUID uniqueness, and domain references before accepting or
+  publishing untrusted history. SHA-256 is integrity, **not authentication**.
 
-A revision may be the HEAD of **several** branches. A HEAD is **not required to
-be a leaf** of the project's combined DAG: another branch may have committed
-descendants of the revision while this branch remained at it. Displaying
-`main · HEAD` and `feature · HEAD` together is therefore correct, whereas
-labelling only global DAG leaves HEAD is wrong.
+## 3. Creating a project: unborn `main`
 
-`HEAD` identifies the current *base for continuing work on that branch*, **not
-a mutable revision**. Saving edits makes a **new immutable revision** and
-advances the chosen branch's ref; it never changes old revision content.
-Historical revisions can be read and used to start another branch. Selecting
-or opening an old revision must not rewrite an existing branch.
+`CreateProject(name)` must atomically create a new project UUIDv7 and a new
+branch UUIDv7 named `main`, with:
 
-## 2. Revision ancestry, branch references and the graph
+- `main.headRevisionId = null` (an **unborn** branch);
+- no committed revisions, no empty synthetic revision R0;
+- an empty, editable model state that an editor can check out into its **own
+  working copy**; no globally shared mutable HEAD;
+- no creation-origin branch or fork revision for `main`.
 
-In the diagrams below, time/topological ancestry runs **top to bottom**. The
-arrows are a display convention; the stored revision references point in the
-opposite direction, **from child to parent**. Labels in `[]` are *references*
-attached to the revision, not extra ancestry nodes.
+The project and empty branch can be displayed immediately; the history area
+contains **zero committed revision cards**. Starting an editor session makes
+(or opens) a private working copy, not a commit. The first successful commit
+creates immutable revision R0 (zero parents) and moves `main.head` from null
+to R0 in one conditional publication.
 
-### Linear history
+## 4. Branch lifecycle and provenance
+
+Creating a branch **from an already committed revision** never creates a
+commit and never mutates the source branch. Supply its exact `sourceRevisionId`
+and, if the user selected an originating branch, `sourceBranchId`.
+
+DVMDB must persist both as immutable creation metadata:
+
+- `originBranchId`: source branch UUIDv7, when known;
+- `forkRevisionId`: exact finalized revision UUIDv7 at creation, when one
+  exists (not the source branch's current or future HEAD).
+
+For a new branch from committed Rn:
+
+1. Verify that Rn exists in the same project, is finalized, and is reachable
+   from the specified source branch when that source is supplied.
+2. Create a new branch UUIDv7, with its own editable-name label.
+3. Set its committed HEAD to Rn and persist both creation-origin fields.
+4. Return the new branch UUID and exact Rn. **No new revision is created.**
+
+Creating a branch from **a user's uncommitted edits** is a different request.
+It must explicitly offer to **commit those edits first** (subject to the
+ordinary concurrency check) or start from the last committed base without
+the edits. Never silently commit someone else's working copy. An unborn
+`main` may be branched only using a deliberately specified empty-state/unborn
+policy; it must not be given a fictitious committed fork revision. The exact
+handling of multiple unborn branches is defined in the branch-creation API,
+not inferred from a missing SHA or zero UUID.
+
+Branches support readable UTF-8 names including spaces. Validate UTF-8,
+length and prohibited control/path-delimiter characters; names must be unique
+under the repository's documented comparison rule. Rename retains UUIDv7,
+HEAD and creation provenance. If the source branch is later renamed, its
+origin UUID remains stable. If source branches are removed, do not fabricate
+new provenance or erase a valid recorded fork point.
+
+## 5. Working copies and multi-user concurrency
+
+Editing occurs **only** in a separate working copy; no user edits the stored
+revision object. A working copy records at least:
+
+- unique `workingCopyId` (UUIDv7), owner/session, owning project UUID;
+- selected target branch UUIDv7 (or explicit detached/historical mode);
+- exact base committed revision UUIDv7 or `null` for an unborn base;
+- mutable model data, dirty state and validation status;
+- local or service-managed persistence and recovery policy.
+
+Alice and Bob may each check out `main` at R7, obtaining **distinct private
+working copies** that both pin R7. They may edit independently. The number
+of working copies does not change the number of branches or committed HEADs.
+A working copy may become stale as the branch advances; stale data must not
+be discarded or silently promoted to a new base. Access to private drafts
+and their cleanup must respect session ownership and eventual authorization.
+
+A read or edit operation spanning multiple model entities must use one pinned
+base snapshot. Changing the active GUI selection must never implicitly move
+a branch HEAD or change a working copy's pinned base.
+
+## 6. Commit protocol (optimistic concurrency)
+
+Every commit request supplies:
+
+- project UUIDv7, target branch UUIDv7 and working-copy identity;
+- `expectedHeadRevisionId`: the committed branch HEAD observed by the editor
+  when the working copy's changes were based on it, **including explicit null
+  for an unborn branch**;
+- proposed complete and validated model snapshot (or a bounded change set
+  that deterministically yields it), commit metadata and idempotency key.
+
+DVMDB must perform, as one atomic logical transaction:
+
+1. Validate permissions, project/branch state, complete model consistency and
+   canonical references; resolve and hash the exact proposed snapshot.
+2. Read and lock (or compare-and-swap) the current branch HEAD. **If it
+   differs from `expectedHeadRevisionId`, do not move HEAD and report a
+   stale-base conflict.**
+3. Create and durably record a fresh immutable revision UUIDv7 with the
+   expected HEAD as its sole parent (zero parents for the first commit).
+4. Publish the new branch HEAD only **after** the snapshot and immutable
+   revision record are durably available. Return the new revision UUIDv7 and
+   record SHA-256.
+
+No failed, timed-out or stale commit may overwrite another user's successful
+commit. If the server may have published despite an interrupted response,
+query the authoritative branch/revision status by request ID or idempotency
+key **before retrying**. A rejected publication may leave unreachable prepared
+objects, but not an observable partial commit or partially moved HEAD.
+
+A changed HEAD means **concurrency collision**, not necessarily conflicting
+content. After an explicit refresh, the editor may compute a three-way
+reconciliation between the pinned base, the current branch HEAD and local
+changes. Non-overlapping edits may be merged; overlapping or semantically
+incompatible edits require user resolution. No automatic rebase, force push,
+last-writer-wins or branch reset is allowed as a side effect of ordinary Save.
+Hydraulic semantic validation must run on the **complete merged network**, not
+merely on independent entity UUID updates.
+
+### Example: two editors
 
 ```text
-Database source (GUI)
-         |
-Project A (DVMDB)
-         |
-        R0                parents = []
-         |
-        R1                parents = [R0]
-         |
-        R2 [main · HEAD]  parents = [R1]
+main HEAD = R7  (immutable)
+Alice's working copy A: base R7, edits pump P
+Bob's working copy B:   base R7, edits pipe Q
+
+Alice commits A with expectedHead R7 -> R8 (parent R7), HEAD becomes R8.
+Bob commits B with expectedHead R7 -> CONFLICT; main remains at R8.
+Bob reconciles against R8, validates complete model, then commits
+  with expectedHead R8 -> R9 (parent R8), HEAD becomes R9.
 ```
 
-`R0` is the initial, immutable empty raw revision created by the current
-project/bootstrap process; it is not a separate mutable project state.
+## 7. Revision DAG and merging
 
-### Divergence and simultaneous branch HEADs
+The **only** immutable ancestry edges connect committed revisions. Each
+revision has zero, one or two ordered parents. Parent UUIDs must refer to
+committed revisions in the same project; the graph is acyclic and complete.
+One-parent commits advance a development line. Two-parent merge commits bind
+both histories; target and source parents have an explicit canonical order.
+
+Branch creation is **not** a revision and does not create a revision-DAG
+edge. A committed fork becomes visible as a divergence **only when the
+branches make separate commits**. Example:
 
 ```text
-        R0
-         |
-        R1
-         |
-        R2
-       /  \
-      R3   F3
-      |     |
-      R4    F4 [feature · HEAD]
-      [main · HEAD]
+            R0
+             |
+            R1  (main and feature may both point here)
+           /  \
+          R2   F2
+          |    |
+     main HEAD  feature HEAD
 ```
 
-The fork is represented by `R3.parents = [R2]` and `F3.parents = [R2]`.
-`main` points to `R4`; `feature` points to `F4`. No branch-object ancestry
-node is stored between R2 and its descendants.
+The graph need not render a separate edge for `originBranchId` or
+`forkRevisionId`. These are provenance metadata, shown in the branch
+inspector. A branch can be presented as a *lane* of development while shared
+commits are logically single revision objects. GUI lanes and headers must not
+create duplicate revision identities.
 
-### Two branches sharing one HEAD, including a non-leaf HEAD
+Merge must compare both source and target committed HEADs against expected
+values before publishing. An up-to-date merge is a no-op; fast-forward may
+advance the target ref to an already committed descendant; a divergent merge
+creates **one** new immutable two-parent revision only after validation.
+Where editors have uncommitted changes, merging must not silently overwrite
+or consume their private working copies. Source-branch HEAD remains unchanged
+unless an explicit separate operation requests otherwise.
 
-```text
-       R0
-        |
-       R1 [main · HEAD]
-        |
-       F2 [feature · HEAD]
-```
+## 8. Reading history and graph presentation
 
-`main` still points to R1, even though feature's F2 descends from R1.
-Similarly, immediately after branching from `main`, both named refs can
-point to precisely the **same** revision, which is drawn only once with both
-labels. Do not duplicate revision objects for each branch.
+- Native and REST readers expose **the same** project/branch/revision UUIDv7
+  contract. No SHA digest is used as an entity ID.
+- History traversal includes every branch HEAD and both parents of merge
+  revisions; graph pagination must pin a stable branch-HEAD snapshot and
+  validate closure before presenting a complete graph.
+- The GUI displays server/database and project organization, **branch lanes
+  with committed revisions** and a clearly marked branch-local committed
+  `HEAD`; the independent private working copy is displayed in an editor or
+  workspace section, **not** as a committed revision.
+- An unborn project displays `main` and a clear **No commits yet** state.
+  It must not display a synthetic R0.
+- A branch whose HEAD is also another branch's HEAD is legitimate. A HEAD
+  may be an ancestor of commits on another branch. Do not assume global DAG
+  leaves alone carry HEAD labels.
+- No arbitrary dashed branch-origin connection is required in the revision
+  graph; provenance belongs in the branch inspector. The graph's history
+  edges must mean revision parenthood only. Display links between GUI source,
+  project and branch containers are organization, not ancestry.
+- UI selection, source filtering, folding, camera movement and inspector tab
+  changes are read-only operations; they never change HEAD or working copies.
 
-### Divergent merge
+## 9. API, replication, atomicity and durability requirements
 
-```text
-           R1
-          /  \
-         R2   F2 [feature · HEAD]
-          \  /
-           M [main · HEAD]
-```
+The API contract must make these distinct operations explicit:
 
-`M.parents = [R2, F2]`: the first parent is the previous target branch
-HEAD and the second is the source branch HEAD. A fast-forward can move the
-target ref directly to an existing descendant without making M. Merging does
-**not** delete or move the source branch. Full graph enumeration must follow
-**both** parents; a first-parent-only list misses the F2 side of this merge
-unless it happens to be reached through another queried ref.
+- create project -> project UUID, unborn `main` branch UUID, null HEAD;
+- list/get branches -> UUID, name, nullable HEAD, `originBranchId`,
+  `forkRevisionId`;
+- checkout/start working copy -> UUID, ownership, exact base revision/null;
+- read immutable revision/snapshot -> UUID, SHA-256 record/snapshot roots,
+  ordered parents and immutable metadata;
+- create branch from **committed** revision, with optional source branch UUID;
+- commit working copy with **exact expected HEAD** and idempotent result;
+- get paginated full revision DAG and branch HEADs under a pinned snapshot;
+- compare, reconcile and merge with explicit expected HEADs.
 
-**Graph ordering rule:** an ancestor appears above all its displayed
-descendants. The order among unrelated siblings is not guaranteed to match
-wall-clock time, because current native revisions carry no author/time/message
-metadata. The renderer must produce stable, legible placement without
-inventing historical timestamps or branch-origin events.
+REST errors must distinguish invalid input, missing objects, permission
+failure, stale expected HEAD (`409 Conflict`), semantic validation failure,
+and transient service failure. An absent expected HEAD is **not** equivalent
+to an explicit null expected HEAD on an unborn branch.
 
-## 3. How DVMDB creates, advances and merges branches — implemented
+Offline/full/incremental replication must preserve project/branch/revision
+UUIDs, immutable branch-origin UUIDs and fork UUIDs, all committed parent
+IDs, all integrity hashes and exact branch HEAD states (including unborn).
+Never silently rewrite UUIDs or fabricate an ancestry edge to resolve a
+replication conflict. Imported branch HEAD publication must obey the same
+atomic durability and concurrency rules as a local commit. Copies of a
+private uncommitted working state are **not** committed history and require
+a distinct explicitly authorized backup/synchronization protocol.
 
-| Action | Actual native operation and effect |
-|---|---|
-| Create project | `ProjectService::createProject()` initializes a new repository with `main` referencing an empty initial revision. |
-| Create a source-less branch | `Repository::createBranch(name)` points it at the canonical empty raw revision; **does not** fork the current `main` HEAD. |
-| Branch from a branch | `createBranch(name, fromBranch)` copies that branch's HEAD **at creation time**; no new revision. |
-| Branch from historical revision | `createBranchAtRevision(name, sourceBranch, id)` points the new name to a revision reachable by **either** parent from the named source branch. Source remains unchanged; no new revision. |
-| Commit/save | A successful commit creates an immutable child revision and publishes it as the chosen branch HEAD. Other refs do not move. |
-| Fast-forward merge | Advances the target to an existing descendant; source remains at its tip. |
-| Divergent merge | Creates a revision with ordered parents `[oldTargetHead, sourceHead]`, then moves only the target ref. Conflicts do not publish a revision or move a branch. |
-| Bundle import | Does not rewind or silently overwrite divergent refs; already-contained incoming history is treated as up-to-date. |
+## 10. Required acceptance scenarios
 
-There is currently **no public arbitrary branch-reset/rewind operation**.
-The agreed AOWIS user rule is that an existing branch's HEAD is not manually
-moved backwards: create a new branch from the selected historical revision
-instead. Commits, merges and imports should continue to preserve this rule;
-make it an explicit regression test whenever a new ref-changing API is added.
-This rule describes the supported APIs, not a claim that editing repository
-files outside DVMDB is safe or impossible.
+1. New project: UUIDv7 project and `main` exist, `main.head = null`, history
+   has zero revisions; checkout has private mutable data.
+2. First commit creates one immutable UUIDv7 R0; a second commit creates R1
+   and advances only the targeted branch.
+3. Creating `feature` from committed R0 creates a distinct branch UUIDv7,
+   records source branch and exact R0, does not add a revision.
+4. Branch creation requested from uncommitted edits explicitly asks whether
+   to commit first or fork from the unchanged committed base.
+5. Two users edit the same branch from one base; only one stale-base commit
+   can advance that HEAD. The other retains a recoverable working copy.
+6. After reconciliation, a subsequent commit has the correct immutable
+   parent and validates the complete hydraulic model.
+7. Sharing committed R0 across multiple HEADs does not duplicate it; branch
+   lanes are distinct, with provenance in the inspector, not extra history
+   edges.
+8. Rename, service restart and bundle import/export preserve branch UUID,
+   origin UUID, fork UUID and complete committed ancestry.
+9. Native and REST return equivalent UUIDv7 IDs, hashes, null unborn HEADs,
+   pagination and conflict semantics.
+10. Failures, cancellations and ambiguous network responses never reset a
+    published HEAD or silently lose a user's uncommitted work.
 
-The GUI must explicitly distinguish *create from empty*, *fork current HEAD*
-and *fork selected historical revision*. In particular, a project-level
-“new branch” gesture must not silently mean both “empty” and “from `main`”.
+## 11. Parameters requiring explicit implementation design
 
-## 4. What DVMDB does **not** store
+The core lifecycle above is fixed. The following choices require a concrete
+native/REST/GUI agreement **before** their respective operations ship:
 
-- No branch creation-event object, original source-branch identity or
-  permanent branch-off timestamp. Revision divergence shows **where histories
-  split**, not necessarily when a particular branch name was created.
-- No persistent branch-parent hierarchy. Creating `feature` from `main` copies
-  a revision hash; it does not establish `feature.parentBranch = main`.
-- No global checked-out HEAD, working copy or server-wide selected branch.
-- No immutable commit message, actor or timestamp in the current revision
-  record. The revision currently contains `id`, content/index roots,
-  `modelIndexed` and zero/one/two ordered parents.
+- Whether and how a second **unborn branch** may be created when no committed
+  fork revision exists; any such operation must represent null honestly and
+  must not create a hidden revision.
+- Where private working copies are persisted (client-local, server-managed or
+  both), draft retention/expiry, session recovery and ownership permissions.
+- Required human commit metadata, monotonic/idempotent request-ID retention,
+  and handling of unknown outcomes following connection loss.
+- Exact merge resolution UI, full hydraulic validator rules, and how failed
+  semantic merges are represented to collaborators.
+- Revision-lane positioning for shared ancestors, many branch HEADs on one
+  committed revision and two-parent merges. The *semantics* of all edges are
+  fixed even where pixel layout choices are not.
 
-Therefore a future GUI may render a separate **clickable branch reference
-card** or a label at the referenced HEAD, but must **not** insert that card
-into revision ancestry or claim it is the historical branch-creation event.
-The exact branch-decoration style remains a GUI presentation decision.
+These choices are not permission to change the immutable commit / private
+working-copy separation, UUIDv7 identity, branch provenance or atomic
+expected-HEAD publication.
 
-## 5. Current read surface and missing full-graph contract
-
-**Implemented native:** `Repository::listBranches()`, `head(branch)`,
-`history(branch, maxCount, after)`, `revision(hash)` and
-`revisionOnBranch(branch, hash)`; project-scoped service wrappers exist for
-list/head/history/revision. `history` yields **newest-first first-parent
-history** with an exclusive hash cursor, default page 100 and maximum 1,000.
-It is not an all-parent graph iterator. `revision(hash)` returns stored
-immutable revision metadata, including both merge parents.
-
-**Implemented HTTP:** `GET /dvmdb/v1/projects/{id}/branches`,
-`GET .../branches/{branch}/head`,
-`GET .../branches/{branch}/history?limit=&after=`, and
-`GET /dvmdb/v1/projects/{id}/revisions/{hash}`. The live
-[OpenAPI contract](dvmdb-http-api.yaml) describes these operations. The
-current GUI combines bounded first-parent pages and therefore must not claim
-to show every reachable revision in a complex merge DAG.
-
-**Implemented in DVMDB, not yet wired into the GUI:**
-`Repository::revisionGraph(maxCount, cursor)` and
-`ProjectService::revisionGraph(projectId, maxCount, cursor)`, exposed through
-`GET /dvmdb/v1/projects/{id}/revision-graph?limit=&cursor=`. The initial
-call captures one branch-name → HEAD snapshot under a repository lock. Each
-page traverses **both** merge parents, returns each reachable revision once
-within that project and reports `complete` / `nextCursor`. Pagination pins
-original heads even after branch advances. HTTP cursors are signed,
-project-specific, and expire on service restart. The traversal order is a
-stable DFS, not a timestamp or global topological sort. The GUI still needs
-migration from its existing first-parent catalogue reader.
-
-### Implemented graph-reader contract and remaining acceptance work
-
-1. **Implemented:** capture a **consistent set of branch names and HEAD hashes** for one
-   project at one logical observation point. No mixed-time per-branch lists.
-   Decide what happens if branches change during a multi-page query (pinned
-   head-set/token preferred).
-2. **Implemented:** traverse **both** ordered parent links of every reachable revision from
-   those pinned heads, deduplicating immutable hashes **within a project**.
-   Include branch-name → HEAD mappings in the result, even when heads coincide.
-3. **Implemented:** return bounded pages with a stable, resumable traversal cursor and an
-   explicit `complete`/frontier indicator. Show parent IDs even if a parent
-   has not yet been loaded; GUI must not invent an edge endpoint or falsely
-   mark the graph complete.
-4. **Partly implemented:** deterministic traversal order, bounds, cancellation, stale/expired
-   cursor behavior, failure handling and resource budgets. Different project
-   scopes must not be merged merely because hashes match (e.g., identical
-   empty roots). Native and HTTP results must obey the **same** contract.
-5. **Implemented:** preserve existing first-parent `history` behavior for its current callers;
-   introduce full-DAG reading separately, not by silently changing history
-   pagination semantics.
-6. **Partly implemented:** include regression coverage for deep history, historical forks, two-parent
-   merges, shared HEADs, branches whose HEADs are non-leaf revisions,
-   concurrent HEAD advances, paging/frontiers, cancelled loads and complete
-   deduplication.
-
-**Graph scope:** “full history” means the union of revisions **reachable from
-published branch HEADs** in the selected project, not every physically
-present unreferenced object. Offline compaction may collect unreachable
-history. This contract doesn't make branch creation logs, wall-clock ordering
-or remote authentication appear where none is stored.
-
-## 6. GUI display and interaction invariants — agreed
-
-- The database source is a GUI-managed container. Display all selected/visible
-  servers and their projects simultaneously; group each project's actual
-  revision DAG under its project. Source/project identity namespaces must be
-  maintained even where hashes or names coincide.
-- Draw ancestry from oldest ancestors at the top toward newer descendants
-  below. Forks and merge edges follow actual revision parent IDs.
-- Attach every named branch and **HEAD** indication to the immutable revision
-  it currently points to. One revision may carry several branch labels;
-  HEAD need not be a leaf. Branch label/card clicks may inspect the branch,
-  while revision clicks inspect the immutable revision.
-- Branch-reference visuals do **not** create revision nodes and do not
-  establish parent-child relationships between branches.
-- Sidebar selection and graph selection refer to the same identities;
-  selecting must not move branch HEADs or unexpectedly re-fit the camera.
-- Graph loading and refreshing distinguish complete from partial history.
-  The GUI must not show fake revisions to fill missing pages.
-- Network checkout and a working-copy session are **deferred**. Eventually a
-  working copy pins a base revision, handles dirty edits and saves only using
-  the exact expected branch HEAD; stale/conflicting saves preserve local work.
-
-## 7. Decisions still open (not blockers for basic graph semantics)
-
-- The exact style/location of branch reference decorations (badge versus
-  clickable sidecard), while maintaining the invariants above.
-- Immutable commit metadata format, annotations, authors and timestamps;
-  migrations and content-hash compatibility need separate design.
-- Retention policies for unreferenced revisions, and optional durable branch
-  creation/audit events. Such events would be *metadata*, not revision DAG
-  parent links.
-- UUIDv7 identity, canonical revision hashing, legacy SHA migration and
-  cross-replica mapping are specified for design sign-off in the
-  [identity roadmap](uuidv7-identity-migration-roadmap.md). Existing P0 graph
-  cursors and budgets are implemented; they require versioning on identity
-  migration.
+**This contract overrides convenience assumptions in any API or GUI design.**
+A feature is complete only when its storage, service, replication and GUI
+behavior agree with the invariants above.
