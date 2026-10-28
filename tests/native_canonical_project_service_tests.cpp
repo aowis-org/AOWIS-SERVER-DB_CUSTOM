@@ -68,6 +68,8 @@ ModelChange change(std::uint8_t number) {
 void exercise() {
     TemporaryRoot root;
     std::string projectName;
+    std::string pendingUnbornProject;
+    std::optional<BranchId> pendingUnbornBranch;
     RevisionId initial = RevisionId::generate();
     RevisionId merged = RevisionId::generate();
     RevisionId featureTip = RevisionId::generate();
@@ -77,6 +79,12 @@ void exercise() {
         projectName = project.id;
         const ProjectInfo other = service.createProject("another project");
         const ProjectInfo unborn = service.createUnbornProjectV2("unborn project");
+        const ProjectInfo pending = service.createUnbornProjectV2("persistently unborn project");
+        pendingUnbornProject = pending.id;
+        pendingUnbornBranch = service.branchId(pending.id, "main");
+        require(pendingUnbornBranch.has_value(), "new unborn main has no branch identity");
+        require(!service.optionalHeadV2(pending.id, "main").has_value(),
+                "new unborn project has a committed HEAD");
         require(!service.optionalHeadV2(unborn.id, "main").has_value(),
                 "unborn project unexpectedly has committed HEAD");
         require(service.historyV2(unborn.id, "main").empty(),
@@ -152,6 +160,17 @@ void exercise() {
     }
     {
         ProjectService reopened(root.path);
+        require(reopened.branchId(pendingUnbornProject, "main") == pendingUnbornBranch,
+                "unborn main branch identity changed after service restart");
+        require(!reopened.optionalHeadV2(pendingUnbornProject, "main").has_value(),
+                "unborn HEAD changed after service restart");
+        require(reopened.historyV2(pendingUnbornProject, "main").empty(),
+                "reopened unborn project contains fabricated history");
+        const RevisionGraphPageV2 unbornGraph = reopened.revisionGraphV2(pendingUnbornProject);
+        require(unbornGraph.revisions.empty() && unbornGraph.heads.size() == 1 &&
+                unbornGraph.heads.front().branchId == *pendingUnbornBranch &&
+                !unbornGraph.heads.front().revision.has_value(),
+                "reopened unborn graph lost its null HEAD or branch identity");
         require(reopened.head(projectName, "main") == merged &&
                 reopened.head(projectName, "develop") == featureTip &&
                 reopened.head(projectName, "historical") == initial,
