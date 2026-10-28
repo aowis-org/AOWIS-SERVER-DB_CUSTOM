@@ -28,7 +28,13 @@ working copy. Several branches can point at the same committed revision.
 `head(branch)` is independent of other branch HEADs and of any GUI selection.
 No repository-global checkout HEAD exists in the multi-user service.
 
-## Private working copies
+## Personal repositories and private working copies
+
+Local committed HEADs and shared published HEADs are separate refs in
+separate DVMDB repositories. The working copy is durable uncommitted state
+inside the editor's personal DVMDB, never an immutable history vertex.
+The complete contract is in
+[private working repositories](private-working-repositories.md).
 
 Checkout creates an independent, editable working copy with UUIDv7, project
 UUID, branch UUID, owner/session, exact committed base UUID (or null), and
@@ -38,10 +44,11 @@ revision for inspection does not make it writable or move any branch HEAD.
 
 ## Commit and conflict behavior
 
-A commit must pin its target branch and `expectedHeadRevisionId` (including
-explicit null for an unborn HEAD), validate the complete proposed model,
-durably create one fresh immutable revision with the correct parents, and
-atomically advance that branch ref only when the expected HEAD matches.
+A local Commit pins its local branch and exact expected local HEAD/null,
+validates the complete proposed model, durably creates a new immutable
+revision, and atomically advances only that local branch ref. Publish/Push
+then transfers verified history and conditionally advances the separate
+shared branch from an exact expected remote HEAD/null.
 Stale HEADs fail without publishing changes. A stale HEAD requires an explicit
 reconcile/rebase/merge workflow; a stale base is not automatically a content
 conflict. Successful writes remain discoverable after ambiguous timeouts

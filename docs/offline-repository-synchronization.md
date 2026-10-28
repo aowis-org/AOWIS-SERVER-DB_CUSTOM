@@ -100,3 +100,15 @@ they require a distinct explicitly authorized draft backup/sync facility.
 Conflicting target HEAD updates are rejected unless an explicit validated
 fast-forward or merge policy applies. See
 [replication contract](uuidv7-revision-replication-v2.md).
+
+## Personal working repository and publication
+
+The personal working DVMDB is a separate repository from each shared
+project source. **Local Commit** creates immutable history without advancing
+shared refs; **Publish** first transfers missing verified immutable objects
+and then conditionally advances the shared branch from its expected remote
+HEAD (including null for an unborn branch). Fetch updates remote-tracking
+refs without destroying local commits or private drafts. See
+[private working repositories](private-working-repositories.md) for the
+full two-stage lifecycle. Existing bundle import commands do not by
+themselves implement the entire private working-copy or publication UX.

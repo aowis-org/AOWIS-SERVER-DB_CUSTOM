@@ -15,6 +15,14 @@ revision IDs. Branch responses include `headRevisionId` (nullable),
 `originBranchId` and `forkRevisionId`. Commit responses include immutable
 revision UUID, parent UUIDs, record hash and committed snapshot identity.
 
+## Personal repository versus shared source
+
+The same REST transport supports different *repository roles*: private
+working DVMDB (durable drafts and **local** commits) and shared project
+DVMDB (published branch refs). This is an explicit connection/authorization
+choice, not a silently inferred role. See
+[private working repositories](private-working-repositories.md).
+
 ## Operations
 
 - List/create projects. New project creates an unborn `main` branch and
@@ -28,16 +36,19 @@ revision UUID, parent UUIDs, record hash and committed snapshot identity.
 - Create/open a private working copy for a user/session, pinned to a
   committed base UUID or explicit null for the unborn initial state.
 - Edit/validate that private working state without changing a committed HEAD.
-- Commit with target branch UUID, exact `expectedHeadRevisionId` (nullable
-  but **required**), canonical model delta/state and an idempotency key.
+- Commit **locally** in a personal DVMDB using required exact expected local
+  HEAD/null, validated model state and an idempotency key.
+- Fetch immutable objects and source remote-tracking state; Publish/Push
+  with required exact expected shared HEAD/null, fast-forward validation,
+  idempotency and durable remote publication.
 - Compare/reconcile stale working copies; merge branches using explicit
   expected source and target heads.
 
 ## Errors and concurrency
 
-A concurrent advance of the target branch returns **409 Conflict** with
-current committed HEAD details. The draft stays intact; no implicit retry,
-rebase or overwrite occurs. Validation failures, missing identities,
+A concurrent local HEAD advance or a stale shared Publish returns **409
+Conflict** with the current affected HEAD. Draft state and already-successful
+local commits remain intact; no implicit retry, rebase or overwrite occurs. Validation failures, missing identities,
 permission failures, unavailable source state and ambiguous transport
 failures have distinct machine-readable outcomes. An omitted expected
 HEAD field is an invalid request, not a synonym for a first commit with

@@ -11,13 +11,15 @@ the agreed model.
 1. **Unborn projects:** project creation generates project UUIDv7 and an
    empty `main` branch UUIDv7 with **null committed HEAD** and no fabricated
    revision. Verify atomic creation and recovery.
-2. **Private workspaces:** support independent UUIDv7 working copies per
-   editor/session, pinned to a committed base UUID or explicit null, with
-   draft recovery and ownership.
-3. **Conditional commits:** validate the complete candidate model, generate
-   one immutable committed revision UUIDv7 and canonical SHA-256, then
-   atomically advance the chosen branch only when its expected committed
-   HEAD/null matches. Provide idempotent operation status.
+2. **Personal working repositories:** Standalone uses built-in DVMDB;
+   basic/web GUI uses a configured private HTTP DVMDB. Implement durable
+   drafts, local immutable commits, repository-qualified local branch refs
+   and remote-tracking state. See
+   [private working repositories](private-working-repositories.md).
+3. **Local Commit, remote Publish:** create validated immutable revisions
+   and atomically advance only local branch HEADs on Commit. Publish verified
+   history using a separate expected **shared** HEAD/null and safe
+   idempotent update; failed Publish keeps all local commits and drafts.
 4. **Branch provenance:** record immutable source branch UUIDv7 and exact
    committed fork revision UUIDv7. Creating a branch from a committed
    snapshot never creates a revision. Creating it from uncommitted edits
@@ -28,7 +30,7 @@ the agreed model.
 6. **Full history and replication:** expose UUIDv7 identities and distinct
    SHA-256 hashes, nullable HEADs, immutable branch provenance, both merge
    parents, and consistent paginated graph snapshots on native and REST.
-7. **GUI integration:** branch-oriented lanes, immutable revision cards,
+7. **GUI integration:** Git-style committed revision ancestry, immutable revision cards,
    separate private working copies, clear conflict recovery and no fake
    branch-origin ancestry edges. See [GUI contract](gui-integration-requirements.md).
 
@@ -50,8 +52,9 @@ the agreed model.
 - Validate deep/multi-branch DAGs, numerous concurrent private working
   copies, multi-project service load, large hydraulic networks and bounded
   graph/bundle pagination with measured CPU, memory, I/O and latency.
-- Define owner/session access to working copies, project/branch write
-  permissions, API authentication, transport encryption and audit events.
+- Record access-control findings and future qualification in the dedicated
+  [security/permissions backlog](security-permissions-design.md). Private
+  HTTP repos require deployment isolation until this work is implemented.
 - Keep native C++ core independent from Qt and SQL backends; native and
   REST entry points must expose consistent commit and conflict rules.
 

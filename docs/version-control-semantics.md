@@ -6,7 +6,8 @@ This document defines behavior; it does not claim that every operation is
 already implemented. [Native architecture](architecture.md),
 [revision API](native-revision-history.md),
 [merge semantics](native-branch-merging.md), and
-[GUI integration](gui-integration-requirements.md) elaborate the same model.
+[GUI integration](gui-integration-requirements.md), and
+[private working repositories](private-working-repositories.md) elaborate the same model.
 
 ## 1. Concepts and terminology
 
@@ -17,7 +18,8 @@ already implemented. [Native architecture](architecture.md),
 | Branch | Persistent, named line of development with a movable pointer to the latest committed revision | Branch ID | Name/HEAD can change; creation provenance cannot |
 | Revision / commit | One **finalized immutable** whole-model snapshot, with ordered revision parents | Revision ID | **Never** |
 | Branch HEAD | The **latest committed revision referenced by that branch**; nullable for an unborn branch | The referenced revision's ID, not another object | Ref moves atomically |
-| Working copy | A **private, mutable editor state** checked out from a committed revision (or the initial empty project state) | Working-copy ID | Editable by its owner/session |
+| Working repository | One user's private durable DVMDB storing local committed history, drafts and remote-tracking refs | Repository ID / configured location | Its local refs and drafts can change |
+| Working copy | A **private, mutable editor state** in the user's working repository, based on a committed revision (or an initial empty project) | Working-copy ID | Editable by its owner/session |
 | Base revision | Exact committed revision on which a working copy's current edits were based; nullable for an unborn branch | Revision ID or null | Pinned until explicit reconcile/rebase |
 | Fork point | Exact immutable source revision from which a new branch was created | Revision ID or null | Immutable creation metadata |
 | Record hash | SHA-256 commitment to a canonical immutable revision record | Not an identity | Never changes for a given revision |
@@ -101,10 +103,8 @@ Creating a branch from **a user's uncommitted edits** is a different request.
 It must explicitly offer to **commit those edits first** (subject to the
 ordinary concurrency check) or start from the last committed base without
 the edits. Never silently commit someone else's working copy. An unborn
-`main` may be branched only using a deliberately specified empty-state/unborn
-policy; it must not be given a fictitious committed fork revision. The exact
-handling of multiple unborn branches is defined in the branch-creation API,
-not inferred from a missing SHA or zero UUID.
+`main` **cannot** be branched until its first commit succeeds. Do not
+manufacture an empty revision or a second unborn branch as a workaround.
 
 Branches support readable UTF-8 names including spaces. Validate UTF-8,
 length and prohibited control/path-delimiter characters; names must be unique
@@ -113,79 +113,78 @@ HEAD and creation provenance. If the source branch is later renamed, its
 origin UUID remains stable. If source branches are removed, do not fabricate
 new provenance or erase a valid recorded fork point.
 
-## 5. Working copies and multi-user concurrency
+## 5. Personal repositories, working copies and concurrency
 
-Editing occurs **only** in a separate working copy; no user edits the stored
-revision object. A working copy records at least:
+Every editor works through a **personal durable DVMDB working repository**.
+Standalone uses its configured built-in native DVMDB. Basic desktop and
+web/browser GUIs use an explicitly configured **private HTTP DVMDB**.
+The personal repository stores local branches, immutable local commits,
+remote-tracking refs and one or more separate mutable UUIDv7 working copies.
+A working copy is not a repository and is not a committed revision.
 
-- unique `workingCopyId` (UUIDv7), owner/session, owning project UUID;
-- selected target branch UUIDv7 (or explicit detached/historical mode);
-- exact base committed revision UUIDv7 or `null` for an unborn base;
-- mutable model data, dirty state and validation status;
-- local or service-managed persistence and recovery policy.
+The **shared project repository** remains authoritative for published
+branches and their committed HEADs. A personal local branch HEAD may advance
+without advancing the corresponding shared branch HEAD. Remote-tracking
+state identifies the shared source/repository, project and branch UUIDs plus
+its last fetched HEAD. Distinct local and remote refs must not be confused.
+Private working repositories must not be silently substituted with a shared
+source, and their absence disables editing rather than risking data loss.
+See [private working repositories](private-working-repositories.md) for the
+full deployment, tracking and recovery model.
 
-Alice and Bob may each check out `main` at R7, obtaining **distinct private
-working copies** that both pin R7. They may edit independently. The number
-of working copies does not change the number of branches or committed HEADs.
-A working copy may become stale as the branch advances; stale data must not
-be discarded or silently promoted to a new base. Access to private drafts
-and their cleanup must respect session ownership and eventual authorization.
+Each working copy has its own UUIDv7, owner/session, project UUID, local
+branch UUID, pinned committed base UUID/null, durable model changes and
+validation/dirty status. Alice and Bob may edit from the same shared R7
+in separate personal repositories; multiple sessions of one user should
+also use distinct drafts unless explicit session locking/version checking
+prevents concurrent overwrite. No working copy can mutate a committed
+revision or either local/shared HEAD as a side effect of ordinary Save.
 
-A read or edit operation spanning multiple model entities must use one pinned
-base snapshot. Changing the active GUI selection must never implicitly move
-a branch HEAD or change a working copy's pinned base.
+## 6. Local Commit and shared Publish (optimistic concurrency)
 
-## 6. Commit protocol (optimistic concurrency)
+**Save / Autosave** durably updates the selected personal working copy;
+it does **not** create a revision or advance a branch HEAD.
 
-Every commit request supplies:
+**Commit** validates the complete candidate hydraulic model, creates one
+new immutable UUIDv7 revision and SHA-256 record in the personal DVMDB,
+and atomically advances only its **local** target branch when
+`expectedLocalHeadRevisionId` exactly matches (explicit null for unborn).
+Local commitment and HEAD update are one logical transaction, with
+idempotency and authoritative status recovery after ambiguous timeouts.
+A concurrent local edit to the same branch or a stale local draft must not
+silently overwrite an existing local commit.
 
-- project UUIDv7, target branch UUIDv7 and working-copy identity;
-- `expectedHeadRevisionId`: the committed branch HEAD observed by the editor
-  when the working copy's changes were based on it, **including explicit null
-  for an unborn branch**;
-- proposed complete and validated model snapshot (or a bounded change set
-  that deterministically yields it), commit metadata and idempotency key.
+**Publish / Push** sends missing verified immutable objects from the personal
+DVMDB to the **shared** DVMDB and conditionally advances the shared branch
+from an exact `expectedRemoteHeadRevisionId` (including null for the first
+publication). The shared server verifies identities, ancestry, hashes,
+model semantics and fast-forward/merge rules before durable publication.
+The remote update is atomic and idempotent; a rejected or timed-out publish
+**never erases the already successful local commit**. Query the shared
+operation status before retrying an ambiguous response.
 
-DVMDB must perform, as one atomic logical transaction:
+**Fetch** only adds/validates immutable history and updates remote-tracking
+refs; it never overwrites private working copies or silently resets local
+branch HEADs. On shared HEAD advance, use an explicit compare/reconcile or
+merge/rebase operation. Overlapping entity edits and non-overlapping but
+hydraulically incompatible changes both require resolution/validation;
+no last-writer-wins or force update occurs during ordinary Publish.
 
-1. Validate permissions, project/branch state, complete model consistency and
-   canonical references; resolve and hash the exact proposed snapshot.
-2. Read and lock (or compare-and-swap) the current branch HEAD. **If it
-   differs from `expectedHeadRevisionId`, do not move HEAD and report a
-   stale-base conflict.**
-3. Create and durably record a fresh immutable revision UUIDv7 with the
-   expected HEAD as its sole parent (zero parents for the first commit).
-4. Publish the new branch HEAD only **after** the snapshot and immutable
-   revision record are durably available. Return the new revision UUIDv7 and
-   record SHA-256.
-
-No failed, timed-out or stale commit may overwrite another user's successful
-commit. If the server may have published despite an interrupted response,
-query the authoritative branch/revision status by request ID or idempotency
-key **before retrying**. A rejected publication may leave unreachable prepared
-objects, but not an observable partial commit or partially moved HEAD.
-
-A changed HEAD means **concurrency collision**, not necessarily conflicting
-content. After an explicit refresh, the editor may compute a three-way
-reconciliation between the pinned base, the current branch HEAD and local
-changes. Non-overlapping edits may be merged; overlapping or semantically
-incompatible edits require user resolution. No automatic rebase, force push,
-last-writer-wins or branch reset is allowed as a side effect of ordinary Save.
-Hydraulic semantic validation must run on the **complete merged network**, not
-merely on independent entity UUID updates.
-
-### Example: two editors
+Example:
 
 ```text
-main HEAD = R7  (immutable)
-Alice's working copy A: base R7, edits pump P
-Bob's working copy B:   base R7, edits pipe Q
-
-Alice commits A with expectedHead R7 -> R8 (parent R7), HEAD becomes R8.
-Bob commits B with expectedHead R7 -> CONFLICT; main remains at R8.
-Bob reconciles against R8, validates complete model, then commits
-  with expectedHead R8 -> R9 (parent R8), HEAD becomes R9.
+Shared main HEAD R7; Alice and Bob each have personal DVMDBs at R7.
+Alice saves draft A, commits locally R8 (shared HEAD still R7).
+Bob saves draft B, commits locally B8 (shared HEAD still R7).
+Alice publishes R8 with expected remote HEAD R7 -> shared HEAD R8.
+Bob publishes B8 with expected remote HEAD R7 -> STALE/REJECTED.
+Bob still owns B8 in his personal repository. He fetches R8,
+reconciles and validates, then publishes a new accepted successor.
 ```
+
+***Commit and Publish are distinct user actions and API operations.***
+Their exact wire schemas, local tracking-reference behavior and any
+future optional combined command must preserve these invariants.
 
 ## 7. Revision DAG and merging
 
@@ -211,9 +210,11 @@ branches make separate commits**. Example:
 
 The graph need not render a separate edge for `originBranchId` or
 `forkRevisionId`. These are provenance metadata, shown in the branch
-inspector. A branch can be presented as a *lane* of development while shared
-commits are logically single revision objects. GUI lanes and headers must not
-create duplicate revision identities.
+inspector. Use Git-style revision-ancestry graph lanes as a **layout of one commit DAG**.
+Branch names and HEAD markers decorate their referenced revision nodes; they
+are not lane ownership or extra ancestry vertices. Where many refs share one
+revision, use a compact branch list/inspector or adjacent reference labels
+without piling unrelated cards into the revision itself.
 
 Merge must compare both source and target committed HEADs against expected
 values before publishing. An up-to-date merge is a no-op; fast-forward may
@@ -230,10 +231,9 @@ unless an explicit separate operation requests otherwise.
 - History traversal includes every branch HEAD and both parents of merge
   revisions; graph pagination must pin a stable branch-HEAD snapshot and
   validate closure before presenting a complete graph.
-- The GUI displays server/database and project organization, **branch lanes
-  with committed revisions** and a clearly marked branch-local committed
-  `HEAD`; the independent private working copy is displayed in an editor or
-  workspace section, **not** as a committed revision.
+- The GUI shows server/project organization and **one committed revision DAG**
+  with branch-ref labels at their tips and optional routing lanes. Private
+  working copies appear in the editor, **not** as committed revisions.
 - An unborn project displays `main` and a clear **No commits yet** state.
   It must not display a synthetic R0.
 - A branch whose HEAD is also another branch's HEAD is legitimate. A HEAD
@@ -257,7 +257,11 @@ The API contract must make these distinct operations explicit:
 - read immutable revision/snapshot -> UUID, SHA-256 record/snapshot roots,
   ordered parents and immutable metadata;
 - create branch from **committed** revision, with optional source branch UUID;
-- commit working copy with **exact expected HEAD** and idempotent result;
+- save drafts and commit locally in the personal repository with exact
+  expected **local** HEAD and idempotent result;
+- fetch immutable objects and remote-tracking HEADs;
+- publish/push committed history using exact expected **shared** HEAD and
+  idempotent result;
 - get paginated full revision DAG and branch HEADs under a pinned snapshot;
 - compare, reconcile and merge with explicit expected HEADs.
 
@@ -271,55 +275,55 @@ UUIDs, immutable branch-origin UUIDs and fork UUIDs, all committed parent
 IDs, all integrity hashes and exact branch HEAD states (including unborn).
 Never silently rewrite UUIDs or fabricate an ancestry edge to resolve a
 replication conflict. Imported branch HEAD publication must obey the same
-atomic durability and concurrency rules as a local commit. Copies of a
-private uncommitted working state are **not** committed history and require
+atomic durability and concurrency rules as a conditional Publish operation.
+Copies of a private uncommitted working state are **not** committed history
+and require
 a distinct explicitly authorized backup/synchronization protocol.
 
 ## 10. Required acceptance scenarios
 
 1. New project: UUIDv7 project and `main` exist, `main.head = null`, history
    has zero revisions; checkout has private mutable data.
-2. First commit creates one immutable UUIDv7 R0; a second commit creates R1
-   and advances only the targeted branch.
+2. First local commit creates immutable UUIDv7 R0 in the personal repository;
+   publishing conditionally advances only the selected shared branch.
 3. Creating `feature` from committed R0 creates a distinct branch UUIDv7,
    records source branch and exact R0, does not add a revision.
-4. Branch creation requested from uncommitted edits explicitly asks whether
-   to commit first or fork from the unchanged committed base.
-5. Two users edit the same branch from one base; only one stale-base commit
-   can advance that HEAD. The other retains a recoverable working copy.
-6. After reconciliation, a subsequent commit has the correct immutable
-   parent and validates the complete hydraulic model.
-7. Sharing committed R0 across multiple HEADs does not duplicate it; branch
-   lanes are distinct, with provenance in the inspector, not extra history
-   edges.
+4. Creating a branch from unborn `main` is rejected until the first commit;
+   uncommitted edits require an explicit commit-first or omit-edits choice.
+5. Alice and Bob have separate personal repositories, each with a draft and
+   a local commit based on shared R7; Alice's conditional Publish succeeds,
+   Bob's stale Publish is rejected without deleting B8 or his drafts.
+6. Explicit reconciliation incorporates Alice's history, validates the full
+   hydraulic model and permits a later conditional Publish.
+7. Shared R0 is one UUIDv7 revision vertex; branch-ref labels and optional
+   Git-style ancestry lanes do not create duplicate revisions or fake edges.
 8. Rename, service restart and bundle import/export preserve branch UUID,
    origin UUID, fork UUID and complete committed ancestry.
-9. Native and REST return equivalent UUIDv7 IDs, hashes, null unborn HEADs,
-   pagination and conflict semantics.
-10. Failures, cancellations and ambiguous network responses never reset a
-    published HEAD or silently lose a user's uncommitted work.
+9. Native and REST preserve UUIDv7 identities, SHA hashes, nullable unborn
+   HEADs, pagination and local-versus-remote conflict behavior.
+10. Failed, cancelled or ambiguous Save, Commit or Publish operations never
+    move the wrong branch HEAD or silently discard local committed/draft work.
 
-## 11. Parameters requiring explicit implementation design
+## 11. Implementation details requiring dedicated design
 
-The core lifecycle above is fixed. The following choices require a concrete
-native/REST/GUI agreement **before** their respective operations ship:
+The **architectural decisions are fixed**: one personal durable DVMDB per
+user, local commits distinct from remote publication, Git-style immutable
+commit DAG, no branching from unborn `main`, and deferred AOWIS-wide
+permissions. The following remain detailed implementation work:
 
-- Whether and how a second **unborn branch** may be created when no committed
-  fork revision exists; any such operation must represent null honestly and
-  must not create a hidden revision.
-- Where private working copies are persisted (client-local, server-managed or
-  both), draft retention/expiry, session recovery and ownership permissions.
-- Required human commit metadata, monotonic/idempotent request-ID retention,
-  and handling of unknown outcomes following connection loss.
-- Exact merge resolution UI, full hydraulic validator rules, and how failed
-  semantic merges are represented to collaborators.
-- Revision-lane positioning for shared ancestors, many branch HEADs on one
-  committed revision and two-parent merges. The *semantics* of all edges are
-  fixed even where pixel layout choices are not.
-
-These choices are not permission to change the immutable commit / private
-working-copy separation, UUIDv7 identity, branch provenance or atomic
-expected-HEAD publication.
+- Durable draft transaction format, explicit session coordination,
+  backup/retention quotas and recovery UX; see
+  [private working repositories](private-working-repositories.md).
+- Exact local branch / remote-tracking record representation, creation
+  of tracking refs on clone, and synchronization transport/API schemas.
+- Idempotency key/result retention and ambiguous-outcome query endpoints
+  for personal Commit and shared Publish separately.
+- Merge/rebase resolution UX and full hydraulic validation requirements.
+- Readable placement of many branch labels pointing to a common revision,
+  stable optional DAG lanes and routing of merge-parent edges.
+- Future account/permission/security rules in the dedicated
+  [security backlog](security-permissions-design.md). Until deployed,
+  unauthenticated HTTP editing must not be exposed to multiple users.
 
 **This contract overrides convenience assumptions in any API or GUI design.**
 A feature is complete only when its storage, service, replication and GUI

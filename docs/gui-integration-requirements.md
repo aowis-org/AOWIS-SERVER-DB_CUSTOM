@@ -14,6 +14,13 @@ immutable `originBranchId` / `forkRevisionId`; it is not a commit vertex.
 A new project creates `main` with no committed HEAD or fabricated initial
 revision. Working copies are independent mutable session state.
 
+## Personal working repository and shared source roles
+
+Standalone uses its embedded DVMDB as the personal repo; basic and web GUI
+require a separately configured private HTTP DVMDB for user drafts and local
+commits. Shared sources remain separate. See
+[private working repositories](private-working-repositories.md).
+
 ## Required operations
 
 1. **Catalogue:** list sources/projects/branches, including unborn branches,
@@ -25,12 +32,12 @@ revision. Working copies are independent mutable session state.
    committed revision UUIDv7, or null for an unborn first checkout.
 4. **Edit:** change only that working copy, retaining dirty state and
    revision base across UI navigation or reconnection.
-5. **Commit:** submit the validated model with target branch UUIDv7,
-   expected committed HEAD UUID/null and idempotency key; only a successful
-   atomic compare-and-swap creates a finalized revision and moves the HEAD.
-6. **Conflict/reconcile:** on stale expected HEAD, preserve local edits,
-   fetch the new committed head, compare/merge and validate the complete
-   hydraulic state before an explicitly requested subsequent commit.
+5. **Commit locally:** validate and create a committed revision in the
+   user's personal DVMDB with an expected **local** HEAD/null and an
+   idempotency key, without advancing the shared branch.
+6. **Publish:** transfer missing immutable objects, then conditionally
+   advance the shared branch from exact expected **remote** HEAD/null.
+   Conflict retains local commits/drafts; fetch/reconcile explicitly.
 7. **Branch from revision:** accept the exact immutable source revision UUID,
    optional source branch UUID, store both creation-origin identities; do not
    create a revision just to name the branch. Uncommitted edits require an
@@ -47,7 +54,8 @@ provide equivalent behavior.
 
 ## Graph and inspector invariants
 
-- Branch lanes organize committed revision histories; revisions alone form
+- One Git-style committed revision DAG displays genuine ancestry, with
+  branch-ref labels and optional stable layout lanes; revisions alone form
   ancestry vertices. A branch is not a leaf dangling from a revision.
 - Shared immutable revisions remain a **single logical UUIDv7 object**.
 - The branch inspector shows `originBranchId` and `forkRevisionId` without
@@ -61,7 +69,8 @@ provide equivalent behavior.
 ## Validation matrix
 
 - Empty project, first commit and independent branch creation.
-- Simultaneous working copies; stale-base rejection and safe reconciliation.
+- Separate personal working repos, local commits, stale remote Publish
+  rejection without losing committed or draft content, and reconciliation.
 - Two divergent commits and two-parent merge.
 - Shared and non-leaf branch HEADs.
 - Branch rename and provenance surviving restart/replication.
