@@ -1,6 +1,8 @@
 # AOWIS / DVMDB security and permission design backlog
 
 **Dedicated deferred design document, not a claim of implemented security.**
+This is the VC-12 track in the [implementation roadmap](roadmap.md), and
+multi-user/public writable deployment cannot be approved before its gates.
 This records findings and requirements to revisit as one AOWIS-wide security
 and permission architecture after the version-control lifecycle and GUI
 integration are stable. Refer to [repository access-control findings](native-repository-access-control.md),

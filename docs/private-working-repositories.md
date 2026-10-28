@@ -4,6 +4,8 @@
 [version-control semantics](version-control-semantics.md),
 [offline synchronization](offline-repository-synchronization.md), and
 [security design backlog](security-permissions-design.md).
+The coordinated backend/GUI implementation sequence and unresolved wire/storage
+decisions are recorded in the [implementation roadmap](roadmap.md).
 The exact wire endpoints and configuration keys are implementation work;
 this document does not claim that they already exist.
 

@@ -8,6 +8,8 @@ already implemented. [Native architecture](architecture.md),
 [merge semantics](native-branch-merging.md), and
 [GUI integration](gui-integration-requirements.md), and
 [private working repositories](private-working-repositories.md) elaborate the same model.
+The step-by-step cross-project delivery sequence and remaining **decision gates**
+are in the [DVMDB implementation roadmap](roadmap.md).
 
 ## 1. Concepts and terminology
 
