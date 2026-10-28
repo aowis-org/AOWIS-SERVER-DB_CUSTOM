@@ -1100,7 +1100,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         try {
             struct stat st{};
             systemCall(::fstat(fd, &st) == 0, "stat UUID branch record");
-            require(Err::Corruption, S_ISREG(st.st_mode) && st.st_size >= 82 && st.st_size <= 320,
+            require(Err::Corruption, S_ISREG(st.st_mode) && st.st_size >= 21 && st.st_size <= 320,
                     "invalid UUID branch record file type or length");
             bytes.resize(static_cast<std::size_t>(st.st_size));
             std::size_t offset = 0;
@@ -1116,17 +1116,25 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         constexpr std::string_view prefixV1 = "AOWIS-BRANCH-1\n";
         constexpr std::string_view prefixV2 = "AOWIS-BRANCH-2\n";
         constexpr std::string_view prefixV3 = "AOWIS-BRANCH-3\n";
+        constexpr std::string_view prefixV4 = "AOWIS-BRANCH-4\n";
+        const bool unbornV4 = bytes.starts_with(prefixV4);
         const bool originV3 = bytes.starts_with(prefixV3);
         const bool revisionV2 = originV3 || bytes.starts_with(prefixV2);
-        require(Err::Corruption, revisionV2 || bytes.starts_with(prefixV1),
+        require(Err::Corruption, unbornV4 || revisionV2 || bytes.starts_with(prefixV1),
                 "invalid UUID branch record marker");
-        const std::size_t prefixSize = originV3 ? prefixV3.size()
+        const std::size_t prefixSize = unbornV4 ? prefixV4.size() : originV3 ? prefixV3.size()
             : revisionV2 ? prefixV2.size() : prefixV1.size();
         const std::size_t split = bytes.find('\n', prefixSize);
         require(Err::Corruption, split != std::string::npos, "invalid UUID branch record name");
         const std::string name = bytes.substr(prefixSize, split - prefixSize);
         try { checkBranch(name); }
         catch (const StorageError&) { throw StorageError(Err::Corruption, "invalid stored branch name"); }
+        if (unbornV4) {
+            require(Err::Corruption, bytes.substr(split + 1) == "-\n-\n" &&
+                    names.insert(name).second, "invalid unborn UUIDv7 branch record");
+            result.push_back(StoredBranch{*parsed, name, Hash{}, std::nullopt, std::nullopt});
+            continue;
+        }
         std::optional<RevisionId> revisionId;
         std::size_t hashOffset = split + 1;
         if (revisionV2) {
@@ -1185,7 +1193,9 @@ void publishStoredBranch(const std::filesystem::path& repository,
     const std::filesystem::path destination = heads / branch.id.toString();
     // Keep the historical BRANCH-2 encoding for branches without creation
     // provenance. Newly forked branches use BRANCH-3 and preserve it forever.
-    const std::string payload = branch.revisionV2
+    const std::string payload = (!branch.revisionV2 && isZero(branch.head))
+        ? std::string("AOWIS-BRANCH-4\n") + branch.name + "\n-\n-\n"
+        : branch.revisionV2
         ? (branch.originBranchId
             ? std::string("AOWIS-BRANCH-3\n") + branch.name + "\n" +
                 branch.revisionV2->toString() + "\n" +
@@ -2079,7 +2089,7 @@ void Repository::discardTornPackTail(std::uint64_t position, std::uint64_t size)
     // Each commit appends its revision object last, so damage that reaches a
     // published head is detected here instead of being silently truncated.
     for (const StoredBranch& branch : readStoredBranches(this->directory_)) {
-        require(Err::Corruption, containsIndex(branch.head),
+        require(Err::Corruption, isZero(branch.head) || containsIndex(branch.head),
                 "branch '" + branch.name + "' references damaged pack tail at offset " +
                 std::to_string(position));
     }
@@ -2787,7 +2797,8 @@ void Repository::publishRef(std::string_view name, const Hash& commitHash, bool 
     const BranchId id = existing ? existing->id : requestedId.value_or(BranchId::generate());
     require(Err::Conflict, !existing || !requestedId || existing->id == *requestedId,
             "branch UUIDv7 conflicts with requested identity");
-    publishStoredBranch(this->directory_, StoredBranch{id, std::string(name), commitHash, std::nullopt},
+    publishStoredBranch(this->directory_, StoredBranch{id, std::string(name), commitHash, std::nullopt,
+                                                           existing ? existing->originBranchId : std::nullopt},
                         !existing.has_value());
 }
 
@@ -2827,7 +2838,8 @@ void Repository::renameBranch(std::string_view previous, std::string_view rename
     require(Err::Unavailable, !source->revisionV2, "UUIDv7 branch requires v2 rename API");
     require(Err::Conflict, source->head == expectedHead, "branch HEAD advanced before rename");
     require(Err::Conflict, !findStoredBranch(this->directory_, renamed), "new branch name already exists");
-    publishStoredBranch(this->directory_, StoredBranch{source->id, std::string(renamed), source->head, std::nullopt}, false);
+    publishStoredBranch(this->directory_, StoredBranch{source->id, std::string(renamed), source->head,
+                                                           std::nullopt, source->originBranchId}, false);
 }
 
 void Repository::createBranch(std::string_view name, std::optional<std::string_view> from) {
@@ -3466,10 +3478,29 @@ RevisionRecordV2 Repository::branchRevisionV2Locked(const ProjectId& project,
     return resolved->record;
 }
 
-std::optional<RevisionId> Repository::optionalHeadV2(const ProjectId& project, std::string_view branch) {
-    // Keep branch existence, project identity and revision verification identical
-    // to the committed-HEAD API until durable unborn refs are enabled.
-    return headV2(project, branch);
+void Repository::createUnbornBranchV2(const ProjectId& project, std::string_view name) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    checkBranch(name);
+    require(Err::Conflict, readStoredBranches(this->directory_).empty(),
+            "unborn branch requires a repository without branches");
+    // The project ownership is pinned by the first immutable revision, as in
+    // createBranchV2. No UUID revision or pack object is written here.
+    (void)project;
+    publishStoredBranch(this->directory_, StoredBranch{
+        BranchId::generate(), std::string(name), Hash{}, std::nullopt, std::nullopt}, true);
+}
+
+std::optional<RevisionId> Repository::optionalHeadV2(
+        const ProjectId& project, std::string_view branch) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
+    require(Err::NotFound, stored.has_value(), "branch not found");
+    if (!stored->revisionV2 && isZero(stored->head)) return std::nullopt;
+    return branchRevisionV2Locked(project, branch).id;
 }
 
 RevisionId Repository::headV2(const ProjectId& project, std::string_view branch) {
@@ -4922,7 +4953,7 @@ VerificationReport Repository::verifyRepository() {
                     published->second == *branch.revisionV2,
                     "v2 branch HEAD UUID/SHA does not match the published revision");
         }
-        tips.push_back(branch.head);
+        if (!isZero(branch.head)) tips.push_back(branch.head);
     }
     const std::function<Bytes(const Hash&)> loadObject =
         [this, &v2](const Hash& hash) {
@@ -6201,8 +6232,9 @@ CompactionStats Repository::compact() {
                     published->second == *branch.revisionV2,
                     "v2 branch HEAD UUID/SHA does not match the published revision");
         }
-        pending.emplace_back(branch.head,
-                             branch.revisionV2 ? ReachableKind::RevisionV2 : ReachableKind::Revision);
+        if (!isZero(branch.head))
+            pending.emplace_back(branch.head,
+                                 branch.revisionV2 ? ReachableKind::RevisionV2 : ReachableKind::Revision);
     }
     // Retain even unreferenced but *published* UUID bindings; no retained
     // UUID may end up pointing to a compacted-away immutable object.

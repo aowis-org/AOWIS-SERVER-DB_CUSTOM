@@ -35,6 +35,27 @@ Key key(unsigned last) {
 std::optional<Bytes> value(std::string_view text) {
     return Bytes(text.begin(), text.end());
 }
+void testUnbornNativeRefFoundation() {
+    Temporary temp;
+    const ProjectId project = ProjectId::generate();
+    BranchId branch = BranchId::generate();
+    {
+        Repository repo(temp.path);
+        repo.createUnbornBranchV2(project, "main");
+        branch = *repo.branchId("main");
+        check(!repo.optionalHeadV2(project, "main"), "unborn HEAD is not null");
+        rejects([&] { repo.createUnbornBranchV2(project, "second"); },
+                StorageErrorKind::Conflict, "second unborn branch accepted");
+        rejects([&] { (void)repo.headV2(project, "main"); },
+                StorageErrorKind::Unavailable, "legacy nonnullable HEAD accepted unborn");
+    }
+    {
+        Repository reopened(temp.path);
+        check(reopened.branchId("main") == branch &&
+              !reopened.optionalHeadV2(project, "main"),
+              "unborn branch not durable across reopen");
+    }
+}
 void testV2Publication() {
     Temporary temp;
     const ProjectId project = ProjectId::generate();
@@ -199,6 +220,7 @@ void testMixingRejected() {
 
 int main() {
     try {
+        testUnbornNativeRefFoundation();
         testV2Publication();
         testMixingRejected();
         testCorruptV2HeadRejected();

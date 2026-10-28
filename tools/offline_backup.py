@@ -82,7 +82,7 @@ def branch_heads(root):
             content = entry.read_bytes()
             parts = content.splitlines(keepends=True)
             require(parts and parts[0] in (b"AOWIS-BRANCH-1\n", b"AOWIS-BRANCH-2\n",
-                                                b"AOWIS-BRANCH-3\n"),
+                                                b"AOWIS-BRANCH-3\n", b"AOWIS-BRANCH-4\n"),
                     f"invalid UUIDv7 branch record marker: {entry}")
             marker = parts[0]
             require(len(parts) == (3 if marker == b"AOWIS-BRANCH-1\n" else
@@ -90,7 +90,10 @@ def branch_heads(root):
                     and parts[1].endswith(b"\n")
                     and BRANCH.fullmatch(parts[1][:-1]) is not None,
                     f"invalid UUIDv7 branch record name or length: {entry}")
-            if marker != b"AOWIS-BRANCH-1\n":
+            if marker == b"AOWIS-BRANCH-4\n":
+                require(parts[2:] == [b"-\n", b"-\n"],
+                        f"invalid unborn UUIDv7 branch record: {entry}")
+            elif marker != b"AOWIS-BRANCH-1\n":
                 require(parts[2].endswith(b"\n") and
                         UUID7.fullmatch(parts[2][:-1].decode("ascii", errors="replace")) is not None,
                         f"invalid UUIDv7 branch HEAD identity: {entry}")
@@ -99,7 +102,7 @@ def branch_heads(root):
                         UUID7.fullmatch(parts[3][:-1].decode("ascii", errors="replace")) is not None
                         and parts[3][:-1].decode("ascii") != entry.name,
                         f"invalid UUIDv7 branch creation origin: {entry}")
-            require(HEAD.fullmatch(parts[-1]) is not None,
+            require(marker == b"AOWIS-BRANCH-4\n" or HEAD.fullmatch(parts[-1]) is not None,
                     f"invalid UUIDv7 branch HEAD digest: {entry}")
             values[entry.name] = content
         require(values, f"project has no published branches: {project.name}")

@@ -328,6 +328,7 @@ public:
     // cannot be mixed with SHA-based branches in one repository.
     RevisionId createBranchV2(const ProjectId& project, std::string_view name,
                               std::optional<std::string_view> from = std::nullopt);
+    void createUnbornBranchV2(const ProjectId& project, std::string_view name);
     RevisionId headV2(const ProjectId& project, std::string_view branch);
     // VC-01 transition: optional committed HEAD contract; existing branches remain born.
     std::optional<RevisionId> optionalHeadV2(const ProjectId& project, std::string_view branch);

@@ -251,11 +251,14 @@ private:
     int descriptor_ = -1;
 };
 
-std::string makeBundle(const fs::path& root, std::string& expected) {
+std::string makeBundle(const fs::path& root, const std::string& projectText, std::string& expected) {
     using namespace aowis::dvmdb;
+    fs::create_directories(root);
     const fs::path sourcePath = root / "source";
     Repository repository(sourcePath);
-    repository.createBranch("main");
+    const std::optional<ProjectId> project = ProjectId::parse(projectText);
+    require(project.has_value(), "invalid project UUID for stress fixture");
+    const RevisionId initial = repository.createBranchV2(*project, "main");
     std::vector<Change> changes;
     changes.reserve(1024);
     for (unsigned index = 0; index < 1024; ++index) {
@@ -272,9 +275,17 @@ std::string makeBundle(const fs::path& root, std::string& expected) {
         }
         changes.push_back(Change{key, std::move(value)});
     }
-    expected = toHex(repository.commit("main", changes).id);
+    expected = repository.commitV2(*project, "main", changes, initial).toString();
     const fs::path output = root / "fixture.bundle";
-    repository.exportBranchBundle("main", output);
+    const int fd = ::open(output.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    require(fd >= 0, "unable to create revision-v2 fixture");
+    try {
+        repository.exportRevisionBundleV2(*project, "main", fd);
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+    ::close(fd);
     std::ifstream file(output, std::ios::binary);
     require(static_cast<bool>(file), "fixture bundle missing");
     const std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -283,8 +294,22 @@ std::string makeBundle(const fs::path& root, std::string& expected) {
     return content;
 }
 
+// Every imported local branch must have its own immutable BranchId. The
+// project/revision/object identities remain unchanged. In revision-v2, the
+// branch ID is a header field, not part of the hashed revision graph.
+std::string withFreshBranchId(const std::string& bundle) {
+    require(bundle.size() >= 40, "revision-v2 fixture header is truncated");
+    std::string result = bundle;
+    const aowis::dvmdb::BranchId id = aowis::dvmdb::BranchId::generate();
+    const std::array<std::uint8_t, 16>& uuid = id.uuid().bytes;
+    for (std::size_t i = 0; i < uuid.size(); ++i)
+        result[24 + i] = static_cast<char>(uuid[i]);
+    return result;
+}
+
 void tightBudget(unsigned short port, const std::string& a, const std::string& b,
-                 const std::string& originalHead, const std::string& fixture) {
+                 const std::string& originalHead, const std::string& fixture,
+                 const std::string& recipientHead, const std::string& recipientFixture) {
     const std::string aRoot = prefix(a);
     const std::string bRoot = prefix(b);
     {
@@ -336,9 +361,9 @@ void tightBudget(unsigned short port, const std::string& a, const std::string& b
             "aborted upload moved existing head");
     require(request(port, "GET", aRoot + "stalled/head").status == 404,
             "aborted transfer created an incomplete branch");
-    const HttpResponse imported = request(port, "POST", bRoot + "from_a/bundle", fixture,
+    const HttpResponse imported = request(port, "POST", bRoot + "from_a/bundle", recipientFixture,
                                            "application/vnd.aowis.bundle");
-    require(imported.status == 201 && field(imported.body, "head") == originalHead,
+    require(imported.status == 201 && field(imported.body, "head") == recipientHead,
             "valid import after budget cleanup failed");
     {
         RawSocket download(port);
@@ -359,7 +384,7 @@ void tightBudget(unsigned short port, const std::string& a, const std::string& b
 }
 
 void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
-                    const std::string& originalHead, const std::string& fixture) {
+                    const std::vector<std::string>& heads, const std::vector<std::string>& fixtures) {
     std::atomic<unsigned> imports{0};
     std::atomic<unsigned> downloads{0};
     std::atomic<unsigned> busy{0};
@@ -371,14 +396,18 @@ void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
     for (unsigned worker = 0; worker < 6; ++worker) {
         workers.emplace_back([&, worker] {
             try {
-                const std::string path = prefix(ids[worker % ids.size()]);
+                const std::size_t projectIndex = worker % ids.size();
+                const std::string path = prefix(ids[projectIndex]);
+                const std::string& fixture = fixtures[projectIndex];
+                const std::string& originalHead = heads[projectIndex];
                 startingLine.arrive_and_wait();
                 for (unsigned iteration = 0; iteration < 4; ++iteration) {
                     const std::string branch = "stress_" + std::to_string(worker) + "_" +
                                                std::to_string(iteration);
+                    const std::string transfer = withFreshBranchId(fixture);
                     bool completed = false;
                     for (unsigned attempt = 0; attempt < 25; ++attempt) {
-                        const HttpResponse uploaded = request(port, "POST", path + branch + "/bundle", fixture,
+                        const HttpResponse uploaded = request(port, "POST", path + branch + "/bundle", transfer,
                                                               "application/vnd.aowis.bundle");
                         if (uploaded.status == 503) {
                             require(uploaded.retry == "1", "busy import omitted Retry-After");
@@ -402,7 +431,7 @@ void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
                             std::this_thread::sleep_for(70ms);
                             continue;
                         }
-                        require(exported.status == 200 && exported.body == fixture,
+                        require(exported.status == 200 && exported.body == transfer,
                                 "concurrent export differs from immutable input bundle");
                         ++downloads;
                         downloaded = true;
@@ -443,12 +472,16 @@ void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
 // Opt-in sustained test. Unlike CTest's short scenario, the *same server*
 // remains up for the requested duration. Each new branch is fully checked.
 void sustainedLoad(const std::string& executable, unsigned seconds, const fs::path& root,
-                   const std::string& fixture, const std::string& expectedHead) {
+                   const std::string& unusedFixture, const std::string& unusedHead) {
+    (void)unusedFixture;
+    (void)unusedHead;
     const fs::path serviceRoot = root / "soak-server";
     const fs::path log = root / "soak-server.log";
     const unsigned short port = freePort();
     std::vector<std::string> projectIds;
     std::array<std::uint64_t, 3> completedByProject{};
+    std::vector<std::string> fixtures;
+    std::vector<std::string> heads;
     std::atomic<unsigned> completedImports{0};
     std::atomic<unsigned> completedExports{0};
     std::atomic<unsigned> busyResponses{0};
@@ -460,6 +493,12 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
         ServerProcess server(executable, serviceRoot, log, port, 32);
         for (const char* name : {"soak-alpha", "soak-beta", "soak-gamma"})
             projectIds.push_back(project(port, name));
+        for (std::size_t index = 0; index < projectIds.size(); ++index) {
+            std::string head;
+            fixtures.push_back(makeBundle(root / ("soak-fixture-" + std::to_string(index)),
+                                          projectIds[index], head));
+            heads.push_back(head);
+        }
         const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
         const std::chrono::steady_clock::time_point end = started + std::chrono::seconds(seconds);
         // Short smoke runs exercise this exact reporting path without
@@ -471,16 +510,20 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
         for (unsigned worker = 0; worker < 6U; ++worker) {
             clients.emplace_back([&, worker]() {
                 unsigned iteration = 0;
-                const std::string base = prefix(projectIds[worker % projectIds.size()]);
+                const std::size_t projectIndex = worker % projectIds.size();
+                const std::string base = prefix(projectIds[projectIndex]);
+                const std::string& fixture = fixtures[projectIndex];
+                const std::string& expectedHead = heads[projectIndex];
                 start.arrive_and_wait();
                 try {
                     while (!failed && std::chrono::steady_clock::now() < end) {
                         const std::string branch = "soak_" + std::to_string(worker) + "_" +
                             std::to_string(iteration++);
+                        const std::string transfer = withFreshBranchId(fixture);
                         bool inserted = false;
                         for (unsigned attempt = 0; attempt < 100U; ++attempt) {
                             const HttpResponse result = request(port, "POST", base + branch + "/bundle",
-                                fixture, "application/vnd.aowis.bundle");
+                                transfer, "application/vnd.aowis.bundle");
                             if (result.status == 503) {
                                 require(result.retry == "1", "soak import missing Retry-After");
                                 ++busyResponses;
@@ -504,7 +547,7 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
                                 std::this_thread::sleep_for(70ms);
                                 continue;
                             }
-                            require(result.status == 200 && result.body == fixture,
+                            require(result.status == 200 && result.body == transfer,
                                     "soak export bytes differ from immutable source");
                             ++completedExports;
                             exported = true;
@@ -567,7 +610,7 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
         const std::vector<std::string> branches = repository.listBranches();
         for (const std::string& branch : branches) {
             if (branch == "main") continue;
-            require(aowis::dvmdb::toHex(repository.head(branch).id) == expectedHead,
+            require(repository.headV2(*aowis::dvmdb::ProjectId::parse(projectIds[index]), branch).toString() == heads[index],
                     "soak branch head wrong on disk after service stop");
             ++completedByProject[index];
         }
@@ -599,12 +642,17 @@ int main(int argc, char** argv) {
     WorkRoot root;
     try {
         std::string head;
-        const std::string fixture = makeBundle(root.path, head);
+        const aowis::dvmdb::ProjectId fixtureProject = aowis::dvmdb::ProjectId::generate();
+        const std::string fixture = makeBundle(root.path, fixtureProject.toString(), head);
         if (std::string(argv[1]) == "--fixture-only") {
             const fs::path path = root.path / "fixture.bundle";
             aowis::dvmdb::Repository recipient(root.path / "fixture-recipient");
-            const aowis::dvmdb::BundleImportResult result = recipient.importBranchBundle(path, "received");
-            require(aowis::dvmdb::toHex(result.head) == head, "fixture import head mismatch");
+            const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            require(fd >= 0, "cannot read fixture");
+            const aowis::dvmdb::RevisionBundleImportV2 result =
+                recipient.importRevisionBundleV2(fixtureProject, fd, "received");
+            ::close(fd);
+            require(result.head.toString() == head, "fixture import head mismatch");
             require(recipient.verifyRepository().revisions >= 2, "fixture import verification failed");
             std::cout << "HTTP stress fixture verified: " << fixture.size() << " bytes\n";
             return 0;
@@ -617,6 +665,8 @@ int main(int argc, char** argv) {
         const fs::path log = root.path / "server.log";
         std::vector<std::string> projects;
         std::vector<std::string> emptyHeads;
+        std::vector<std::string> projectFixtures;
+        std::vector<std::string> projectHeads;
         {
             const unsigned short port = freePort();
             ServerProcess server(argv[1], serviceRoot, log, port, 4);
@@ -625,18 +675,25 @@ int main(int argc, char** argv) {
             projects.push_back(project(port, "gamma"));
             for (const std::string& id : projects)
                 emptyHeads.push_back(field(request(port, "GET", prefix(id) + "main/head").body, "id"));
-            const HttpResponse imported = request(port, "POST", prefix(projects[0]) + "seed/bundle", fixture,
+            for (std::size_t index = 0; index < projects.size(); ++index) {
+                std::string projectHead;
+                projectFixtures.push_back(makeBundle(root.path / ("project-" + std::to_string(index)),
+                                                     projects[index], projectHead));
+                projectHeads.push_back(projectHead);
+            }
+            const HttpResponse imported = request(port, "POST", prefix(projects[0]) + "seed/bundle", projectFixtures[0],
                                                    "application/vnd.aowis.bundle");
-            require(imported.status == 201 && field(imported.body, "head") == head,
+            require(imported.status == 201 && field(imported.body, "head") == projectHeads[0],
                     "initial import failed: HTTP " + std::to_string(imported.status) + " " + imported.body);
-            tightBudget(port, projects[0], projects[1], head, fixture);
+            tightBudget(port, projects[0], projects[1], projectHeads[0], projectFixtures[0],
+                        projectHeads[1], projectFixtures[1]);
             server.stop();
             require(!server.forcedShutdown(), "staging test server did not stop cleanly");
         }
         {
             const unsigned short port = freePort();
             ServerProcess server(argv[1], serviceRoot, log, port, 32);
-            concurrentLoad(port, projects, head, fixture);
+            concurrentLoad(port, projects, projectHeads, projectFixtures);
             server.stop();
             require(!server.forcedShutdown(), "concurrent test server did not stop cleanly");
         }
@@ -647,13 +704,13 @@ int main(int argc, char** argv) {
             const std::vector<std::string> branches = repository.listBranches();
             require(branches.size() == (index == 2 ? 9U : 10U), "unexpected post-stress branch count");
             for (const std::string& branch : branches) {
-                require(aowis::dvmdb::toHex(repository.head(branch).id) ==
-                            (branch == "main" ? emptyHeads[index] : head),
+                require(repository.headV2(*aowis::dvmdb::ProjectId::parse(id), branch).toString() ==
+                            (branch == "main" ? emptyHeads[index] : projectHeads[index]),
                         "post-stress branch points at an unexpected revision");
             }
         }
         std::cout << "HTTP concurrent transfer stress passed; projects=3, payload="
-                  << fixture.size() << " bytes\n";
+                  << projectFixtures[0].size() << " bytes\n";
         return 0;
     } catch (const std::exception& error) {
         root.preserve();
