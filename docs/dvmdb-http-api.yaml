@@ -34,6 +34,10 @@ paths:
                     items: {$ref: '#/components/schemas/Project'}
     post:
       operationId: createProject
+      description: |
+        By default creates a project with a committed initial main revision
+        for backward compatibility. Set unborn:true to create main with a
+        durable UUIDv7 branch identity, explicit null HEAD and zero revisions.
       requestBody:
         required: true
         content:
@@ -44,9 +48,10 @@ paths:
               required: [name]
               properties:
                 name: {type: string, minLength: 1, maxLength: 200}
+                unborn: {type: boolean, default: false}
       responses:
         '201':
-          description: Project and initial main branch published
+          description: Project and initial main branch published (optionally unborn)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
@@ -178,7 +183,16 @@ paths:
     get:
       operationId: getUuidv7BranchHead
       responses:
-        '200': {description: Current immutable revision UUIDv7 in the id field}
+        '200':
+          description: Current revision UUIDv7 in id, or explicit null for unborn branch
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [id]
+                properties:
+                  id: {type: [string, 'null'], format: uuid, description: UUIDv7 revision or null before first commit}
         '404': {$ref: '#/components/responses/NotFound'}
   /projects/{projectId}/branches/{branch}/history:
     parameters:
@@ -188,7 +202,7 @@ paths:
       - {name: after, in: query, schema: {type: string, format: uuid}}
     get:
       operationId: getUuidv7History
-      description: First-parent history, newest-first, using an exclusive UUIDv7 revision cursor.
+      description: First-parent history, newest-first, using an exclusive UUIDv7 revision cursor. Unborn branches return an empty array.
       responses:
         '200': {description: Revision objects with UUIDv7 IDs, ordered parent UUIDs, integrity hashes}
         '400': {$ref: '#/components/responses/BadRequest'}
@@ -217,7 +231,8 @@ paths:
         branch reference that is distinct from revision ancestry. Revisions contain id,
         recordHash, snapshot roots, modelIndexed, parents (revision UUID array),
         and parentRecordHashes (corresponding SHA-256 array).
-        HEAD snapshots are pinned into authenticated cursors across refreshes.
+        Unborn HEADs have explicit null revision and recordHash, and do not
+        contribute revision ancestry. HEAD snapshots are pinned into authenticated cursors across refreshes.
         Cursors are invalid after server restart or when used for another project.
         Pagination bounds are 1..1000 items, up to 1024 branch HEADs and
         250000 traversed revisions. The complete boolean and nextCursor are

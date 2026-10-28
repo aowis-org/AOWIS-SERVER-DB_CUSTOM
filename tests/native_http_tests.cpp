@@ -1666,6 +1666,63 @@ void exerciseRevisionBundleV2Http() {
 }
 
 
+void exerciseUnbornProjectHttp() {
+    namespace native = aowis::dvmdb;
+    TemporaryRoot temp;
+    native::ProjectService service(temp.root());
+    TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL, 10000, 1024ULL * 1024ULL});
+    Client client(server.port());
+    const QString projects = QStringLiteral("/dvmdb/v1/projects");
+    check(client.call("POST", projects,
+        QJsonObject{{"name", "bad unborn"}, {"unborn", "true"}}).status == 400,
+        "HTTP accepted non-boolean unborn selector");
+    const Response created = client.call("POST", projects,
+        QJsonObject{{"name", "Empty project"}, {"unborn", true}});
+    const std::string project = created.json.value("id").toString().toStdString();
+    check(created.status == 201 && native::ProjectId::parse(project).has_value(),
+        "HTTP unborn project creation failed");
+    const QString prefix = projects + "/" + QString::fromStdString(project);
+    const QString headPath = prefix + "/branches/main/head";
+    const QString historyPath = prefix + "/branches/main/history";
+    const QString graphPath = prefix + "/revision-graph";
+    const Response unbornHead = client.call("GET", headPath);
+    check(unbornHead.status == 200 && unbornHead.json.contains("id") &&
+          unbornHead.json.value("id").isNull(), "HTTP unborn HEAD is not explicit null");
+    const Response history = client.call("GET", historyPath);
+    check(history.status == 200 && history.json.value("revisions").toArray().isEmpty(),
+          "HTTP unborn history must be empty");
+    const Response graph = client.call("GET", graphPath + "?limit=1");
+    const QJsonArray heads = graph.json.value("heads").toArray();
+    check(graph.status == 200 && heads.size() == 1 &&
+          heads.at(0).toObject().value("branch") == "main" &&
+          heads.at(0).toObject().value("revision").isNull() &&
+          heads.at(0).toObject().value("recordHash").isNull() &&
+          native::BranchId::parse(heads.at(0).toObject().value("branchId").toString().toStdString()) &&
+          graph.json.value("revisions").toArray().isEmpty() &&
+          graph.json.value("complete").toBool() && graph.json.value("nextCursor").isNull(),
+          "HTTP unborn graph must have one null HEAD and zero revisions");
+    const std::optional<native::ProjectId> id = native::ProjectId::parse(project);
+    native::Key key{};
+    key[15] = 9;
+    std::optional<native::RevisionId> first;
+    service.withRepository(project, [&](native::Repository& repository) {
+        first = repository.commitV2(*id, "main", {{key, native::Bytes{1, 2, 3}}}, std::nullopt);
+    });
+    check(first.has_value(), "HTTP first unborn commit returned no revision");
+    const QString firstId = QString::fromStdString(first->toString());
+    check(client.call("GET", headPath).json.value("id").toString() == firstId,
+          "HTTP HEAD failed to transition from null after first commit");
+    const Response firstRevision = client.call("GET", prefix + "/revisions/" + firstId);
+    check(firstRevision.status == 200 &&
+          firstRevision.json.value("parents").toArray().isEmpty(),
+          "HTTP first unborn commit must have no parents");
+    const Response after = client.call("GET", graphPath);
+    check(after.status == 200 && after.json.value("heads").toArray().size() == 1 &&
+          after.json.value("heads").toArray().at(0).toObject().value("revision") == firstId &&
+          after.json.value("revisions").toArray().size() == 1,
+          "HTTP graph did not expose first committed revision");
+}
+
 void exerciseUuidv7HistoryHttp() {
     namespace native = aowis::dvmdb;
     TemporaryRoot temp;
@@ -1924,6 +1981,7 @@ int main(int argc, char** argv) {
         // their dedicated lower-level regression suites until service cutover.
         exerciseTransferStagingBudget();
         exerciseRevisionBundleV2Http();
+        exerciseUnbornProjectHttp();
         exerciseUuidv7HistoryHttp();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
