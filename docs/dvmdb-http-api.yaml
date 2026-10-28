@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: AOWIS DVMDB Service API
   version: 2.0.0
-  description: UUIDv7-only HTTP project, branch, revision, hydraulic persistence, semantic merging, and AOWREV21/22 full/incremental bundle transfer.
+  description: UUIDv7-only HTTP project, branch, revision, hydraulic persistence, semantic merging, and AOWREV21/22 and provenance-aware AOWREV23/24 full/incremental bundle transfer.
 servers:
   - url: http://127.0.0.1:8755/dvmdb/v1
 paths:
@@ -64,7 +64,10 @@ paths:
       operationId: exportRevisionBundleV2
       description: |
         UUIDv7 revision-graph transfer, separate from SHA revision bundles.
-        AOWREV21 full bundle or AOWREV22 incremental from the specified
+        AOWREV21 full bundle or AOWREV22 incremental when the source branch
+        has no recorded origin; provenance-aware AOWREV23 full or AOWREV24
+        incremental otherwise. Existing importers must be upgraded to read
+        provenance-aware formats. Incremental bundles use the specified
         recipient-base revision UUIDv7. Uses project-scoped scratch files,
         chunked HTTP streaming and the global transfer staging quota. Does
         not support network resumption or authentication.

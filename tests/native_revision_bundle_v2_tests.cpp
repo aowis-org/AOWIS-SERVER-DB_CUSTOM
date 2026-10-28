@@ -306,11 +306,151 @@ void run() {
         }, StorageErrorKind::LimitExceeded, "export byte limit not enforced");
     }
 }
+
+void runForkProvenanceBundle() {
+    Temporary files;
+    const ProjectId project = ProjectId::generate();
+    Repository source(files.path / "source");
+    const RevisionId root = source.createBranchV2(project, "main");
+    const RevisionId historical = source.commitV2(project, "main", {{key(1), Bytes{1}}}, root);
+    const BranchId origin = *source.branchId("main");
+    const RevisionId newer = source.commitV2(project, "main", {{key(2), Bytes{2}}}, historical);
+    const BranchCreationResultV2 fork = source.createBranchAtRevisionWithIdentityV2(
+        project, "Prüfung Süd", "main", historical);
+    check(fork.originBranchId == origin && fork.forkRevisionId == historical,
+          "source historical fork provenance was not recorded");
+    const RevisionId advanced = source.commitV2(
+        project, "Prüfung Süd", {{key(3), Bytes{3}}}, historical);
+    check(advanced != newer && advanced != historical, "fork did not advance independently");
+
+    const fs::path full = files.bundle();
+    {
+        File out(full, O_RDWR | O_CREAT | O_EXCL);
+        source.exportRevisionBundleV2(project, "Prüfung Süd", out.fd);
+        std::array<char, 8> magic{};
+        check(::pread(out.fd, magic.data(), magic.size(), 0) == 8 &&
+              std::string(magic.data(), magic.size()) == "AOWREV23",
+              "full historical fork bundle has no provenance-aware format");
+    }
+    Repository recipient(files.path / "recipient");
+    {
+        File in(full, O_RDONLY);
+        check(recipient.importRevisionBundleV2(project, in.fd, "Prüfung Süd").head == advanced,
+              "historical fork import did not publish exact HEAD");
+    }
+    const auto checkProvenance = [&](Repository& repository, const RevisionId& expectedHead) {
+        const RevisionGraphPageV2 graph = repository.revisionGraphV2(project, 50);
+        check(graph.heads.size() == 1 && graph.heads[0].branchId == fork.branchId &&
+              graph.heads[0].revision == expectedHead &&
+              graph.heads[0].originBranchId == origin &&
+              graph.heads[0].forkRevisionId == historical,
+              "historical fork origin/point changed during bundle round-trip");
+    };
+    checkProvenance(recipient, advanced);
+    {
+        Repository reopened(files.path / "recipient");
+        checkProvenance(reopened, advanced);
+    }
+    {
+        File in(full, O_RDONLY);
+        check(recipient.importRevisionBundleV2(project, in.fd, "Prüfung Süd").status ==
+              BundleImportStatus::UpToDate, "historical fork replay was not idempotent");
+        checkProvenance(recipient, advanced);
+    }
+    const RevisionId later = source.commitV2(
+        project, "Prüfung Süd", {{key(4), Bytes{4}}}, advanced);
+    const fs::path delta = files.bundle();
+    {
+        File out(delta, O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "Prüfung Süd", advanced, out.fd);
+        std::array<char, 8> magic{};
+        check(::pread(out.fd, magic.data(), magic.size(), 0) == 8 &&
+              std::string(magic.data(), magic.size()) == "AOWREV24",
+              "incremental historical fork bundle has no provenance-aware format");
+        File in(delta, O_RDONLY);
+        check(recipient.importRevisionBundleV2(project, in.fd, "Prüfung Süd").head == later,
+              "historical fork incremental bundle did not advance HEAD");
+    }
+    checkProvenance(recipient, later);
+    {
+        Repository reopened(files.path / "recipient");
+        checkProvenance(reopened, later);
+    }
+    {
+        const fs::path emptyDelta = files.bundle();
+        File out(emptyDelta, O_RDWR | O_CREAT | O_EXCL);
+        source.exportIncrementalRevisionBundleV2(project, "Prüfung Süd", later, out.fd);
+        check(fs::file_size(emptyDelta) == 176,
+              "same-HEAD provenance-aware delta contained unexpected payload");
+        File in(emptyDelta, O_RDONLY);
+        check(recipient.importRevisionBundleV2(project, in.fd, "Prüfung Süd").status ==
+              BundleImportStatus::UpToDate,
+              "same-HEAD provenance-aware delta did not replay cleanly");
+        checkProvenance(recipient, later);
+    }
+    // The transport must not accept a fork UUID that isn't in the true
+    // ancestry, and rejection must not publish a branch or new provenance.
+    const fs::path forged = files.bundle();
+    fs::copy_file(full, forged);
+    {
+        File out(forged, O_RDWR);
+        const RevisionId unrelated = RevisionId::generate();
+        check(::pwrite(out.fd, unrelated.uuid().bytes.data(), 16, 112) == 16,
+              "unable to forge the bundled fork UUID");
+    }
+    {
+        Repository clean(files.path / "forged-target");
+        File in(forged, O_RDONLY);
+        expectError([&] { (void)clean.importRevisionBundleV2(project, in.fd, "Prüfung Süd"); },
+                    StorageErrorKind::InvalidInput,
+                    "bundle with a non-ancestor fork revision was accepted");
+        check(!clean.hasBranch("Prüfung Süd"),
+              "invalid fork provenance published a branch");
+    }
+    // An already imported branch must not accept a different immutable
+    // origin, even if all revision objects and the advertised HEAD match.
+    const fs::path changedOrigin = files.bundle();
+    fs::copy_file(full, changedOrigin);
+    {
+        File out(changedOrigin, O_RDWR);
+        const BranchId unrelatedOrigin = BranchId::generate();
+        check(::pwrite(out.fd, unrelatedOrigin.uuid().bytes.data(), 16, 96) == 16,
+              "unable to change bundled source branch identity");
+    }
+    {
+        File in(changedOrigin, O_RDONLY);
+        expectError([&] { (void)recipient.importRevisionBundleV2(project, in.fd, "Prüfung Süd"); },
+                    StorageErrorKind::Conflict,
+                    "replayed bundle replaced immutable origin branch identity");
+        checkProvenance(recipient, later);
+    }
+    // The historical AOWREV21/AOWREV22 formats are still readable, and
+    // an old-format bundle cannot guess provenance absent from its header.
+    const fs::path legacy = files.bundle();
+    {
+        File out(legacy, O_RDWR | O_CREAT | O_EXCL);
+        source.exportRevisionBundleV2(project, "main", out.fd);
+        std::array<char, 8> magic{};
+        check(::pread(out.fd, magic.data(), magic.size(), 0) == 8 &&
+              std::string(magic.data(), magic.size()) == "AOWREV21",
+              "legacy provenance-free bundle changed format");
+        Repository clean(files.path / "legacy-target");
+        File in(legacy, O_RDONLY);
+        check(clean.importRevisionBundleV2(project, in.fd, "main").head == newer,
+              "legacy branch bundle failed to import");
+        const RevisionGraphPageV2 graph = clean.revisionGraphV2(project, 50);
+        check(graph.heads.size() == 1 && !graph.heads[0].originBranchId &&
+              !graph.heads[0].forkRevisionId,
+              "legacy branch import fabricated fork metadata");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         run();
+        runForkProvenanceBundle();
         std::cout << "UUIDv7 full-revision bundle replication passed\n";
     } catch (const std::exception& error) {
         std::cerr << "UUIDv7 full-revision bundle replication FAILED: " << error.what() << '\n';

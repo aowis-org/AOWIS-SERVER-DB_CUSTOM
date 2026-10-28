@@ -29,3 +29,29 @@ An unborn branch is represented as a **branch with null HEAD**—not as a
 fabricated empty revision. Private working copies are not committed history;
 backing up an editor's uncommitted changes requires a different, explicitly
 authorized session mechanism.
+
+## UUIDv7 revision-bundle provenance wire formats (VC-02)
+
+A revision bundle stores branch provenance in its **header metadata**, not
+in revision records or the commit-parent DAG. Importers accept the original
+`AOWREV21` (96-byte full header) and `AOWREV22` (144-byte incremental
+header). These legacy headers have no provenance fields: importing one into
+a new branch must **not guess** an origin or fork revision. Importing into an
+existing branch must preserve the local recorded provenance.
+
+The provenance-aware formats are `AOWREV23` (128-byte full header) and
+`AOWREV24` (176-byte incremental header). Their initial 96/144 bytes are
+identical to the corresponding legacy header. An additional 32 bytes contain
+`originBranchId` (16-byte binary UUIDv7) followed by `forkRevisionId`
+(16-byte binary UUIDv7), using 16 zero bytes for an absent optional value.
+The exporter uses these formats when either piece of provenance exists.
+Provenance-free root branches continue to export the legacy wire format.
+
+The importer checks UUIDv7 validity, requires an origin whenever a fork
+revision exists, and verifies that the fork revision is a genuine ancestor
+of the incoming HEAD. On subsequent imports into an existing branch,
+non-legacy provenance must match the immutable local record; neither
+fast-forward nor idempotent replay may overwrite it. All validation occurs
+before publishing the imported branch reference. Older importers do **not**
+understand `AOWREV23/24`; upgrade recipients before transferring a branch
+with provenance. This format change does not add any DAG vertices or edges.

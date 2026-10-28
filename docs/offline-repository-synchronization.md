@@ -10,10 +10,11 @@ existing revision.
 ## Native UUIDv7 bundle APIs
 
 - `Repository::exportRevisionBundleV2(project, branch, fd)` exports a complete
-  `AOWREV21` branch snapshot: project UUID, branch UUID, revision UUID,
-  complete reachable ancestry and the associated content objects.
+  `AOWREV21` branch snapshot when no origin is recorded, or `AOWREV23`
+  when immutable fork provenance exists: project UUID, branch UUID,
+  revision UUID, complete ancestry and associated content objects.
 - `Repository::exportIncrementalRevisionBundleV2(project, branch, base, fd)`
-  exports an `AOWREV22` delta based on an authenticated UUIDv7 revision and
+  exports an `AOWREV22` delta (or provenance-aware `AOWREV24`) based on an authenticated UUIDv7 revision and
   expected record SHA-256. Missing immutable objects must already be present
   in the recipient repository.
 - `Repository::importRevisionBundleV2(project, fd, localBranch)` verifies the
@@ -63,8 +64,9 @@ compatibility migration for older pre-release repositories.
 The canonical HTTP routes are project-scoped:
 
 - `GET /dvmdb/v1/projects/{projectUuid}/branches/{branch}/bundle`
-  exports a complete `AOWREV21` bundle.
-- `GET .../bundle?base={revisionUuidV7}` exports an `AOWREV22` delta.
+  exports a complete `AOWREV21` or provenance-aware `AOWREV23` bundle.
+- `GET .../bundle?base={revisionUuidV7}` exports an `AOWREV22` or
+  provenance-aware `AOWREV24` delta.
 - `POST .../bundle` imports a binary bundle and reports branch creation,
   fast-forward or idempotent replay; divergent history fails with a conflict.
 

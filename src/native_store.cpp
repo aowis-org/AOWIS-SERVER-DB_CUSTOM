@@ -5042,7 +5042,8 @@ std::uint64_t Repository::packSize() {
 }
 
 // UUIDv7 revision bundles carry immutable content and stable object identity,
-// never host pack/index offsets. Full: AOWREV21. Incremental: AOWREV22.
+// never host pack/index offsets. Legacy full/delta: AOWREV21/AOWREV22.
+// Provenance-aware full/delta: AOWREV23/AOWREV24 (32 extra header bytes).
 // Both use a caller-owned regular file as the on-disk payload stage. Per-object
 // indexes, visited hashes and verification marks live in repository-local
 // scratch files, avoiding payload-sized heap maps and a 64 MiB RAM ceiling.
@@ -5053,8 +5054,16 @@ constexpr std::array<std::uint8_t, 8> revisionBundleMagicV2{
 constexpr std::array<std::uint8_t, 8> revisionDeltaMagicV2{
     'A', 'O', 'W', 'R', 'E', 'V', '2', '2'
 };
+constexpr std::array<std::uint8_t, 8> revisionBundleProvenanceMagicV2{
+    'A', 'O', 'W', 'R', 'E', 'V', '2', '3'
+};
+constexpr std::array<std::uint8_t, 8> revisionDeltaProvenanceMagicV2{
+    'A', 'O', 'W', 'R', 'E', 'V', '2', '4'
+};
 constexpr std::uint64_t revisionBundleHeaderV2 = 96;
 constexpr std::uint64_t revisionDeltaHeaderV2 = 144;
+constexpr std::uint64_t revisionBundleProvenanceHeaderV2 = 128;
+constexpr std::uint64_t revisionDeltaProvenanceHeaderV2 = 176;
 // Bound file/CPU/disk work even when an offline caller leaves BundleLimits
 // unspecified. Operators can impose lower limits through BundleLimits.
 constexpr std::uint64_t revisionBundleMaxBytesV2 = 64ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -5183,7 +5192,12 @@ void Repository::exportRevisionBundleV2Locked(const ProjectId& project,
     SortedBundleHashes ordered(this->scratch_);
     objects.forEach([&](const Hash& hash) { ordered.append(hash); });
     ordered.finalize();
-    const std::uint64_t headerSize = base ? revisionDeltaHeaderV2 : revisionBundleHeaderV2;
+    require(Err::Corruption, !ref->forkRevisionId || ref->originBranchId,
+            "branch fork revision has no origin branch identity");
+    const bool hasProvenance = ref->originBranchId.has_value() || ref->forkRevisionId.has_value();
+    const std::uint64_t headerSize = hasProvenance
+        ? (base ? revisionDeltaProvenanceHeaderV2 : revisionBundleProvenanceHeaderV2)
+        : (base ? revisionDeltaHeaderV2 : revisionBundleHeaderV2);
     std::uint64_t total = headerSize;
     // Preflight byte limits before exposing any bundle content.
     while (const std::optional<Hash> hash = ordered.next()) {
@@ -5212,7 +5226,9 @@ void Repository::exportRevisionBundleV2Locked(const ProjectId& project,
     objects.forEach([&](const Hash& hash) { sorted.append(hash); });
     sorted.finalize();
     Bytes header(static_cast<std::size_t>(headerSize), 0);
-    const std::array<std::uint8_t, 8>& magic = base ? revisionDeltaMagicV2 : revisionBundleMagicV2;
+    const std::array<std::uint8_t, 8>& magic = hasProvenance
+        ? (base ? revisionDeltaProvenanceMagicV2 : revisionBundleProvenanceMagicV2)
+        : (base ? revisionDeltaMagicV2 : revisionBundleMagicV2);
     std::copy(magic.begin(), magic.end(), header.begin());
     std::copy(project.uuid().bytes.begin(), project.uuid().bytes.end(), header.begin() + 8);
     std::copy(ref->id.uuid().bytes.begin(), ref->id.uuid().bytes.end(), header.begin() + 24);
@@ -5222,6 +5238,17 @@ void Repository::exportRevisionBundleV2Locked(const ProjectId& project,
     if (base) {
         std::copy(base->uuid().bytes.begin(), base->uuid().bytes.end(), header.begin() + 96);
         std::copy(baseHash.begin(), baseHash.end(), header.begin() + 112);
+    }
+    if (hasProvenance) {
+        const std::size_t at = base ? revisionDeltaHeaderV2 : revisionBundleHeaderV2;
+        if (ref->originBranchId) {
+            std::copy(ref->originBranchId->uuid().bytes.begin(),
+                      ref->originBranchId->uuid().bytes.end(), header.begin() + at);
+        }
+        if (ref->forkRevisionId) {
+            std::copy(ref->forkRevisionId->uuid().bytes.begin(),
+                      ref->forkRevisionId->uuid().bytes.end(), header.begin() + at + 16);
+        }
     }
     try {
         writeExact(fd, header.data(), header.size(), 0);
@@ -5260,10 +5287,15 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
     checkRevisionBundleLimitV2(size, 0, limits);
     std::array<std::uint8_t, 8> magic{};
     readExact(fd, magic.data(), magic.size(), 0);
-    const bool incremental = magic == revisionDeltaMagicV2;
-    require(Err::InvalidInput, incremental || magic == revisionBundleMagicV2,
+    const bool incremental = magic == revisionDeltaMagicV2 ||
+                             magic == revisionDeltaProvenanceMagicV2;
+    const bool hasProvenance = magic == revisionBundleProvenanceMagicV2 ||
+                               magic == revisionDeltaProvenanceMagicV2;
+    require(Err::InvalidInput, incremental || hasProvenance || magic == revisionBundleMagicV2,
             "unsupported UUIDv7 revision replication format");
-    const std::uint64_t headerSize = incremental ? revisionDeltaHeaderV2 : revisionBundleHeaderV2;
+    const std::uint64_t headerSize = hasProvenance
+        ? (incremental ? revisionDeltaProvenanceHeaderV2 : revisionBundleProvenanceHeaderV2)
+        : (incremental ? revisionDeltaHeaderV2 : revisionBundleHeaderV2);
     require(Err::InvalidInput, size >= headerSize, "truncated v2 replication header");
     Bytes header(static_cast<std::size_t>(headerSize));
     readExact(fd, header.data(), header.size(), 0);
@@ -5279,6 +5311,21 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             "bundle has invalid UUIDv7 identity");
     require(Err::Conflict, *project == expectedProject,
             "v2 bundle project does not match explicitly expected project UUID");
+    std::optional<BranchId> originBranchId;
+    std::optional<RevisionId> forkRevisionId;
+    if (hasProvenance) {
+        const std::size_t at = incremental ? revisionDeltaHeaderV2 : revisionBundleHeaderV2;
+        const auto isNullUuid = [&](std::size_t offset) {
+            return std::all_of(header.begin() + static_cast<std::ptrdiff_t>(offset),
+                               header.begin() + static_cast<std::ptrdiff_t>(offset + 16),
+                               [](std::uint8_t value) { return value == 0; });
+        };
+        if (!isNullUuid(at)) originBranchId = BranchId::parse(parseUuid(at));
+        if (!isNullUuid(at + 16)) forkRevisionId = RevisionId::parse(parseUuid(at + 16));
+        require(Err::InvalidInput, originBranchId.has_value() &&
+                (!forkRevisionId || originBranchId),
+                "invalid UUIDv7 branch provenance in replication bundle");
+    }
     Hash tipHash{};
     std::copy_n(header.begin() + 56, 32, tipHash.begin());
     const std::uint64_t count = readU64(header.data() + 88);
@@ -5300,6 +5347,11 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
     }
     require(Err::Conflict, !existing || existing->id == *branchId,
             "v2 replication would rebind branch UUID");
+    if (existing && hasProvenance) {
+        require(Err::Conflict, existing->originBranchId == originBranchId &&
+                existing->forkRevisionId == forkRevisionId,
+                "v2 replication branch fork provenance conflicts with local branch");
+    }
     std::optional<RevisionId> base;
     Hash baseHash{};
     if (incremental) {
@@ -5417,6 +5469,32 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             throw StorageError(Err::InvalidInput,
                                std::string("invalid v2 bundle ancestry: ") + error.what());
         throw;
+    }
+    if (forkRevisionId) {
+        // Provenance cannot identify an unrelated revision: the immutable
+        // fork point must be a genuine ancestor of this branch's HEAD.
+        std::set<RevisionId> seen;
+        std::vector<RevisionId> pending{*incoming};
+        bool foundFork = false;
+        while (!pending.empty()) {
+            const RevisionId id = pending.back();
+            pending.pop_back();
+            if (!seen.insert(id).second) continue;
+            require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjectsV2,
+                    "v2 bundle fork provenance exceeds ancestry budget");
+            if (id == *forkRevisionId) {
+                foundFork = true;
+                break;
+            }
+            const std::optional<Bytes> encoded = getRevision(id);
+            require(Err::InvalidInput, encoded.has_value(),
+                    "v2 bundle fork ancestry has an unavailable revision");
+            const RevisionRecordV2 record = decodeRevisionRecordV2(*encoded);
+            for (const RevisionParentV2& parent : record.parents)
+                pending.push_back(parent.id);
+        }
+        require(Err::InvalidInput, foundFork,
+                "v2 bundle fork revision is not an ancestor of branch HEAD");
     }
     if (incremental) {
         // A matching recipient base in the header is not enough: an
@@ -5591,10 +5669,9 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
     }
     publishStoredBranch(this->directory_, StoredBranch{*branchId, std::string(localBranch),
                                                         tipHash, *incoming,
-                                                        existing ? findStoredBranch(this->directory_, localBranch)->originBranchId
-                                                                 : std::nullopt,
-                                                        existing ? findStoredBranch(this->directory_, localBranch)->forkRevisionId
-                                                                 : std::nullopt}, !existing);
+                                                        existing ? existing->originBranchId : originBranchId,
+                                                        existing ? existing->forkRevisionId : forkRevisionId},
+                        !existing);
     return RevisionBundleImportV2{status, *incoming, imported};
 }
 
