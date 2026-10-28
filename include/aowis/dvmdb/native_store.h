@@ -264,6 +264,15 @@ struct RevisionGraphPageV2 {
     std::optional<RevisionGraphCursorV2> next;
 };
 
+// The identity and immutable provenance returned by one atomic branch creation.
+// These fields are creation metadata, never revision-parent edges.
+struct BranchCreationResultV2 {
+    BranchId branchId;
+    RevisionId revisionId;
+    std::optional<BranchId> originBranchId;
+    std::optional<RevisionId> forkRevisionId;
+};
+
 struct MergeResult {
     MergeStatus status = MergeStatus::UpToDate;
     Hash base{};
@@ -329,6 +338,11 @@ public:
     // cannot be mixed with SHA-based branches in one repository.
     RevisionId createBranchV2(const ProjectId& project, std::string_view name,
                               std::optional<std::string_view> from = std::nullopt);
+    // Return the new branch UUID and fork metadata from the same locked write;
+    // the revision-only API above remains available to existing consumers.
+    BranchCreationResultV2 createBranchWithIdentityV2(
+        const ProjectId& project, std::string_view name,
+        std::optional<std::string_view> from = std::nullopt);
     void createUnbornBranchV2(const ProjectId& project, std::string_view name);
     RevisionId headV2(const ProjectId& project, std::string_view branch);
     // VC-01 transition: optional committed HEAD contract; existing branches remain born.
@@ -366,6 +380,9 @@ public:
                                  const RevisionId& candidate);
     RevisionId createBranchAtRevisionV2(const ProjectId& project, std::string_view name,
                                         std::string_view sourceBranch, const RevisionId& revision);
+    BranchCreationResultV2 createBranchAtRevisionWithIdentityV2(
+        const ProjectId& project, std::string_view name,
+        std::string_view sourceBranch, const RevisionId& revision);
     // UUIDv7 three-way merge. Domain callbacks are pure and execute under the
     // repository lock; both explicit UUIDv7 HEAD pins are checked atomically.
     // Empty options retains the conservative native merge behavior.

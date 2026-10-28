@@ -98,6 +98,9 @@ public:
     ProjectInfo createProjectV2(std::string_view name);
     RevisionId createBranchV2(std::string_view projectId, std::string_view name,
                               std::optional<std::string_view> source = std::nullopt);
+    BranchCreationResultV2 createBranchWithIdentityV2(
+        std::string_view projectId, std::string_view name,
+        std::optional<std::string_view> source = std::nullopt);
     RevisionId headV2(std::string_view projectId, std::string_view branch);
     std::optional<RevisionId> optionalHeadV2(std::string_view projectId, std::string_view branch);
     std::vector<RevisionGraphRevisionV2> historyV2(
@@ -108,6 +111,9 @@ public:
         std::optional<RevisionGraphCursorV2> cursor = std::nullopt);
     RevisionId createBranchAtRevisionV2(std::string_view projectId, std::string_view name,
                                         std::string_view sourceBranch, const RevisionId& revision);
+    BranchCreationResultV2 createBranchAtRevisionWithIdentityV2(
+        std::string_view projectId, std::string_view name,
+        std::string_view sourceBranch, const RevisionId& revision);
     MergeResultV2 mergeBranchesV2(std::string_view projectId, std::string_view target,
                                   std::string_view source,
                                   std::optional<RevisionId> expectedTarget = std::nullopt,

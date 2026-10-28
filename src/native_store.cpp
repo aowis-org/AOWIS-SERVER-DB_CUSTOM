@@ -2910,6 +2910,12 @@ bool Repository::revisionReachableFromV2(const ProjectId& project, const Revisio
 
 RevisionId Repository::createBranchAtRevisionV2(const ProjectId& project,
         std::string_view name, std::string_view sourceBranch, const RevisionId& revision) {
+    return createBranchAtRevisionWithIdentityV2(project, name, sourceBranch, revision).revisionId;
+}
+
+BranchCreationResultV2 Repository::createBranchAtRevisionWithIdentityV2(
+        const ProjectId& project, std::string_view name,
+        std::string_view sourceBranch, const RevisionId& revision) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -2939,10 +2945,11 @@ RevisionId Repository::createBranchAtRevisionV2(const ProjectId& project,
     }
     require(Err::InvalidInput, selectedHash.has_value(),
             "revision is not reachable from source branch");
-    publishStoredBranch(this->directory_, StoredBranch{BranchId::generate(),
-            std::string(name), *selectedHash, revision,
-            findStoredBranch(this->directory_, sourceBranch)->id, revision}, true);
-    return revision;
+    const BranchId sourceId = findStoredBranch(this->directory_, sourceBranch)->id;
+    const BranchId createdId = BranchId::generate();
+    publishStoredBranch(this->directory_, StoredBranch{createdId,
+            std::string(name), *selectedHash, revision, sourceId, revision}, true);
+    return BranchCreationResultV2{createdId, revision, sourceId, revision};
 }
 
 MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
@@ -3701,6 +3708,12 @@ void Repository::renameBranchV2(const ProjectId& project, std::string_view previ
 
 RevisionId Repository::createBranchV2(const ProjectId& project, std::string_view name,
                                        std::optional<std::string_view> from) {
+    return createBranchWithIdentityV2(project, name, from).revisionId;
+}
+
+BranchCreationResultV2 Repository::createBranchWithIdentityV2(
+        const ProjectId& project, std::string_view name,
+        std::optional<std::string_view> from) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -3728,13 +3741,14 @@ RevisionId Repository::createBranchV2(const ProjectId& project, std::string_view
         require(Err::Internal, root.has_value(), "new root revision did not resolve");
         checksum = root->recordHash;
     }
-    publishStoredBranch(this->directory_, StoredBranch{BranchId::generate(), std::string(name),
-                                                        checksum, id,
-                                                        from ? std::optional<BranchId>(
-                                                            findStoredBranch(this->directory_, *from)->id)
-                                                             : std::nullopt,
-                                                        from ? std::optional<RevisionId>(id) : std::nullopt}, true);
-    return id;
+    const std::optional<BranchId> sourceId = from
+        ? std::optional<BranchId>(findStoredBranch(this->directory_, *from)->id) : std::nullopt;
+    const std::optional<RevisionId> forkId = from
+        ? std::optional<RevisionId>(id) : std::nullopt;
+    const BranchId createdId = BranchId::generate();
+    publishStoredBranch(this->directory_, StoredBranch{createdId, std::string(name),
+                                                        checksum, id, sourceId, forkId}, true);
+    return BranchCreationResultV2{createdId, id, sourceId, forkId};
 }
 
 bool Repository::hasBranch(std::string_view branch) {

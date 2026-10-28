@@ -213,9 +213,14 @@ void runImmutableForkProvenance() {
         sourceId = *repository.branchId(sourceName);
         later = repository.commitV2(project, sourceName, {{key(20), Bytes{20}}}, original);
         const std::size_t before = repository.revisionGraphV2(project).revisions.size();
-        check(repository.createBranchAtRevisionV2(project, forkName, sourceName, original) == original,
-              "historical fork did not select the requested immutable revision");
-        forkId = *repository.branchId(forkName);
+        const BranchCreationResultV2 createdFork = repository.createBranchAtRevisionWithIdentityV2(
+            project, forkName, sourceName, original);
+        check(createdFork.revisionId == original && createdFork.originBranchId == sourceId &&
+              createdFork.forkRevisionId == original,
+              "historical fork creation did not return exact revision provenance");
+        forkId = createdFork.branchId;
+        check(repository.branchId(forkName) == forkId,
+              "historical fork creation returned the wrong persistent branch UUID");
         const RevisionGraphPageV2 created = repository.revisionGraphV2(project);
         check(created.revisions.size() == before,
               "creating a historical branch introduced a synthetic revision");
@@ -257,8 +262,13 @@ void runService() {
     ProjectService service(tmp.path);
     const ProjectInfo project = service.createProjectV2("first");
     const RevisionId root = service.headV2(project.id, "main");
-    check(service.createBranchV2(project.id, "second", "main") == root,
-          "service did not create shared HEAD");
+    const BranchId sourceId = *service.branchId(project.id, "main");
+    const BranchCreationResultV2 created = service.createBranchWithIdentityV2(
+        project.id, "second", "main");
+    check(created.revisionId == root && created.originBranchId == sourceId &&
+          created.forkRevisionId == root &&
+          service.branchId(project.id, "second") == created.branchId,
+          "service did not return persistent identity and exact fork provenance");
     const RevisionGraphPageV2 graph = service.revisionGraphV2(project.id, 2);
     check(graph.heads.size() == 2 && graph.revisions.size() == 1 && !graph.next &&
           graph.heads[0].revision == root && graph.heads[1].revision == root,

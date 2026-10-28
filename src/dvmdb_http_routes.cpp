@@ -1013,30 +1013,21 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             if (object.contains("fromBranch")) from = requiredString(object, "fromBranch");
             requireInput(!object.contains("revision") || from.has_value(),
                          "revision requires fromBranch");
-            RevisionId created = RevisionId::generate();
-            if (object.contains("revision"))
-                created = service.createBranchAtRevisionV2(project, name, *from,
-                    parseRevisionIdV2(requiredString(object, "revision")));
-            else
-                created = service.createBranchV2(project, name,
+            // Return the identity/provenance captured by the atomic native
+            // branch write. Never re-resolve a mutable branch name afterward.
+            const BranchCreationResultV2 created = object.contains("revision")
+                ? service.createBranchAtRevisionWithIdentityV2(project, name, *from,
+                    parseRevisionIdV2(requiredString(object, "revision")))
+                : service.createBranchWithIdentityV2(project, name,
                     from ? std::optional<std::string_view>(*from) : std::nullopt);
-            const std::optional<BranchId> branch = service.branchId(project, name);
-            requireInput(branch.has_value(), "new branch has no UUIDv7 identity");
-            // Read the persisted provenance rather than inferring it from the
-            // request: a branch's immutable origin is not commit ancestry.
-            const RevisionGraphPageV2 graph = service.revisionGraphV2(project, 1);
-            const auto recorded = std::find_if(graph.heads.begin(), graph.heads.end(),
-                [&](const RevisionGraphHeadV2& head) { return head.branchId == *branch; });
-            requireInput(recorded != graph.heads.end(),
-                         "new branch is missing from the authoritative revision graph");
-            return Reply{201, QJsonObject{{"id", revisionIdStringV2(created)},
+            return Reply{201, QJsonObject{{"id", revisionIdStringV2(created.revisionId)},
                 {"branch", QString::fromStdString(name)},
-                {"branchId", QString::fromStdString(branch->toString())},
-                {"originBranchId", recorded->originBranchId
-                    ? QJsonValue(QString::fromStdString(recorded->originBranchId->toString()))
+                {"branchId", QString::fromStdString(created.branchId.toString())},
+                {"originBranchId", created.originBranchId
+                    ? QJsonValue(QString::fromStdString(created.originBranchId->toString()))
                     : QJsonValue(QJsonValue::Null)},
-                {"forkRevisionId", recorded->forkRevisionId
-                    ? QJsonValue(revisionIdStringV2(*recorded->forkRevisionId))
+                {"forkRevisionId", created.forkRevisionId
+                    ? QJsonValue(revisionIdStringV2(*created.forkRevisionId))
                     : QJsonValue(QJsonValue::Null)}}};
         });
     });

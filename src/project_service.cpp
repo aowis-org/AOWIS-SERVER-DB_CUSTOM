@@ -421,32 +421,44 @@ Revision ProjectService::createBranchShaFixture(std::string_view projectId, std:
 
 RevisionId ProjectService::createBranchV2(std::string_view projectId,
               std::string_view name, std::optional<std::string_view> source) {
+    return createBranchWithIdentityV2(projectId, name, source).revisionId;
+}
+
+BranchCreationResultV2 ProjectService::createBranchWithIdentityV2(
+        std::string_view projectId, std::string_view name,
+        std::optional<std::string_view> source) {
     if (!validBranchName(name) || (source && !validBranchName(*source)))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
-    RevisionId created = RevisionId::generate();
+    std::optional<BranchCreationResultV2> created;
     withRepository(projectId, [&](Repository& repository) {
-        created = translated<RevisionId>([&]() {
-            return repository.createBranchV2(*project, name, source);
+        created = translated<BranchCreationResultV2>([&]() {
+            return repository.createBranchWithIdentityV2(*project, name, source);
         });
     });
-    return created;
+    return *created;
 }
 
 RevisionId ProjectService::createBranchAtRevisionV2(std::string_view projectId,
                 std::string_view name, std::string_view sourceBranch, const RevisionId& revision) {
+    return createBranchAtRevisionWithIdentityV2(projectId, name, sourceBranch, revision).revisionId;
+}
+
+BranchCreationResultV2 ProjectService::createBranchAtRevisionWithIdentityV2(
+        std::string_view projectId, std::string_view name,
+        std::string_view sourceBranch, const RevisionId& revision) {
     if (!validBranchName(name) || !validBranchName(sourceBranch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
-    RevisionId created = RevisionId::generate();
+    std::optional<BranchCreationResultV2> created;
     withRepository(projectId, [&](Repository& repository) {
-        created = translated<RevisionId>([&]() {
-            return repository.createBranchAtRevisionV2(*project, name, sourceBranch, revision);
+        created = translated<BranchCreationResultV2>([&]() {
+            return repository.createBranchAtRevisionWithIdentityV2(*project, name, sourceBranch, revision);
         });
     });
-    return created;
+    return *created;
 }
 
 MergeResultV2 ProjectService::mergeBranchesV2(std::string_view projectId,

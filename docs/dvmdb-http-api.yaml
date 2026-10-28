@@ -152,7 +152,25 @@ paths:
                 fromBranch: {type: string}
                 revision: {type: string, format: uuid, description: Historical revision UUIDv7; requires fromBranch}
       responses:
-        '201': {description: UUIDv7 revision ID, branch name and branch UUIDv7}
+        '201':
+          description: Atomic branch creation result; fork provenance is immutable metadata, not an ancestry edge
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, branch, branchId, originBranchId, forkRevisionId]
+                properties:
+                  id: {type: string, format: uuid, description: Exact committed fork revision UUIDv7}
+                  branch: {type: string, description: Newly created branch name}
+                  branchId: {type: string, format: uuid, description: Persistent UUIDv7 of the new branch}
+                  originBranchId:
+                    oneOf:
+                      - {type: string, format: uuid}
+                      - {type: 'null'}
+                  forkRevisionId:
+                    oneOf:
+                      - {type: string, format: uuid}
+                      - {type: 'null'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '409': {$ref: '#/components/responses/Conflict'}
   /projects/{projectId}/branches/{branch}:
@@ -227,8 +245,8 @@ paths:
         Native v2 graph semantics: union of all branch HEAD ancestry, both merge
         parents and deduplicated revisions. HEADs include branch UUIDv7,
         branch name, revision UUIDv7 and record SHA-256. HEADs additionally
-        include `originBranchId` (UUIDv7 or null), an immutable creation-source
-        branch reference that is distinct from revision ancestry. Revisions contain id,
+        include `originBranchId` and `forkRevisionId` (UUIDv7 or null),
+        immutable creation provenance distinct from revision ancestry. Revisions contain id,
         recordHash, snapshot roots, modelIndexed, parents (revision UUID array),
         and parentRecordHashes (corresponding SHA-256 array).
         Unborn HEADs have explicit null revision and recordHash, and do not
@@ -581,7 +599,11 @@ components:
       name: branch
       in: path
       required: true
-      schema: {type: string, pattern: '^[a-zA-Z0-9_-]{1,96}$'}
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 96
+        description: Valid UTF-8 branch label (maximum 96 bytes); internal spaces allowed, control characters and path delimiters rejected
   responses:
     BadRequest:
       description: Invalid request
