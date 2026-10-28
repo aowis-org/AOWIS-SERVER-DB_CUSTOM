@@ -1676,6 +1676,21 @@ void exerciseUnbornProjectHttp() {
     check(client.call("POST", projects,
         QJsonObject{{"name", "bad unborn"}, {"unborn", "true"}}).status == 400,
         "HTTP accepted non-boolean unborn selector");
+    check(client.call("POST", projects,
+        QJsonObject{{"name", "null unborn"}, {"unborn", QJsonValue(QJsonValue::Null)}}).status == 400,
+        "HTTP accepted null instead of an explicit unborn boolean");
+    for (const QJsonObject& request : {
+             QJsonObject{{"name", "legacy default"}},
+             QJsonObject{{"name", "explicit committed"}, {"unborn", false}}}) {
+        const Response legacy = client.call("POST", projects, request);
+        check(legacy.status == 201, "HTTP committed project compatibility creation failed");
+        const QString legacyHeadPath = projects + "/" + legacy.json.value("id").toString() +
+                                       "/branches/main/head";
+        const Response legacyHead = client.call("GET", legacyHeadPath);
+        check(legacyHead.status == 200 &&
+              native::RevisionId::parse(legacyHead.json.value("id").toString().toStdString()).has_value(),
+              "HTTP committed project compatibility lost initial revision HEAD");
+    }
     const Response created = client.call("POST", projects,
         QJsonObject{{"name", "Empty project"}, {"unborn", true}});
     const std::string project = created.json.value("id").toString().toStdString();
