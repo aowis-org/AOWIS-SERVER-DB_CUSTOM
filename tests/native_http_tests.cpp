@@ -1672,6 +1672,11 @@ void exerciseUnbornProjectHttp() {
     native::ProjectService service(temp.root());
     TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL, 10000, 1024ULL * 1024ULL});
     Client client(server.port());
+    const Response repository = client.call("GET", "/dvmdb/v1/repository");
+    check(repository.status == 200 && repository.json.keys() == QStringList({"repositoryId"})
+          && repository.json.value("repositoryId").toString() ==
+              QString::fromStdString(service.repositoryId()),
+          "HTTP repository identity differs from native root UUID");
     const QString projects = QStringLiteral("/dvmdb/v1/projects");
     check(client.call("POST", projects,
         QJsonObject{{"name", "bad unborn"}, {"unborn", "true"}}).status == 400,

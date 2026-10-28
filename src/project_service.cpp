@@ -119,6 +119,60 @@ void writeManifest(const std::filesystem::path& path, const ProjectInfo& info) {
     syscallChecked(::close(fd) == 0, "close project manifest");
 }
 
+// Persistent service-root identity is independent of project and branch IDs.
+// Its first publication is exclusive and durable. Older catalogues without
+// this file receive an ID on their first open; an existing malformed file is
+// corruption and must never be silently replaced with a new identity.
+std::string loadRepositoryIdentity(const std::filesystem::path& root) {
+    const std::filesystem::path path = root / "repository.id";
+    const auto readExisting = [&]() -> std::string {
+        check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path),
+              "unsafe DVMDB repository identity file: " + path.string());
+        check(std::filesystem::file_size(path) <= 80,
+              "oversized DVMDB repository identity: " + path.string());
+        std::ifstream stream(path, std::ios::binary);
+        check(stream.good(), "cannot read DVMDB repository identity");
+        const std::string data((std::istreambuf_iterator<char>(stream)),
+                               std::istreambuf_iterator<char>());
+        constexpr std::string_view marker = "AOWIS-REPOSITORY-1\n";
+        check(data.starts_with(marker) && data.size() == marker.size() + 37
+              && data.back() == '\n', "invalid DVMDB repository identity format");
+        const std::string id = data.substr(marker.size(), 36);
+        check(UuidV7::parse(id).has_value(), "invalid DVMDB repository UUIDv7");
+        return id;
+    };
+    if (std::filesystem::exists(path) || std::filesystem::is_symlink(path))
+        return readExisting();
+
+    const std::string id = UuidV7::generate().toString();
+    const std::string body = "AOWIS-REPOSITORY-1\n" + id + "\n";
+    // Prepare on the same filesystem and publish only fully synchronized bytes.
+    // A crash before link() cannot expose a partial authoritative identity.
+    const std::filesystem::path staging = root / (".repository-id-creating-" + id);
+    const int fd = ::open(staging.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    syscallChecked(fd >= 0, "stage DVMDB repository identity");
+    try {
+        std::size_t written = 0;
+        while (written < body.size()) {
+            const ssize_t amount = ::write(fd, body.data() + written, body.size() - written);
+            if (amount < 0 && errno == EINTR) continue;
+            syscallChecked(amount > 0, "write DVMDB repository identity");
+            written += static_cast<std::size_t>(amount);
+        }
+        syscallChecked(::fsync(fd) == 0, "sync DVMDB repository identity");
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+    syscallChecked(::close(fd) == 0, "close DVMDB repository identity");
+    syscallChecked(::link(staging.c_str(), path.c_str()) == 0,
+                   "publish DVMDB repository identity");
+    syncDirectory(root);
+    syscallChecked(::unlink(staging.c_str()) == 0, "remove DVMDB identity staging file");
+    syncDirectory(root);
+    return id;
+}
+
 ProjectInfo readManifest(const std::filesystem::path& projectDirectory) {
     const std::filesystem::path path = projectDirectory / "project.meta";
     check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path),
@@ -219,6 +273,7 @@ ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendin
                            "another database server owns this project root");
     }
     try {
+        this->repository_id_ = loadRepositoryIdentity(this->root_);
         for (const std::filesystem::directory_entry& entry :
              std::filesystem::directory_iterator(this->projects_)) {
             const std::string id = entry.path().filename().string();
@@ -249,6 +304,10 @@ ProjectService::~ProjectService() {
 void ProjectService::ensureHealthy() const {
     if (this->uncertain_) throw ProjectError(ProjectErrorKind::Unavailable,
         "catalogue publication status is uncertain; restart the database server");
+}
+
+std::string ProjectService::repositoryId() const {
+    return this->repository_id_;
 }
 
 std::size_t ProjectService::maxPendingOperations() const noexcept {

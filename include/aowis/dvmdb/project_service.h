@@ -123,6 +123,9 @@ public:
                              std::optional<RevisionId> expectedHead = std::nullopt);
     std::optional<ModelRecord> getModelAtRevisionV2(std::string_view projectId,
                                                    const RevisionId& revision, const Key& key);
+    // Persistent identity of this DVMDB catalogue / repository root (UUIDv7).
+    // Not a user identity and not an authorization credential.
+    std::string repositoryId() const;
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);
@@ -181,6 +184,7 @@ private:
     ProjectInfo createProjectImpl(std::string_view name, bool v2, bool unborn = false);
 
     std::filesystem::path root_;
+    std::string repository_id_;
     std::filesystem::path projects_;
     int lockFd_ = -1;
     const std::size_t maxPending_;

@@ -50,6 +50,22 @@ are durable. A browser may additionally maintain temporary UI state, but
 browser memory/storage is not an authoritative DVMDB working repository.
 Offline edits on an HTTP-only client are not promised by this architecture.
 
+## Persistent repository identity (VC-03)
+
+The DVMDB catalogue root persists a UUIDv7 in `repository.id` using the
+`AOWIS-REPOSITORY-1` marker. Existing catalogue roots acquire an identity
+on their first opening with `ProjectService` and keep it across restarts and
+offline backups. A malformed existing identity fails closed instead of being
+regenerated. Separate catalogue roots receive separate UUIDs; the identity
+belongs to the DVMDB root, not to a GUI profile name, connection URL, project,
+branch, or user. `ProjectService::repositoryId()` and read-only
+`GET /dvmdb/v1/repository` expose the same value. It is **not authorization**.
+
+This is the identity foundation only. Repository-qualified remote-tracking
+records, clone/fetch, and private-working-repository configuration remain
+separate VC-03/VC-06 implementation tasks; this endpoint does not enable
+editing or implicitly select a private repository.
+
 ## Clone/checkout and branch tracking
 
 A project and its logical branches keep their UUIDv7 identities across clone,

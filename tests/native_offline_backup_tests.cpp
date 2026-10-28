@@ -72,8 +72,11 @@ struct Snapshot {
     std::string alternateBranchId;
 };
 
-void compare(const std::filesystem::path& root, const std::vector<Snapshot>& expected) {
+void compare(const std::filesystem::path& root, const std::vector<Snapshot>& expected,
+             const std::string& expectedRepositoryId) {
     ProjectService service(root);
+    require(service.repositoryId() == expectedRepositoryId,
+            "backup/restore changed the durable repository UUIDv7");
     const std::vector<ProjectInfo> projects = service.listProjects();
     require(projects.size() == expected.size(), "restored project count mismatch");
     for (const Snapshot& item : expected) {
@@ -101,8 +104,10 @@ void tests(const std::string& python, const std::string& script, const std::stri
     const std::filesystem::path restored = temporary.directory / "restored";
     const std::filesystem::path reserved = temporary.directory / "reserved";
     std::vector<Snapshot> expected;
+    std::string originalRepositoryId;
     {
         ProjectService service(source);
+        originalRepositoryId = service.repositoryId();
         for (int index = 0; index < 3; ++index) {
             const ProjectInfo info = service.createProject("Hydraulic project " + std::to_string(index));
             const RevisionId before = service.head(info.id, "main");
@@ -135,12 +140,26 @@ void tests(const std::string& python, const std::string& script, const std::stri
     }
     require(run(python, script, verify, "backup", source, backup) == 0,
             "offline backup creation failed");
-    compare(backup, expected);
+    compare(backup, expected, originalRepositoryId);
     require(run(python, script, verify, "verify", backup) == 0,
             "offline backup verification failed");
     require(run(python, script, verify, "restore", backup, restored) == 0,
             "verified restore failed");
-    compare(restored, expected);
+    compare(restored, expected, originalRepositoryId);
+    // A backup with a corrupted catalogue-root identity must fail closed;
+    // restore must never invent a different UUID or publish such a root.
+    const std::filesystem::path backupIdentity = backup / "repository.id";
+    {
+        std::ofstream corrupted(backupIdentity, std::ios::binary | std::ios::trunc);
+        corrupted << "AOWIS-REPOSITORY-1\nnot-a-uuid\n";
+    }
+    const std::filesystem::path badRepositoryRestore = temporary.directory / "bad-repository-identity";
+    require(run(python, script, verify, "restore", backup, badRepositoryRestore) != 0,
+            "invalid repository UUIDv7 was accepted during restore");
+    require(!std::filesystem::exists(badRepositoryRestore),
+            "invalid repository identity was published during restore");
+    std::filesystem::copy_file(source / "repository.id", backupIdentity,
+                               std::filesystem::copy_options::overwrite_existing);
     // Corrupt/duplicated identity metadata must fail the same full verifier
     // used by offline backup/restore, even though every revision is valid.
     const std::filesystem::path refs = backup / "projects" / expected[0].id /
@@ -162,7 +181,7 @@ void tests(const std::string& python, const std::string& script, const std::stri
                                destinationId, std::filesystem::copy_options::overwrite_existing);
     require(run(python, script, verify, "backup", source, backup) != 0,
             "existing destination was overwritten");
-    compare(backup, expected);
+    compare(backup, expected, originalRepositoryId);
     // Pre-release SHA-head records are not eligible for canonical backups.
     const std::filesystem::path shaRef = source / "projects" / expected[0].id /
                                           "repository" / "refs" / "heads" / expected[0].mainBranchId;

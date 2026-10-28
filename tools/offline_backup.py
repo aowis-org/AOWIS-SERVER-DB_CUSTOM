@@ -74,6 +74,22 @@ def projects_in(root):
     return result
 
 
+def repository_identity(root):
+    # Legacy catalogues have no ID until a ProjectService first opens them.
+    # A present identity must be valid; never replace malformed metadata.
+    path = root / "repository.id"
+    if not path.exists() and not path.is_symlink():
+        return None
+    require(path.is_file() and not path.is_symlink(), f"unsafe repository identity: {path}")
+    payload = path.read_bytes()
+    parts = payload.splitlines(keepends=True)
+    require(len(parts) == 2 and parts[0] == b"AOWIS-REPOSITORY-1\n"
+            and parts[1].endswith(b"\n") and
+            UUID7.fullmatch(parts[1][:-1].decode("ascii", errors="replace")) is not None,
+            f"invalid DVMDB repository identity: {path}")
+    return parts[1][:-1]
+
+
 def branch_heads(root):
     heads = {}
     for project in projects_in(root):
@@ -140,6 +156,7 @@ def lock_file(path, stack):
 def acquire_source_locks(root, stack):
     # A ProjectService holds the catalogue lock during its entire lifetime.
     lock_file(root / "catalogue.lock", stack)
+    repository_identity(root)
     for project in projects_in(root):
         # Every Repository holds maintenance.lock shared throughout its lifetime.
         lock_file(project / "repository" / "maintenance.lock", stack)
@@ -201,6 +218,7 @@ def publish_no_replace(source, target):
 
 def verify(root, verify_binary):
     # Native verification may rebuild derived indexes; run it only on staging.
+    repository_identity(root)
     expected = branch_heads(root)
     for project in projects_in(root):
         result = subprocess.run([str(verify_binary), "--full", str(project / "repository")],
@@ -216,11 +234,13 @@ def copy_and_verify(source, destination, verify_binary):
     ensure_distinct(source, destination)
     with contextlib.ExitStack() as locks:
         expected = acquire_source_locks(source, locks)
+        source_id = repository_identity(source)
         reject_links_and_special(source)
         scratch = Path(tempfile.mkdtemp(prefix=".aowis-offline-copy-", dir=destination.parent))
         try:
             # Refuse links/special entries and do not follow symlinks on traversal.
             shutil.copytree(source, scratch, dirs_exist_ok=True, symlinks=True)
+            require(repository_identity(scratch) == source_id, "copied repository identity changed")
             require(branch_heads(scratch) == expected, "copied catalogue or branch heads changed")
             verify(scratch, verify_binary)
             require(branch_heads(scratch) == expected, "verified copy differs from source heads")

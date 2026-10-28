@@ -960,6 +960,11 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     server.Get("/dvmdb/v1/health", [](const httplib::Request&, httplib::Response& response) {
         send(response, Reply{200, QJsonObject{{"status", QStringLiteral("ok")}}});
     });
+    server.Get("/dvmdb/v1/repository", [&service](const httplib::Request&, httplib::Response& response) {
+        guarded(response, [&]() {
+            return Reply{200, QJsonObject{{"repositoryId", QString::fromStdString(service.repositoryId())}}};
+        });
+    });
     server.Get("/dvmdb/v1/ready", [&service](const httplib::Request&, httplib::Response& response) {
         guarded(response, [&]() {
             (void)service.listProjects();

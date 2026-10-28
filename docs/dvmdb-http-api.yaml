@@ -11,6 +11,21 @@ paths:
       operationId: health
       responses:
         '200': {description: Server process is responding}
+  /repository:
+    get:
+      operationId: getRepositoryIdentity
+      description: Stable UUIDv7 identity of this DVMDB catalogue root. Not an authentication token.
+      responses:
+        '200':
+          description: Persistent repository identity
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [repositoryId]
+                additionalProperties: false
+                properties:
+                  repositoryId: {type: string, format: uuid}
   /ready:
     get:
       operationId: readiness

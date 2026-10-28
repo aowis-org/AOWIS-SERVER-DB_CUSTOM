@@ -2,6 +2,7 @@
 #include "aowis/dvmdb/revision_record_v2.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -68,6 +69,7 @@ ModelChange change(std::uint8_t number) {
 void exercise() {
     TemporaryRoot root;
     std::string projectName;
+    std::string savedRepositoryId;
     std::string pendingUnbornProject;
     std::optional<BranchId> pendingUnbornBranch;
     RevisionId initial = RevisionId::generate();
@@ -75,6 +77,11 @@ void exercise() {
     RevisionId featureTip = RevisionId::generate();
     {
         ProjectService service(root.path);
+        savedRepositoryId = service.repositoryId();
+        require(aowis::dvmdb::UuidV7::parse(savedRepositoryId).has_value(),
+                "new repository root has no UUIDv7 identity");
+        require(service.repositoryId() == savedRepositoryId,
+                "repository UUID changed during the service lifetime");
         const ProjectInfo project = service.createProject("canonical native UUIDv7");
         projectName = project.id;
         const ProjectInfo other = service.createProject("another project");
@@ -160,6 +167,8 @@ void exercise() {
     }
     {
         ProjectService reopened(root.path);
+        require(reopened.repositoryId() == savedRepositoryId,
+                "repository UUID changed after restart");
         require(reopened.branchId(pendingUnbornProject, "main") == pendingUnbornBranch,
                 "unborn main branch identity changed after service restart");
         require(!reopened.optionalHeadV2(pendingUnbornProject, "main").has_value(),
@@ -177,6 +186,25 @@ void exercise() {
                 "canonical UUIDv7 identities changed after reopening");
         require(reopened.revision(projectName, merged).parents.size() == 2,
                 "reopened native merger lost ancestry");
+    }
+    // Independent DVMDB roots have different identities even when the
+    // project names coincide. Identity is never derived from a GUI label.
+    {
+        TemporaryRoot otherRoot;
+        ProjectService other(otherRoot.path);
+        require(other.repositoryId() != savedRepositoryId,
+                "independent repository roots share the same UUID");
+    }
+    // Corrupted identity must not be silently regenerated on restart.
+    {
+        const std::filesystem::path identity = root.path / "repository.id";
+        std::ofstream corrupted(identity, std::ios::binary | std::ios::trunc);
+        corrupted << "AOWIS-REPOSITORY-1\nnot-a-uuid\n";
+        corrupted.close();
+        bool rejected = false;
+        try { ProjectService invalid(root.path); }
+        catch (const aowis::dvmdb::StorageError&) { rejected = true; }
+        require(rejected, "corrupted repository identity was silently regenerated");
     }
 }
 } // namespace
