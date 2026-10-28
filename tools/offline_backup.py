@@ -23,13 +23,25 @@ import tempfile
 
 
 PROJECT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
-BRANCH = re.compile(rb"[a-zA-Z0-9_-]{1,96}\Z")
 UUID7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 HEAD = re.compile(rb"(?!0{64}\n)[0-9a-f]{64}\n\Z")
 
 
 class BackupError(Exception):
     pass
+
+
+def valid_branch_label(label):
+    # Match the native UUID-keyed branch label contract (UTF-8 byte limit,
+    # internal spaces, no controls or URL/path delimiters).
+    if not 1 <= len(label) <= 96 or label in (b".", b"..") or label.startswith(b" ") or label.endswith(b" "):
+        return False
+    try:
+        text = label.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return all(ord(character) >= 0x20 and ord(character) != 0x7f
+               and character not in "/\\%?#" for character in text)
 
 
 def require(condition, message):
@@ -82,13 +94,15 @@ def branch_heads(root):
             content = entry.read_bytes()
             parts = content.splitlines(keepends=True)
             require(parts and parts[0] in (b"AOWIS-BRANCH-1\n", b"AOWIS-BRANCH-2\n",
-                                                b"AOWIS-BRANCH-3\n", b"AOWIS-BRANCH-4\n"),
+                                               b"AOWIS-BRANCH-3\n", b"AOWIS-BRANCH-4\n",
+                                               b"AOWIS-BRANCH-5\n"),
                     f"invalid UUIDv7 branch record marker: {entry}")
             marker = parts[0]
             require(len(parts) == (3 if marker == b"AOWIS-BRANCH-1\n" else
-                                   5 if marker == b"AOWIS-BRANCH-3\n" else 4)
+                                   5 if marker == b"AOWIS-BRANCH-3\n" else
+                                   6 if marker == b"AOWIS-BRANCH-5\n" else 4)
                     and parts[1].endswith(b"\n")
-                    and BRANCH.fullmatch(parts[1][:-1]) is not None,
+                    and valid_branch_label(parts[1][:-1]),
                     f"invalid UUIDv7 branch record name or length: {entry}")
             if marker == b"AOWIS-BRANCH-4\n":
                 require(parts[2:] == [b"-\n", b"-\n"],
@@ -97,11 +111,15 @@ def branch_heads(root):
                 require(parts[2].endswith(b"\n") and
                         UUID7.fullmatch(parts[2][:-1].decode("ascii", errors="replace")) is not None,
                         f"invalid UUIDv7 branch HEAD identity: {entry}")
-            if marker == b"AOWIS-BRANCH-3\n":
+            if marker in (b"AOWIS-BRANCH-3\n", b"AOWIS-BRANCH-5\n"):
                 require(parts[3].endswith(b"\n") and
                         UUID7.fullmatch(parts[3][:-1].decode("ascii", errors="replace")) is not None
                         and parts[3][:-1].decode("ascii") != entry.name,
                         f"invalid UUIDv7 branch creation origin: {entry}")
+            if marker == b"AOWIS-BRANCH-5\n":
+                require(parts[4].endswith(b"\n") and
+                        UUID7.fullmatch(parts[4][:-1].decode("ascii", errors="replace")) is not None,
+                        f"invalid immutable UUIDv7 branch fork revision: {entry}")
             require(marker == b"AOWIS-BRANCH-4\n" or HEAD.fullmatch(parts[-1]) is not None,
                     f"invalid UUIDv7 branch HEAD digest: {entry}")
             values[entry.name] = content

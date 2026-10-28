@@ -106,7 +106,7 @@ void tests(const std::string& python, const std::string& script, const std::stri
         for (int index = 0; index < 3; ++index) {
             const ProjectInfo info = service.createProject("Hydraulic project " + std::to_string(index));
             const RevisionId before = service.head(info.id, "main");
-            const std::string secondary = index == 1 ? "scenario" : "design";
+            const std::string secondary = index == 1 ? "Scénario Süd 2026" : "design";
             service.createBranch(info.id, secondary, "main", before);
             Key key{};
             key[0] = static_cast<std::uint8_t>(index + 1);
@@ -201,6 +201,38 @@ void tests(const std::string& python, const std::string& script, const std::stri
     {
         std::ofstream output(shaRef, std::ios::binary | std::ios::trunc);
         output << originalRef;
+    }
+    // Backups must validate immutable BRANCH-5 fork metadata, not merely
+    // recognize its marker. Invalid fork UUIDs must prevent publication.
+    const std::filesystem::path forkRef = source / "projects" / expected[0].id /
+                                          "repository" / "refs" / "heads" / expected[0].alternateBranchId;
+    const std::string originalForkRef = [&] {
+        std::ifstream input(forkRef, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    }();
+    require(originalForkRef.starts_with("AOWIS-BRANCH-5\n"),
+            "new historical fork did not use the durable BRANCH-5 record");
+    {
+        std::string forged = originalForkRef;
+        std::size_t forkStart = 0;
+        for (int line = 0; line < 4; ++line) {
+            forkStart = forged.find('\n', forkStart);
+            require(forkStart != std::string::npos, "incomplete BRANCH-5 fork record");
+            ++forkStart;
+        }
+        require(forkStart + 36 < forged.size() && forged[forkStart + 36] == '\n',
+                "unexpected BRANCH-5 fork UUID layout");
+        forged.replace(forkStart, 36, std::string(36, 'x'));
+        std::ofstream output(forkRef, std::ios::binary | std::ios::trunc);
+        output << forged;
+    }
+    const std::filesystem::path badFork = temporary.directory / "bad-fork";
+    require(run(python, script, verify, "backup", source, badFork) != 0,
+            "malformed immutable fork UUID was accepted into offline backup");
+    require(!std::filesystem::exists(badFork), "invalid fork backup was published");
+    {
+        std::ofstream output(forkRef, std::ios::binary | std::ios::trunc);
+        output << originalForkRef;
     }
     const std::filesystem::path hidden = shaRef.parent_path() / ".unexpected";
     {
