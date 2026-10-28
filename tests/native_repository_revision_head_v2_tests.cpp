@@ -44,6 +44,10 @@ void testUnbornNativeRefFoundation() {
         repo.createUnbornBranchV2(project, "main");
         branch = *repo.branchId("main");
         check(!repo.optionalHeadV2(project, "main"), "unborn HEAD is not null");
+        check(repo.historyV2(project, "main", 10).empty(),
+              "unborn branch must have empty history");
+        rejects([&] { (void)repo.historyV2(project, "main", 10, RevisionId::generate()); },
+                StorageErrorKind::InvalidInput, "unborn history accepted a cursor");
         rejects([&] { repo.createUnbornBranchV2(project, "second"); },
                 StorageErrorKind::Conflict, "second unborn branch accepted");
         rejects([&] { (void)repo.headV2(project, "main"); },

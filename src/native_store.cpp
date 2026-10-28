@@ -3529,6 +3529,13 @@ std::vector<RevisionGraphRevisionV2> Repository::historyV2(
     refreshIndex();
     require(Err::InvalidInput, maxCount >= 1 && maxCount <= 1000,
             "v2 history page size must be between 1 and 1000");
+    const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
+    require(Err::NotFound, stored.has_value(), "branch not found");
+    if (!stored->revisionV2 && isZero(stored->head)) {
+        require(Err::InvalidInput, !after,
+                "unborn branch cannot have a history cursor");
+        return {};
+    }
     const RevisionRecordV2 tip = branchRevisionV2Locked(project, branch);
     RevisionResolverV2 resolver(this->directory_, project);
     const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
