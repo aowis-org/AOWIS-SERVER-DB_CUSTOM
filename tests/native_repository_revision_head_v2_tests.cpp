@@ -58,6 +58,29 @@ void testUnbornNativeRefFoundation() {
         check(reopened.branchId("main") == branch &&
               !reopened.optionalHeadV2(project, "main"),
               "unborn branch not durable across reopen");
+        rejects([&] { (void)reopened.commitV2(project, "main", {}, RevisionId::generate()); },
+                StorageErrorKind::Conflict, "unborn commit accepted a non-null expected HEAD");
+        const RevisionId first = reopened.commitV2(project, "main", {{key(1), value("first")}});
+        check(reopened.optionalHeadV2(project, "main") == first,
+              "first raw commit did not publish unborn HEAD");
+        const auto bytes = reopened.readRevisionV2(project, first);
+        check(bytes && decodeRevisionRecordV2(*bytes).parents.empty(),
+              "first raw revision has a parent");
+        check(reopened.branchId("main") == branch, "first commit changed branch identity");
+        rejects([&] { (void)reopened.commitV2(project, "main", {}, RevisionId::generate()); },
+                StorageErrorKind::Conflict, "committed branch accepted stale expected HEAD");
+    }
+    {
+        Repository modelRepo(temp.path / "model");
+        modelRepo.createUnbornBranchV2(project, "main");
+        const RevisionId first = modelRepo.commitModelV2(project, "main", {});
+        const auto bytes = modelRepo.readRevisionV2(project, first);
+        check(bytes.has_value(), "first model revision missing");
+        const RevisionRecordV2 record = decodeRevisionRecordV2(*bytes);
+        check(record.parents.empty() && record.modelIndexed,
+              "first model revision must be parentless and model-indexed");
+        check(modelRepo.optionalHeadV2(project, "main") == first,
+              "first model commit did not publish unborn HEAD");
     }
 }
 void testV2Publication() {

@@ -4407,13 +4407,17 @@ RevisionId Repository::commitV2(const ProjectId& project, std::string_view branc
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    const RevisionRecordV2 previous = branchRevisionV2Locked(project, branch);
-    if (expectedHead)
-        require(Err::Conflict, previous.id == *expectedHead, "branch HEAD changed before commit");
-    require(Err::InvalidInput, !previous.modelIndexed,
+    const std::optional<StoredBranch> starting = findStoredBranch(this->directory_, branch);
+    require(Err::NotFound, starting.has_value(), "branch not found");
+    const bool unborn = !starting->revisionV2 && isZero(starting->head);
+    const std::optional<RevisionRecordV2> previous = unborn ? std::nullopt :
+        std::optional<RevisionRecordV2>(branchRevisionV2Locked(project, branch));
+    require(Err::Conflict, !expectedHead || (previous && previous->id == *expectedHead),
+            "branch HEAD changed before commit");
+    require(Err::InvalidInput, !previous || !previous->modelIndexed,
             "raw edits cannot modify a model-indexed revision");
-    const Hash newRoot = applyEncodedChangesLocked(previous.root, changes);
-    const RevisionId newId = writeRevisionV2Locked(project, newRoot, Hash{}, false, {previous.id});
+    const Hash newRoot = applyEncodedChangesLocked(previous ? previous->root : Hash{}, changes);
+    const RevisionId newId = writeRevisionV2Locked(project, newRoot, Hash{}, false, previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{});
     RevisionResolverV2 resolver(this->directory_, project);
     const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
@@ -4422,7 +4426,7 @@ RevisionId Repository::commitV2(const ProjectId& project, std::string_view branc
     const std::optional<ResolvedRevisionV2> updated = resolver.resolve(newId, reader);
     require(Err::Internal, updated.has_value(), "new revision failed post-write verification");
     const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
-    require(Err::Internal, stored && stored->revisionV2 == std::optional<RevisionId>(previous.id),
+    require(Err::Internal, stored && stored->id == starting->id && stored->revisionV2 == (previous ? std::optional<RevisionId>(previous->id) : std::nullopt) && (previous || isZero(stored->head)),
             "branch changed during v2 commit");
     publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
                             updated->recordHash, newId, stored->originBranchId}, false);
@@ -4449,16 +4453,20 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    const RevisionRecordV2 previous = branchRevisionV2Locked(project, branch);
-    require(Err::Conflict, !expectedHead || previous.id == *expectedHead,
+    const std::optional<StoredBranch> starting = findStoredBranch(this->directory_, branch);
+    require(Err::NotFound, starting.has_value(), "branch not found");
+    const bool unborn = !starting->revisionV2 && isZero(starting->head);
+    const std::optional<RevisionRecordV2> previous = unborn ? std::nullopt :
+        std::optional<RevisionRecordV2>(branchRevisionV2Locked(project, branch));
+    require(Err::Conflict, !expectedHead || (previous && previous->id == *expectedHead),
             "branch HEAD changed since model edit was prepared");
-    require(Err::InvalidInput, previous.modelIndexed || isZero(previous.root),
+    require(Err::InvalidInput, !previous || previous->modelIndexed || isZero(previous->root),
             "cannot enable model indexing on a populated raw branch");
     const PreparedModelCommit prepared = prepareModelCommitLocked(
-        previous.root, previous.referencesRoot, std::move(changes));
-    const Hash newRoot = applyEncodedChangesLocked(previous.root, prepared.encoded);
+        previous ? previous->root : Hash{}, previous ? previous->referencesRoot : Hash{}, std::move(changes));
+    const Hash newRoot = applyEncodedChangesLocked(previous ? previous->root : Hash{}, prepared.encoded);
     const RevisionId revisionId = writeRevisionV2Locked(
-        project, newRoot, prepared.referencesRoot, true, {previous.id});
+        project, newRoot, prepared.referencesRoot, true, previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{});
     RevisionResolverV2 resolver(this->directory_, project);
     const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
@@ -4467,8 +4475,9 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
     const std::optional<ResolvedRevisionV2> saved = resolver.resolve(revisionId, reader);
     require(Err::Internal, saved.has_value(), "model revision did not resolve after write");
     const std::optional<StoredBranch> branchRecord = findStoredBranch(this->directory_, branch);
-    require(Err::Internal, branchRecord &&
-            branchRecord->revisionV2 == std::optional<RevisionId>(previous.id),
+    require(Err::Internal, branchRecord && branchRecord->id == starting->id &&
+            branchRecord->revisionV2 == (previous ? std::optional<RevisionId>(previous->id) : std::nullopt) &&
+            (previous || isZero(branchRecord->head)),
             "model branch HEAD changed during commit");
     publishStoredBranch(this->directory_, StoredBranch{
         branchRecord->id, branchRecord->name, saved->recordHash, revisionId,
