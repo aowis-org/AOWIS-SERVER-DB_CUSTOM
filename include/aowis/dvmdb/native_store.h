@@ -250,6 +250,7 @@ struct RevisionGraphHeadV2 {
     std::optional<RevisionId> revision;
     Hash recordHash{};
     std::optional<BranchId> originBranchId; // Immutable creation provenance.
+    std::optional<RevisionId> forkRevisionId; // Exact immutable fork point, not a revision parent.
 };
 
 struct RevisionGraphCursorV2 {

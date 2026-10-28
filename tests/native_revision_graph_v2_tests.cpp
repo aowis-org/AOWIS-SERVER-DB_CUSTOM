@@ -225,7 +225,8 @@ void runImmutableForkProvenance() {
         bool found = false;
         for (const RevisionGraphHeadV2& head : created.heads) {
             if (head.branchId != forkId) continue;
-            check(head.originBranchId == sourceId && head.revision == original,
+            check(head.originBranchId == sourceId && head.forkRevisionId == original &&
+                  head.revision == original,
                   "created branch lost its source UUID or selected historical HEAD");
             found = true;
         }
@@ -241,7 +242,8 @@ void runImmutableForkProvenance() {
         for (const RevisionGraphHeadV2& head : persisted.heads) {
             if (head.branchId != forkId) continue;
             check(head.name == forkName && head.originBranchId == sourceId &&
-                  head.revision.has_value() && head.revision != original,
+                  head.forkRevisionId == original && head.revision.has_value() &&
+                  head.revision != original,
                   "restart lost source identity or updated fork HEAD");
             found = true;
         }
