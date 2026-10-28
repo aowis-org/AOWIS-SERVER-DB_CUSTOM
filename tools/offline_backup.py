@@ -81,13 +81,26 @@ def branch_heads(root):
                     f"invalid UUIDv7 branch filename: {entry}")
             content = entry.read_bytes()
             parts = content.splitlines(keepends=True)
-            require(len(parts) == 4 and parts[0] == b"AOWIS-BRANCH-2\n"
-                    and BRANCH.fullmatch(parts[1][:-1]) is not None
+            require(parts and parts[0] in (b"AOWIS-BRANCH-1\n", b"AOWIS-BRANCH-2\n",
+                                                b"AOWIS-BRANCH-3\n"),
+                    f"invalid UUIDv7 branch record marker: {entry}")
+            marker = parts[0]
+            require(len(parts) == (3 if marker == b"AOWIS-BRANCH-1\n" else
+                                   5 if marker == b"AOWIS-BRANCH-3\n" else 4)
                     and parts[1].endswith(b"\n")
-                    and parts[2].endswith(b"\n")
-                    and UUID7.fullmatch(parts[2][:-1].decode("ascii", errors="replace")) is not None
-                    and HEAD.fullmatch(parts[3]) is not None,
-                    f"invalid UUIDv7 revision branch record: {entry}")
+                    and BRANCH.fullmatch(parts[1][:-1]) is not None,
+                    f"invalid UUIDv7 branch record name or length: {entry}")
+            if marker != b"AOWIS-BRANCH-1\n":
+                require(parts[2].endswith(b"\n") and
+                        UUID7.fullmatch(parts[2][:-1].decode("ascii", errors="replace")) is not None,
+                        f"invalid UUIDv7 branch HEAD identity: {entry}")
+            if marker == b"AOWIS-BRANCH-3\n":
+                require(parts[3].endswith(b"\n") and
+                        UUID7.fullmatch(parts[3][:-1].decode("ascii", errors="replace")) is not None
+                        and parts[3][:-1].decode("ascii") != entry.name,
+                        f"invalid UUIDv7 branch creation origin: {entry}")
+            require(HEAD.fullmatch(parts[-1]) is not None,
+                    f"invalid UUIDv7 branch HEAD digest: {entry}")
             values[entry.name] = content
         require(values, f"project has no published branches: {project.name}")
         heads[project.name] = (project.joinpath("project.meta").read_bytes(), values)

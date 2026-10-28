@@ -3466,6 +3466,12 @@ RevisionRecordV2 Repository::branchRevisionV2Locked(const ProjectId& project,
     return resolved->record;
 }
 
+std::optional<RevisionId> Repository::optionalHeadV2(const ProjectId& project, std::string_view branch) {
+    // Keep branch existence, project identity and revision verification identical
+    // to the committed-HEAD API until durable unborn refs are enabled.
+    return headV2(project, branch);
+}
+
 RevisionId Repository::headV2(const ProjectId& project, std::string_view branch) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);

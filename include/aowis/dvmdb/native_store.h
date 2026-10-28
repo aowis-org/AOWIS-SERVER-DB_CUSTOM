@@ -329,6 +329,8 @@ public:
     RevisionId createBranchV2(const ProjectId& project, std::string_view name,
                               std::optional<std::string_view> from = std::nullopt);
     RevisionId headV2(const ProjectId& project, std::string_view branch);
+    // VC-01 transition: optional committed HEAD contract; existing branches remain born.
+    std::optional<RevisionId> optionalHeadV2(const ProjectId& project, std::string_view branch);
     // First-parent UUIDv7 history, newest-first; after is an exclusive revision
     // UUID cursor and must belong to the pinned branch's first-parent chain.
     std::vector<RevisionGraphRevisionV2> historyV2(

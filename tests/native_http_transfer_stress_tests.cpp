@@ -488,7 +488,8 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
                                 continue;
                             }
                             require(result.status == 201 && field(result.body, "head") == expectedHead,
-                                    "soak import published incorrect revision");
+                                    "soak import published incorrect revision: HTTP " +
+                                    std::to_string(result.status) + " " + result.body);
                             ++completedImports;
                             inserted = true;
                             break;
@@ -627,7 +628,7 @@ int main(int argc, char** argv) {
             const HttpResponse imported = request(port, "POST", prefix(projects[0]) + "seed/bundle", fixture,
                                                    "application/vnd.aowis.bundle");
             require(imported.status == 201 && field(imported.body, "head") == head,
-                    "initial import failed");
+                    "initial import failed: HTTP " + std::to_string(imported.status) + " " + imported.body);
             tightBudget(port, projects[0], projects[1], head, fixture);
             server.stop();
             require(!server.forcedShutdown(), "staging test server did not stop cleanly");

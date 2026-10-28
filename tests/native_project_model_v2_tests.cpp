@@ -60,6 +60,8 @@ void testV2ModelWorkflow() {
         const ProjectInfo info = service.createProjectV2("New UUID model project");
         project = *ProjectId::parse(info.id);
         root = service.headV2(info.id, "main");
+        check(service.optionalHeadV2(info.id, "main") == std::optional<RevisionId>{root},
+              "optional HEAD disagrees with committed HEAD");
         check(service.listBranches(info.id) == std::vector<std::string>{"main"},
               "initial branch missing");
         rejects([&] { (void)service.getModelAtRevisionV2(info.id, root, a); },

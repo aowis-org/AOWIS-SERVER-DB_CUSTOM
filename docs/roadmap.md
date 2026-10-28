@@ -65,8 +65,7 @@ DVMDB/GUI specification update.
 
 **Operational parameters still to specify in their implementation milestones:**
 lease duration/renewal and fencing-token encoding; draft quotas, backup and
-retention; completed operation-result retention and status API; SQLite and
-PostgreSQL transaction details; and model conflict reporting. These are
+retention; completed operation-result retention and status API; native DVMDB transactional metadata, persistence and crash-recovery details; and model conflict reporting. These are
 implementation parameters, **not reopened architectural decisions**.
 Permissions remain deferred to VC-12; until then personal HTTP repositories
 require actual deployment isolation, never an assertion of security based
@@ -99,6 +98,10 @@ changed files only, a fresh timestamp and reproducible tests per checkpoint.
 **Done when:** current implementation gaps are listed against exact APIs and
 fixtures; both teams agree on the baseline, approved DG-04 migration policy,
 and test commands.
+
+VC-00 baseline findings and reproducible read-only probe: see
+[`vc00-baseline.md`](vc00-baseline.md). The VC-01 acceptance criteria remain
+unsatisfied; no existing repository is rewritten by this audit.
 
 ### VC-01 — Unborn projects, nullable committed HEADs and graph API
 

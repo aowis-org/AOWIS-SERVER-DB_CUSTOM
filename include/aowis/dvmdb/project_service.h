@@ -97,6 +97,7 @@ public:
     RevisionId createBranchV2(std::string_view projectId, std::string_view name,
                               std::optional<std::string_view> source = std::nullopt);
     RevisionId headV2(std::string_view projectId, std::string_view branch);
+    std::optional<RevisionId> optionalHeadV2(std::string_view projectId, std::string_view branch);
     std::vector<RevisionGraphRevisionV2> historyV2(
         std::string_view projectId, std::string_view branch, std::size_t maxCount = 100,
         std::optional<RevisionId> after = std::nullopt);

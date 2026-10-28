@@ -462,6 +462,17 @@ MergeResultV2 ProjectService::mergeBranchesV2(std::string_view projectId,
     return result;
 }
 
+std::optional<RevisionId> ProjectService::optionalHeadV2(std::string_view projectId, std::string_view branch) {
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    const std::shared_ptr<Project> entry = findProject(projectId);
+    return translated<std::optional<RevisionId>>([&]() {
+        return openRepository(*entry)->optionalHeadV2(*project, branch);
+    });
+}
+
 RevisionId ProjectService::headV2(std::string_view projectId, std::string_view branch) {
     if (!validBranchName(branch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
