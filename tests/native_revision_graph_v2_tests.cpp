@@ -198,6 +198,58 @@ void runBranchOriginsAndNames() {
     }
 }
 
+void runImmutableForkProvenance() {
+    Temporary temp;
+    const ProjectId project = ProjectId::generate();
+    const std::string sourceName = "Source – Süd";
+    const std::string forkName = "Historical Fork";
+    BranchId sourceId = BranchId::generate();
+    BranchId forkId = BranchId::generate();
+    RevisionId original = RevisionId::generate();
+    RevisionId later = RevisionId::generate();
+    {
+        Repository repository(temp.path / "repository");
+        original = repository.createBranchV2(project, sourceName);
+        sourceId = *repository.branchId(sourceName);
+        later = repository.commitV2(project, sourceName, {{key(20), Bytes{20}}}, original);
+        const std::size_t before = repository.revisionGraphV2(project).revisions.size();
+        check(repository.createBranchAtRevisionV2(project, forkName, sourceName, original) == original,
+              "historical fork did not select the requested immutable revision");
+        forkId = *repository.branchId(forkName);
+        const RevisionGraphPageV2 created = repository.revisionGraphV2(project);
+        check(created.revisions.size() == before,
+              "creating a historical branch introduced a synthetic revision");
+        check(repository.headV2(project, sourceName) == later &&
+              repository.headV2(project, forkName) == original,
+              "historical fork moved the source HEAD or forked from the wrong revision");
+        bool found = false;
+        for (const RevisionGraphHeadV2& head : created.heads) {
+            if (head.branchId != forkId) continue;
+            check(head.originBranchId == sourceId && head.revision == original,
+                  "created branch lost its source UUID or selected historical HEAD");
+            found = true;
+        }
+        check(found, "historical fork is missing from revision graph");
+        repository.renameBranchV2(project, sourceName, "Renamed Source", later);
+        (void)repository.commitV2(project, "Renamed Source", {{key(21), Bytes{21}}}, later);
+        (void)repository.commitV2(project, forkName, {{key(22), Bytes{22}}}, original);
+    }
+    {
+        Repository reopened(temp.path / "repository");
+        const RevisionGraphPageV2 persisted = reopened.revisionGraphV2(project);
+        bool found = false;
+        for (const RevisionGraphHeadV2& head : persisted.heads) {
+            if (head.branchId != forkId) continue;
+            check(head.name == forkName && head.originBranchId == sourceId &&
+                  head.revision.has_value() && head.revision != original,
+                  "restart lost source identity or updated fork HEAD");
+            found = true;
+        }
+        check(found && reopened.branchId("Renamed Source") == sourceId,
+              "restart lost branch identity or original source after rename");
+    }
+}
+
 void runService() {
     Temporary tmp;
     ProjectService service(tmp.path);
@@ -224,6 +276,7 @@ int main() {
         runUnbornGraph();
         runRepository();
         runBranchOriginsAndNames();
+        runImmutableForkProvenance();
         runService();
         std::cout << "UUIDv7 first-parent history and pinned all-parent graph passed\n";
         return 0;
