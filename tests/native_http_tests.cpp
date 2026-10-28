@@ -1775,9 +1775,21 @@ void exerciseUuidv7HistoryHttp() {
           "HTTP V2 root detail is invalid");
     const Response feature = client.call("POST", basePath + "/branches",
         QJsonObject{{"name", "feature"}, {"fromBranch", "main"}});
+    const Response initialGraph = client.call("GET", graphPath + "?limit=1");
+    QString mainBranchId;
+    for (const QJsonValue& value : initialGraph.json.value("heads").toArray()) {
+        const QJsonObject item = value.toObject();
+        if (item.value("branch").toString() == QStringLiteral("main"))
+            mainBranchId = item.value("branchId").toString();
+    }
+    check(initialGraph.status == 200 &&
+          native::BranchId::parse(mainBranchId.toStdString()).has_value(),
+          "HTTP V2 initial graph did not expose the main branch identity");
     check(feature.status == 201 && feature.json.value("id").toString() == rootId &&
-          native::BranchId::parse(feature.json.value("branchId").toString().toStdString()),
-          "HTTP V2 branch creation did not share the root revision");
+          native::BranchId::parse(feature.json.value("branchId").toString().toStdString()) &&
+          feature.json.value("originBranchId").toString() == mainBranchId &&
+          feature.json.value("forkRevisionId").toString() == rootId,
+          "HTTP V2 branch creation did not return persisted fork provenance");
     check(client.call("POST", basePath + "/branches",
         QJsonObject{{"name", "orphan"}}).status == 400,
           "source-less V2 fork allowed for nonempty project");
@@ -1826,8 +1838,11 @@ void exerciseUuidv7HistoryHttp() {
           QString::fromStdString(mainTip.toString()), "V2 history did not begin at current HEAD");
     const Response historic = client.call("POST", basePath + "/branches",
         QJsonObject{{"name", "historic"}, {"fromBranch", "main"}, {"revision", rootId}});
-    check(historic.status == 201 && historic.json.value("id").toString() == rootId,
-          "V2 historical branching returned wrong revision");
+    check(historic.status == 201 && historic.json.value("id").toString() == rootId &&
+          native::BranchId::parse(historic.json.value("branchId").toString().toStdString()) &&
+          historic.json.value("originBranchId").toString() == mainBranchId &&
+          historic.json.value("forkRevisionId").toString() == rootId,
+          "V2 historical branching did not return exact persisted fork provenance");
     const Response renamed = client.call("PATCH", basePath + "/branches/historic",
         QJsonObject{{"name", "archived"}, {"expectedHead", rootId}});
     check(renamed.status == 200 &&

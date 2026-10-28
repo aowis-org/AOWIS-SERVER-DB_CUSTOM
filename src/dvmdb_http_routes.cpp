@@ -1022,9 +1022,22 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                     from ? std::optional<std::string_view>(*from) : std::nullopt);
             const std::optional<BranchId> branch = service.branchId(project, name);
             requireInput(branch.has_value(), "new branch has no UUIDv7 identity");
+            // Read the persisted provenance rather than inferring it from the
+            // request: a branch's immutable origin is not commit ancestry.
+            const RevisionGraphPageV2 graph = service.revisionGraphV2(project, 1);
+            const auto recorded = std::find_if(graph.heads.begin(), graph.heads.end(),
+                [&](const RevisionGraphHeadV2& head) { return head.branchId == *branch; });
+            requireInput(recorded != graph.heads.end(),
+                         "new branch is missing from the authoritative revision graph");
             return Reply{201, QJsonObject{{"id", revisionIdStringV2(created)},
                 {"branch", QString::fromStdString(name)},
-                {"branchId", QString::fromStdString(branch->toString())}}};
+                {"branchId", QString::fromStdString(branch->toString())},
+                {"originBranchId", recorded->originBranchId
+                    ? QJsonValue(QString::fromStdString(recorded->originBranchId->toString()))
+                    : QJsonValue(QJsonValue::Null)},
+                {"forkRevisionId", recorded->forkRevisionId
+                    ? QJsonValue(revisionIdStringV2(*recorded->forkRevisionId))
+                    : QJsonValue(QJsonValue::Null)}}};
         });
     });
     server.Patch("/dvmdb/v1/projects/:id/branches/:branch",
