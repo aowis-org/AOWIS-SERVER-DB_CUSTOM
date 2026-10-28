@@ -1135,7 +1135,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         if (unbornV4) {
             require(Err::Corruption, bytes.substr(split + 1) == "-\n-\n" &&
                     names.insert(name).second, "invalid unborn UUIDv7 branch record");
-            result.push_back(StoredBranch{*parsed, name, Hash{}, std::nullopt, std::nullopt});
+            result.push_back(StoredBranch{*parsed, name, Hash{}, std::nullopt, std::nullopt, std::nullopt});
             continue;
         }
         std::optional<RevisionId> revisionId;
@@ -2813,7 +2813,8 @@ void Repository::publishRef(std::string_view name, const Hash& commitHash, bool 
     require(Err::Conflict, !existing || !requestedId || existing->id == *requestedId,
             "branch UUIDv7 conflicts with requested identity");
     publishStoredBranch(this->directory_, StoredBranch{id, std::string(name), commitHash, std::nullopt,
-                                                           existing ? existing->originBranchId : std::nullopt},
+                                                           existing ? existing->originBranchId : std::nullopt,
+                                                           std::nullopt},
                         !existing.has_value());
 }
 
@@ -3504,7 +3505,7 @@ void Repository::createUnbornBranchV2(const ProjectId& project, std::string_view
     // createBranchV2. No UUID revision or pack object is written here.
     (void)project;
     publishStoredBranch(this->directory_, StoredBranch{
-        BranchId::generate(), std::string(name), Hash{}, std::nullopt, std::nullopt}, true);
+        BranchId::generate(), std::string(name), Hash{}, std::nullopt, std::nullopt, std::nullopt}, true);
 }
 
 std::optional<RevisionId> Repository::optionalHeadV2(
