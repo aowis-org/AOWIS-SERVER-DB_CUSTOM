@@ -259,6 +259,10 @@ ProjectInfo ProjectService::createProject(std::string_view name) {
     return createProjectImpl(name, true);
 }
 
+ProjectInfo ProjectService::createUnbornProjectV2(std::string_view name) {
+    return createProjectImpl(name, true, true);
+}
+
 ProjectInfo ProjectService::createProjectShaFixture(std::string_view name) {
     return createProjectImpl(name, false);
 }
@@ -267,7 +271,7 @@ ProjectInfo ProjectService::createProjectV2(std::string_view name) {
     return createProjectImpl(name, true);
 }
 
-ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2) {
+ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2, bool unborn) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
     if (!validName(name)) throw ProjectError(ProjectErrorKind::InvalidInput,
@@ -295,7 +299,8 @@ ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2) {
                 const std::optional<ProjectId> project = ProjectId::parse(info.id);
                 if (!project) throw StorageError(StorageErrorKind::Internal,
                                                  "new project UUIDv7 did not validate");
-                (void)repository.createBranchV2(*project, "main");
+                if (unborn) repository.createUnbornBranchV2(*project, "main");
+                else (void)repository.createBranchV2(*project, "main");
             } else {
                 repository.createBranch("main");
             }

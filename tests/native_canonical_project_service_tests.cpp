@@ -76,6 +76,19 @@ void exercise() {
         const ProjectInfo project = service.createProject("canonical native UUIDv7");
         projectName = project.id;
         const ProjectInfo other = service.createProject("another project");
+        const ProjectInfo unborn = service.createUnbornProjectV2("unborn project");
+        require(!service.optionalHeadV2(unborn.id, "main").has_value(),
+                "unborn project unexpectedly has committed HEAD");
+        require(service.historyV2(unborn.id, "main").empty(),
+                "unborn project has a nonempty revision history");
+        require(service.revisionGraphV2(unborn.id).revisions.empty(),
+                "unborn project has graph revisions");
+        const RevisionId firstUnborn = service.commitModelV2(unborn.id, "main", {change(9)});
+        require(service.optionalHeadV2(unborn.id, "main") == firstUnborn,
+                "first unborn commit did not publish the HEAD");
+        require(service.revision(unborn.id, firstUnborn).parents.empty(),
+                "first unborn commit must have no parents");
+
         require(ProjectId::parse(project.id).has_value(), "canonical project is not UUIDv7");
         initial = service.head(project.id, "main");
         require(initial != service.head(other.id, "main"),

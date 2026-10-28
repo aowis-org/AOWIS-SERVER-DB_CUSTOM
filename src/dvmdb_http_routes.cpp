@@ -968,8 +968,12 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                           httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject object = parseBody(request, maxJsonSmallBytes);
-            requireKeys(object, {"name"});
-            return Reply{201, projectJson(service.createProjectV2(requiredString(object, "name")))};
+            requireKeys(object, {"name", "unborn"});
+            const QJsonValue unborn = object.value("unborn");
+            requireInput(unborn.isUndefined() || unborn.isBool(), "unborn must be a boolean");
+            const std::string name = requiredString(object, "name");
+            return Reply{201, projectJson(unborn.toBool(false)
+                ? service.createUnbornProjectV2(name) : service.createProjectV2(name))};
         });
     });
     server.Get("/dvmdb/v1/projects/:id", [&service](const httplib::Request& request,
@@ -1037,7 +1041,9 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         guarded(response, [&]() {
             const std::string project = pathParam(request, "id");
             const std::string branch = pathParam(request, "branch");
-            return Reply{200, QJsonObject{{"id", revisionIdStringV2(service.headV2(project, branch))}}};
+            const std::optional<RevisionId> head = service.optionalHeadV2(project, branch);
+            return Reply{200, QJsonObject{{"id", head ? QJsonValue(revisionIdStringV2(*head))
+                                                      : QJsonValue(QJsonValue::Null)}}};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/branches/:branch/history",

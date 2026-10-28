@@ -70,6 +70,8 @@ public:
 
     // Canonical native service API: revision IDs are UUIDv7, never SHA-256.
     ProjectInfo createProject(std::string_view name);
+    // Explicit opt-in until all clients support nullable initial HEADs.
+    ProjectInfo createUnbornProjectV2(std::string_view name);
     RevisionId createBranch(std::string_view projectId, std::string_view name,
                             std::optional<std::string_view> source = std::nullopt,
                             std::optional<RevisionId> fromRevision = std::nullopt);
@@ -170,7 +172,7 @@ private:
     std::shared_ptr<Project> findProject(std::string_view id) const;
     std::shared_ptr<Repository> openRepository(Project& project) const;
     void ensureHealthy() const;
-    ProjectInfo createProjectImpl(std::string_view name, bool v2);
+    ProjectInfo createProjectImpl(std::string_view name, bool v2, bool unborn = false);
 
     std::filesystem::path root_;
     std::filesystem::path projects_;
