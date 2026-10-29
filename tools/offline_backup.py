@@ -148,40 +148,97 @@ def tracking_metadata(root):
 
 
 def working_copy_records(root):
-    """Validate and compare the exact bytes of private working-copy records."""
+    """Verify every published private draft and preserve exact bytes on restore."""
     directory = root / "working-copies"
     if not directory.exists() and not directory.is_symlink():
         return {}
     safe_directory(directory)
     records = {}
+    hex_digits = set(b"0123456789abcdef")
+
+    def decimal(value):
+        require(value.isdigit() and (value == b"0" or not value.startswith(b"0"))
+                and len(value) <= 20 and int(value) <= (1 << 64) - 1,
+                "invalid draft generation/lease/count")
+        return int(value)
+
+    def uuid(value):
+        return UUID7.fullmatch(value.decode("ascii", errors="replace")) is not None
+
+    def valid_model_record(encoded):
+        require(len(encoded) % 2 == 0 and all(ch in hex_digits for ch in encoded),
+                "invalid draft model record hex")
+        record = bytes.fromhex(encoded.decode("ascii"))
+        require(len(record) >= 15 and record[:5] == b"AOMD\x01" and
+                int.from_bytes(record[5:7], "big") != 0, "invalid draft model record header")
+        count = int.from_bytes(record[7:11], "big")
+        offset = 11 + count * 16
+        require(offset + 4 <= len(record) and
+                int.from_bytes(record[offset:offset + 4], "big") == len(record) - offset - 4,
+                "invalid draft model record length")
+
     for path in sorted(directory.iterdir()):
-        if path.name.startswith(".creating-"):
-            require(UUID7.fullmatch(path.name[len(".creating-"):]) is not None
+        if path.name.startswith((".creating-", ".updating-")):
+            prefix = ".creating-" if path.name.startswith(".creating-") else ".updating-"
+            require(UUID7.fullmatch(path.name[len(prefix):]) is not None
                     and path.is_file() and not path.is_symlink(),
                     f"unsafe working-copy staging record: {path}")
             continue
         require(UUID7.fullmatch(path.name) is not None
                 and path.is_file() and not path.is_symlink()
-                and path.stat().st_size <= 512,
+                and path.stat().st_size <= 8 * 1024 * 1024,
                 f"invalid working-copy record: {path}")
         body = path.read_bytes()
         lines = body.splitlines(keepends=True)
-        require(len(lines) == 9 and lines[0] == b"AOWIS-WORKING-COPY-1\n" and
+        require(lines and lines[0] in (b"AOWIS-WORKING-COPY-1\n",
+                                          b"AOWIS-WORKING-COPY-2\n") and
                 all(line.endswith(b"\n") for line in lines),
                 f"invalid working-copy record format: {path}")
+        version2 = lines[0] == b"AOWIS-WORKING-COPY-2\n"
+        if not version2:
+            require(len(body) <= 512, f"oversized v1 working-copy record: {path}")
         fields = [b"project", b"branch", b"base", b"session", b"generation",
-                  b"dirty", b"validation", b"changes"]
+                  b"dirty", b"validation"]
+        if version2:
+            fields += [b"lease-session", b"lease-token", b"lease-expires"]
+        fields += [b"changes"]
+        require(len(lines) >= 1 + len(fields), f"truncated working-copy record: {path}")
         values = []
         for line, field in zip(lines[1:], fields):
             parts = line[:-1].split(b"\t")
             require(len(parts) == 2 and parts[0] == field,
                     f"invalid working-copy field: {path}")
             values.append(parts[1])
-        uuid = lambda value: UUID7.fullmatch(value.decode("ascii", errors="replace")) is not None
         require(uuid(values[0]) and uuid(values[1]) and
-                (values[2] == b"-" or uuid(values[2])) and uuid(values[3]) and
-                values[4:] == [b"0", b"0", b"unvalidated", b"0"],
-                f"invalid initial working-copy state: {path}")
+                (values[2] == b"-" or uuid(values[2])) and uuid(values[3]),
+                f"invalid draft identity: {path}")
+        generation = decimal(values[4])
+        require(values[5] in (b"0", b"1") and values[6] == b"unvalidated",
+                f"invalid draft dirty/validation state: {path}")
+        if version2:
+            owner, token = values[7:9]
+            expires = decimal(values[9])
+            require((owner == b"-" and token == b"-" and expires == 0) or
+                    (uuid(owner) and uuid(token) and expires != 0),
+                    f"invalid draft lease state: {path}")
+        count = decimal(values[-1])
+        require(count <= 20000 and len(lines) == len(fields) + 1 + count,
+                f"invalid draft change count: {path}")
+        require((values[5] == b"1") == (count != 0),
+                f"invalid draft dirty/change mismatch: {path}")
+        if not version2:
+            require(generation == 0 and count == 0 and values[5] == b"0",
+                    f"invalid initial working-copy state: {path}")
+        previous = None
+        for line in lines[len(fields) + 1:]:
+            parts = line[:-1].split(b"\t")
+            require(len(parts) == 3 and parts[0] == b"change" and
+                    len(parts[1]) == 32 and all(ch in hex_digits for ch in parts[1]) and
+                    (previous is None or previous < parts[1]),
+                    f"invalid draft change key: {path}")
+            previous = parts[1]
+            if parts[2] != b"-":
+                valid_model_record(parts[2])
         records[path.name] = body
     return records
 

@@ -61,8 +61,8 @@ struct RemoteTrackingRefV1 {
 
 // VC-04: persisted, uncommitted working-copy identity. A working copy is
 // private repository state, never a committed revision or mutable branch HEAD.
-// Generation starts at zero; write leases and candidate changes are added by
-// the following VC-04 implementation stages.
+// Saves persist an overlay of typed model changes without advancing HEAD.
+// The UUIDv7 fencing token is rotated on every lease acquisition or takeover.
 struct WorkingCopyInfoV1 {
     std::string id;
     std::string projectId;
@@ -71,6 +71,16 @@ struct WorkingCopyInfoV1 {
     std::string sessionId;
     std::uint64_t generation = 0;
     bool dirty = false;
+    std::vector<ModelChange> candidateChanges;
+    std::optional<std::string> leaseSessionId;
+    std::optional<std::string> leaseToken;
+    std::uint64_t leaseExpiresAtMs = 0;
+};
+
+struct WorkingCopyLeaseV1 {
+    std::string token;                // UUIDv7, changes on every acquisition
+    std::uint64_t expiresAtMs = 0;   // UTC epoch milliseconds
+    std::uint64_t generation = 0;    // caller must pin for Save
 };
 
 class ProjectService final {
@@ -184,6 +194,21 @@ public:
         std::optional<RevisionId> baseRevision, std::string_view sessionId);
     WorkingCopyInfoV1 workingCopyV1(std::string_view draftId) const;
     std::vector<WorkingCopyInfoV1> listWorkingCopiesV1() const;
+    // Only one nonexpired writer may hold a draft lease. The same session
+    // may reacquire, invalidating its previous token. Expired leases may be
+    // explicitly taken over by a different session; no candidate is lost.
+    WorkingCopyLeaseV1 acquireWorkingCopyLeaseV1(
+        std::string_view draftId, std::string_view sessionId, std::uint32_t seconds);
+    // All changes are applied atomically to the draft's candidate overlay.
+    // The full resulting record is fsynced before this returns; Save never
+    // touches committed HEADs or immutable revisions.
+    WorkingCopyInfoV1 saveWorkingCopyChangesV1(
+        std::string_view draftId, std::string_view sessionId,
+        std::string_view fencingToken, std::uint64_t expectedGeneration,
+        const std::vector<ModelChange>& changes);
+    void releaseWorkingCopyLeaseV1(
+        std::string_view draftId, std::string_view sessionId,
+        std::string_view fencingToken);
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);

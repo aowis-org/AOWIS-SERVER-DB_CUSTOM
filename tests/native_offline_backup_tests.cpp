@@ -83,8 +83,12 @@ void compare(const std::filesystem::path& root, const std::vector<Snapshot>& exp
     require(drafts.size() == 1 && drafts.front().projectId == expected.front().id &&
             drafts.front().branchId == expected.front().mainBranchId &&
             drafts.front().baseRevision == expected.front().main &&
-            drafts.front().generation == 0 && !drafts.front().dirty,
-            "backup/restore did not preserve immutable working-copy identity and base");
+            drafts.front().generation == 1 && drafts.front().dirty &&
+            drafts.front().candidateChanges.size() == 1 &&
+            drafts.front().candidateChanges.front().record.has_value() &&
+            drafts.front().candidateChanges.front().record->payload ==
+                std::vector<std::uint8_t>({42, 43}),
+            "backup/restore lost the saved private candidate overlay");
     for (const Snapshot& item : expected) {
         const ProjectInfo project = service.project(item.id);
         require(project.name == item.name, "restored project identity mismatch");
@@ -147,6 +151,19 @@ void tests(const std::string& python, const std::string& script, const std::stri
                 const aowis::dvmdb::WorkingCopyInfoV1 draft =
                     service.createWorkingCopyV1(info.id, "main", after, session);
                 require(draft.baseRevision == after, "could not create backup draft fixture");
+                const aowis::dvmdb::WorkingCopyLeaseV1 lease =
+                    service.acquireWorkingCopyLeaseV1(draft.id, session, 120);
+                Key candidateKey{};
+                candidateKey[15] = 9;
+                ModelRecord candidate;
+                candidate.kind = 44;
+                candidate.payload = {42, 43};
+                const aowis::dvmdb::WorkingCopyInfoV1 saved =
+                    service.saveWorkingCopyChangesV1(draft.id, session, lease.token,
+                                                    lease.generation, {{candidateKey, candidate}});
+                require(saved.generation == 1 && saved.dirty,
+                        "failed to save private draft before backup");
+                service.releaseWorkingCopyLeaseV1(draft.id, session, lease.token);
             }
         }
         // The catalogue is open; an offline snapshot must refuse it promptly.
