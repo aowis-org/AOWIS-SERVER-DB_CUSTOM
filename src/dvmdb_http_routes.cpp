@@ -26,6 +26,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -52,6 +53,10 @@ constexpr std::size_t maxHttpEntityIds = 10000;
 
 // Exact route patterns (also used to select per-route JSON body limits).
 const char* const routeProjects = "/dvmdb/v1/projects";
+const char* const routeWorkingCopies = "/dvmdb/v1/working-copies";
+const char* const routeWorkingCopySave = "/dvmdb/v1/working-copies/:draft/save";
+const char* const routeWorkingCopyLease = "/dvmdb/v1/working-copies/:draft/lease";
+const char* const routeWorkingCopyRelease = "/dvmdb/v1/working-copies/:draft/release";
 const char* const routeBranches = "/dvmdb/v1/projects/:id/branches";
 const char* const routeRevisionBundleV2 = "/dvmdb/v1/projects/:id/branches/:branch/bundle";
 const char* const revisionBundleMimeV2 = "application/vnd.aowis.revision-bundle-v2";
@@ -259,6 +264,105 @@ Bytes decodeModelPayloadV2(const QJsonObject& object) {
     if (payload.isEmpty()) return {};
     const std::uint8_t* first = reinterpret_cast<const std::uint8_t*>(payload.constData());
     return Bytes(first, first + payload.size());
+}
+
+
+// Use decimal strings for uint64 values: JSON numbers lose precision above
+// 2^53 and must not silently alter the optimistic draft generation.
+std::uint64_t strictUint64(const QJsonObject& object, const QString& field) {
+    const std::string value = requiredString(object, field);
+    requireInput(!value.empty() && value.size() <= 20 &&
+                 std::all_of(value.begin(), value.end(), [](char ch) { return ch >= '0' && ch <= '9'; }),
+                 "invalid unsigned decimal field");
+    std::uint64_t result = 0;
+    const std::from_chars_result parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+    requireInput(parsed.ec == std::errc() && parsed.ptr == value.data() + value.size(),
+                 "invalid or overflowing unsigned decimal field");
+    return result;
+}
+
+QJsonValue optionalRevisionJson(const std::optional<RevisionId>& id) {
+    return id ? QJsonValue(revisionIdStringV2(*id)) : QJsonValue(QJsonValue::Null);
+}
+
+QJsonObject workingCopyJson(const WorkingCopyInfoV1& draft, bool includeChanges = true) {
+    QJsonArray changes;
+    if (includeChanges) for (const ModelChange& change : draft.candidateChanges) {
+        const QString uuid = modelKeyStringV2(change.key);
+        if (!change.record) {
+            changes.append(QJsonObject{{"uuid", uuid}, {"delete", true}});
+            continue;
+        }
+        QJsonArray references;
+        for (const Key& reference : change.record->references)
+            references.append(modelKeyStringV2(reference));
+        const Bytes& payload = change.record->payload;
+        const QByteArray bytes = payload.empty() ? QByteArray() :
+            QByteArray(reinterpret_cast<const char*>(payload.data()),
+                       static_cast<qsizetype>(payload.size()));
+        changes.append(QJsonObject{{"uuid", uuid}, {"kind", static_cast<int>(change.record->kind)},
+                                   {"references", references},
+                                   {"payloadBase64", QString::fromLatin1(bytes.toBase64())}});
+    }
+    QJsonObject result{
+        {"id", QString::fromStdString(draft.id)},
+        {"projectId", QString::fromStdString(draft.projectId)},
+        {"branchId", QString::fromStdString(draft.branchId)},
+        {"baseRevision", optionalRevisionJson(draft.baseRevision)},
+        {"sessionId", QString::fromStdString(draft.sessionId)},
+        {"generation", QString::number(static_cast<qulonglong>(draft.generation))},
+        {"dirty", draft.dirty},
+        {"leaseSessionId", draft.leaseSessionId
+            ? QJsonValue(QString::fromStdString(*draft.leaseSessionId)) : QJsonValue(QJsonValue::Null)},
+        {"leaseExpiresAtMs", QString::number(static_cast<qulonglong>(draft.leaseExpiresAtMs))}
+    };
+    if (includeChanges) result.insert(QStringLiteral("changes"), changes);
+    return result;
+}
+
+// Identical native model-record encoding for committed batches and private
+// draft overlays. Draft saves never invoke the commit operation.
+std::vector<ModelChange> parseModelChangesV2(const QJsonObject& object, bool forCommit = false) {
+    requireInput(object.value("changes").isArray(), "missing changes array");
+    const QJsonArray entries = object.value("changes").toArray();
+    requireInput(!entries.isEmpty() && entries.size() <= 128,
+                 forCommit ? "model commit requires 1..128 changes" :
+                             "model save requires 1..128 changes");
+    std::vector<ModelChange> changes;
+    std::set<Key> seen;
+    changes.reserve(static_cast<std::size_t>(entries.size()));
+    for (const QJsonValue& value : entries) {
+        requireInput(value.isObject(), "model change must be an object");
+        const QJsonObject item = value.toObject();
+        requireKeys(item, {"uuid", "delete", "kind", "references", "payloadBase64"});
+        const Key key = parseModelKeyV2(requiredString(item, "uuid"));
+        requireInput(seen.insert(key).second,
+                     forCommit ? "duplicate model UUID in commit" : "duplicate model UUID in save");
+        if (item.value("delete") == QJsonValue(true)) {
+            requireInput(item.size() == 2 && item.contains("uuid"),
+                         "deletion may only contain uuid and delete");
+            changes.push_back(ModelChange{key, std::nullopt});
+            continue;
+        }
+        requireInput(!item.contains("delete"), "delete must be true or absent");
+        requireInput(item.value("kind").isDouble(), "missing model record kind");
+        const double number = item.value("kind").toDouble();
+        requireInput(number >= 0 && number <= 65535 &&
+                     number == static_cast<double>(static_cast<std::uint16_t>(number)),
+                     "model record kind must be uint16");
+        requireInput(item.value("references").isArray(), "missing model references");
+        const QJsonArray references = item.value("references").toArray();
+        requireInput(references.size() <= 65535, "too many model references");
+        ModelRecord record;
+        record.kind = static_cast<std::uint16_t>(number);
+        for (const QJsonValue& reference : references) {
+            requireInput(reference.isString(), "model reference must be a UUID");
+            record.references.push_back(parseModelKeyV2(reference.toString().toStdString()));
+        }
+        record.payload = decodeModelPayloadV2(item);
+        changes.push_back(ModelChange{key, std::move(record)});
+    }
+    return changes;
 }
 
 
@@ -588,7 +692,10 @@ std::vector<hydraulic::HydraulicEntityChange> parseHydraulicChangesV2(const QJso
 std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     if (request.method != "POST") return std::nullopt;
     const std::string& route = request.matched_route;
-    if (route == routeProjects || route == routeBranches) return maxJsonSmallBytes;
+    if (route == routeProjects || route == routeBranches ||
+        route == routeWorkingCopies || route == routeWorkingCopyLease ||
+        route == routeWorkingCopyRelease) return maxJsonSmallBytes;
+    if (route == routeWorkingCopySave) return maxJsonModelBytes;
     if (route == routeMergesV2 ||
         route == routeHydraulicMergesV2) return maxJsonMergeBytes;
     if (route == routeNetworks || route == routeEdits || route == routeModelCommitsV2) return maxJsonModelBytes;
@@ -1001,6 +1108,78 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, QJsonObject{{"status", QStringLiteral("ready")}}};
         });
     });
+    // VC-04: private, persistent working copies. These are draft operations,
+    // not revision-graph commits. Repository role is checked in the native API.
+    server.Get(routeWorkingCopies, [&service](const httplib::Request&, httplib::Response& response) {
+        guarded(response, [&]() {
+            const std::vector<WorkingCopyInfoV1> drafts = service.listWorkingCopiesV1();
+            requireInput(drafts.size() <= 1000, "too many working copies for one HTTP response");
+            QJsonArray items;
+            for (const WorkingCopyInfoV1& draft : drafts)
+                items.append(workingCopyJson(draft, false));
+            return Reply{200, QJsonObject{{"workingCopies", items}}};
+        });
+    });
+    server.Post(routeWorkingCopies, [&service](const httplib::Request& request,
+                                               httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonSmallBytes);
+            requireKeys(body, {"projectId", "branch", "baseRevision", "sessionId"});
+            requireInput(body.contains("baseRevision"), "missing baseRevision (use null for unborn)");
+            const QJsonValue base = body.value("baseRevision");
+            requireInput(base.isNull() || base.isString(), "baseRevision must be UUIDv7 or null");
+            const std::optional<RevisionId> id = base.isString()
+                ? std::optional<RevisionId>(parseRevisionIdV2(base.toString().toStdString()))
+                : std::nullopt;
+            return Reply{201, workingCopyJson(service.createWorkingCopyV1(
+                requiredString(body, "projectId"), requiredString(body, "branch"), id,
+                requiredString(body, "sessionId")))};
+        });
+    });
+    server.Get("/dvmdb/v1/working-copies/:draft", [&service](const httplib::Request& request,
+                                                              httplib::Response& response) {
+        guarded(response, [&]() {
+            return Reply{200, workingCopyJson(service.workingCopyV1(pathParam(request, "draft")))};
+        });
+    });
+    server.Post(routeWorkingCopyLease, [&service](const httplib::Request& request,
+                                                  httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonSmallBytes);
+            requireKeys(body, {"sessionId", "seconds"});
+            requireInput(body.value("seconds").isDouble(), "missing lease seconds");
+            const double seconds = body.value("seconds").toDouble();
+            requireInput(seconds >= 1 && seconds <= 120 && seconds == static_cast<double>(static_cast<int>(seconds)),
+                         "lease seconds must be 1..120 integer");
+            const WorkingCopyLeaseV1 lease = service.acquireWorkingCopyLeaseV1(
+                pathParam(request, "draft"), requiredString(body, "sessionId"),
+                static_cast<std::uint32_t>(seconds));
+            return Reply{200, QJsonObject{{"token", QString::fromStdString(lease.token)},
+                {"expiresAtMs", QString::number(static_cast<qulonglong>(lease.expiresAtMs))},
+                {"generation", QString::number(static_cast<qulonglong>(lease.generation))}}};
+        });
+    });
+    server.Post(routeWorkingCopySave, [&service](const httplib::Request& request,
+                                                 httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonModelBytes);
+            requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes"});
+            const std::vector<ModelChange> changes = parseModelChangesV2(body);
+            return Reply{200, workingCopyJson(service.saveWorkingCopyChangesV1(
+                pathParam(request, "draft"), requiredString(body, "sessionId"),
+                requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"), changes))};
+        });
+    });
+    server.Post(routeWorkingCopyRelease, [&service](const httplib::Request& request,
+                                                    httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonSmallBytes);
+            requireKeys(body, {"sessionId", "fencingToken"});
+            service.releaseWorkingCopyLeaseV1(pathParam(request, "draft"),
+                requiredString(body, "sessionId"), requiredString(body, "fencingToken"));
+            return Reply{200, QJsonObject{{"released", true}}};
+        });
+    });
     server.Get(routeProjects, [&service](const httplib::Request&, httplib::Response& response) {
         guarded(response, [&]() {
             QJsonArray projects;
@@ -1182,43 +1361,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const QJsonObject object = parseBody(request, maxJsonModelBytes);
             requireKeys(object, {"expectedHead", "changes"});
             const RevisionId expected = parseRevisionIdV2(requiredString(object, "expectedHead"));
-            requireInput(object.value("changes").isArray(), "missing changes array");
-            const QJsonArray entries = object.value("changes").toArray();
-            requireInput(!entries.isEmpty() && entries.size() <= 128,
-                         "model commit requires 1..128 changes");
-            std::vector<ModelChange> changes;
-            std::set<Key> seen;
-            changes.reserve(static_cast<std::size_t>(entries.size()));
-            for (const QJsonValue& value : entries) {
-                requireInput(value.isObject(), "model change must be an object");
-                const QJsonObject item = value.toObject();
-                requireKeys(item, {"uuid", "delete", "kind", "references", "payloadBase64"});
-                const Key key = parseModelKeyV2(requiredString(item, "uuid"));
-                requireInput(seen.insert(key).second, "duplicate model UUID in commit");
-                if (item.value("delete") == QJsonValue(true)) {
-                    requireInput(item.size() == 2 && item.contains("uuid"),
-                                 "deletion may only contain uuid and delete");
-                    changes.push_back(ModelChange{key, std::nullopt});
-                    continue;
-                }
-                requireInput(!item.contains("delete"), "delete must be true or absent");
-                requireInput(item.value("kind").isDouble(), "missing model record kind");
-                const double number = item.value("kind").toDouble();
-                requireInput(number >= 0 && number <= 65535 &&
-                             number == static_cast<double>(static_cast<std::uint16_t>(number)),
-                             "model record kind must be uint16");
-                requireInput(item.value("references").isArray(), "missing model references");
-                const QJsonArray references = item.value("references").toArray();
-                requireInput(references.size() <= 65535, "too many model references");
-                ModelRecord record;
-                record.kind = static_cast<std::uint16_t>(number);
-                for (const QJsonValue& reference : references) {
-                    requireInput(reference.isString(), "model reference must be a UUID");
-                    record.references.push_back(parseModelKeyV2(reference.toString().toStdString()));
-                }
-                record.payload = decodeModelPayloadV2(item);
-                changes.push_back(ModelChange{key, std::move(record)});
-            }
+            std::vector<ModelChange> changes = parseModelChangesV2(object, true);
             const RevisionId saved = service.commitModelV2(pathParam(request, "id"),
                                            pathParam(request, "branch"), std::move(changes), expected);
             return Reply{201, QJsonObject{{"id", revisionIdStringV2(saved)}}};

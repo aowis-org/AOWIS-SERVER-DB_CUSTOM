@@ -20,7 +20,7 @@ def document_routes(text):
         for method in re.findall(r"^    (get|post|patch):", part, re.M):
             canonical = path.replace('{projectId}', ':id').replace('{branch}', ':branch')
             canonical = canonical.replace('{revision}', ':revision').replace('{networkId}', ':network')
-            canonical = canonical.replace('{entityId}', ':entity')
+            canonical = canonical.replace('{entityId}', ':entity').replace('{draftId}', ':draft')
             result.add((method.upper(), '/dvmdb/v1' + canonical))
     return result
 
@@ -55,6 +55,7 @@ def main():
     for route in [('POST', '/dvmdb/v1/projects'),
                   ('GET', '/dvmdb/v1/projects/:id/revision-graph'),
                   ('POST', '/dvmdb/v1/projects/:id/branches/:branch/model-commits'),
+                  ('POST', '/dvmdb/v1/working-copies/:draft/save'),
                   ('POST', '/dvmdb/v1/projects/:id/branches/:branch/bundle'),
                   ('POST', '/dvmdb/v1/projects/:id/branches/:branch/networks'),
                   ('POST', '/dvmdb/v1/projects/:id/hydraulic-merges')]:

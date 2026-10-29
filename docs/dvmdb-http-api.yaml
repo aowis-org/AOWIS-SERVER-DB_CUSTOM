@@ -72,6 +72,114 @@ paths:
       responses:
         '200': {description: Catalogue is available}
         '503': {description: Catalogue unavailable}
+  /working-copies:
+    get:
+      operationId: listPrivateWorkingCopies
+      description: List persisted private draft metadata (candidate overlays omitted from this listing). No fencing token is returned.
+      responses:
+        '200': {description: Array of workingCopies; each has UUIDv7 IDs, nullable baseRevision, string generation and candidate changes}
+    post:
+      operationId: createPrivateWorkingCopy
+      description: Create an uncommitted draft at the exact current HEAD of a local private repository. An unborn branch requires baseRevision:null. Never creates a revision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [projectId, branch, baseRevision, sessionId]
+              properties:
+                projectId: {type: string, format: uuid}
+                branch: {type: string, description: Existing local branch name}
+                baseRevision: {type: [string, 'null'], format: uuid}
+                sessionId: {type: string, format: uuid}
+      responses:
+        '201': {description: Persistent draft with UUIDv7 ID, pinned base and generation "0"}
+        '409': {description: Repository is not private or branch HEAD changed}
+  /working-copies/{draftId}:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: getPrivateWorkingCopy
+      description: Return saved draft candidate model changes, lease holder metadata, pinned base and generation; never reveal the fencing token.
+      responses:
+        '200': {description: Working-copy metadata and full candidate overlay}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /working-copies/{draftId}/lease:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: acquirePrivateWorkingCopyLease
+      description: Acquire or reacquire an exclusive expiring writer lease, rotating the fencing UUIDv7. No automatic takeover until expiry/release.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, seconds]
+              properties:
+                sessionId: {type: string, format: uuid}
+                seconds: {type: integer, minimum: 1, maximum: 120}
+      responses:
+        '200': {description: Fresh token UUIDv7, expiresAtMs and generation as decimal strings}
+        '409': {description: Draft has another active writer}
+  /working-copies/{draftId}/save:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: savePrivateWorkingCopyChanges
+      description: |
+        Transactionally merge 1..128 model changes into the private candidate.
+        The session, live fencing token and exact expected generation are
+        required. generation is a decimal string (not an imprecise JSON number).
+        Each change is either uuid+delete:true or uuid+kind+references+payloadBase64,
+        using the same typed native model-envelope semantics as model-commits.
+        Saved drafts survive restart; this endpoint NEVER creates a commit or
+        advances a branch HEAD.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, fencingToken, expectedGeneration, changes]
+              properties:
+                sessionId: {type: string, format: uuid}
+                fencingToken: {type: string, format: uuid}
+                expectedGeneration: {type: string, pattern: '^[0-9]{1,20}$'}
+                changes:
+                  type: array
+                  minItems: 1
+                  maxItems: 128
+                  items:
+                    type: object
+                    description: Model change; uuid+delete:true, or uuid+kind+references+payloadBase64
+      responses:
+        '200': {description: Saved draft with incremented generation decimal string and full candidate overlay}
+        '409': {description: Stale generation, fencing token or expired lease}
+  /working-copies/{draftId}/release:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: releasePrivateWorkingCopyLease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, fencingToken]
+              properties:
+                sessionId: {type: string, format: uuid}
+                fencingToken: {type: string, format: uuid}
+      responses:
+        '200': {description: '{"released":true}'}
+        '409': {description: Lease token was superseded or released}
   /projects:
     get:
       operationId: listProjects

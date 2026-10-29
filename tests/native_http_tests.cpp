@@ -2031,6 +2031,127 @@ void exerciseUuidv7HistoryHttp() {
 
 }
 
+
+void exerciseWorkingCopyHttp() {
+    namespace native = aowis::dvmdb;
+    TemporaryRoot root;
+    std::string projectId;
+    std::string draftId;
+    const QString firstSession = QString::fromStdString(native::UuidV7::generate().toString());
+    const QString otherSession = QString::fromStdString(native::UuidV7::generate().toString());
+    const QString modelUuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        native::ProjectService service(root.root());
+        const native::ProjectInfo project = service.createUnbornProjectV2("private working-copy HTTP");
+        projectId = project.id;
+        TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
+                                                         10000ULL, 1024ULL * 1024ULL});
+        Client client(server.port());
+        const QString listPath = QStringLiteral("/dvmdb/v1/working-copies");
+        const QJsonObject create{{"projectId", QString::fromStdString(projectId)},
+                                 {"branch", "main"}, {"baseRevision", QJsonValue::Null},
+                                 {"sessionId", firstSession}};
+        check(client.call("POST", listPath, create).status == 409,
+              "non-private repository accepted draft creation");
+        service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+        check(client.call("POST", listPath,
+              QJsonObject{{"projectId", QString::fromStdString(projectId)},
+                          {"branch", "main"}, {"sessionId", firstSession}}).status == 400,
+              "draft creation accepted missing explicit unborn base");
+        const Response created = client.call("POST", listPath, create);
+        const QString id = created.json.value("id").toString();
+        check(created.status == 201 && native::UuidV7::parse(id.toStdString()).has_value() &&
+              created.json.value("baseRevision").isNull() &&
+              created.json.value("generation") == QStringLiteral("0") &&
+              !created.json.value("dirty").toBool(),
+              "HTTP unborn draft creation failed");
+        draftId = id.toStdString();
+        const QString detailPath = listPath + "/" + id;
+        check(client.call("GET", listPath).json.value("workingCopies").toArray().size() == 1 &&
+              client.call("GET", listPath).json.value("workingCopies").toArray().at(0).toObject()
+                  .value("changes").isUndefined() &&
+              client.call("GET", detailPath).json.value("id") == id &&
+              client.call("GET", listPath + "/not-a-uuid").status == 400,
+              "HTTP working-copy list/read/UUID validation failed");
+        const QString leasePath = detailPath + "/lease";
+        const Response leased = client.call("POST", leasePath,
+            QJsonObject{{"sessionId", firstSession}, {"seconds", 30}});
+        const QString token = leased.json.value("token").toString();
+        check(leased.status == 200 && native::UuidV7::parse(token.toStdString()).has_value() &&
+              leased.json.value("generation") == QStringLiteral("0") &&
+              !leased.json.value("expiresAtMs").toString().isEmpty() &&
+              client.call("POST", leasePath,
+                  QJsonObject{{"sessionId", otherSession}, {"seconds", 30}}).status == 409,
+              "HTTP draft writer lease was not exclusive");
+        const QJsonObject entity{{"uuid", modelUuid}, {"kind", 4},
+                                 {"references", QJsonArray{}}, {"payloadBase64", "AQID"}};
+        const QString savePath = detailPath + "/save";
+        const QJsonObject save{{"sessionId", firstSession}, {"fencingToken", token},
+                               {"expectedGeneration", "0"}, {"changes", QJsonArray{entity}}};
+        check(client.call("POST", savePath,
+            QJsonObject{{"sessionId", firstSession}, {"fencingToken", token},
+                        {"expectedGeneration", 0}, {"changes", QJsonArray{entity}}}).status == 400,
+              "HTTP draft accepted unsafe numeric generation");
+        check(client.call("POST", savePath,
+            QJsonObject{{"sessionId", firstSession}, {"fencingToken", token},
+                        {"expectedGeneration", "0"}, {"changes", QJsonArray{entity, entity}}}).status == 400,
+              "HTTP draft accepted duplicate model UUIDs in one save");
+        const Response persisted = client.call("POST", savePath, save);
+        const QJsonArray persistedChanges = persisted.json.value("changes").toArray();
+        check(persisted.status == 200 && persisted.json.value("generation") == QStringLiteral("1") &&
+              persisted.json.value("dirty") == QJsonValue(true) && persistedChanges.size() == 1 &&
+              persistedChanges.at(0).toObject().value("uuid") == modelUuid &&
+              persistedChanges.at(0).toObject().value("payloadBase64") == QStringLiteral("AQID"),
+              "HTTP draft save did not retain opaque model payload");
+        check(client.call("POST", savePath, save).status == 409,
+              "HTTP accepted stale draft generation");
+        check(client.call("POST", savePath,
+              QJsonObject{{"sessionId", firstSession}, {"fencingToken", otherSession},
+                          {"expectedGeneration", "1"}, {"changes", QJsonArray{entity}}}).status == 409,
+              "HTTP accepted invalid fencing token");
+        check(client.call("GET", detailPath).json.value("generation") == QStringLiteral("1") &&
+              client.call("GET", detailPath).json.value("changes").toArray().size() == 1 &&
+              !client.call("GET", detailPath).json.contains("token") &&
+              !service.optionalHeadV2(projectId, "main").has_value() &&
+              service.revisionGraphV2(projectId).revisions.empty(),
+              "HTTP draft save changed committed HEAD or lost candidate");
+        const Response released = client.call("POST", detailPath + "/release",
+            QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}});
+        check(released.status == 200 && released.json.value("released") == QJsonValue(true) &&
+              client.call("POST", detailPath + "/release",
+                  QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}}).status == 409,
+              "HTTP lease release did not fence stale token");
+        const Response taken = client.call("POST", leasePath,
+            QJsonObject{{"sessionId", otherSession}, {"seconds", 30}});
+        check(taken.status == 200 && taken.json.value("token") != token &&
+              taken.json.value("generation") == QStringLiteral("1") &&
+              client.call("POST", savePath,
+                  QJsonObject{{"sessionId", firstSession}, {"fencingToken", token},
+                              {"expectedGeneration", "1"}, {"changes", QJsonArray{entity}}}).status == 409,
+              "HTTP lease takeover did not fence original session");
+        server.stop();
+    }
+    {
+        native::ProjectService reopened(root.root());
+        const native::WorkingCopyInfoV1 draft = reopened.workingCopyV1(draftId);
+        check(draft.generation == 1 && draft.dirty && draft.candidateChanges.size() == 1 &&
+              draft.candidateChanges.front().record.has_value() &&
+              draft.candidateChanges.front().record->payload == native::Bytes{1, 2, 3} &&
+              !reopened.optionalHeadV2(projectId, "main").has_value(),
+              "HTTP draft candidate did not survive repository restart");
+        TestServer server(reopened, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
+                                                         10000ULL, 1024ULL * 1024ULL});
+        Client client(server.port());
+        const Response restored = client.call("GET",
+            QStringLiteral("/dvmdb/v1/working-copies/") + QString::fromStdString(draftId));
+        check(restored.status == 200 && restored.json.value("generation") == QStringLiteral("1") &&
+              restored.json.value("changes").toArray().size() == 1 &&
+              restored.json.value("baseRevision").isNull(),
+              "HTTP draft GET lost saved candidate after service restart");
+        server.stop();
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2045,6 +2166,7 @@ int main(int argc, char** argv) {
         exerciseTransferStagingBudget();
         exerciseRevisionBundleV2Http();
         exerciseUnbornProjectHttp();
+        exerciseWorkingCopyHttp();
         exerciseUuidv7HistoryHttp();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";

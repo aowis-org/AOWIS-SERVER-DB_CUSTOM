@@ -74,10 +74,33 @@ uncertain, the service refuses further writes until restart and inspection.
 Offline backup/restore verifies both record versions and preserves their
 exact bytes, candidate data and lease generation.
 
+## Private HTTP draft operations
+
+The server exposes the native draft lifecycle through these routes (all under
+`/dvmdb/v1`): `GET/POST /working-copies`, `GET /working-copies/{draftId}`,
+`POST /working-copies/{draftId}/lease`, `POST /working-copies/{draftId}/save`
+and `POST /working-copies/{draftId}/release`. Drafts are allowed only when the
+DVMDB repository is configured with functional role `private`; this role is
+not a user permission or a login.
+
+The create request requires `projectId`, existing branch name, originating
+`sessionId` UUIDv7 and explicit `baseRevision` (null for unborn). The Save
+request requires session UUIDv7, current fencing UUIDv7, decimal-string
+`expectedGeneration` and 1..128 changes. Generation and lease-expiration
+values are represented as **decimal strings**, preserving the complete uint64
+value without JSON floating-point rounding. Model changes use the same native
+model-record representation as the existing model-commit endpoint. Read/list
+responses include lease-holder status, **not** the active fencing token.
+The list response omits candidates; `GET /working-copies/{draftId}` returns
+the full saved candidate overlay. Only a successful lease acquisition returns a token.
+Reopening after restart uses the same persisted draft UUID; stale generations
+and stale tokens are rejected, never silently rebased. No draft operation
+changes a committed HEAD or creates a revision.
+
 ## Integration boundary
 
-The native Save path is durable and fenced, but it does not yet implement
+The native and HTTP Save paths are durable and fenced, but do not yet implement
 historical checkout, materialization/verification of the entire base model,
 semantic validation of the assembled candidate, candidate discard, or the
-private HTTP/UI editor workflow. These are VC-04 tasks before enabling GUI
+GUI editor workflow. These are remaining VC-04 tasks before enabling GUI
 editing. A local Commit is a separate VC-05 operation.
