@@ -105,9 +105,19 @@ void tests(const std::string& python, const std::string& script, const std::stri
     const std::filesystem::path reserved = temporary.directory / "reserved";
     std::vector<Snapshot> expected;
     std::string originalRepositoryId;
+    std::string remoteRepositoryId;
     {
         ProjectService service(source);
         originalRepositoryId = service.repositoryId();
+        // Tracking metadata is part of a verified offline snapshot, but it
+        // must never change a local branch's mutable HEAD.
+        remoteRepositoryId = aowis::dvmdb::UuidV7::generate().toString();
+        service.configureRepositoryRoleV1(aowis::dvmdb::RepositoryRoleV1::Private);
+        service.registerRemoteRepositoryV1(remoteRepositoryId,
+                                            "https://remote.example.test/dvmdb/v1");
+        service.recordRemoteTrackingRefV1({remoteRepositoryId,
+              ProjectId::generate().toString(), aowis::dvmdb::BranchId::generate().toString(),
+              std::nullopt}, std::nullopt);
         for (int index = 0; index < 3; ++index) {
             const ProjectInfo info = service.createProject("Hydraulic project " + std::to_string(index));
             const RevisionId before = service.head(info.id, "main");
@@ -141,11 +151,45 @@ void tests(const std::string& python, const std::string& script, const std::stri
     require(run(python, script, verify, "backup", source, backup) == 0,
             "offline backup creation failed");
     compare(backup, expected, originalRepositoryId);
+    {
+        ProjectService snapshot(backup);
+        require(snapshot.repositoryRoleV1() == aowis::dvmdb::RepositoryRoleV1::Private &&
+                snapshot.remoteRepositoriesV1().size() == 1 &&
+                snapshot.remoteRepositoriesV1().front().repositoryId == remoteRepositoryId &&
+                snapshot.remoteTrackingRefsV1().size() == 1 &&
+                !snapshot.remoteTrackingRefsV1().front().observedHead.has_value(),
+                "offline backup lost qualified remote tracking or unborn observation");
+    }
     require(run(python, script, verify, "verify", backup) == 0,
             "offline backup verification failed");
     require(run(python, script, verify, "restore", backup, restored) == 0,
             "verified restore failed");
     compare(restored, expected, originalRepositoryId);
+    {
+        ProjectService snapshot(restored);
+        require(snapshot.repositoryRoleV1() == aowis::dvmdb::RepositoryRoleV1::Private &&
+                snapshot.remoteRepositoriesV1().size() == 1 &&
+                snapshot.remoteTrackingRefsV1().size() == 1 &&
+                !snapshot.remoteTrackingRefsV1().front().observedHead.has_value(),
+                "offline restore lost remote tracking metadata");
+    }
+    const std::filesystem::path backupTracking = backup / "repository.tracking";
+    std::ifstream trackingInput(backupTracking, std::ios::binary);
+    const std::string originalTracking((std::istreambuf_iterator<char>(trackingInput)),
+                                        std::istreambuf_iterator<char>());
+    {
+        std::ofstream corrupted(backupTracking, std::ios::binary | std::ios::trunc);
+        corrupted << "AOWIS-TRACKING-1\nrole\tprivate\nref\tinvalid\n";
+    }
+    const std::filesystem::path badTrackingRestore = temporary.directory / "bad-tracking";
+    require(run(python, script, verify, "restore", backup, badTrackingRestore) != 0,
+            "offline restore accepted malformed remote tracking metadata");
+    require(!std::filesystem::exists(badTrackingRestore),
+            "offline restore published malformed remote tracking metadata");
+    {
+        std::ofstream reset(backupTracking, std::ios::binary | std::ios::trunc);
+        reset << originalTracking;
+    }
     // A backup with a corrupted catalogue-root identity must fail closed;
     // restore must never invent a different UUID or publish such a root.
     const std::filesystem::path backupIdentity = backup / "repository.id";

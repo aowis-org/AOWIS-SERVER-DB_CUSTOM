@@ -66,6 +66,120 @@ ModelChange change(std::uint8_t number) {
     return ModelChange{key, record};
 }
 
+void exerciseRemoteTracking() {
+    using aowis::dvmdb::RepositoryRoleV1;
+    using aowis::dvmdb::RemoteTrackingRefV1;
+    TemporaryRoot localRoot;
+    TemporaryRoot sharedRoot;
+    TemporaryRoot otherSharedRoot;
+    std::string remoteId;
+    std::string secondRemoteId;
+    std::string projectId;
+    std::string branchId;
+    RevisionId committed = RevisionId::generate();
+    RevisionId sharedTip = RevisionId::generate();
+    {
+        ProjectService shared(sharedRoot.path);
+        remoteId = shared.repositoryId();
+        const ProjectInfo project = shared.createUnbornProjectV2("shared unborn project");
+        projectId = project.id;
+        branchId = shared.branchId(projectId, "main")->toString();
+    }
+    // Clone the same logical UUIDs into independently owned repository roots.
+    // Copying the project here is just test fixture setup, not a Fetch API.
+    for (const std::filesystem::path& target : {localRoot.path, otherSharedRoot.path}) {
+        std::filesystem::create_directories(target / "projects");
+        std::filesystem::copy(sharedRoot.path / "projects" / projectId,
+                              target / "projects" / projectId,
+                              std::filesystem::copy_options::recursive);
+    }
+    {
+        ProjectService second(otherSharedRoot.path);
+        secondRemoteId = second.repositoryId();
+        committed = second.commitModelV2(projectId, "main", {change(61)});
+    }
+    {
+        ProjectService local(localRoot.path);
+        require(local.repositoryRoleV1() == RepositoryRoleV1::Unconfigured &&
+                local.remoteRepositoriesV1().empty() && local.remoteTrackingRefsV1().empty(),
+                "legacy root unexpectedly has a role or remote tracking data");
+        local.configureRepositoryRoleV1(RepositoryRoleV1::Private);
+        local.configureRepositoryRoleV1(RepositoryRoleV1::Private);
+        expectError([&]() { local.configureRepositoryRoleV1(RepositoryRoleV1::Shared); },
+                    ProjectErrorKind::Conflict);
+        expectError([&]() { local.registerRemoteRepositoryV1(local.repositoryId(),
+                    "https://example.test/dvmdb/v1"); }, ProjectErrorKind::InvalidInput);
+        expectError([&]() { local.registerRemoteRepositoryV1(remoteId,
+                    "https://user:pass@example.test/"); }, ProjectErrorKind::InvalidInput);
+        local.registerRemoteRepositoryV1(remoteId, "https://shared.example.test/dvmdb/v1");
+        local.registerRemoteRepositoryV1(remoteId, "https://shared.example.test/dvmdb/v1");
+        expectError([&]() { local.registerRemoteRepositoryV1(secondRemoteId,
+                    "https://shared.example.test/dvmdb/v1"); }, ProjectErrorKind::Conflict);
+        local.registerRemoteRepositoryV1(secondRemoteId, "file:///mnt/shared-dvmdb");
+        expectError([&]() { local.registerRemoteRepositoryV1(remoteId,
+                    "https://changed.example.test/dvmdb/v1"); }, ProjectErrorKind::Conflict);
+        require(local.remoteRepositoriesV1().size() == 2,
+                "remote registry did not preserve distinct repository UUIDs");
+        const RemoteTrackingRefV1 unborn{remoteId, projectId, branchId, std::nullopt};
+        const RemoteTrackingRefV1 committedRemote{secondRemoteId, projectId, branchId, committed};
+        local.recordRemoteTrackingRefV1(unborn, std::nullopt);
+        local.recordRemoteTrackingRefV1(committedRemote, std::nullopt);
+        require(local.remoteTrackingRefsV1().size() == 2,
+                "same logical branch from two remotes collided in tracking namespace");
+        expectError([&]() { local.recordRemoteTrackingRefV1(unborn, std::nullopt); },
+                    ProjectErrorKind::Conflict);
+        ProjectService shared(sharedRoot.path);
+        sharedTip = shared.commitModelV2(projectId, "main", {change(62)});
+        const RemoteTrackingRefV1 firstCommit{remoteId, projectId, branchId, sharedTip};
+        local.recordRemoteTrackingRefV1(firstCommit,
+            std::optional<std::optional<RevisionId>>(std::optional<RevisionId>{}));
+        expectError([&]() { local.recordRemoteTrackingRefV1(unborn,
+                    std::optional<std::optional<RevisionId>>(std::optional<RevisionId>{})); },
+                    ProjectErrorKind::Conflict);
+        require(local.remoteTrackingRefsV1().size() == 2 &&
+                !local.listProjects().empty() &&
+                !local.optionalHeadV2(projectId, "main").has_value(),
+                "remote tracking unexpectedly moved the local unborn branch HEAD");
+        const RevisionId localTip = local.commitModelV2(projectId, "main", {change(63)});
+        require(localTip != sharedTip && localTip != committed &&
+                shared.optionalHeadV2(projectId, "main") == sharedTip,
+                "local commit moved shared repository HEAD");
+        ProjectService second(otherSharedRoot.path);
+        require(second.optionalHeadV2(projectId, "main") == committed,
+                "local commit moved another remote repository HEAD");
+    }
+    {
+        ProjectService reopened(localRoot.path);
+        require(reopened.repositoryRoleV1() == RepositoryRoleV1::Private &&
+                reopened.remoteRepositoriesV1().size() == 2 &&
+                reopened.remoteTrackingRefsV1().size() == 2,
+                "remote registry or tracking state changed across restart");
+        bool foundFirst = false;
+        bool foundSecond = false;
+        for (const RemoteTrackingRefV1& entry : reopened.remoteTrackingRefsV1()) {
+            require(entry.projectId == projectId && entry.branchId == branchId,
+                    "reloaded tracking branch identity changed");
+            if (entry.remoteRepositoryId == remoteId && entry.observedHead == sharedTip)
+                foundFirst = true;
+            if (entry.remoteRepositoryId == secondRemoteId && entry.observedHead == committed)
+                foundSecond = true;
+        }
+        require(foundFirst && foundSecond, "reloaded tracking lost repository qualification");
+        reopened.recordRemoteTrackingRefV1({remoteId, projectId, branchId, sharedTip},
+            std::optional<std::optional<RevisionId>>(std::optional<RevisionId>(sharedTip)));
+    }
+    {
+        const std::filesystem::path tracking = localRoot.path / "repository.tracking";
+        std::ofstream corrupted(tracking, std::ios::binary | std::ios::trunc);
+        corrupted << "AOWIS-TRACKING-1\nrole\tprivate\nref\tinvalid\n";
+        corrupted.close();
+        bool rejected = false;
+        try { ProjectService invalid(localRoot.path); }
+        catch (const aowis::dvmdb::StorageError&) { rejected = true; }
+        require(rejected, "corrupt remote tracking metadata was silently accepted");
+    }
+}
+
 void exercise() {
     TemporaryRoot root;
     std::string projectName;
@@ -212,6 +326,7 @@ void exercise() {
 int main() {
     try {
         exercise();
+        exerciseRemoteTracking();
         std::cout << "Canonical UUIDv7 ProjectService tests passed\n";
         return 0;
     } catch (const std::exception& error) {

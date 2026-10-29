@@ -90,6 +90,63 @@ def repository_identity(root):
     return parts[1][:-1]
 
 
+def tracking_metadata(root):
+    """Validate optional VC-03 tracking schema; preserve its exact bytes."""
+    path = root / "repository.tracking"
+    if not path.exists() and not path.is_symlink():
+        return None
+    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 8 * 1024 * 1024,
+            f"unsafe or oversized repository tracking metadata: {path}")
+    payload = path.read_bytes()
+    require(payload.endswith(b"\n"), f"truncated repository tracking metadata: {path}")
+    lines = payload.decode("ascii", errors="replace").splitlines()
+    require(len(lines) >= 2 and lines[0] == "AOWIS-TRACKING-1" and
+            lines[1] in ("role\tunconfigured", "role\tprivate", "role\tshared"),
+            f"invalid repository tracking header: {path}")
+    local_id = repository_identity(root)
+    remote_ids = set()
+    remote_endpoints = set()
+    tracking_keys = set()
+    for line in lines[2:]:
+        fields = line.split("\t")
+        if len(fields) == 3 and fields[0] == "remote":
+            remote_id, encoded = fields[1:]
+            require(UUID7.fullmatch(remote_id) is not None and
+                    remote_id != (local_id or b"").decode("ascii") and
+                    remote_id not in remote_ids and len(remote_ids) < 64 and
+                    len(encoded) % 2 == 0 and len(encoded) <= 4096 and
+                    re.fullmatch("[0-9a-f]*", encoded) is not None,
+                    f"invalid remote registry entry: {path}")
+            endpoint = bytes.fromhex(encoded)
+            require(1 <= len(endpoint) <= 2048 and
+                    endpoint.startswith((b"http://", b"https://", b"file:///")) and
+                    all(0x20 < ch < 0x7f and ch not in (ord('@'), ord('#'), ord('\\'))
+                        for ch in endpoint) and
+                    endpoint not in (b"http://", b"https://", b"file:///") and
+                    (endpoint.startswith(b"file:///") or
+                     endpoint.split(b"://", 1)[1][:1] not in (b"/", b":", b"?")),
+                    f"invalid remote endpoint: {path}")
+            require(endpoint not in remote_endpoints,
+                    f"remote endpoint registered under multiple UUIDs: {path}")
+            remote_ids.add(remote_id)
+            remote_endpoints.add(endpoint)
+        elif len(fields) == 5 and fields[0] == "ref":
+            remote_id, project_id, branch_id, head = fields[1:]
+            key = remote_id, project_id, branch_id
+            require(UUID7.fullmatch(remote_id) is not None and
+                    UUID7.fullmatch(project_id) is not None and
+                    UUID7.fullmatch(branch_id) is not None and
+                    (head == "-" or UUID7.fullmatch(head) is not None) and
+                    key not in tracking_keys and len(tracking_keys) < 10000,
+                    f"invalid remote tracking ref: {path}")
+            tracking_keys.add(key)
+        else:
+            raise BackupError(f"unknown repository tracking record: {path}")
+    require(all(key[0] in remote_ids for key in tracking_keys),
+            f"unregistered remote in repository tracking: {path}")
+    return payload
+
+
 def branch_heads(root):
     heads = {}
     for project in projects_in(root):
@@ -157,6 +214,7 @@ def acquire_source_locks(root, stack):
     # A ProjectService holds the catalogue lock during its entire lifetime.
     lock_file(root / "catalogue.lock", stack)
     repository_identity(root)
+    tracking_metadata(root)
     for project in projects_in(root):
         # Every Repository holds maintenance.lock shared throughout its lifetime.
         lock_file(project / "repository" / "maintenance.lock", stack)
@@ -219,6 +277,7 @@ def publish_no_replace(source, target):
 def verify(root, verify_binary):
     # Native verification may rebuild derived indexes; run it only on staging.
     repository_identity(root)
+    tracking_metadata(root)
     expected = branch_heads(root)
     for project in projects_in(root):
         result = subprocess.run([str(verify_binary), "--full", str(project / "repository")],
@@ -235,14 +294,18 @@ def copy_and_verify(source, destination, verify_binary):
     with contextlib.ExitStack() as locks:
         expected = acquire_source_locks(source, locks)
         source_id = repository_identity(source)
+        source_tracking = tracking_metadata(source)
         reject_links_and_special(source)
         scratch = Path(tempfile.mkdtemp(prefix=".aowis-offline-copy-", dir=destination.parent))
         try:
             # Refuse links/special entries and do not follow symlinks on traversal.
             shutil.copytree(source, scratch, dirs_exist_ok=True, symlinks=True)
             require(repository_identity(scratch) == source_id, "copied repository identity changed")
+            require(tracking_metadata(scratch) == source_tracking, "copied remote tracking metadata changed")
             require(branch_heads(scratch) == expected, "copied catalogue or branch heads changed")
             verify(scratch, verify_binary)
+            require(tracking_metadata(scratch) == source_tracking,
+                    "verified remote tracking metadata changed")
             require(branch_heads(scratch) == expected, "verified copy differs from source heads")
             sync_tree(scratch)
             publish_no_replace(scratch, destination)
@@ -273,6 +336,8 @@ def main():
                 try:
                     shutil.copytree(source, scratch, dirs_exist_ok=True, symlinks=True)
                     require(branch_heads(scratch) == expected, "copied branch heads changed")
+                    require(tracking_metadata(scratch) == tracking_metadata(source),
+                            "copied remote tracking metadata changed")
                     require(verify(scratch, verify_binary) == expected,
                             "verification changed published branch heads")
                 finally:

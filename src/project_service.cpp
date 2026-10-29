@@ -10,6 +10,9 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <sstream>
+#include <set>
+#include <tuple>
 #include <memory>
 #include <optional>
 #include <sys/file.h>
@@ -173,6 +176,176 @@ std::string loadRepositoryIdentity(const std::filesystem::path& root) {
     return id;
 }
 
+// VC-03 root-level tracking schema. These are metadata observations, not
+// authoritative refs. The only writable branch HEAD lives in this root's
+// native Repository. Each remote reference is qualified by remote repository,
+// logical project and logical branch UUIDv7, never by a mutable name.
+using TrackingKeyOnDisk = std::tuple<std::string, std::string, std::string>;
+struct TrackingStateOnDisk {
+    RepositoryRoleV1 role = RepositoryRoleV1::Unconfigured;
+    std::map<std::string, RemoteRepositoryV1> remotes;
+    std::map<TrackingKeyOnDisk, RemoteTrackingRefV1> refs;
+};
+
+std::string roleToken(RepositoryRoleV1 role) {
+    switch (role) {
+    case RepositoryRoleV1::Unconfigured: return "unconfigured";
+    case RepositoryRoleV1::Private: return "private";
+    case RepositoryRoleV1::Shared: return "shared";
+    }
+    throw ProjectError(ProjectErrorKind::InvalidInput, "invalid repository role");
+}
+
+bool validRemoteEndpoint(std::string_view endpoint) {
+    if (endpoint.empty() || endpoint.size() > 2048) return false;
+    if (!endpoint.starts_with("http://") && !endpoint.starts_with("https://") &&
+        !endpoint.starts_with("file:///")) return false;
+    const std::size_t prefix = endpoint.starts_with("https://") ? 8 :
+        endpoint.starts_with("http://") ? 7 : 7;
+    if (endpoint.size() <= prefix) return false;
+    if (!endpoint.starts_with("file:///")) {
+        const std::size_t hostnameEnd = endpoint.find_first_of("/:?", prefix);
+        if (hostnameEnd == prefix) return false;
+    }
+    for (unsigned char ch : endpoint) {
+        if (ch <= 0x20U || ch >= 0x7fU || ch == '@' || ch == '#' || ch == '\\')
+            return false;
+    }
+    return true;
+}
+
+std::string decodeRemoteEndpoint(std::string_view encoded) {
+    check(encoded.size() % 2 == 0 && encoded.size() <= 4096,
+          "invalid remote endpoint encoding");
+    std::string result;
+    result.reserve(encoded.size() / 2);
+    const auto digit = [](char value) -> int {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return 10 + value - 'a';
+        return -1;
+    };
+    for (std::size_t offset = 0; offset < encoded.size(); offset += 2) {
+        const int first = digit(encoded[offset]);
+        const int second = digit(encoded[offset + 1]);
+        check(first >= 0 && second >= 0, "invalid remote endpoint encoding");
+        result.push_back(static_cast<char>((first << 4) | second));
+    }
+    check(validRemoteEndpoint(result), "invalid stored remote endpoint");
+    return result;
+}
+
+std::vector<std::string> trackingFields(const std::string& line) {
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t end = line.find('\t', start);
+        fields.push_back(line.substr(start, end == std::string::npos ? end : end - start));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return fields;
+}
+
+TrackingStateOnDisk loadTrackingState(const std::filesystem::path& root,
+                                      std::string_view localRepositoryId) {
+    const std::filesystem::path stage = root / "repository.tracking.tmp";
+    if (std::filesystem::exists(stage) || std::filesystem::is_symlink(stage)) {
+        check(!std::filesystem::is_symlink(stage) && std::filesystem::is_regular_file(stage),
+              "unsafe stale tracking staging file");
+        syscallChecked(::unlink(stage.c_str()) == 0, "discard unpublished tracking staging file");
+        syncDirectory(root);
+    }
+    TrackingStateOnDisk result;
+    const std::filesystem::path path = root / "repository.tracking";
+    if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path)) return result;
+    check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path) &&
+          std::filesystem::file_size(path) <= 8 * 1024 * 1024,
+          "invalid repository tracking metadata file");
+    std::ifstream stream(path, std::ios::binary);
+    check(stream.good(), "cannot read repository tracking metadata");
+    const std::string data((std::istreambuf_iterator<char>(stream)),
+                           std::istreambuf_iterator<char>());
+    check(!data.empty() && data.back() == '\n', "truncated repository tracking metadata");
+    std::istringstream input(data);
+    std::string line;
+    check(static_cast<bool>(std::getline(input, line)) && line == "AOWIS-TRACKING-1",
+          "invalid repository tracking metadata marker");
+    check(static_cast<bool>(std::getline(input, line)), "missing repository tracking role");
+    if (line == "role\tunconfigured") result.role = RepositoryRoleV1::Unconfigured;
+    else if (line == "role\tprivate") result.role = RepositoryRoleV1::Private;
+    else if (line == "role\tshared") result.role = RepositoryRoleV1::Shared;
+    else check(false, "invalid repository tracking role");
+    while (std::getline(input, line)) {
+        const std::vector<std::string> fields = trackingFields(line);
+        if (fields.size() == 3 && fields[0] == "remote") {
+            check(UuidV7::parse(fields[1]).has_value() && fields[1] != localRepositoryId,
+                  "invalid remote repository UUID in tracking registry");
+            const RemoteRepositoryV1 remote{fields[1], decodeRemoteEndpoint(fields[2])};
+            check(result.remotes.emplace(remote.repositoryId, remote).second &&
+                  result.remotes.size() <= 64, "duplicate or excessive remote registry entries");
+        } else if (fields.size() == 5 && fields[0] == "ref") {
+            check(UuidV7::parse(fields[1]).has_value() &&
+                  UuidV7::parse(fields[2]).has_value() &&
+                  UuidV7::parse(fields[3]).has_value() &&
+                  (fields[4] == "-" || RevisionId::parse(fields[4]).has_value()),
+                  "invalid qualified remote tracking ref");
+            RemoteTrackingRefV1 ref{fields[1], fields[2], fields[3], std::nullopt};
+            if (fields[4] != "-") ref.observedHead = *RevisionId::parse(fields[4]);
+            check(result.refs.emplace(TrackingKeyOnDisk{ref.remoteRepositoryId, ref.projectId,
+                  ref.branchId}, ref).second && result.refs.size() <= 10000,
+                  "duplicate or excessive remote tracking refs");
+        } else check(false, "unknown repository tracking record");
+    }
+    check(input.eof() && !input.bad(), "cannot read full repository tracking metadata");
+    std::set<std::string> endpoints;
+    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : result.remotes)
+        check(endpoints.insert(entry.second.endpoint).second,
+              "remote endpoint assigned to multiple repository UUIDs");
+    for (const std::pair<const TrackingKeyOnDisk, RemoteTrackingRefV1>& record : result.refs)
+        check(result.remotes.contains(record.second.remoteRepositoryId),
+              "tracking ref references an unregistered repository");
+    return result;
+}
+
+void storeTrackingState(const std::filesystem::path& root, const TrackingStateOnDisk& state) {
+    std::string body = "AOWIS-TRACKING-1\nrole\t" + roleToken(state.role) + "\n";
+    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : state.remotes)
+        body += "remote\t" + entry.first + "\t" + encodeName(entry.second.endpoint) + "\n";
+    for (const std::pair<const TrackingKeyOnDisk, RemoteTrackingRefV1>& entry : state.refs) {
+        const RemoteTrackingRefV1& ref = entry.second;
+        body += "ref\t" + ref.remoteRepositoryId + "\t" + ref.projectId + "\t" +
+            ref.branchId + "\t" + (ref.observedHead ? ref.observedHead->toString() : "-") + "\n";
+    }
+    check(body.size() <= 8 * 1024 * 1024, "repository tracking metadata exceeds size limit",
+          StorageErrorKind::InvalidInput);
+    const std::filesystem::path stage = root / "repository.tracking.tmp";
+    const std::filesystem::path path = root / "repository.tracking";
+    const int fd = ::open(stage.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    syscallChecked(fd >= 0, "stage repository tracking metadata");
+    try {
+        std::size_t offset = 0;
+        while (offset < body.size()) {
+            const ssize_t written = ::write(fd, body.data() + offset, body.size() - offset);
+            if (written < 0 && errno == EINTR) continue;
+            syscallChecked(written > 0, "write repository tracking metadata");
+            offset += static_cast<std::size_t>(written);
+        }
+        syscallChecked(::fsync(fd) == 0, "sync repository tracking metadata");
+    } catch (...) {
+        ::close(fd);
+        std::error_code ignored;
+        std::filesystem::remove(stage, ignored);
+        throw;
+    }
+    syscallChecked(::close(fd) == 0, "close repository tracking metadata");
+    if (::rename(stage.c_str(), path.c_str()) != 0) {
+        std::error_code ignored;
+        std::filesystem::remove(stage, ignored);
+        throwSystemError("publish repository tracking metadata");
+    }
+    syncDirectory(root);
+}
+
 ProjectInfo readManifest(const std::filesystem::path& projectDirectory) {
     const std::filesystem::path path = projectDirectory / "project.meta";
     check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path),
@@ -274,6 +447,10 @@ ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendin
     }
     try {
         this->repository_id_ = loadRepositoryIdentity(this->root_);
+        const TrackingStateOnDisk tracking = loadTrackingState(this->root_, this->repository_id_);
+        this->repository_role_ = tracking.role;
+        this->remotes_ = tracking.remotes;
+        this->tracking_ = tracking.refs;
         for (const std::filesystem::directory_entry& entry :
              std::filesystem::directory_iterator(this->projects_)) {
             const std::string id = entry.path().filename().string();
@@ -308,6 +485,109 @@ void ProjectService::ensureHealthy() const {
 
 std::string ProjectService::repositoryId() const {
     return this->repository_id_;
+}
+
+RepositoryRoleV1 ProjectService::repositoryRoleV1() const {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    return this->repository_role_;
+}
+
+void ProjectService::persistTrackingMetadata() {
+    TrackingStateOnDisk current;
+    current.role = this->repository_role_;
+    current.remotes = this->remotes_;
+    current.refs = this->tracking_;
+    // Never continue accepting metadata writes after an uncertain durable
+    // publication. The authoritative state must be reloaded on restart.
+    try { storeTrackingState(this->root_, current); }
+    catch (...) { this->uncertain_ = true; throw; }
+}
+
+void ProjectService::configureRepositoryRoleV1(RepositoryRoleV1 role) {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    if (role == RepositoryRoleV1::Unconfigured)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "choose private or shared role explicitly");
+    if (this->repository_role_ == role) return;
+    if (this->repository_role_ != RepositoryRoleV1::Unconfigured)
+        throw ProjectError(ProjectErrorKind::Conflict, "repository role already configured");
+    this->repository_role_ = role;
+    persistTrackingMetadata();
+}
+
+std::vector<RemoteRepositoryV1> ProjectService::remoteRepositoriesV1() const {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    std::vector<RemoteRepositoryV1> output;
+    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : this->remotes_)
+        output.push_back(entry.second);
+    return output;
+}
+
+void ProjectService::registerRemoteRepositoryV1(std::string_view remoteRepositoryId,
+                                                 std::string_view endpoint) {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    if (!UuidV7::parse(remoteRepositoryId).has_value() ||
+        remoteRepositoryId == this->repository_id_ || !validRemoteEndpoint(endpoint))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid remote identity or endpoint");
+    const std::string id(remoteRepositoryId);
+    const std::string url(endpoint);
+    const std::map<std::string, RemoteRepositoryV1>::const_iterator existing =
+        this->remotes_.find(id);
+    if (existing != this->remotes_.end()) {
+        if (existing->second.endpoint == url) return;
+        throw ProjectError(ProjectErrorKind::Conflict,
+                           "remote repository UUID already registered at another endpoint");
+    }
+    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : this->remotes_) {
+        if (entry.second.endpoint == url)
+            throw ProjectError(ProjectErrorKind::Conflict,
+                               "remote endpoint already registered under another UUID");
+    }
+    if (this->remotes_.size() >= 64)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "remote registry limit exceeded");
+    this->remotes_.emplace(id, RemoteRepositoryV1{id, url});
+    persistTrackingMetadata();
+}
+
+std::vector<RemoteTrackingRefV1> ProjectService::remoteTrackingRefsV1() const {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    std::vector<RemoteTrackingRefV1> output;
+    for (const std::pair<const TrackingKey, RemoteTrackingRefV1>& entry : this->tracking_)
+        output.push_back(entry.second);
+    return output;
+}
+
+void ProjectService::recordRemoteTrackingRefV1(
+    const RemoteTrackingRefV1& observation,
+    std::optional<std::optional<RevisionId>> expectedObservedHead) {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    if (!this->remotes_.contains(observation.remoteRepositoryId) ||
+        !ProjectId::parse(observation.projectId).has_value() ||
+        !BranchId::parse(observation.branchId).has_value())
+        throw ProjectError(ProjectErrorKind::InvalidInput,
+                           "tracking ref must target a registered repository and UUIDv7 project/branch");
+    const TrackingKey key{observation.remoteRepositoryId, observation.projectId,
+                          observation.branchId};
+    const std::map<TrackingKey, RemoteTrackingRefV1>::const_iterator current =
+        this->tracking_.find(key);
+    if (!expectedObservedHead.has_value()) {
+        if (current != this->tracking_.end())
+            throw ProjectError(ProjectErrorKind::Conflict, "remote tracking ref already exists");
+    } else if (current == this->tracking_.end() ||
+               current->second.observedHead != *expectedObservedHead) {
+        throw ProjectError(ProjectErrorKind::Conflict, "remote tracking HEAD changed");
+    }
+    if (current != this->tracking_.end() &&
+        current->second.observedHead == observation.observedHead) return;
+    if (current == this->tracking_.end() && this->tracking_.size() >= 10000)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "remote tracking ref limit exceeded");
+    this->tracking_.insert_or_assign(key, observation);
+    persistTrackingMetadata();
 }
 
 std::size_t ProjectService::maxPendingOperations() const noexcept {

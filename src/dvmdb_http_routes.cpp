@@ -965,6 +965,36 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, QJsonObject{{"repositoryId", QString::fromStdString(service.repositoryId())}}};
         });
     });
+    // Read-only VC-03 repository-qualified tracking metadata. The registry
+    // is configuration, not proof of endpoint identity or authorization.
+    server.Get("/dvmdb/v1/repository/tracking", [&service](const httplib::Request&,
+                                                            httplib::Response& response) {
+        guarded(response, [&]() {
+            const RepositoryRoleV1 role = service.repositoryRoleV1();
+            const QString roleName = role == RepositoryRoleV1::Private ? QStringLiteral("private") :
+                role == RepositoryRoleV1::Shared ? QStringLiteral("shared") :
+                QStringLiteral("unconfigured");
+            QJsonArray remotes;
+            for (const RemoteRepositoryV1& remote : service.remoteRepositoriesV1()) {
+                remotes.append(QJsonObject{
+                    {"repositoryId", QString::fromStdString(remote.repositoryId)},
+                    {"endpoint", QString::fromStdString(remote.endpoint)}});
+            }
+            QJsonArray tracked;
+            for (const RemoteTrackingRefV1& ref : service.remoteTrackingRefsV1()) {
+                tracked.append(QJsonObject{
+                    {"remoteRepositoryId", QString::fromStdString(ref.remoteRepositoryId)},
+                    {"projectId", QString::fromStdString(ref.projectId)},
+                    {"branchId", QString::fromStdString(ref.branchId)},
+                    {"observedHeadRevisionId", ref.observedHead
+                        ? QJsonValue(QString::fromStdString(ref.observedHead->toString()))
+                        : QJsonValue(QJsonValue::Null)}});
+            }
+            return Reply{200, QJsonObject{
+                {"repositoryId", QString::fromStdString(service.repositoryId())},
+                {"role", roleName}, {"remotes", remotes}, {"tracking", tracked}}};
+        });
+    });
     server.Get("/dvmdb/v1/ready", [&service](const httplib::Request&, httplib::Response& response) {
         guarded(response, [&]() {
             (void)service.listProjects();

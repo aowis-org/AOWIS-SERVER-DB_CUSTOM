@@ -1677,6 +1677,34 @@ void exerciseUnbornProjectHttp() {
           && repository.json.value("repositoryId").toString() ==
               QString::fromStdString(service.repositoryId()),
           "HTTP repository identity differs from native root UUID");
+    const Response emptyTracking = client.call("GET", "/dvmdb/v1/repository/tracking");
+    check(emptyTracking.status == 200 &&
+          emptyTracking.json.value("repositoryId") == repository.json.value("repositoryId") &&
+          emptyTracking.json.value("role").toString() == QStringLiteral("unconfigured") &&
+          emptyTracking.json.value("remotes").toArray().isEmpty() &&
+          emptyTracking.json.value("tracking").toArray().isEmpty(),
+          "HTTP tracking metadata did not report an unconfigured repository");
+    const std::string remoteId = native::UuidV7::generate().toString();
+    const std::string trackedProject = native::ProjectId::generate().toString();
+    const std::string trackedBranch = native::BranchId::generate().toString();
+    service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+    service.registerRemoteRepositoryV1(remoteId, "https://shared.example.test/dvmdb/v1");
+    service.recordRemoteTrackingRefV1({remoteId, trackedProject, trackedBranch, std::nullopt},
+                                      std::nullopt);
+    const Response tracking = client.call("GET", "/dvmdb/v1/repository/tracking");
+    const QJsonArray refs = tracking.json.value("tracking").toArray();
+    check(tracking.status == 200 &&
+          tracking.json.value("role").toString() == QStringLiteral("private") &&
+          tracking.json.value("remotes").toArray().size() == 1 && refs.size() == 1 &&
+          refs.at(0).toObject().value("remoteRepositoryId").toString() ==
+              QString::fromStdString(remoteId) &&
+          refs.at(0).toObject().value("projectId").toString() ==
+              QString::fromStdString(trackedProject) &&
+          refs.at(0).toObject().value("branchId").toString() ==
+              QString::fromStdString(trackedBranch) &&
+          refs.at(0).toObject().contains("observedHeadRevisionId") &&
+          refs.at(0).toObject().value("observedHeadRevisionId").isNull(),
+          "HTTP tracking metadata lost explicit unborn HEAD or remote identity");
     const QString projects = QStringLiteral("/dvmdb/v1/projects");
     check(client.call("POST", projects,
         QJsonObject{{"name", "bad unborn"}, {"unborn", "true"}}).status == 400,

@@ -26,6 +26,46 @@ paths:
                 additionalProperties: false
                 properties:
                   repositoryId: {type: string, format: uuid}
+  /repository/tracking:
+    get:
+      operationId: getRepositoryTracking
+      description: |
+        Read-only VC-03 repository role, remote registry and observed tracking
+        refs. An absent tracking entry is distinct from an entry with a null
+        observed HEAD (unborn). Endpoint/UUID are configuration, not
+        authentication. No branch HEAD is modified by this endpoint.
+      responses:
+        '200':
+          description: Repository-qualified tracking metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [repositoryId, role, remotes, tracking]
+                additionalProperties: false
+                properties:
+                  repositoryId: {type: string, format: uuid}
+                  role: {type: string, enum: [unconfigured, private, shared]}
+                  remotes:
+                    type: array
+                    items:
+                      type: object
+                      required: [repositoryId, endpoint]
+                      additionalProperties: false
+                      properties:
+                        repositoryId: {type: string, format: uuid}
+                        endpoint: {type: string}
+                  tracking:
+                    type: array
+                    items:
+                      type: object
+                      required: [remoteRepositoryId, projectId, branchId, observedHeadRevisionId]
+                      additionalProperties: false
+                      properties:
+                        remoteRepositoryId: {type: string, format: uuid}
+                        projectId: {type: string, format: uuid}
+                        branchId: {type: string, format: uuid}
+                        observedHeadRevisionId: {type: [string, 'null'], format: uuid}
   /ready:
     get:
       operationId: readiness

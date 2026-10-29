@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <optional>
 #include <vector>
 
 namespace aowis::dvmdb {
@@ -39,6 +41,22 @@ public:
     ProjectErrorKind kind() const noexcept;
 private:
     ProjectErrorKind kind_;
+};
+
+// VC-03 metadata. "Private" and "Shared" describe deployment intent;
+// neither is authentication or an authorization capability.
+enum class RepositoryRoleV1 { Unconfigured, Private, Shared };
+
+struct RemoteRepositoryV1 {
+    std::string repositoryId;      // Actual remote root UUIDv7, not a GUI profile name.
+    std::string endpoint;          // Connection hint, NOT an authenticated identity.
+};
+
+struct RemoteTrackingRefV1 {
+    std::string remoteRepositoryId;
+    std::string projectId;         // Logical project UUIDv7 remains stable on clone.
+    std::string branchId;          // Logical branch UUIDv7 remains stable on clone.
+    std::optional<RevisionId> observedHead; // Null means observed unborn HEAD.
 };
 
 class ProjectService final {
@@ -126,6 +144,24 @@ public:
     // Persistent identity of this DVMDB catalogue / repository root (UUIDv7).
     // Not a user identity and not an authorization credential.
     std::string repositoryId() const;
+    // Metadata only: these calls NEVER mutate a local or remote branch HEAD.
+    // Missing tracking entry differs from an observed null (unborn) HEAD.
+    RepositoryRoleV1 repositoryRoleV1() const;
+    void configureRepositoryRoleV1(RepositoryRoleV1 role);
+    std::vector<RemoteRepositoryV1> remoteRepositoriesV1() const;
+    // Re-registering the same ID/endpoint is idempotent. Conflicting endpoint
+    // or a remote equal to this repository UUID is rejected.
+    void registerRemoteRepositoryV1(std::string_view remoteRepositoryId,
+                                    std::string_view endpoint);
+    std::vector<RemoteTrackingRefV1> remoteTrackingRefsV1() const;
+    // expectedObservedHead: nullopt => no tracking record exists;
+    // engaged with null inner value => record exists with unborn HEAD;
+    // engaged with revision => record exists with that exact HEAD.
+    // The caller must obtain the observation from a verified fetch; recording
+    // it does not verify an endpoint or grant access to that endpoint.
+    void recordRemoteTrackingRefV1(
+        const RemoteTrackingRefV1& observation,
+        std::optional<std::optional<RevisionId>> expectedObservedHead);
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);
@@ -185,6 +221,11 @@ private:
 
     std::filesystem::path root_;
     std::string repository_id_;
+    RepositoryRoleV1 repository_role_ = RepositoryRoleV1::Unconfigured;
+    std::map<std::string, RemoteRepositoryV1> remotes_;
+    using TrackingKey = std::tuple<std::string, std::string, std::string>;
+    std::map<TrackingKey, RemoteTrackingRefV1> tracking_;
+    void persistTrackingMetadata(); // called with catalogue mutex held
     std::filesystem::path projects_;
     int lockFd_ = -1;
     const std::size_t maxPending_;
