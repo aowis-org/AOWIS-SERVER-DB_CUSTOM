@@ -853,6 +853,13 @@ ProjectInfo ProjectService::createUnbornProjectV2(std::string_view name) {
     return createProjectImpl(name, true, true);
 }
 
+ProjectInfo ProjectService::provisionCloneTargetV2(std::string_view projectId,
+                                                    std::string_view name) {
+    if (!ProjectId::parse(projectId))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "clone target project must be UUIDv7");
+    return createProjectImpl(name, true, false, std::string(projectId));
+}
+
 ProjectInfo ProjectService::createProjectShaFixture(std::string_view name) {
     return createProjectImpl(name, false);
 }
@@ -861,14 +868,27 @@ ProjectInfo ProjectService::createProjectV2(std::string_view name) {
     return createProjectImpl(name, true);
 }
 
-ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2, bool unborn) {
+ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2, bool unborn,
+                                             std::optional<std::string> cloneProjectId) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
     if (!validName(name)) throw ProjectError(ProjectErrorKind::InvalidInput,
                                             "project name must contain 1..200 non-control bytes");
     ProjectInfo info;
     info.name = std::string(name);
-    do {
+    if (cloneProjectId) {
+        info.id = *cloneProjectId;
+        const std::map<std::string, std::shared_ptr<Project>>::const_iterator existing =
+            this->entries_.find(info.id);
+        if (existing != this->entries_.end()) {
+            if (existing->second->info.name != info.name)
+                throw ProjectError(ProjectErrorKind::Conflict,
+                                   "clone project UUID already has a different name");
+            return existing->second->info;
+        }
+        if (std::filesystem::exists(this->projects_ / (".creating-" + info.id)))
+            throw ProjectError(ProjectErrorKind::Busy, "clone project publication is pending");
+    } else do {
         try { info.id = ProjectId::generate().toString(); }
         catch (const std::runtime_error& error) {
             throw StorageError(StorageErrorKind::Internal,
@@ -885,7 +905,10 @@ ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2, bo
         writeManifest(staging / "project.meta", info);
         {
             Repository repository(staging / "repository");
-            if (v2) {
+            if (cloneProjectId) {
+                // No local branch, revision or model is fabricated: importing
+                // the verified bundle establishes the original branch UUID.
+            } else if (v2) {
                 const std::optional<ProjectId> project = ProjectId::parse(info.id);
                 if (!project) throw StorageError(StorageErrorKind::Internal,
                                                  "new project UUIDv7 did not validate");

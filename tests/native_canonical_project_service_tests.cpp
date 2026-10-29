@@ -323,10 +323,71 @@ void exercise() {
 }
 } // namespace
 
+namespace {
+void exerciseCloneTargetProvision() {
+    TemporaryRoot targetRoot;
+    TemporaryRoot sourceRoot;
+    const std::string logicalProject = ProjectId::generate().toString();
+    std::string originalRepositoryId;
+    {
+    ProjectService target(targetRoot.path);
+    const ProjectInfo provisioned = target.provisionCloneTargetV2(logicalProject, "Shared network");
+    require(provisioned.id == logicalProject && provisioned.name == "Shared network",
+            "clone target changed logical project UUID or name");
+    require(target.listBranches(logicalProject).empty(),
+            "clone target fabricated a branch before receiving its bundle");
+    require(target.provisionCloneTargetV2(logicalProject, "Shared network").id == logicalProject,
+            "retry of clone target provisioning was not idempotent");
+    expectError([&]() { (void)target.provisionCloneTargetV2(logicalProject, "Different"); },
+                ProjectErrorKind::Conflict);
+    expectError([&]() { (void)target.provisionCloneTargetV2("not-a-uuid", "Bad"); },
+                ProjectErrorKind::InvalidInput);
+    originalRepositoryId = target.repositoryId();
+    }
+    // Exercise the real first-clone bundle transfer from an unrelated root.
+    {
+        ProjectService source(sourceRoot.path);
+        // The logical project has to originate in the source repository, so
+        // provision it explicitly here without manufacturing any HEAD.
+        source.provisionCloneTargetV2(logicalProject, "Shared network");
+        RevisionId sourceHead = RevisionId::generate();
+        std::optional<BranchId> sourceBranch;
+        source.withRepository(logicalProject, [&](aowis::dvmdb::Repository& repository) {
+            sourceHead = repository.createBranchV2(*ProjectId::parse(logicalProject), "main");
+            sourceBranch = repository.branchId("main");
+        });
+        aowis::dvmdb::ScratchFile bundle = source.createScratchFile(logicalProject);
+        source.withRepository(logicalProject, [&](aowis::dvmdb::Repository& repository) {
+            repository.exportRevisionBundleV2(*ProjectId::parse(logicalProject), "main", bundle.fd());
+        });
+        ProjectService destination(targetRoot.path);
+        destination.withRepository(logicalProject, [&](aowis::dvmdb::Repository& repository) {
+            const aowis::dvmdb::RevisionBundleImportV2 imported =
+                repository.importRevisionBundleV2(*ProjectId::parse(logicalProject), bundle.fd(), "main");
+            require(imported.status == aowis::dvmdb::BundleImportStatus::Created &&
+                    imported.head == sourceHead,
+                    "first clone bundle did not publish the original immutable HEAD");
+        });
+        require(destination.branchId(logicalProject, "main") == sourceBranch,
+                "first clone changed the original branch UUIDv7");
+    }
+    {
+        ProjectService reopened(targetRoot.path);
+        require(reopened.repositoryId() != logicalProject &&
+                reopened.repositoryId() == originalRepositoryId &&
+                reopened.project(logicalProject).name == "Shared network" &&
+                reopened.listBranches(logicalProject).size() == 1 &&
+                reopened.listBranches(logicalProject).front() == "main",
+                "clone transfer did not survive destination restart");
+    }
+}
+} // namespace
+
 int main() {
     try {
         exercise();
         exerciseRemoteTracking();
+        exerciseCloneTargetProvision();
         std::cout << "Canonical UUIDv7 ProjectService tests passed\n";
         return 0;
     } catch (const std::exception& error) {

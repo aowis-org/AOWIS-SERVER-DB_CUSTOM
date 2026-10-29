@@ -219,6 +219,32 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
         '400': {$ref: '#/components/responses/BadRequest'}
+  /projects/clone-target:
+    post:
+      operationId: provisionCloneTargetV2
+      description: |
+        Idempotently provision an empty destination project with the exact
+        logical UUIDv7 and display name supplied by the remote source. No
+        branch or revision is created. Used immediately before importing a
+        full UUIDv7 revision bundle into the personal repository. A differing
+        existing project name is a conflict. This is identity provisioning,
+        not a merge or a project copy by itself. Unborn branch transfer is
+        not supported by revision bundles.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [projectId, name]
+              properties:
+                projectId: {type: string, format: uuid, description: Existing logical UUIDv7 from source}
+                name: {type: string, minLength: 1, maxLength: 200}
+      responses:
+        '200': {description: Existing matching or newly provisioned empty project}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /projects/{projectId}/branches/{branch}/bundle:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}

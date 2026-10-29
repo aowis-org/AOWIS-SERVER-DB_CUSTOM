@@ -1199,6 +1199,16 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 ? service.createUnbornProjectV2(name) : service.createProjectV2(name))};
         });
     });
+    server.Post("/dvmdb/v1/projects/clone-target", [&service](const httplib::Request& request,
+                                                                httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject object = parseBody(request, maxJsonSmallBytes);
+            requireKeys(object, {"projectId", "name"});
+            const std::string id = requiredString(object, "projectId");
+            const std::string name = requiredString(object, "name");
+            return Reply{200, projectJson(service.provisionCloneTargetV2(id, name))};
+        });
+    });
     server.Get("/dvmdb/v1/projects/:id", [&service](const httplib::Request& request,
                                                   httplib::Response& response) {
         guarded(response, [&]() {

@@ -104,3 +104,17 @@ historical checkout, materialization/verification of the entire base model,
 semantic validation of the assembled candidate, candidate discard, or the
 GUI editor workflow. These are remaining VC-04 tasks before enabling GUI
 editing. A local Commit is a separate VC-05 operation.
+
+## Provisioning a first-clone project for committed revisions
+
+`POST /dvmdb/v1/projects/clone-target` accepts a source logical project
+UUIDv7 (`projectId`) and display `name`. It publishes an empty catalogue
+project with **that exact UUIDv7**; it creates no local branch or commit.
+Repeated provisioning with the same identity and name is idempotent;
+a different name for the same existing UUID is a conflict. The personal
+repository's own root UUIDv7 remains independent of this logical project
+UUIDv7. Following provisioning, a verified full revision bundle can create
+the destination branch with its source branch UUIDv7 and immutable history.
+The first-clone process does not alter source HEADs or create a draft.
+Unborn branch transfer cannot use a nonempty revision bundle and requires
+an explicit UUID-preserving unborn-branch operation.

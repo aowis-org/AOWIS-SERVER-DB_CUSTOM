@@ -114,6 +114,9 @@ public:
     ProjectInfo createProject(std::string_view name);
     // Explicit opt-in until all clients support nullable initial HEADs.
     ProjectInfo createUnbornProjectV2(std::string_view name);
+    // Provision an empty catalogue project with an existing logical UUIDv7.
+    // Only a full verified branch bundle may populate it. Safe to retry.
+    ProjectInfo provisionCloneTargetV2(std::string_view projectId, std::string_view name);
     RevisionId createBranch(std::string_view projectId, std::string_view name,
                             std::optional<std::string_view> source = std::nullopt,
                             std::optional<RevisionId> fromRevision = std::nullopt);
@@ -264,7 +267,8 @@ private:
     std::shared_ptr<Project> findProject(std::string_view id) const;
     std::shared_ptr<Repository> openRepository(Project& project) const;
     void ensureHealthy() const;
-    ProjectInfo createProjectImpl(std::string_view name, bool v2, bool unborn = false);
+    ProjectInfo createProjectImpl(std::string_view name, bool v2, bool unborn = false,
+                                  std::optional<std::string> cloneProjectId = std::nullopt);
 
     std::filesystem::path root_;
     std::string repository_id_;

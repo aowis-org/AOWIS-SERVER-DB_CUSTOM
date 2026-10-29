@@ -1617,6 +1617,29 @@ void exerciseRevisionBundleV2Http() {
     check(full.status == 200 && full.body.startsWith("AOWREV21") &&
           full.contentType == "application/vnd.aowis.revision-bundle-v2",
           "HTTP UUIDv7 full export is not AOWREV21");
+    // First-clone path: provision the exact logical project UUID in a
+    // different root, then import the verified bundle without copying files.
+    const std::filesystem::path freshPath = temp.root() / "v2-http-fresh-clone";
+    native::ProjectService fresh(freshPath);
+    TestServer freshServer(fresh, limits);
+    Client freshClient(freshServer.port());
+    const QString clonePath = QStringLiteral("/dvmdb/v1/projects/clone-target");
+    const QJsonObject provisionBody{{"projectId", QString::fromStdString(project.id)},
+                                    {"name", "Revision transfer"}};
+    check(freshClient.call("POST", clonePath, provisionBody).status == 200 &&
+          freshClient.call("POST", clonePath, provisionBody).status == 200 &&
+          fresh.listBranches(project.id).empty(),
+          "first clone failed to provision an empty project with the source UUID");
+    check(freshClient.call("POST", clonePath,
+          QJsonObject{{"projectId", QString::fromStdString(project.id)},
+                      {"name", "Wrong project name"}}).status == 409,
+          "clone target silently renamed a provisioned project");
+    const BinaryResponse firstImport = freshClient.callRaw(
+        "POST", prefix, full.body, "application/vnd.aowis.revision-bundle-v2");
+    check(firstImport.status == 201 && fresh.headV2(project.id, "main") == tip &&
+          fresh.branchId(project.id, "main") == identity &&
+          fresh.repositoryId() != source.repositoryId(),
+          "first HTTP clone failed to preserve logical UUIDs and independent repository root");
     check(sender.callRaw("GET", prefix + "?base=not-a-uuid").status == 400,
           "invalid v2 incremental base accepted");
     check(sender.callRaw("GET", prefix + "?unused=1").status == 400,
