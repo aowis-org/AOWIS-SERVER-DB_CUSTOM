@@ -59,6 +59,20 @@ struct RemoteTrackingRefV1 {
     std::optional<RevisionId> observedHead; // Null means observed unborn HEAD.
 };
 
+// VC-04: persisted, uncommitted working-copy identity. A working copy is
+// private repository state, never a committed revision or mutable branch HEAD.
+// Generation starts at zero; write leases and candidate changes are added by
+// the following VC-04 implementation stages.
+struct WorkingCopyInfoV1 {
+    std::string id;
+    std::string projectId;
+    std::string branchId;
+    std::optional<RevisionId> baseRevision;
+    std::string sessionId;
+    std::uint64_t generation = 0;
+    bool dirty = false;
+};
+
 class ProjectService final {
     struct Project;
 public:
@@ -162,6 +176,14 @@ public:
     void recordRemoteTrackingRefV1(
         const RemoteTrackingRefV1& observation,
         std::optional<std::optional<RevisionId>> expectedObservedHead);
+    // Begin a durable, empty draft at an exact currently observed local HEAD.
+    // An unborn branch supplies null base. Only a private repository can
+    // create drafts. Does not commit or change any branch HEAD.
+    WorkingCopyInfoV1 createWorkingCopyV1(
+        std::string_view projectId, std::string_view branch,
+        std::optional<RevisionId> baseRevision, std::string_view sessionId);
+    WorkingCopyInfoV1 workingCopyV1(std::string_view draftId) const;
+    std::vector<WorkingCopyInfoV1> listWorkingCopiesV1() const;
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);

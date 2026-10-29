@@ -418,6 +418,114 @@ bool ProjectService::validBranchName(std::string_view name) {
 
 ProjectService::Project::Project(ProjectInfo value) : info(std::move(value)) {}
 
+namespace {
+// Draft records are kept at the private catalogue root, independently of
+// committed repository packs and refs. One file is one atomic draft creation;
+// this initial schema records an explicitly empty candidate change set.
+constexpr std::string_view workingCopyMarker = "AOWIS-WORKING-COPY-1\n";
+
+std::filesystem::path workingCopyDirectory(const std::filesystem::path& root) {
+    return root / "working-copies";
+}
+
+std::string draftBody(const WorkingCopyInfoV1& draft) {
+    return std::string(workingCopyMarker)
+        + "project\t" + draft.projectId + "\n"
+        + "branch\t" + draft.branchId + "\n"
+        + "base\t" + (draft.baseRevision ? draft.baseRevision->toString() : "-") + "\n"
+        + "session\t" + draft.sessionId + "\n"
+        + "generation\t0\n"
+        + "dirty\t0\n"
+        + "validation\tunvalidated\n"
+        + "changes\t0\n";
+}
+
+WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
+    check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path)
+          && std::filesystem::file_size(path) <= 512,
+          "unsafe or oversized working-copy record: " + path.string());
+    const std::string id = path.filename().string();
+    check(UuidV7::parse(id).has_value(), "invalid working-copy record UUIDv7");
+    std::ifstream stream(path, std::ios::binary);
+    check(stream.good(), "cannot open working-copy record");
+    const std::string body((std::istreambuf_iterator<char>(stream)),
+                           std::istreambuf_iterator<char>());
+    check(body.starts_with(workingCopyMarker) && !body.empty() && body.back() == '\n',
+          "invalid working-copy record marker");
+    std::istringstream lines(body.substr(workingCopyMarker.size()));
+    const std::function<std::string(std::string_view)> nextField =
+        [&](std::string_view name) -> std::string {
+        std::string line;
+        check(static_cast<bool>(std::getline(lines, line)) &&
+              line.starts_with(std::string(name) + "\t"),
+              "invalid working-copy record field: " + std::string(name));
+        return line.substr(name.size() + 1);
+    };
+    WorkingCopyInfoV1 draft;
+    draft.id = id;
+    draft.projectId = nextField("project");
+    draft.branchId = nextField("branch");
+    const std::string base = nextField("base");
+    draft.sessionId = nextField("session");
+    check(nextField("generation") == "0" && nextField("dirty") == "0" &&
+          nextField("validation") == "unvalidated" && nextField("changes") == "0",
+          "invalid initial working-copy state");
+    std::string extra;
+    check(!std::getline(lines, extra) && lines.eof(), "trailing working-copy record content");
+    check(ProjectId::parse(draft.projectId).has_value() &&
+          BranchId::parse(draft.branchId).has_value() &&
+          UuidV7::parse(draft.sessionId).has_value(),
+          "invalid working-copy project, branch or session identity");
+    if (base != "-") {
+        draft.baseRevision = RevisionId::parse(base);
+        check(draft.baseRevision.has_value(), "invalid working-copy base revision");
+    }
+    return draft;
+}
+
+void createWorkingCopyRecord(const std::filesystem::path& root,
+                             const WorkingCopyInfoV1& draft) {
+    const std::filesystem::path directory = workingCopyDirectory(root);
+    if (!std::filesystem::exists(directory)) {
+        syscallChecked(std::filesystem::create_directory(directory), "create working-copy directory");
+        syncDirectory(root);
+    }
+    check(!std::filesystem::is_symlink(directory) && std::filesystem::is_directory(directory),
+          "invalid working-copy directory");
+    const std::filesystem::path published = directory / draft.id;
+    const std::filesystem::path staging = directory / (".creating-" + draft.id);
+    const std::string body = draftBody(draft);
+    const int fd = ::open(staging.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    syscallChecked(fd >= 0, "stage working-copy record");
+    try {
+        std::size_t offset = 0;
+        while (offset < body.size()) {
+            const ssize_t amount = ::write(fd, body.data() + offset, body.size() - offset);
+            if (amount < 0 && errno == EINTR) continue;
+            syscallChecked(amount > 0, "write working-copy record");
+            offset += static_cast<std::size_t>(amount);
+        }
+        syscallChecked(::fsync(fd) == 0, "sync working-copy record");
+    } catch (...) {
+        ::close(fd);
+        ::unlink(staging.c_str());
+        throw;
+    }
+    syscallChecked(::close(fd) == 0, "close working-copy record");
+    try {
+        syscallChecked(::link(staging.c_str(), published.c_str()) == 0,
+                       "publish working-copy record");
+        syncDirectory(directory);
+        syscallChecked(::unlink(staging.c_str()) == 0, "remove staged working copy");
+        syncDirectory(directory);
+    } catch (...) {
+        // If link succeeded publication may be durable, even if fsync failed.
+        // Never silently retry using this UUID without inspecting the record.
+        throw;
+    }
+}
+} // namespace
+
 ProjectService::Operation::Operation(std::shared_ptr<Project> project) noexcept
     : project_(std::move(project)) {}
 
@@ -693,6 +801,76 @@ std::shared_ptr<Repository> ProjectService::openRepository(Project& project) con
         }
     }
     return project.repository;
+}
+
+WorkingCopyInfoV1 ProjectService::createWorkingCopyV1(
+        std::string_view projectId, std::string_view branch,
+        std::optional<RevisionId> baseRevision, std::string_view sessionId) {
+    if (!UuidV7::parse(sessionId).has_value() || !validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft session or branch");
+    {
+        std::lock_guard<std::mutex> guard(this->mutex_);
+        ensureHealthy();
+        if (this->repository_role_ != RepositoryRoleV1::Private)
+            throw ProjectError(ProjectErrorKind::Conflict,
+                               "working copies require an explicitly private repository");
+    }
+    const std::optional<BranchId> localBranch = branchId(projectId, branch);
+    if (!localBranch)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "draft requires a UUIDv7 branch");
+    // This first VC-04 slice supports exact HEAD checkout only. A concurrent
+    // commit after this read cannot change the immutable pinned draft base.
+    if (optionalHeadV2(projectId, branch) != baseRevision)
+        throw ProjectError(ProjectErrorKind::Conflict,
+                           "working-copy base must match current local HEAD");
+    WorkingCopyInfoV1 draft;
+    draft.id = UuidV7::generate().toString();
+    draft.projectId = std::string(projectId);
+    draft.branchId = localBranch->toString();
+    draft.baseRevision = baseRevision;
+    draft.sessionId = std::string(sessionId);
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    try { createWorkingCopyRecord(this->root_, draft); }
+    catch (...) { this->uncertain_ = true; throw; }
+    return draft;
+}
+
+WorkingCopyInfoV1 ProjectService::workingCopyV1(std::string_view draftId) const {
+    if (!UuidV7::parse(draftId).has_value())
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid working-copy UUIDv7");
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
+    if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
+        throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
+    return readWorkingCopy(path);
+}
+
+std::vector<WorkingCopyInfoV1> ProjectService::listWorkingCopiesV1() const {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    std::vector<WorkingCopyInfoV1> result;
+    const std::filesystem::path directory = workingCopyDirectory(this->root_);
+    if (!std::filesystem::exists(directory) && !std::filesystem::is_symlink(directory))
+        return result;
+    check(!std::filesystem::is_symlink(directory) && std::filesystem::is_directory(directory),
+          "invalid working-copy directory");
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(directory)) {
+        const std::string id = entry.path().filename().string();
+        if (id.starts_with(".creating-")) {
+            check(!entry.is_symlink() && entry.is_regular_file(),
+                  "unsafe staged working-copy record");
+            continue; // unpublished crash remnant, never advertise as a draft
+        }
+        result.push_back(readWorkingCopy(entry.path()));
+    }
+    std::sort(result.begin(), result.end(),
+              [](const WorkingCopyInfoV1& left, const WorkingCopyInfoV1& right) {
+                  return left.id < right.id;
+              });
+    return result;
 }
 
 std::vector<ProjectInfo> ProjectService::listProjects() const {

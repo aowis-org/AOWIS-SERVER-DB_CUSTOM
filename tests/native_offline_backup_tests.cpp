@@ -79,6 +79,12 @@ void compare(const std::filesystem::path& root, const std::vector<Snapshot>& exp
             "backup/restore changed the durable repository UUIDv7");
     const std::vector<ProjectInfo> projects = service.listProjects();
     require(projects.size() == expected.size(), "restored project count mismatch");
+    const std::vector<aowis::dvmdb::WorkingCopyInfoV1> drafts = service.listWorkingCopiesV1();
+    require(drafts.size() == 1 && drafts.front().projectId == expected.front().id &&
+            drafts.front().branchId == expected.front().mainBranchId &&
+            drafts.front().baseRevision == expected.front().main &&
+            drafts.front().generation == 0 && !drafts.front().dirty,
+            "backup/restore did not preserve immutable working-copy identity and base");
     for (const Snapshot& item : expected) {
         const ProjectInfo project = service.project(item.id);
         require(project.name == item.name, "restored project identity mismatch");
@@ -136,6 +142,12 @@ void tests(const std::string& python, const std::string& script, const std::stri
             expected.push_back({info.id, info.name, secondary, *after, before,
                                 service.branchId(info.id, "main")->toString(),
                                 service.branchId(info.id, secondary)->toString()});
+            if (index == 0) {
+                const std::string session = aowis::dvmdb::UuidV7::generate().toString();
+                const aowis::dvmdb::WorkingCopyInfoV1 draft =
+                    service.createWorkingCopyV1(info.id, "main", after, session);
+                require(draft.baseRevision == after, "could not create backup draft fixture");
+            }
         }
         // The catalogue is open; an offline snapshot must refuse it promptly.
         require(run(python, script, verify, "backup", source, reserved) != 0,
@@ -189,6 +201,29 @@ void tests(const std::string& python, const std::string& script, const std::stri
     {
         std::ofstream reset(backupTracking, std::ios::binary | std::ios::trunc);
         reset << originalTracking;
+    }
+    // A malformed draft must never be backed up or restored as usable private data.
+    const aowis::dvmdb::WorkingCopyInfoV1 draftInfo = [&]() {
+        ProjectService store(backup);
+        return store.listWorkingCopiesV1().front();
+    }();
+    const std::filesystem::path draftPath = backup / "working-copies" / draftInfo.id;
+    const std::string originalDraft = [&]() {
+        std::ifstream input(draftPath, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    }();
+    {
+        std::ofstream invalid(draftPath, std::ios::binary | std::ios::trunc);
+        invalid << "AOWIS-WORKING-COPY-1\nproject\tbroken\n";
+    }
+    const std::filesystem::path invalidDraftRestore = temporary.directory / "bad-draft";
+    require(run(python, script, verify, "restore", backup, invalidDraftRestore) != 0,
+            "offline restore accepted corrupt private working-copy metadata");
+    require(!std::filesystem::exists(invalidDraftRestore),
+            "offline restore published corrupt working-copy metadata");
+    {
+        std::ofstream reset(draftPath, std::ios::binary | std::ios::trunc);
+        reset << originalDraft;
     }
     // A backup with a corrupted catalogue-root identity must fail closed;
     // restore must never invent a different UUID or publish such a root.

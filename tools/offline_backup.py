@@ -147,6 +147,45 @@ def tracking_metadata(root):
     return payload
 
 
+def working_copy_records(root):
+    """Validate and compare the exact bytes of private working-copy records."""
+    directory = root / "working-copies"
+    if not directory.exists() and not directory.is_symlink():
+        return {}
+    safe_directory(directory)
+    records = {}
+    for path in sorted(directory.iterdir()):
+        if path.name.startswith(".creating-"):
+            require(UUID7.fullmatch(path.name[len(".creating-"):]) is not None
+                    and path.is_file() and not path.is_symlink(),
+                    f"unsafe working-copy staging record: {path}")
+            continue
+        require(UUID7.fullmatch(path.name) is not None
+                and path.is_file() and not path.is_symlink()
+                and path.stat().st_size <= 512,
+                f"invalid working-copy record: {path}")
+        body = path.read_bytes()
+        lines = body.splitlines(keepends=True)
+        require(len(lines) == 9 and lines[0] == b"AOWIS-WORKING-COPY-1\n" and
+                all(line.endswith(b"\n") for line in lines),
+                f"invalid working-copy record format: {path}")
+        fields = [b"project", b"branch", b"base", b"session", b"generation",
+                  b"dirty", b"validation", b"changes"]
+        values = []
+        for line, field in zip(lines[1:], fields):
+            parts = line[:-1].split(b"\t")
+            require(len(parts) == 2 and parts[0] == field,
+                    f"invalid working-copy field: {path}")
+            values.append(parts[1])
+        uuid = lambda value: UUID7.fullmatch(value.decode("ascii", errors="replace")) is not None
+        require(uuid(values[0]) and uuid(values[1]) and
+                (values[2] == b"-" or uuid(values[2])) and uuid(values[3]) and
+                values[4:] == [b"0", b"0", b"unvalidated", b"0"],
+                f"invalid initial working-copy state: {path}")
+        records[path.name] = body
+    return records
+
+
 def branch_heads(root):
     heads = {}
     for project in projects_in(root):
@@ -215,6 +254,7 @@ def acquire_source_locks(root, stack):
     lock_file(root / "catalogue.lock", stack)
     repository_identity(root)
     tracking_metadata(root)
+    working_copy_records(root)
     for project in projects_in(root):
         # Every Repository holds maintenance.lock shared throughout its lifetime.
         lock_file(project / "repository" / "maintenance.lock", stack)
@@ -278,6 +318,7 @@ def verify(root, verify_binary):
     # Native verification may rebuild derived indexes; run it only on staging.
     repository_identity(root)
     tracking_metadata(root)
+    working_copy_records(root)
     expected = branch_heads(root)
     for project in projects_in(root):
         result = subprocess.run([str(verify_binary), "--full", str(project / "repository")],
@@ -295,6 +336,7 @@ def copy_and_verify(source, destination, verify_binary):
         expected = acquire_source_locks(source, locks)
         source_id = repository_identity(source)
         source_tracking = tracking_metadata(source)
+        source_drafts = working_copy_records(source)
         reject_links_and_special(source)
         scratch = Path(tempfile.mkdtemp(prefix=".aowis-offline-copy-", dir=destination.parent))
         try:
@@ -302,10 +344,13 @@ def copy_and_verify(source, destination, verify_binary):
             shutil.copytree(source, scratch, dirs_exist_ok=True, symlinks=True)
             require(repository_identity(scratch) == source_id, "copied repository identity changed")
             require(tracking_metadata(scratch) == source_tracking, "copied remote tracking metadata changed")
+            require(working_copy_records(scratch) == source_drafts, "copied working-copy records changed")
             require(branch_heads(scratch) == expected, "copied catalogue or branch heads changed")
             verify(scratch, verify_binary)
             require(tracking_metadata(scratch) == source_tracking,
                     "verified remote tracking metadata changed")
+            require(working_copy_records(scratch) == source_drafts,
+                    "verified working-copy records changed")
             require(branch_heads(scratch) == expected, "verified copy differs from source heads")
             sync_tree(scratch)
             publish_no_replace(scratch, destination)
@@ -338,6 +383,8 @@ def main():
                     require(branch_heads(scratch) == expected, "copied branch heads changed")
                     require(tracking_metadata(scratch) == tracking_metadata(source),
                             "copied remote tracking metadata changed")
+                    require(working_copy_records(scratch) == working_copy_records(source),
+                            "copied working-copy records changed")
                     require(verify(scratch, verify_binary) == expected,
                             "verification changed published branch heads")
                 finally:
