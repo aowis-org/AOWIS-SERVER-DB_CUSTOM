@@ -344,9 +344,12 @@ SQLite/PostgreSQL transaction implementations with identical externally
 visible semantics. Git-style lane placement and legibility are GUI layout
 work, not a change to ancestry.
 
-Authentication, authorization, audit and permissions remain explicitly
-separate [security backlog](security-permissions-design.md) work at VC-12.
-Until then, unauthenticated HTTP editing must not be exposed across users.
+Authentication, authorization, audit and permissions are outside the
+version-control implementation roadmap. The independent
+[deferred security backlog](security-permissions-design.md) records future
+ideas but has no VC milestone. The current functional model must not be
+mistaken for an authorization system; unauthenticated writable HTTP editing
+should not be exposed to untrusted users.
 
 **This contract overrides convenience assumptions in any API or GUI design.**
 A feature is complete only when storage, service, replication and GUI

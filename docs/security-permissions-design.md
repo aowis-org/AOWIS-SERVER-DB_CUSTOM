@@ -1,11 +1,14 @@
 # AOWIS / DVMDB security and permission design backlog
 
-**Dedicated deferred design document, not a claim of implemented security.**
-This is the VC-12 track in the [implementation roadmap](roadmap.md), and
-multi-user/public writable deployment cannot be approved before its gates.
-This records findings and requirements to revisit as one AOWIS-wide security
-and permission architecture after the version-control lifecycle and GUI
-integration are stable. Refer to [repository access-control findings](native-repository-access-control.md),
+**Unscheduled future reference only; not a milestone in the database/GUI
+version-control implementation roadmap.** The [DVMDB roadmap](roadmap.md) and
+companion GUI roadmap end at VC-11. This document collects security findings,
+questions and possible design requirements for an eventual, **separately
+approved AOWIS-wide initiative**. It creates **no current implementation task,
+numbered milestone, release gate or dependency** for the graph, private drafts,
+local commits, fetch, publish or merge. No security solution is selected yet.
+The deployment cautions below describe risks, not acceptance criteria for the
+current functional roadmap. Refer to [repository access-control findings](native-repository-access-control.md),
 [private working repositories](private-working-repositories.md), and
 [REST design](rest-api-design.md).
 
@@ -57,7 +60,7 @@ integration are stable. Refer to [repository access-control findings](native-rep
     working repositories, untrusted replication bundles, replayed pushes,
     unsafe log contents and denial-of-service via oversized histories.
 
-## Required security qualification before multi-user exposure
+## Potential qualification for a future multi-user security initiative
 
 - Authentication on every writable HTTP operation and server-side isolation
   for personal working repositories and working copies.
@@ -68,16 +71,18 @@ integration are stable. Refer to [repository access-control findings](native-rep
 - Secret management, TLS expectations, deployment guide, backups and
   a release gate explicitly disallowing unauthenticated multi-user access.
 
-**Schedule:** complete the core lifecycle first, but treat unauthenticated
-remote editing as development-only and do not ship it for shared/public
-exposure before these requirements are enforced.
+**Timing:** no date, milestone number or development sequence is assigned.
+The present integration may proceed without these features; unauthenticated
+writable HTTP endpoints should be confined to trusted/isolated deployments.
+Any decision to support public or multi-user writable access requires its own
+explicit product scope and security review.
 
 ## Interim constraints for the approved private-repository design
 
 - One intended user has a separate DVMDB working repository, but multiple
-  devices/sessions may reach it. Until VC-12 identity enforcement, these
-  must be isolated operationally and **not exposed as unauthenticated
-  multi-user services**.
+  devices/sessions may reach it. Without authentication, this is a functional
+  ownership convention only. Keep access operationally isolated and **do not
+  expose it as an unauthenticated multi-user service**.
 - Draft writer leases, fencing tokens and version checks prevent accidental
   concurrent overwrites; they **are not authorization**. Future policy must
   bind lease issuance, takeover and recovery to authenticated ownership.
@@ -91,5 +96,27 @@ exposure before these requirements are enforced.
   conflict resolutions, model validation and publication authorization.
 
 Exact roles, credential storage, authentication, revocation, tenancy, quotas,
-and security-test gates remain part of dedicated VC-12 work, not prerequisites
-for isolated developer test deployments.
+and possible security-specific review criteria remain open design questions.
+They are not prerequisites for isolated developer/test deployments and are not
+assigned to any current VC milestone.
+
+## Why this backlog is separate
+
+- The existing `AccessPolicyStore` and `aowis-dvmdb-access` are provisional
+  native policy utilities; they do not enforce authentication at the REST
+  boundary. Do not build new GUI authorization features on that assumption.
+- The `private`, `shared` and `unconfigured` repository roles from VC-03
+  describe intended repository use, not access rights. Repository UUIDv7,
+  branch UUIDv7, SHA-256 digests and tracked remote identities cannot stand
+  in for credentials or verified service/user identities.
+- VC-04 leases and fencing tokens are correctness mechanisms for concurrent
+  drafts. VC-05/VC-07 idempotency keys are correctness mechanisms for retries.
+  Neither grants a user permission to perform an operation.
+- A future design must choose how native library users, local Standalone
+  storage, desktop HTTP clients, browser clients and shared services receive
+  consistent security policy. No policy, identity provider or secret format
+  is committed by the current project.
+- Keep future security tests and deployment approval requirements in a
+  **separately authorized plan**, not the VC-11 functional qualification
+  matrix. Completing the current version-control roadmap neither provides
+  nor claims internet-facing/multi-user security.

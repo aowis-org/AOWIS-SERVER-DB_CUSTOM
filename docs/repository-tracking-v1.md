@@ -2,11 +2,13 @@
 
 This document defines a **metadata-only** prerequisite for independent personal
 and shared DVMDB repositories. It does not implement Fetch, Clone, Checkout,
-Commit, Publish, authentication, or authorization; those remain in subsequent
-VC milestones. In particular, a configured remote URL or UUID **cannot** prove
-that a remote endpoint is authentic. Identity must be verified at connection
-and again at fetch/publish time. Deployment isolation is required for private
-HTTP roots until VC-12 permissions exist.
+Commit or Publish; those belong to subsequent VC milestones. Authentication
+and authorization belong **outside this entire VC roadmap**. In particular,
+a configured remote URL or UUID **cannot** prove an endpoint is authentic.
+Repository-ID matching at connection and fetch/publish is a functional
+wrong-target check, not cryptographic authentication. Until a separately
+approved security initiative, deploy unauthenticated writable HTTP roots only
+in controlled environments. See the [deferred security notes](security-permissions-design.md).
 
 ## Logical identity and namespaces
 
@@ -71,8 +73,9 @@ read; these operations are **not themselves a verification protocol**.
 `GET /dvmdb/v1/repository/tracking` supplies repository UUID, role, remote
 registry and qualified observed refs (including explicit JSON null for unborn
 HEADs). It is read-only: no HTTP route can change this metadata yet. Publishing
-these endpoints without authentication can reveal deployment metadata; until
-VC-12, deploy them behind appropriately isolated and protected transports.
+these endpoints without authentication can reveal deployment metadata; use
+controlled/isolated deployments. Future access control is tracked only in
+[separate security notes](security-permissions-design.md).
 
 VC-03 is **not complete** until the GUI can explicitly configure a personal
 working repository and can safely verify remote identity/targeting; verified

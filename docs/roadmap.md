@@ -6,8 +6,9 @@ This is the authoritative *step-by-step delivery order* for the
 [version-control contract](version-control-semantics.md),
 [private working repositories](private-working-repositories.md),
 [REST contract](rest-api-design.md),
-[replication contract](offline-repository-synchronization.md), and
-[security/permission design backlog](security-permissions-design.md).
+[replication contract](offline-repository-synchronization.md). Security is
+tracked independently in the [deferred security notes](security-permissions-design.md)
+and is **not a milestone or dependency of this roadmap**.
 The companion GUI plan is `AOWIS-SERVER-GUI/docs/dvmdb-integration-roadmap.md`.
 They use identical milestone IDs, so individual implementation threads can be
 handed off independently. **Do not restore the previous automatic empty
@@ -38,10 +39,12 @@ revision, writable HEAD, or branch-provenance graph-edge model.**
 7. History is **one Git-style revision DAG** with genuine zero/one/two-parent
    edges. Branches decorate their current HEADs; no invented branch-origin
    edges or duplicate committed revision nodes. Drafts live outside the DAG.
-8. Security remains a **separate design phase**. Until it is implemented,
-   private HTTP DVMDB deployment **must be isolated** and multi-user/public
-   writable exposure is out of scope; a configured URL does not enforce
-   ownership.
+8. **Security is outside the version-control implementation program.**
+   Repository roles and UUIDs identify resources but do not authenticate users
+   or enforce permissions. The independent
+   [security backlog](security-permissions-design.md) is reference material,
+   not a future VC stage. For now, do not expose unauthenticated writable HTTP
+   services to untrusted/public clients.
 
 Normative changes to this section require an explicit cross-repository design
 review and coordinated edits to both roadmaps and the version-control contract.
@@ -67,9 +70,10 @@ DVMDB/GUI specification update.
 lease duration/renewal and fencing-token encoding; draft quotas, backup and
 retention; completed operation-result retention and status API; native DVMDB transactional metadata, persistence and crash-recovery details; and model conflict reporting. These are
 implementation parameters, **not reopened architectural decisions**.
-Permissions remain deferred to VC-12; until then personal HTTP repositories
-require actual deployment isolation, never an assertion of security based
-only on their configured URL.
+Authentication and permissions are excluded from all VC milestones; do not
+introduce them as prerequisites for implementing or accepting VC-00–VC-11.
+Treat controlled deployment of unauthenticated HTTP repositories as separate
+operational guidance, not as a version-control deliverable.
 
 ## C. Required implementation sequence
 
@@ -319,23 +323,12 @@ repos and one shared repo, including failed Push and later successful merge.
 **Done when:** documented acceptance matrix from `version-control-semantics.md`
 passes, no unsafe data migration is implicit, and test evidence is recorded.
 
-### VC-12 — Dedicated security, permission and operational hardening
-
-**Deferred design milestone; mandatory gate before public/multi-user writable
-service deployment.** Keep implementation work separately tracked in
-[security-permissions-design.md](security-permissions-design.md).
-
-- Threat-model native and HTTP operations, drafts, repo tracking, import,
-  branch mutation, publishing, admin actions and source trust.
-- Design authenticated user, device and service identities, ownership,
-  authorization, audit, credential storage, TLS, quotas and revocation.
-- Enforce server-side single-user draft isolation; a claimed `ownerId` or
-  configured URL is never proof of authorization. Test cross-user denials.
-- Until qualified, allow only deployment-isolated private working DVMDBs
-  and trusted development/shared sources; clearly label insecure modes.
-
-**Done when:** separate security review, penetration/abuse tests and
-release authorization permit multi-user/public writable operation.
+**Scope boundary:** This roadmap ends at **VC-11**. Authentication,
+authorization, permissions, audit and public-service security qualification
+belong to a separate, unscheduled AOWIS-wide design effort. They have **no VC
+number**, and they are not part of the database/graph integration acceptance
+criteria. Preserve ideas in the [deferred security notes](security-permissions-design.md)
+without adding implementation tasks to this roadmap.
 
 ## D. Cross-repository delivery and checks
 
@@ -353,7 +346,6 @@ release authorization permit multi-user/public writable operation.
 | VC-09 | Pinned UUIDv7 graph including null/multi-parent | Genuine Git-style history, labels and inspector |
 | VC-10 | Transport/native integration support | End-to-end embedded, basic and browser workflows |
 | VC-11 | Format, fault, durability and replica qualification | Real Qt/Standalone/browser acceptance evidence |
-| VC-12 | Security authorization/audit qualification | Authentication, permissions and denied-action UI |
 
 **Delivery order:** DVMDB contract/API for a milestone first; GUI can add
 read-only or disabled scaffolding in parallel, but must not activate editing
@@ -403,7 +395,6 @@ should state its prerequisite milestone(s) and test status.
 16. Two branches change the same hydraulic model from a common ancestor:
     manual three-way conflict resolution and whole-model validation are
     required, with no automatic rebase or premature Publish.
-12. Private HTTP deployment remains isolated until VC-12 security sign-off.
 
 ## F. Starting another implementation thread
 
