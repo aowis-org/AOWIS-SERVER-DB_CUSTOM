@@ -422,12 +422,12 @@ bool ProjectService::validBranchName(std::string_view name) {
 ProjectService::Project::Project(ProjectInfo value) : info(std::move(value)) {}
 
 namespace {
-// Private drafts never share refs with immutable commits. AOWIS-WORKING-COPY-1
-// is retained for read compatibility; acquisition upgrades it to version 2.
-constexpr std::string_view workingCopyMarkerV1 = "AOWIS-WORKING-COPY-1\n";
-constexpr std::string_view workingCopyMarkerV2 = "AOWIS-WORKING-COPY-2\n";
+// Private draft format: one authoritative pre-release record encoding.
+// No readers or migrators for experimental V1/V2 drafts are retained.
+constexpr std::string_view workingCopyMarker = "AOWIS-WORKING-COPY-3\n";
 constexpr std::size_t workingCopyMaxBytes = 8 * 1024 * 1024;
 constexpr std::size_t workingCopyMaxChanges = 20000;
+constexpr std::size_t workingCopyMaxEvents = 4096;
 
 std::filesystem::path workingCopyDirectory(const std::filesystem::path& root) {
     return root / "working-copies";
@@ -478,8 +478,66 @@ Bytes unhexBytes(std::string_view encoded) {
     return result;
 }
 
-std::string draftBody(const WorkingCopyInfoV1& draft, bool version2) {
-    std::string body = std::string(version2 ? workingCopyMarkerV2 : workingCopyMarkerV1)
+// Basic transport/integrity verification for MODEL's AO WE frame. The full
+// entity schema belongs to MODEL; the HTTP endpoint additionally decodes it
+// with ModelEditTransactionCodec. This Qt-free service verifies framing,
+// length, SHA-256, and the event's intrinsic UUIDv7 before persisting it.
+WorkingCopyEventV1 verifiedEditEvent(const Bytes& encoded) {
+    constexpr std::size_t header = 9;
+    constexpr std::size_t digest = 32;
+    if (encoded.size() < header + 16 + digest || encoded.size() > 8 * 1024 * 1024 + header + digest ||
+        encoded[0] != 'A' || encoded[1] != 'O' || encoded[2] != 'W' ||
+        encoded[3] != 'E' || encoded[4] != 1)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid edit event frame");
+    const std::uint32_t size = (static_cast<std::uint32_t>(encoded[5]) << 24) |
+        (static_cast<std::uint32_t>(encoded[6]) << 16) |
+        (static_cast<std::uint32_t>(encoded[7]) << 8) | encoded[8];
+    if (size < 16 || encoded.size() != header + static_cast<std::size_t>(size) + digest)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid edit event length");
+    Bytes payload(encoded.begin() + header, encoded.begin() + header + size);
+    const Hash hash = sha256(payload);
+    if (!std::equal(hash.begin(), hash.end(), encoded.begin() + header + size))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "edit event digest mismatch");
+    UuidV7 uuid;
+    std::copy_n(payload.begin(), uuid.bytes.size(), uuid.bytes.begin());
+    const std::string id = uuid.toString();
+    if (!UuidV7::parse(id).has_value())
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid edit event UUIDv7");
+    return WorkingCopyEventV1{id, encoded};
+}
+
+std::string saveBatchFingerprint(const std::vector<ModelChange>& changes,
+                                 const std::vector<WorkingCopyEventV1>& events) {
+    // Canonical, unambiguous length-delimited digest of the complete request.
+    // Sort changes by key because candidate overlay order is entity identity.
+    std::map<Key, std::optional<ModelRecord>> ordered;
+    for (const ModelChange& change : changes)
+        if (!ordered.emplace(change.key, change.record).second)
+            throw ProjectError(ProjectErrorKind::InvalidInput, "duplicate key in event save");
+    Bytes bytes;
+    const std::function<void(std::size_t)> appendSize = [&](std::size_t size) {
+        const std::uint64_t count = static_cast<std::uint64_t>(size);
+        for (unsigned shift = 0; shift < 8; ++shift)
+            bytes.push_back(static_cast<std::uint8_t>(count >> (56 - shift * 8)));
+    };
+    appendSize(ordered.size());
+    for (const std::pair<const Key, std::optional<ModelRecord>>& entry : ordered) {
+        bytes.insert(bytes.end(), entry.first.begin(), entry.first.end());
+        const Bytes record = entry.second ? encodeModelRecord(*entry.second) : Bytes{};
+        appendSize(record.size());
+        bytes.insert(bytes.end(), record.begin(), record.end());
+    }
+    appendSize(events.size());
+    for (const WorkingCopyEventV1& event : events) {
+        appendSize(event.encoded.size());
+        bytes.insert(bytes.end(), event.encoded.begin(), event.encoded.end());
+    }
+    const Hash hash = sha256(bytes);
+    return hexBytes(hash.data(), hash.size());
+}
+
+std::string draftBody(const WorkingCopyInfoV1& draft) {
+    std::string body = std::string(workingCopyMarker)
         + "project\t" + draft.projectId + "\n"
         + "branch\t" + draft.branchId + "\n"
         + "base\t" + (draft.baseRevision ? draft.baseRevision->toString() : "-") + "\n"
@@ -487,11 +545,9 @@ std::string draftBody(const WorkingCopyInfoV1& draft, bool version2) {
         + "generation\t" + std::to_string(draft.generation) + "\n"
         + "dirty\t" + (draft.dirty ? "1" : "0") + "\n"
         + "validation\tunvalidated\n";
-    if (version2) {
-        body += "lease-session\t" + draft.leaseSessionId.value_or("-") + "\n"
-            + "lease-token\t" + draft.leaseToken.value_or("-") + "\n"
-            + "lease-expires\t" + std::to_string(draft.leaseExpiresAtMs) + "\n";
-    }
+    body += "lease-session\t" + draft.leaseSessionId.value_or("-") + "\n"
+        + "lease-token\t" + draft.leaseToken.value_or("-") + "\n"
+        + "lease-expires\t" + std::to_string(draft.leaseExpiresAtMs) + "\n";
     body += "changes\t" + std::to_string(draft.candidateChanges.size()) + "\n";
     for (const ModelChange& change : draft.candidateChanges) {
         body += "change\t" + hexBytes(change.key.data(), change.key.size()) + "\t";
@@ -504,7 +560,15 @@ std::string draftBody(const WorkingCopyInfoV1& draft, bool version2) {
         check(body.size() <= workingCopyMaxBytes, "draft candidate exceeds storage limit",
               StorageErrorKind::InvalidInput);
     }
-    check(body.size() <= (version2 ? workingCopyMaxBytes : 512),
+    body += "events\t" + std::to_string(draft.journal.size()) + "\n";
+    for (const WorkingCopyEventV1& event : draft.journal) {
+        body += "event\t" + event.id + "\t" +
+            hexBytes(event.encoded.data(), event.encoded.size()) + "\n";
+        check(body.size() <= workingCopyMaxBytes, "draft event journal exceeds storage limit",
+              StorageErrorKind::InvalidInput);
+    }
+    body += "last-save\t" + draft.lastSaveFingerprint.value_or("-") + "\n";
+    check(body.size() <= workingCopyMaxBytes,
           "draft candidate exceeds storage limit", StorageErrorKind::InvalidInput);
     return body;
 }
@@ -519,11 +583,9 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
     check(stream.good(), "cannot open working-copy record");
     const std::string body((std::istreambuf_iterator<char>(stream)),
                            std::istreambuf_iterator<char>());
-    const bool version2 = body.starts_with(workingCopyMarkerV2);
-    check((version2 || body.starts_with(workingCopyMarkerV1)) &&
-          !body.empty() && body.back() == '\n', "invalid working-copy record marker");
-    const std::string_view marker = version2 ? workingCopyMarkerV2 : workingCopyMarkerV1;
-    if (!version2) check(body.size() <= 512, "oversized v1 working-copy record");
+    check(body.starts_with(workingCopyMarker) && !body.empty() && body.back() == '\n',
+          "invalid working-copy record marker");
+    const std::string_view marker = workingCopyMarker;
     std::istringstream lines(body.substr(marker.size()));
     const std::function<std::string(std::string_view)> nextField =
         [&](std::string_view name) -> std::string {
@@ -544,7 +606,7 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
     check(dirty == "0" || dirty == "1", "invalid draft dirty state");
     draft.dirty = dirty == "1";
     check(nextField("validation") == "unvalidated", "invalid draft validation state");
-    if (version2) {
+    {
         const std::string owner = nextField("lease-session");
         const std::string token = nextField("lease-token");
         draft.leaseExpiresAtMs = decimalField(nextField("lease-expires"));
@@ -574,6 +636,33 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
         if (payload != "-") change.record = decodeModelRecord(unhexBytes(payload));
         draft.candidateChanges.push_back(std::move(change));
     }
+    {
+        const std::uint64_t events = decimalField(nextField("events"));
+        check(events <= workingCopyMaxEvents, "too many saved draft events");
+        std::set<std::string> eventIds;
+        for (std::uint64_t i = 0; i < events; ++i) {
+            const std::string field = nextField("event");
+            const std::size_t tab = field.find('\t');
+            check(tab == 36 && field.find('\t', tab + 1) == std::string::npos,
+                  "malformed draft journal event");
+            const WorkingCopyEventV1 event = verifiedEditEvent(
+                unhexBytes(std::string_view(field).substr(tab + 1)));
+            check(field.substr(0, tab) == event.id && eventIds.insert(event.id).second,
+                  "invalid or duplicate draft journal event");
+            draft.journal.push_back(event);
+        }
+        const std::string fingerprint = nextField("last-save");
+        if (fingerprint != "-") {
+            check(fingerprint.size() == 64 &&
+                  std::all_of(fingerprint.begin(), fingerprint.end(), [](char ch) {
+                      return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+                  }), "invalid last-save fingerprint");
+            draft.lastSaveFingerprint = fingerprint;
+        }
+        check((draft.journal.empty() && !draft.lastSaveFingerprint) ||
+              (!draft.journal.empty() && draft.lastSaveFingerprint && draft.generation > 0),
+              "inconsistent draft journal metadata");
+    }
     std::string extra;
     check(!std::getline(lines, extra) && lines.eof(), "trailing working-copy record content");
     check(ProjectId::parse(draft.projectId).has_value() &&
@@ -585,8 +674,6 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
         check(draft.baseRevision.has_value(), "invalid working-copy base revision");
     }
     check(draft.dirty == !draft.candidateChanges.empty(), "invalid draft dirty/change mismatch");
-    if (!version2) check(draft.generation == 0 && !draft.dirty && count == 0,
-                         "invalid initial working-copy state");
     return draft;
 }
 
@@ -597,7 +684,7 @@ void replaceWorkingCopyRecord(const std::filesystem::path& root,
     const std::filesystem::path directory = workingCopyDirectory(root);
     const std::filesystem::path published = directory / draft.id;
     const std::filesystem::path stage = directory / (".updating-" + UuidV7::generate().toString());
-    const std::string body = draftBody(draft, true);
+    const std::string body = draftBody(draft);
     const int fd = ::open(stage.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     syscallChecked(fd >= 0, "stage draft update");
     try {
@@ -638,7 +725,7 @@ void createWorkingCopyRecord(const std::filesystem::path& root,
           "invalid working-copy directory");
     const std::filesystem::path published = directory / draft.id;
     const std::filesystem::path staging = directory / (".creating-" + draft.id);
-    const std::string body = draftBody(draft, false);
+    const std::string body = draftBody(draft);
     const int fd = ::open(staging.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     syscallChecked(fd >= 0, "stage working-copy record");
     try {
@@ -1082,6 +1169,9 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyChangesV1(
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
     WorkingCopyInfoV1 draft = readWorkingCopy(path);
+    if (!draft.journal.empty())
+        throw ProjectError(ProjectErrorKind::Conflict,
+                           "journalled draft requires atomic event saves");
     if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
         !draft.leaseToken || *draft.leaseToken != fencingToken ||
         draft.leaseExpiresAtMs <= nowEpochMs() || draft.generation != expectedGeneration)
@@ -1104,7 +1194,70 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyChangesV1(
     draft.dirty = !draft.candidateChanges.empty();
     ++draft.generation;
     // Serialization and size/record validation is done BEFORE publishing.
-    (void)draftBody(draft, true);
+    (void)draftBody(draft);
+    try { replaceWorkingCopyRecord(this->root_, draft); }
+    catch (...) { this->uncertain_ = true; throw; }
+    return draft;
+}
+
+WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
+        std::string_view draftId, std::string_view sessionId,
+        std::string_view fencingToken, std::uint64_t expectedGeneration,
+        const std::vector<ModelChange>& changes,
+        const std::vector<Bytes>& encodedTransactions) {
+    if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
+        !UuidV7::parse(fencingToken).has_value() || changes.size() > workingCopyMaxChanges ||
+        encodedTransactions.empty() || encodedTransactions.size() > 128)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft event-save parameters");
+    std::vector<WorkingCopyEventV1> events;
+    std::set<std::string> incoming;
+    for (const Bytes& bytes : encodedTransactions) {
+        WorkingCopyEventV1 event = verifiedEditEvent(bytes);
+        if (!incoming.insert(event.id).second)
+            throw ProjectError(ProjectErrorKind::InvalidInput, "duplicate edit event UUID");
+        events.push_back(std::move(event));
+    }
+    const std::string fingerprint = saveBatchFingerprint(changes, events);
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    if (this->repository_role_ != RepositoryRoleV1::Private)
+        throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
+    const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
+    if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
+        throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
+    WorkingCopyInfoV1 draft = readWorkingCopy(path);
+    if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
+        !draft.leaseToken || *draft.leaseToken != fencingToken ||
+        draft.leaseExpiresAtMs <= nowEpochMs())
+        throw ProjectError(ProjectErrorKind::Conflict, "stale draft writer lease");
+    // Lost HTTP acknowledgements are resolved without repeating a Save.
+    if (expectedGeneration < std::numeric_limits<std::uint64_t>::max() &&
+        draft.generation == expectedGeneration + 1 &&
+        draft.lastSaveFingerprint == fingerprint)
+        return draft;
+    if (draft.generation != expectedGeneration ||
+        draft.generation == std::numeric_limits<std::uint64_t>::max())
+        throw ProjectError(ProjectErrorKind::Conflict, "draft generation changed");
+    std::set<std::string> applied;
+    for (const WorkingCopyEventV1& event : draft.journal) applied.insert(event.id);
+    for (const WorkingCopyEventV1& event : events)
+        if (applied.contains(event.id))
+            throw ProjectError(ProjectErrorKind::Conflict, "edit event already saved");
+    if (draft.journal.size() + events.size() > workingCopyMaxEvents)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "draft event journal is full");
+    std::map<Key, std::optional<ModelRecord>> merged;
+    for (const ModelChange& change : draft.candidateChanges) merged.emplace(change.key, change.record);
+    for (const ModelChange& change : changes) merged[change.key] = change.record;
+    if (merged.size() > workingCopyMaxChanges)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "draft candidate has too many changes");
+    draft.candidateChanges.clear();
+    for (const std::pair<const Key, std::optional<ModelRecord>>& entry : merged)
+        draft.candidateChanges.push_back(ModelChange{entry.first, entry.second});
+    draft.journal.insert(draft.journal.end(), events.begin(), events.end());
+    draft.dirty = !draft.candidateChanges.empty();
+    draft.lastSaveFingerprint = fingerprint;
+    ++draft.generation;
+    (void)draftBody(draft); // Validate complete overlay + journal before publishing.
     try { replaceWorkingCopyRecord(this->root_, draft); }
     catch (...) { this->uncertain_ = true; throw; }
     return draft;

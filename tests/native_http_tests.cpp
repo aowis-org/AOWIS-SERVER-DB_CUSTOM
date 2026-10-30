@@ -1,3 +1,4 @@
+#include "model_edit_event_fixture.h"
 #include "aowis/dvmdb/dvmdb_http_routes.h"
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
@@ -2152,12 +2153,50 @@ void exerciseWorkingCopyHttp() {
                   QJsonObject{{"sessionId", firstSession}, {"fencingToken", token},
                               {"expectedGeneration", "1"}, {"changes", QJsonArray{entity}}}).status == 409,
               "HTTP lease takeover did not fence original session");
+        const native::Bytes event = native::test::editEvent(
+            native::UuidV7::generate(), native::UuidV7::generate());
+        const QByteArray eventBytes(reinterpret_cast<const char*>(event.data()),
+                                    static_cast<qsizetype>(event.size()));
+        const QString encodedEvent = QString::fromLatin1(eventBytes.toBase64());
+        const QString eventSavePath = detailPath + "/save-events";
+        const QJsonObject eventSave{{"sessionId", otherSession},
+                                    {"fencingToken", taken.json.value("token")},
+                                    {"expectedGeneration", "1"},
+                                    {"changes", QJsonArray{entity}},
+                                    {"events", QJsonArray{encodedEvent}}};
+        const Response savedEvents = client.call("POST", eventSavePath, eventSave);
+        check(savedEvents.status == 200 &&
+              savedEvents.json.value("generation") == QStringLiteral("2") &&
+              savedEvents.json.value("eventCount") == QStringLiteral("1") &&
+              savedEvents.json.value("acceptedEventIds").toArray().size() == 1 &&
+              !savedEvents.json.contains("changes") && !savedEvents.json.contains("events") &&
+              client.call("GET", detailPath).json.value("events").toArray().at(0)
+                  .toObject().value("payloadBase64") == encodedEvent,
+              "HTTP atomic event Save did not persist event and candidate together");
+        const Response replay = client.call("POST", eventSavePath, eventSave);
+        check(replay.status == 200 && replay.json.value("generation") == QStringLiteral("2") &&
+              replay.json.value("acceptedEventIds").toArray().size() == 1,
+              "HTTP lost-acknowledgement event replay was not idempotent");
+        check(client.call("POST", savePath,
+              QJsonObject{{"sessionId", otherSession},
+                          {"fencingToken", taken.json.value("token")},
+                          {"expectedGeneration", "2"},
+                          {"changes", QJsonArray{entity}}}).status == 409,
+              "HTTP unjournalled save bypassed existing event journal");
+        check(client.call("POST", eventSavePath,
+              QJsonObject{{"sessionId", otherSession},
+                          {"fencingToken", taken.json.value("token")},
+                          {"expectedGeneration", "2"},
+                          {"changes", QJsonArray{entity}},
+                          {"events", QJsonArray{"AAAA"}}}).status == 400,
+              "HTTP accepted malformed MODEL event bytes");
         server.stop();
     }
     {
         native::ProjectService reopened(root.root());
         const native::WorkingCopyInfoV1 draft = reopened.workingCopyV1(draftId);
-        check(draft.generation == 1 && draft.dirty && draft.candidateChanges.size() == 1 &&
+        check(draft.generation == 2 && draft.dirty && draft.journal.size() == 1 &&
+              draft.candidateChanges.size() == 1 &&
               draft.candidateChanges.front().record.has_value() &&
               draft.candidateChanges.front().record->payload == native::Bytes{1, 2, 3} &&
               !reopened.optionalHeadV2(projectId, "main").has_value(),
@@ -2167,7 +2206,8 @@ void exerciseWorkingCopyHttp() {
         Client client(server.port());
         const Response restored = client.call("GET",
             QStringLiteral("/dvmdb/v1/working-copies/") + QString::fromStdString(draftId));
-        check(restored.status == 200 && restored.json.value("generation") == QStringLiteral("1") &&
+        check(restored.status == 200 && restored.json.value("generation") == QStringLiteral("2") &&
+              restored.json.value("events").toArray().size() == 1 &&
               restored.json.value("changes").toArray().size() == 1 &&
               restored.json.value("baseRevision").isNull(),
               "HTTP draft GET lost saved candidate after service restart");

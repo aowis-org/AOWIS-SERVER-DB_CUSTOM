@@ -1,3 +1,4 @@
+#include "model_edit_event_fixture.h"
 #include "aowis/dvmdb/project_service.h"
 
 #include <array>
@@ -87,7 +88,9 @@ void compare(const std::filesystem::path& root, const std::vector<Snapshot>& exp
             drafts.front().candidateChanges.size() == 1 &&
             drafts.front().candidateChanges.front().record.has_value() &&
             drafts.front().candidateChanges.front().record->payload ==
-                std::vector<std::uint8_t>({42, 43}),
+                std::vector<std::uint8_t>({42, 43}) &&
+            drafts.front().journal.size() == 1 &&
+            drafts.front().journal.front().encoded.size() > 32,
             "backup/restore lost the saved private candidate overlay");
     for (const Snapshot& item : expected) {
         const ProjectInfo project = service.project(item.id);
@@ -158,9 +161,11 @@ void tests(const std::string& python, const std::string& script, const std::stri
                 ModelRecord candidate;
                 candidate.kind = 44;
                 candidate.payload = {42, 43};
+                const aowis::dvmdb::Bytes event = aowis::dvmdb::test::editEvent(
+                    aowis::dvmdb::UuidV7::generate(), aowis::dvmdb::UuidV7::generate());
                 const aowis::dvmdb::WorkingCopyInfoV1 saved =
-                    service.saveWorkingCopyChangesV1(draft.id, session, lease.token,
-                                                    lease.generation, {{candidateKey, candidate}});
+                    service.saveWorkingCopyTransactionsV1(draft.id, session, lease.token,
+                                         lease.generation, {{candidateKey, candidate}}, {event});
                 require(saved.generation == 1 && saved.dirty,
                         "failed to save private draft before backup");
                 service.releaseWorkingCopyLeaseV1(draft.id, session, lease.token);

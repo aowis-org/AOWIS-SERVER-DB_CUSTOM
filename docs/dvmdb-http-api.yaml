@@ -126,6 +126,42 @@ paths:
       responses:
         '200': {description: Fresh token UUIDv7, expiresAtMs and generation as decimal strings}
         '409': {description: Draft has another active writer}
+  /working-copies/{draftId}/save-events:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: savePrivateWorkingCopyEditEvents
+      description: |
+        Atomically publish MODEL edit events and candidate model changes in the
+        same durable draft update. Idempotent replay of the immediately prior
+        identical request returns the saved generation. Event UUIDs are stable
+        across retries. The lease and generation are checked. No commit occurs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, fencingToken, expectedGeneration, changes, events]
+              properties:
+                sessionId: {type: string, format: uuid}
+                fencingToken: {type: string, format: uuid}
+                expectedGeneration: {type: string, pattern: '^[0-9]{1,20}$'}
+                changes:
+                  type: array
+                  minItems: 1
+                  maxItems: 128
+                  items: {type: object}
+                events:
+                  type: array
+                  minItems: 1
+                  maxItems: 128
+                  items: {type: string, description: Canonical MODEL edit transaction frame as base64}
+      responses:
+        '200': {description: Durable candidate and event journal; exact event UUIDs preserved}
+        '400': {description: Malformed event frame, duplicate edit or invalid model change}
+        '409': {description: Conflicting generation, event UUID or writer lease}
   /working-copies/{draftId}/save:
     parameters:
       - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}

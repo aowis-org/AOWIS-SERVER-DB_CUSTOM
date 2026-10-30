@@ -1,3 +1,4 @@
+#include "model_edit_event_fixture.h"
 #include "aowis/dvmdb/project_service.h"
 #include "aowis/dvmdb/object_id.h"
 
@@ -247,12 +248,95 @@ void testLeasedTransactionalCandidateSaves() {
     }
 }
 
+void testAtomicJournalAndIdempotentReplay() {
+    TemporaryRoot root;
+    const std::string session = UuidV7::generate().toString();
+    const UuidV7 eventId = UuidV7::generate();
+    const UuidV7 entityId = UuidV7::generate();
+    const aowis::dvmdb::Bytes event = aowis::dvmdb::test::editEvent(eventId, entityId);
+    const aowis::dvmdb::Bytes differentEvent =
+        aowis::dvmdb::test::editEvent(eventId, entityId, 1, 3);
+    Key key = entityId.bytes;
+    ModelRecord record;
+    record.kind = 5;
+    record.payload = {8, 9, 10};
+    const std::vector<ModelChange> changes{{key, record}};
+    std::string projectId;
+    std::string draftId;
+    std::string token;
+    {
+        ProjectService service(root.path);
+        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
+        projectId = service.createUnbornProjectV2("atomic edit journal").id;
+        draftId = service.createWorkingCopyV1(projectId, "main", std::nullopt, session).id;
+        token = service.acquireWorkingCopyLeaseV1(draftId, session, 120).token;
+        const WorkingCopyInfoV1 saved = service.saveWorkingCopyTransactionsV1(
+            draftId, session, token, 0, changes, {event});
+        require(saved.generation == 1 && saved.journal.size() == 1 &&
+                saved.journal[0].id == eventId.toString() &&
+                saved.journal[0].encoded == event &&
+                saved.candidateChanges[0].record->payload == record.payload &&
+                !service.optionalHeadV2(projectId, "main").has_value(),
+                "atomic event save lost journal/model or advanced HEAD");
+        const WorkingCopyInfoV1 retry = service.saveWorkingCopyTransactionsV1(
+            draftId, session, token, 0, changes, {event});
+        require(retry.generation == 1 && retry.journal.size() == 1,
+                "lost-acknowledgement retry duplicated a journal event");
+        expectError([&]() { (void)service.saveWorkingCopyTransactionsV1(
+            draftId, session, token, 0, changes, {differentEvent}); }, ProjectErrorKind::Conflict);
+        expectError([&]() { (void)service.saveWorkingCopyTransactionsV1(
+            draftId, session, token, 1, changes, {event}); }, ProjectErrorKind::Conflict);
+        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+            draftId, session, token, 1, changes); }, ProjectErrorKind::Conflict);
+        aowis::dvmdb::Bytes corrupt = aowis::dvmdb::test::editEvent(UuidV7::generate(), entityId);
+        corrupt.back() ^= 0x80;
+        expectError([&]() { (void)service.saveWorkingCopyTransactionsV1(
+            draftId, session, token, 1, changes, {corrupt}); }, ProjectErrorKind::InvalidInput);
+        require(service.workingCopyV1(draftId).generation == 1,
+                "rejected journal save mutated generation");
+    }
+    {
+        ProjectService reopened(root.path);
+        const WorkingCopyInfoV1 persisted = reopened.workingCopyV1(draftId);
+        require(persisted.generation == 1 && persisted.journal.size() == 1 &&
+                persisted.journal[0].encoded == event &&
+                persisted.candidateChanges.size() == 1,
+                "restart lost journal or materialized candidate");
+        const std::string nextToken = reopened.acquireWorkingCopyLeaseV1(draftId, session, 120).token;
+        const aowis::dvmdb::Bytes next =
+            aowis::dvmdb::test::editEvent(UuidV7::generate(), entityId, 2, 3);
+        const WorkingCopyInfoV1 appended = reopened.saveWorkingCopyTransactionsV1(
+            draftId, session, nextToken, 1, changes, {next});
+        require(appended.generation == 2 && appended.journal.size() == 2 &&
+                appended.journal[0].encoded == event && appended.journal[1].encoded == next,
+                "append did not preserve transaction order");
+    }
+    // Damage the persisted event's hex bytes, not just the record marker.
+    const std::filesystem::path path = root.path / "working-copies" / draftId;
+    std::ifstream input(path, std::ios::binary);
+    std::string body((std::istreambuf_iterator<char>(input)), {});
+    const std::size_t pos = body.find("event\t");
+    require(pos != std::string::npos, "missing stored journal for corruption test");
+    const std::size_t payload = body.find('\t', pos + 6);
+    require(payload != std::string::npos && payload + 10 < body.size(), "bad journal test fixture");
+    body[payload + 10] = body[payload + 10] == '0' ? '1' : '0';
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << body;
+    output.close();
+    ProjectService reopened(root.path);
+    bool rejected = false;
+    try { (void)reopened.workingCopyV1(draftId); }
+    catch (const std::exception&) { rejected = true; }
+    require(rejected, "corrupt on-disk event was accepted");
+}
+
 }
 
 int main() {
     try {
         testWorkingCopyCreationAndRecovery();
         testLeasedTransactionalCandidateSaves();
+        testAtomicJournalAndIdempotentReplay();
         std::cout << "VC-04 persistent working-copy bootstrap passed\n";
     } catch (const std::exception& error) {
         std::cerr << "VC-04 working-copy bootstrap failed: " << error.what() << '\n';

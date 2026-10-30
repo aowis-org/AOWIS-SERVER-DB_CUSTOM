@@ -12,6 +12,7 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -190,17 +191,12 @@ def working_copy_records(root):
                 f"invalid working-copy record: {path}")
         body = path.read_bytes()
         lines = body.splitlines(keepends=True)
-        require(lines and lines[0] in (b"AOWIS-WORKING-COPY-1\n",
-                                          b"AOWIS-WORKING-COPY-2\n") and
+        require(lines and lines[0] == b"AOWIS-WORKING-COPY-3\n" and
                 all(line.endswith(b"\n") for line in lines),
                 f"invalid working-copy record format: {path}")
-        version2 = lines[0] == b"AOWIS-WORKING-COPY-2\n"
-        if not version2:
-            require(len(body) <= 512, f"oversized v1 working-copy record: {path}")
         fields = [b"project", b"branch", b"base", b"session", b"generation",
                   b"dirty", b"validation"]
-        if version2:
-            fields += [b"lease-session", b"lease-token", b"lease-expires"]
+        fields += [b"lease-session", b"lease-token", b"lease-expires"]
         fields += [b"changes"]
         require(len(lines) >= 1 + len(fields), f"truncated working-copy record: {path}")
         values = []
@@ -215,22 +211,18 @@ def working_copy_records(root):
         generation = decimal(values[4])
         require(values[5] in (b"0", b"1") and values[6] == b"unvalidated",
                 f"invalid draft dirty/validation state: {path}")
-        if version2:
-            owner, token = values[7:9]
-            expires = decimal(values[9])
-            require((owner == b"-" and token == b"-" and expires == 0) or
-                    (uuid(owner) and uuid(token) and expires != 0),
-                    f"invalid draft lease state: {path}")
+        owner, token = values[7:9]
+        expires = decimal(values[9])
+        require((owner == b"-" and token == b"-" and expires == 0) or
+                (uuid(owner) and uuid(token) and expires != 0),
+                f"invalid draft lease state: {path}")
         count = decimal(values[-1])
-        require(count <= 20000 and len(lines) == len(fields) + 1 + count,
+        require(count <= 20000 and len(lines) >= len(fields) + 1 + count,
                 f"invalid draft change count: {path}")
         require((values[5] == b"1") == (count != 0),
                 f"invalid draft dirty/change mismatch: {path}")
-        if not version2:
-            require(generation == 0 and count == 0 and values[5] == b"0",
-                    f"invalid initial working-copy state: {path}")
         previous = None
-        for line in lines[len(fields) + 1:]:
+        for line in lines[len(fields) + 1: len(fields) + 1 + count]:
             parts = line[:-1].split(b"\t")
             require(len(parts) == 3 and parts[0] == b"change" and
                     len(parts[1]) == 32 and all(ch in hex_digits for ch in parts[1]) and
@@ -239,6 +231,35 @@ def working_copy_records(root):
             previous = parts[1]
             if parts[2] != b"-":
                 valid_model_record(parts[2])
+        tail = lines[len(fields) + 1 + count:]
+        require(len(tail) >= 2 and tail[0].startswith(b"events\t"),
+                f"missing draft journal count: {path}")
+        event_count = decimal(tail[0][7:-1])
+        require(event_count <= 4096 and len(tail) == event_count + 2,
+                f"invalid draft journal count: {path}")
+        seen_events = set()
+        for line in tail[1:-1]:
+            parts = line[:-1].split(b"\t")
+            require(len(parts) == 3 and parts[0] == b"event" and
+                    UUID7.fullmatch(parts[1].decode("ascii", "replace")) and
+                    parts[1] not in seen_events,
+                    f"invalid duplicate or named journal event: {path}")
+            seen_events.add(parts[1])
+            require(len(parts[2]) % 2 == 0 and
+                    all(ch in hex_digits for ch in parts[2]),
+                    f"invalid event hex: {path}")
+            encoded = bytes.fromhex(parts[2].decode("ascii"))
+            require(len(encoded) >= 9 + 16 + 32 and encoded[:5] == b"AOWE\x01" and
+                    int.from_bytes(encoded[5:9], "big") == len(encoded) - 9 - 32 and
+                    hashlib.sha256(encoded[9:-32]).digest() == encoded[-32:] and
+                    bytes.fromhex(parts[1].replace(b"-", b"").decode("ascii")) == encoded[9:25],
+                    f"invalid journal frame/digest/id: {path}")
+        require(tail[-1].startswith(b"last-save\t"), f"missing last-save hash: {path}")
+        last = tail[-1][10:-1]
+        require((event_count == 0 and last == b"-") or
+                (event_count > 0 and generation > 0 and len(last) == 64 and
+                 all(ch in hex_digits for ch in last)),
+                f"invalid last-save hash: {path}")
         records[path.name] = body
     return records
 

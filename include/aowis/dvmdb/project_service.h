@@ -63,6 +63,11 @@ struct RemoteTrackingRefV1 {
 // private repository state, never a committed revision or mutable branch HEAD.
 // Saves persist an overlay of typed model changes without advancing HEAD.
 // The UUIDv7 fencing token is rotated on every lease acquisition or takeover.
+struct WorkingCopyEventV1 {
+    std::string id;  // UUIDv7 of a MODEL edit transaction.
+    Bytes encoded;    // Exact ModelEditTransactionCodec binary frame.
+};
+
 struct WorkingCopyInfoV1 {
     std::string id;
     std::string projectId;
@@ -72,6 +77,8 @@ struct WorkingCopyInfoV1 {
     std::uint64_t generation = 0;
     bool dirty = false;
     std::vector<ModelChange> candidateChanges;
+    std::vector<WorkingCopyEventV1> journal;
+    std::optional<std::string> lastSaveFingerprint; // Last journalled batch for idempotency.
     std::optional<std::string> leaseSessionId;
     std::optional<std::string> leaseToken;
     std::uint64_t leaseExpiresAtMs = 0;
@@ -209,6 +216,14 @@ public:
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes);
+    // Atomically persist MODEL transaction frames and the corresponding candidate
+    // model changes. Original event UUIDs are retained across retries. A replay
+    // of the immediately preceding identical batch is idempotent.
+    WorkingCopyInfoV1 saveWorkingCopyTransactionsV1(
+        std::string_view draftId, std::string_view sessionId,
+        std::string_view fencingToken, std::uint64_t expectedGeneration,
+        const std::vector<ModelChange>& changes,
+        const std::vector<Bytes>& encodedTransactions);
     void releaseWorkingCopyLeaseV1(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken);

@@ -37,13 +37,13 @@ complete model from the pinned base are separate VC-04 work.
 ## On-disk format
 
 Each published draft has one record named `working-copies/<draft-uuidv7>`.
-The initial creation uses `AOWIS-WORKING-COPY-1`; the first lease acquisition
-upgrades the draft to `AOWIS-WORKING-COPY-2`. Both remain readable.
+All new drafts use `AOWIS-WORKING-COPY-3`, including unborn drafts with no
+lease. Earlier experimental formats are not supported.
 
-Version 2 fields, in strict order, use UTF-8/ASCII tab-separated records:
+The canonical fields, in strict order, use UTF-8/ASCII tab-separated records:
 
 ```text
-AOWIS-WORKING-COPY-2
+AOWIS-WORKING-COPY-3
 project\t<project-uuidv7>
 branch\t<branch-uuidv7>
 base\t<revision-uuidv7-or-dash>
@@ -57,6 +57,10 @@ lease-expires\t<decimal-unix-epoch-ms-or-zero>
 changes\t<count>
 change\t<16-byte-key-as-32-lowercase-hex>\t<model-envelope-hex-or-dash>
 ...
+events\t<count>
+event\t<transaction-uuidv7>\t<MODEL-binary-frame-as-hex>
+...
+last-save\t<last-batch-sha256-or-dash>
 ```
 
 The change records are strictly sorted by entity UUID key. The model envelope
@@ -71,8 +75,8 @@ directory is fsynced. On crash, readers see either the old complete record
 or the new complete record. Any unpublished `.creating-` or `.updating-`
 staging file is ignored but checked for safe type/name. If publication is
 uncertain, the service refuses further writes until restart and inspection.
-Offline backup/restore verifies both record versions and preserves their
-exact bytes, candidate data and lease generation.
+Offline backup/restore verifies the current record format and preserves its
+exact bytes, candidate data, edit journal and lease generation.
 
 ## Private HTTP draft operations
 
@@ -118,3 +122,32 @@ the destination branch with its source branch UUIDv7 and immutable history.
 The first-clone process does not alter source HEADs or create a draft.
 Unborn branch transfer cannot use a nonempty revision bundle and requires
 an explicit UUID-preserving unborn-branch operation.
+
+## Atomic MODEL edit journal (VC-04)
+
+`POST /dvmdb/v1/working-copies/{draftId}/save-events` accepts the active
+writer session and fencing token, decimal-string `expectedGeneration`, one or
+more base64-encoded canonical MODEL editing transactions in `events`, and the
+corresponding typed `changes` array. The existing candidate and new journal
+entries are written as **one fsynced working-copy update**. A successful
+response acknowledges both; it does not create a revision or move HEAD.
+
+Draft records use only `AOWIS-WORKING-COPY-3`; previous experimental V1/V2
+records are intentionally unsupported. Existing development drafts must be
+recreated; no pre-release migration or compatibility decoder is maintained.
+The current format stores the combined journal and materialized
+candidate. Each event preserves its MODEL UUIDv7 and original bytes, in user
+operation order. `GET` returns both the candidate overlay and the journal;
+`GET` list returns only metadata including `eventCount`. The last event-save
+request is fingerprinted for an idempotent retry at its original generation.
+Replaying an older batch or changing an existing event UUID is a conflict.
+An unjournalled `/save` operation is rejected once a journal exists.
+
+The native service verifies the MODEL frame size, SHA-256 and intrinsic UUIDv7;
+the Qt-enabled HTTP route additionally runs MODEL's complete transaction
+decoder. The native C++ caller must supply MODEL-validated event bytes and
+model-record changes that correspond to those events. Field-by-field semantic
+reconciliation is not yet provided by DVMDB. The working-copy record remains
+bounded to 8 MiB including the accumulated journal; segment/pack storage is
+needed before long-running heavy edit histories are supported. This is the
+first atomic acknowledgement boundary, not the complete undo/redo subsystem.

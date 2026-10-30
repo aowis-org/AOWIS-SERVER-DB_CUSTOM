@@ -5,6 +5,7 @@
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
 #include <QByteArray>
+#include <aowis/model/edit/model_edit_transaction.h>
 #include <variant>
 #include <type_traits>
 #endif
@@ -55,6 +56,7 @@ constexpr std::size_t maxHttpEntityIds = 10000;
 const char* const routeProjects = "/dvmdb/v1/projects";
 const char* const routeWorkingCopies = "/dvmdb/v1/working-copies";
 const char* const routeWorkingCopySave = "/dvmdb/v1/working-copies/:draft/save";
+const char* const routeWorkingCopyEventSave = "/dvmdb/v1/working-copies/:draft/save-events";
 const char* const routeWorkingCopyLease = "/dvmdb/v1/working-copies/:draft/lease";
 const char* const routeWorkingCopyRelease = "/dvmdb/v1/working-copies/:draft/release";
 const char* const routeBranches = "/dvmdb/v1/projects/:id/branches";
@@ -316,7 +318,19 @@ QJsonObject workingCopyJson(const WorkingCopyInfoV1& draft, bool includeChanges 
             ? QJsonValue(QString::fromStdString(*draft.leaseSessionId)) : QJsonValue(QJsonValue::Null)},
         {"leaseExpiresAtMs", QString::number(static_cast<qulonglong>(draft.leaseExpiresAtMs))}
     };
-    if (includeChanges) result.insert(QStringLiteral("changes"), changes);
+    result.insert(QStringLiteral("eventCount"),
+                  QString::number(static_cast<qulonglong>(draft.journal.size())));
+    if (includeChanges) {
+        result.insert(QStringLiteral("changes"), changes);
+        QJsonArray events;
+        for (const WorkingCopyEventV1& event : draft.journal) {
+            const QByteArray bytes(reinterpret_cast<const char*>(event.encoded.data()),
+                                   static_cast<qsizetype>(event.encoded.size()));
+            events.append(QJsonObject{{"id", QString::fromStdString(event.id)},
+                                      {"payloadBase64", QString::fromLatin1(bytes.toBase64())}});
+        }
+        result.insert(QStringLiteral("events"), events);
+    }
     return result;
 }
 
@@ -695,7 +709,7 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     if (route == routeProjects || route == routeBranches ||
         route == routeWorkingCopies || route == routeWorkingCopyLease ||
         route == routeWorkingCopyRelease) return maxJsonSmallBytes;
-    if (route == routeWorkingCopySave) return maxJsonModelBytes;
+    if (route == routeWorkingCopySave || route == routeWorkingCopyEventSave) return maxJsonModelBytes;
     if (route == routeMergesV2 ||
         route == routeHydraulicMergesV2) return maxJsonMergeBytes;
     if (route == routeNetworks || route == routeEdits || route == routeModelCommitsV2) return maxJsonModelBytes;
@@ -1168,6 +1182,53 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, workingCopyJson(service.saveWorkingCopyChangesV1(
                 pathParam(request, "draft"), requiredString(body, "sessionId"),
                 requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"), changes))};
+        });
+    });
+    // Atomic offline-event replay: event bytes and candidate records publish in
+    // the same fsynced working-copy record. No event can be acknowledged alone.
+    server.Post(routeWorkingCopyEventSave, [&service](const httplib::Request& request,
+                                                      httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonModelBytes);
+            requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes", "events"});
+            const std::vector<ModelChange> changes = parseModelChangesV2(body);
+            requireInput(body.value("events").isArray(), "missing edit events array");
+            const QJsonArray items = body.value("events").toArray();
+            requireInput(!items.isEmpty() && items.size() <= 128,
+                         "event save requires 1..128 transactions");
+            std::vector<Bytes> events;
+            for (const QJsonValue& item : items) {
+                requireInput(item.isString(), "edit event must be base64");
+                const QByteArray encoded = item.toString().toLatin1();
+                requireInput(!encoded.isEmpty() && encoded.size() < 12 * 1024 * 1024,
+                             "invalid edit event base64 size");
+                const QByteArray decoded = QByteArray::fromBase64(encoded, QByteArray::AbortOnBase64DecodingErrors);
+                requireInput(!decoded.isEmpty() && decoded.toBase64() == encoded,
+                             "invalid edit event base64 encoding");
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+                QString error;
+                requireInput(aowis::model::ModelEditTransactionCodec::decode(decoded, &error).has_value(),
+                             "invalid MODEL edit transaction");
+#endif
+                events.emplace_back(reinterpret_cast<const std::uint8_t*>(decoded.constData()),
+                                    reinterpret_cast<const std::uint8_t*>(decoded.constData()) + decoded.size());
+            }
+            const WorkingCopyInfoV1 saved = service.saveWorkingCopyTransactionsV1(
+                pathParam(request, "draft"), requiredString(body, "sessionId"),
+                requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"),
+                changes, events);
+            // Small ACK for weak connections. Full candidate/journal is fetched
+            // explicitly only for recovery or undo history inspection.
+            QJsonArray confirmedIds;
+            const std::size_t beginning = saved.journal.size() - events.size();
+            for (std::size_t i = beginning; i < saved.journal.size(); ++i)
+                confirmedIds.append(QString::fromStdString(saved.journal[i].id));
+            return Reply{200, QJsonObject{
+                {"id", QString::fromStdString(saved.id)},
+                {"generation", QString::number(static_cast<qulonglong>(saved.generation))},
+                {"eventCount", QString::number(static_cast<qulonglong>(saved.journal.size()))},
+                {"acceptedEventIds", confirmedIds}
+            }};
         });
     });
     server.Post(routeWorkingCopyRelease, [&service](const httplib::Request& request,
