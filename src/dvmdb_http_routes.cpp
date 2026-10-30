@@ -32,6 +32,8 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -1190,7 +1192,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                                       httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject body = parseBody(request, maxJsonModelBytes);
-            requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes", "events"});
+            requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes", "events", "membership"});
             const std::vector<ModelChange> changes = parseModelChangesV2(body);
             requireInput(body.value("events").isArray(), "missing edit events array");
             const QJsonArray items = body.value("events").toArray();
@@ -1213,10 +1215,143 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 events.emplace_back(reinterpret_cast<const std::uint8_t*>(decoded.constData()),
                                     reinterpret_cast<const std::uint8_t*>(decoded.constData()) + decoded.size());
             }
+            std::vector<ModelChange> materialized = changes;
+            std::optional<std::string> logicalRequestFingerprint;
+            if (body.contains("membership")) {
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+                requireInput(body.value("membership").isArray(), "membership must be an array");
+                const QJsonArray membership = body.value("membership").toArray();
+                requireInput(!membership.isEmpty() && membership.size() <= 128,
+                             "membership requires 1..128 bounded operations");
+                std::vector<hydraulic::DraftMembershipIntent> intents;
+                std::set<Key> identities;
+                for (const QJsonValue& item : membership) {
+                    requireInput(item.isObject(), "membership entry must be an object");
+                    const QJsonObject entry = item.toObject();
+                    requireKeys(entry, {"networkId", "entityId", "kind", "collectionIndex", "inserted"});
+                    requireInput(entry.value("kind").isDouble() &&
+                                 entry.value("collectionIndex").isDouble() &&
+                                 entry.value("inserted").isBool(),
+                                 "invalid membership kind, collection or operation");
+                    const double kind = entry.value("kind").toDouble();
+                    const double collection = entry.value("collectionIndex").toDouble();
+                    requireInput(kind >= 1 && kind <= 65535 &&
+                                 kind == static_cast<double>(static_cast<std::uint16_t>(kind)) &&
+                                 collection >= 0 && collection < 18 &&
+                                 collection == static_cast<double>(static_cast<std::uint16_t>(collection)),
+                                 "invalid membership kind or collection index");
+                    hydraulic::DraftMembershipIntent intent;
+                    intent.network = parseModelKeyV2(requiredString(entry, "networkId"));
+                    intent.member = parseModelKeyV2(requiredString(entry, "entityId"));
+                    intent.kind = static_cast<std::uint16_t>(kind);
+                    intent.collection = static_cast<std::uint16_t>(collection);
+                    intent.inserted = entry.value("inserted").toBool();
+                    requireInput(identities.insert(intent.member).second,
+                                 "duplicate membership entity in save");
+                    intents.push_back(intent);
+                }
+                // The fingerprint is of the *logical* request, not its derived
+                // native chunk records. Replays after a lost response must
+                // return the prior acknowledgement without re-applying intents.
+                const QByteArray requestBytes = QJsonDocument(body).toJson(QJsonDocument::Compact);
+                logicalRequestFingerprint = QCryptographicHash::hash(
+                    requestBytes, QCryptographicHash::Sha256).toHex().toStdString();
+                const std::string draftId = pathParam(request, "draft");
+                const WorkingCopyInfoV1 draft = service.workingCopyV1(draftId);
+                const std::uint64_t expected = strictUint64(body, "expectedGeneration");
+                if (draft.generation == expected && !intents.empty()) {
+                    std::map<Key, std::optional<ModelRecord>> existing;
+                    for (const ModelChange& change : draft.candidateChanges)
+                        existing.emplace(change.key, change.record);
+                    const std::function<std::optional<ModelRecord>(const Key&)> reader =
+                        [&service, &draft, &existing](const Key& key) -> std::optional<ModelRecord> {
+                        const std::map<Key, std::optional<ModelRecord>>::const_iterator it =
+                            existing.find(key);
+                        if (it != existing.end()) return it->second;
+                        if (!draft.baseRevision) return std::nullopt;
+                        return service.getModelAtRevisionV2(draft.projectId, *draft.baseRevision, key);
+                    };
+                    // Every membership transition must be the exact
+                    // before/after image in the MODEL event journal. Otherwise
+                    // future undo/redo could reverse a different model.
+                    const std::array<QString, 18> memberTypes = {
+                        QStringLiteral("HydraulicPipeMaterial"),
+                        QStringLiteral("HydraulicPatternTime"),
+                        QStringLiteral("HydraulicCurveTankVolume"),
+                        QStringLiteral("HydraulicCurvePumpHead"),
+                        QStringLiteral("HydraulicCurvePumpEfficiency"),
+                        QStringLiteral("HydraulicCurveValveHeadloss"),
+                        QStringLiteral("HydraulicCurveValveCharacteristic"),
+                        QStringLiteral("HydraulicCurveGeneric"),
+                        QStringLiteral("HydraulicNodeReservoir"),
+                        QStringLiteral("HydraulicNodeJunction"),
+                        QStringLiteral("HydraulicNodeTank"),
+                        QStringLiteral("HydraulicDemandPoint"),
+                        QStringLiteral("HydraulicLinkPipe"),
+                        QStringLiteral("HydraulicLinkPump"),
+                        QStringLiteral("HydraulicLinkValve"),
+                        QStringLiteral("HydraulicControlSimple"),
+                        QStringLiteral("HydraulicControlRule"),
+                        QStringLiteral("HydraulicMapLabel")
+                    };
+                    std::map<Key, aowis::model::ModelEntityEdit> eventMembership;
+                    std::set<Key> intentKeys;
+                    for (const hydraulic::DraftMembershipIntent& intent : intents)
+                        intentKeys.insert(intent.member);
+                    for (const Bytes& encoded : events) {
+                        const QByteArray frame(reinterpret_cast<const char*>(encoded.data()),
+                                               static_cast<qsizetype>(encoded.size()));
+                        const std::optional<aowis::model::ModelEditTransaction> event =
+                            aowis::model::ModelEditTransactionCodec::decode(frame);
+                        requireInput(event.has_value(), "invalid membership MODEL event");
+                        for (const aowis::model::ModelEntityEdit& edit : event->edits) {
+                            const Key key = hydraulic::keyFromUuid(edit.entityId);
+                            if ((!edit.before || !edit.after) && !intentKeys.contains(key))
+                                requireInput(false, "missing membership for created or removed entity");
+                            if (intentKeys.contains(key)) {
+                                requireInput(eventMembership.emplace(key, edit).second,
+                                             "duplicate membership edit in event batch");
+                            }
+                        }
+                    }
+                    for (const hydraulic::DraftMembershipIntent& intent : intents) {
+                        const std::map<Key, aowis::model::ModelEntityEdit>::const_iterator match =
+                            eventMembership.find(intent.member);
+                        requireInput(match != eventMembership.end() &&
+                                     match->second.entityType == memberTypes.at(intent.collection),
+                                     "MODEL event does not describe requested membership type");
+                        const aowis::model::ModelEntityEdit& edit = match->second;
+                        const std::optional<ModelRecord> previous = reader(intent.member);
+                        const std::vector<ModelChange>::const_iterator incoming =
+                            std::find_if(changes.begin(), changes.end(),
+                                [&intent](const ModelChange& change) {
+                                    return change.key == intent.member;
+                                });
+                        requireInput(incoming != changes.end(), "missing entity record for membership");
+                        if (intent.inserted) {
+                            requireInput(!edit.before && edit.after && incoming->record &&
+                                         incoming->record->payload == hydraulic::bytesFromQByteArray(*edit.after),
+                                         "membership insertion differs from MODEL after-image");
+                        } else {
+                            requireInput(edit.before && !edit.after && previous &&
+                                         previous->payload == hydraulic::bytesFromQByteArray(*edit.before) &&
+                                         !incoming->record,
+                                         "membership removal differs from MODEL before-image");
+                        }
+                    }
+                    hydraulic::materializeDraftMembership(reader, intents, materialized);
+                } else if (draft.generation != expected + (expected < std::numeric_limits<std::uint64_t>::max() ? 1 : 0)) {
+                    throw ProjectError(ProjectErrorKind::Conflict, "draft generation changed");
+                }
+#else
+                throw ProjectError(ProjectErrorKind::InvalidInput,
+                                   "hydraulic membership requires the model persistence build");
+#endif
+            }
             const WorkingCopyInfoV1 saved = service.saveWorkingCopyTransactionsV1(
                 pathParam(request, "draft"), requiredString(body, "sessionId"),
                 requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"),
-                changes, events);
+                materialized, events, logicalRequestFingerprint);
             // Small ACK for weak connections. Full candidate/journal is fetched
             // explicitly only for recovery or undo history inspection.
             QJsonArray confirmedIds;

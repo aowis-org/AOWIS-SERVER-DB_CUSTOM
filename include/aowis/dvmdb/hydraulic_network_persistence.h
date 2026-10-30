@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 
 // Optional Qt/hydraulic persistence adapter for a complete NetworkHydraulic aggregate. The
 // authoritative entity bytes are encoded by the native-owned canonical ModelCodec;
@@ -17,6 +18,29 @@
 namespace aowis::dvmdb::hydraulic {
 
 inline constexpr std::uint16_t hydraulicNetworkKind = 100;
+
+// VC-04 draft transaction membership operation. The GUI transmits logical
+// collection identity; only this DVMDB adapter knows chunk and manifest bytes.
+// The owning network must already exist in the pinned base or candidate.
+struct DraftMembershipIntent final {
+    Key network;
+    Key member;
+    std::uint16_t kind = 0;
+    std::uint16_t collection = 0;
+    bool inserted = false;
+};
+
+// Add native root/chunk ModelChanges for a bounded batch of validated logical
+// membership intents. `readCurrent` returns the draft BEFORE the incoming
+// batch (candidate overlay first, immutable base second); `changes` initially
+// contains the caller's ordinary entity updates. This function never writes.
+// The resulting changes are published together with the events by the
+// existing generation-checked, fsynced ProjectService draft replacement.
+void materializeDraftMembership(
+    const std::function<std::optional<ModelRecord>(const Key&)>& readCurrent,
+    const std::vector<DraftMembershipIntent>& intents,
+    std::vector<ModelChange>& changes);
+
 
 // Replaces one complete hydraulic network inside the branch in ONE atomic
 // model commit. Other networks in the branch are unaffected. All 18 top-level

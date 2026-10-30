@@ -1204,7 +1204,8 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes,
-        const std::vector<Bytes>& encodedTransactions) {
+        const std::vector<Bytes>& encodedTransactions,
+        std::optional<std::string> logicalRequestFingerprint) {
     if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
         !UuidV7::parse(fencingToken).has_value() || changes.size() > workingCopyMaxChanges ||
         encodedTransactions.empty() || encodedTransactions.size() > 128)
@@ -1217,7 +1218,14 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
             throw ProjectError(ProjectErrorKind::InvalidInput, "duplicate edit event UUID");
         events.push_back(std::move(event));
     }
-    const std::string fingerprint = saveBatchFingerprint(changes, events);
+    const std::string fingerprint = logicalRequestFingerprint.has_value()
+        ? *logicalRequestFingerprint : saveBatchFingerprint(changes, events);
+    if (logicalRequestFingerprint.has_value() &&
+        (fingerprint.size() != 64 ||
+         !std::all_of(fingerprint.begin(), fingerprint.end(), [](char ch) {
+             return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+         })))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid logical event request fingerprint");
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
     if (this->repository_role_ != RepositoryRoleV1::Private)

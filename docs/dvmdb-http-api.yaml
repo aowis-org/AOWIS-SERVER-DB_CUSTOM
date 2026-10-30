@@ -158,6 +158,21 @@ paths:
                   minItems: 1
                   maxItems: 128
                   items: {type: string, description: Canonical MODEL edit transaction frame as base64}
+                membership:
+                  type: array
+                  minItems: 1
+                  maxItems: 128
+                  description: Optional logical hydraulic membership edits. DVMDB derives native manifest and chunk updates atomically; not available without hydraulic support.
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [networkId, entityId, kind, collectionIndex, inserted]
+                    properties:
+                      networkId: {type: string, format: uuid}
+                      entityId: {type: string, format: uuid}
+                      kind: {type: integer, minimum: 1, maximum: 65535}
+                      collectionIndex: {type: integer, minimum: 0, maximum: 17}
+                      inserted: {type: boolean}
       responses:
         '200': {description: Durable candidate and event journal; exact event UUIDs preserved}
         '400': {description: Malformed event frame, duplicate edit or invalid model change}

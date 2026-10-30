@@ -1439,6 +1439,186 @@ std::optional<Revision> tryIndexedScalarEdits(
 
 } // namespace
 
+void materializeDraftMembership(
+    const std::function<std::optional<ModelRecord>(const Key&)>& readCurrent,
+    const std::vector<DraftMembershipIntent>& intents,
+    std::vector<ModelChange>& changes) {
+    if (intents.empty()) return;
+    if (intents.size() > 128)
+        throw StorageError(StorageErrorKind::InvalidInput, "too many hydraulic membership intents");
+    constexpr std::array<std::uint16_t, collectionCount> kinds = {
+        8, 9, 10, 11, 12, 13, 14, 15, 2, junctionKind, 3, 7,
+        pipeKind, 5, 6, 16, 17, 18
+    };
+    const std::function<void(std::uint16_t, const Key&, const ModelRecord&)> validatePayload =
+        [](std::uint16_t expectedKind, const Key& entityId, const ModelRecord& record) {
+        const QUuid uuid = uuidFromKey(entityId);
+        const QByteArray payload = qByteArrayFromBytes(record.payload);
+#define CHECK_CANONICAL(name, type, typeKind) \
+        if (expectedKind == typeKind) { \
+            QString error; \
+            const std::optional<type> decoded = ModelCodec<type>::decode(payload, &error); \
+            if (!decoded || decoded->uuid != uuid || \
+                ModelCodec<type>::encode(*decoded) != payload) \
+                throw StorageError(StorageErrorKind::InvalidInput, \
+                    "invalid canonical hydraulic entity payload"); \
+            return; \
+        }
+        AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(CHECK_CANONICAL)
+#undef CHECK_CANONICAL
+        throw StorageError(StorageErrorKind::InvalidInput, "unsupported hydraulic entity kind");
+    };
+    std::map<Key, std::optional<ModelRecord>> incoming;
+    for (const ModelChange& change : changes)
+        if (!incoming.emplace(change.key, change.record).second)
+            throw StorageError(StorageErrorKind::InvalidInput, "duplicate draft entity change");
+    std::map<Key, std::vector<DraftMembershipIntent>> grouped;
+    std::set<Key> seenMembers;
+    for (const DraftMembershipIntent& intent : intents) {
+        if (intent.collection >= collectionCount ||
+            kinds[intent.collection] != intent.kind ||
+            intent.network == intent.member ||
+            !seenMembers.insert(intent.member).second)
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid or duplicate hydraulic membership intent");
+        const std::map<Key, std::optional<ModelRecord>>::const_iterator proposed =
+            incoming.find(intent.member);
+        if (proposed == incoming.end() || proposed->second.has_value() != intent.inserted ||
+            (intent.inserted && proposed->second->kind != intent.kind))
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "membership intent disagrees with candidate entity change");
+        if (intent.inserted)
+            validatePayload(intent.kind, intent.member, *proposed->second);
+        const std::optional<ModelRecord> previous = readCurrent(intent.member);
+        if (intent.inserted ? previous.has_value()
+                            : !previous.has_value() || previous->kind != intent.kind)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "hydraulic membership conflicts with staged entity state");
+        grouped[intent.network].push_back(intent);
+    }
+    // Never accept user-supplied native manifest/chunk writes in the same batch.
+    for (const ModelChange& change : changes)
+        if (change.record && (change.record->kind == hydraulicNetworkKind ||
+                              change.record->kind == chunkKind))
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "internal hydraulic records are server-owned");
+
+    std::vector<ModelChange> nativeChanges;
+    for (const std::pair<const Key, std::vector<DraftMembershipIntent>>& group : grouped) {
+        const QUuid networkId = uuidFromKey(group.first);
+        if (networkId.isNull())
+            throw StorageError(StorageErrorKind::InvalidInput, "invalid hydraulic network UUID");
+        if (incoming.contains(group.first))
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "network metadata and membership cannot change together");
+        const std::optional<ModelRecord> root = readCurrent(group.first);
+        if (!root || root->kind != hydraulicNetworkKind)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "hydraulic membership requires an existing network root");
+        Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
+        if (manifest.metadata.uuid != networkId)
+            throw StorageError(StorageErrorKind::Corruption, "wrong hydraulic network root identity");
+        checkRoot(manifest, *root);
+        // Read only the affected collections. Unchanged hydraulic lists and
+        // their chunks are never decoded or rewritten for this draft Save.
+        std::set<std::size_t> touchedCollections;
+        for (const DraftMembershipIntent& intent : group.second)
+            touchedCollections.insert(intent.collection);
+        for (const std::size_t collection : touchedCollections)
+            loadMembersUsing(readCurrent, manifest, collection);
+        std::set<Key> allMembers = memberKeys(manifest);
+        std::map<Key, std::optional<ModelRecord>> changedChunks;
+        bool rootChanged = false;
+        for (const DraftMembershipIntent& intent : group.second) {
+            const std::size_t collection = intent.collection;
+            const QUuid memberId = uuidFromKey(intent.member);
+            if (memberId.isNull())
+                throw StorageError(StorageErrorKind::InvalidInput, "invalid hydraulic member UUID");
+            QList<QUuid>& chunkIds = manifest.chunks[collection];
+            if (intent.inserted) {
+                if (!allMembers.insert(intent.member).second)
+                    throw StorageError(StorageErrorKind::Conflict,
+                                       "hydraulic entity already belongs to network");
+                manifest.members[collection].append(memberId);
+                bool appended = false;
+                if (!chunkIds.isEmpty()) {
+                    const Key lastKey = keyFromUuid(chunkIds.last());
+                    const std::map<Key, std::optional<ModelRecord>>::const_iterator staged =
+                        changedChunks.find(lastKey);
+                    const std::optional<ModelRecord> last = staged == changedChunks.end()
+                        ? readCurrent(lastKey) : staged->second;
+                    if (!last)
+                        throw StorageError(StorageErrorKind::Corruption, "missing last membership chunk");
+                    MemberChunk lastChunk = decodeChunk(*last, networkId, collection);
+                    if (lastChunk.members.size() < chunkCapacity) {
+                        lastChunk.members.append(memberId);
+                        changedChunks[lastKey] = encodeChunk(lastChunk);
+                        appended = true;
+                    }
+                }
+                if (!appended) {
+                    if (manifest.nextChunk[collection] == std::numeric_limits<quint32>::max())
+                        throw StorageError(StorageErrorKind::LimitExceeded,
+                                           "hydraulic chunk serial exhausted");
+                    const QUuid chunkId = chunkUuid(networkId, collection,
+                                                    manifest.nextChunk[collection]++);
+                    const Key chunkKey = keyFromUuid(chunkId);
+                    if (readCurrent(chunkKey) || changedChunks.contains(chunkKey))
+                        throw StorageError(StorageErrorKind::Conflict,
+                                           "hydraulic membership chunk identity collision");
+                    chunkIds.append(chunkId);
+                    changedChunks[chunkKey] = encodeChunk(MemberChunk{
+                        networkId, collection, QList<QUuid>{memberId}});
+                    rootChanged = true;
+                }
+            } else {
+                if (!allMembers.erase(intent.member) ||
+                    !manifest.members[collection].removeOne(memberId))
+                    throw StorageError(StorageErrorKind::Conflict,
+                                       "hydraulic entity is absent from expected collection");
+                bool removed = false;
+                for (qsizetype index = 0; index < chunkIds.size(); ++index) {
+                    const Key chunkKey = keyFromUuid(chunkIds.at(index));
+                    const std::map<Key, std::optional<ModelRecord>>::const_iterator staged =
+                        changedChunks.find(chunkKey);
+                    const std::optional<ModelRecord> old = staged == changedChunks.end()
+                        ? readCurrent(chunkKey) : staged->second;
+                    if (!old)
+                        throw StorageError(StorageErrorKind::Corruption, "missing membership chunk");
+                    MemberChunk chunk = decodeChunk(*old, networkId, collection);
+                    if (!chunk.members.removeOne(memberId)) continue;
+                    if (chunk.members.isEmpty()) {
+                        changedChunks[chunkKey] = std::nullopt;
+                        chunkIds.removeAt(index);
+                        rootChanged = true;
+                    } else {
+                        changedChunks[chunkKey] = encodeChunk(chunk);
+                    }
+                    removed = true;
+                    break;
+                }
+                if (!removed)
+                    throw StorageError(StorageErrorKind::Corruption,
+                                       "member missing from declared hydraulic chunk");
+            }
+        }
+        for (const std::pair<const Key, std::optional<ModelRecord>>& change : changedChunks)
+            nativeChanges.push_back(ModelChange{change.first, change.second});
+        if (rootChanged) {
+            ModelRecord changedRoot = *root;
+            changedRoot.payload = bytesFromQByteArray(encodeManifest(manifest));
+            changedRoot.references = chunkKeys(manifest);
+            nativeChanges.push_back(ModelChange{group.first, std::move(changedRoot)});
+        }
+    }
+    if (changes.size() + nativeChanges.size() > 4096)
+        throw StorageError(StorageErrorKind::LimitExceeded,
+                           "hydraulic membership draft has too many native changes");
+    // The incoming vector is untouched if any intent fails validation.
+    changes.insert(changes.end(), nativeChanges.begin(), nativeChanges.end());
+}
+
+
 std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
     HydraulicEntityType type, std::size_t maxCount) {

@@ -151,3 +151,31 @@ reconciliation is not yet provided by DVMDB. The working-copy record remains
 bounded to 8 MiB including the accumulated journal; segment/pack storage is
 needed before long-running heavy edit histories are supported. This is the
 first atomic acknowledgement boundary, not the complete undo/redo subsystem.
+
+## Hydraulic membership in atomic event saves
+
+When a MODEL transaction creates or deletes a hydraulic entity, the GUI adds
+`membership` to the same `/save-events` request. Each item contains
+`networkId`, `entityId` (canonical UUIDs), `kind` (native ModelRecord kind),
+`collectionIndex` (0..17 in the established hydraulic collection order), and
+`inserted` (boolean). The request includes the matching ordinary entity
+creation/deletion in `changes` and the exact reversible MODEL before/after
+image in `events`.
+
+DVMDB checks the event image against the typed model payload or the pinned
+candidate's existing entity. It computes the native membership-chunk and root
+updates itself. Only affected collections are read, and only modified chunks
+and necessary root metadata are placed into the resulting candidate overlay.
+All generated records, original transactions and entity changes are published
+in a **single generation-checked durable draft replacement**. A failed
+materialization leaves the draft unchanged. The request fingerprint is derived
+from canonical JSON of the original logical request, not the derived chunk
+records, so the immediately preceding identical request can be acknowledged
+after a lost response without reapplying its membership changes.
+
+This endpoint intentionally requires the owning hydraulic network to exist in
+the pinned base or existing candidate. Creating a new network root, editing
+network-wide metadata, and committing candidate overlays are separate tasks.
+The HTTP request is JSON-framed for the existing API; canonical MODEL entity
+and event payloads remain binary, encoded as base64 for transport. No ZIP
+containers, compatibility reader, or new persisted format are introduced.

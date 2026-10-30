@@ -223,7 +223,11 @@ public:
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes,
-        const std::vector<Bytes>& encodedTransactions);
+        const std::vector<Bytes>& encodedTransactions,
+        // Optional exact logical request fingerprint for server-materialized
+        // membership writes. Remains stable across dropped responses even
+        // though native chunk records are derived from the previous draft.
+        std::optional<std::string> logicalRequestFingerprint = std::nullopt);
     void releaseWorkingCopyLeaseV1(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken);

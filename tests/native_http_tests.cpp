@@ -3,6 +3,10 @@
 #ifdef AOWIS_HTTP_WITH_HYDRAULIC
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
 #endif
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+#include "aowis/dvmdb/hydraulic_network_persistence.h"
+#include <aowis/model/edit/model_edit_transaction.h>
+#endif
 
 #include <httplib.h>
 
@@ -2215,6 +2219,144 @@ void exerciseWorkingCopyHttp() {
     }
 }
 
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+void exerciseHydraulicDraftMembershipHttp() {
+    namespace native = aowis::dvmdb;
+    TemporaryRoot root;
+    native::ProjectService service(root.root());
+    const native::ProjectInfo project = service.createUnbornProjectV2("draft-membership-test");
+    const native::ProjectId projectUuid = *native::ProjectId::parse(project.id);
+    const QUuid networkUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+    const QUuid oldUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+    const QUuid newUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+    const QString networkId = networkUuid.toString(QUuid::WithoutBraces);
+    const QString oldId = oldUuid.toString(QUuid::WithoutBraces);
+    const QString newId = newUuid.toString(QUuid::WithoutBraces);
+    NetworkHydraulic network;
+    network.uuid = networkUuid;
+    network.id = QStringLiteral("draft-membership");
+    HydraulicNodeJunction initial;
+    initial.uuid = oldUuid;
+    initial.id = QStringLiteral("J1");
+    initial.elevation_m = 20;
+    network.nodes_junctions.append(initial);
+    // New projects have an unborn HEAD: establish a real empty model revision
+    // before exercising the committed-network fixture.
+    check(!service.optionalHeadV2(project.id, "main").has_value(),
+          "new hydraulic fixture project should have an unborn HEAD");
+    const native::RevisionId head = service.commitModelV2(project.id, "main", {});
+    check(service.optionalHeadV2(project.id, "main") == head,
+          "first hydraulic fixture commit did not establish the HEAD");
+    native::RevisionId base = head;
+    service.withRepository(project.id, [&](native::Repository& repository) {
+        base = native::hydraulic::saveHydraulicNetworkV2(repository, projectUuid,
+                                                         "main", network, head);
+    });
+    service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+    TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
+                                                     10000ULL, 1024ULL * 1024ULL});
+    Client client(server.port());
+    const QString session = QString::fromStdString(native::UuidV7::generate().toString());
+    const QString listPath = QStringLiteral("/dvmdb/v1/working-copies");
+    const Response created = client.call("POST", listPath,
+        QJsonObject{{"projectId", QString::fromStdString(project.id)},
+                    {"branch", "main"}, {"baseRevision", QString::fromStdString(base.toString())},
+                    {"sessionId", session}});
+    check(created.status == 201, "hydraulic draft checkout failed");
+    const QString path = listPath + "/" + created.json.value("id").toString();
+    const Response leased = client.call("POST", path + "/lease",
+                                        QJsonObject{{"sessionId", session}, {"seconds", 60}});
+    check(leased.status == 200, "hydraulic draft lease failed");
+    const QString token = leased.json.value("token").toString();
+    HydraulicNodeJunction added;
+    added.uuid = newUuid;
+    added.id = QStringLiteral("J2");
+    added.elevation_m = 55;
+    const QByteArray encoded = native::ModelCodec<HydraulicNodeJunction>::encode(added);
+    const QJsonObject addition{{"uuid", newId}, {"kind", 1}, {"references", QJsonArray{}},
+                               {"payloadBase64", QString::fromLatin1(encoded.toBase64())}};
+    const QJsonObject insertion{{"networkId", networkId}, {"entityId", newId},
+                                {"kind", 1}, {"collectionIndex", 9}, {"inserted", true}};
+    const std::function<QString(const QUuid&, const QString&,
+                                std::optional<QByteArray>, std::optional<QByteArray>)> eventFrame =
+        [](const QUuid& member, const QString& action,
+           std::optional<QByteArray> before, std::optional<QByteArray> after) {
+        aowis::model::ModelEditTransaction transaction;
+        transaction.transactionId = QUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+        transaction.operation = action;
+        transaction.edits.append(aowis::model::ModelEntityEdit{
+            member, QStringLiteral("HydraulicNodeJunction"), std::move(before), std::move(after)});
+        QString encodeError;
+        const QByteArray frame = aowis::model::ModelEditTransactionCodec::encode(
+            transaction, &encodeError);
+        if (frame.isEmpty())
+            throw std::runtime_error("could not encode hydraulic member edit event: " +
+                                     encodeError.toStdString());
+        return QString::fromLatin1(frame.toBase64());
+    };
+    const QString firstEvent = eventFrame(newUuid, QStringLiteral("hydraulic.junction.create"),
+                                          std::nullopt, encoded);
+    const QJsonObject first{{"sessionId", session}, {"fencingToken", token},
+                            {"expectedGeneration", "0"}, {"changes", QJsonArray{addition}},
+                            {"events", QJsonArray{firstEvent}},
+                            {"membership", QJsonArray{insertion}}};
+    QJsonObject invalid = first;
+    invalid.insert("membership", QJsonArray{QJsonObject{
+        {"networkId", networkId}, {"entityId", newId}, {"kind", 4},
+        {"collectionIndex", 9}, {"inserted", true}}});
+    check(client.call("POST", path + "/save-events", invalid).status == 400,
+          "mismatched membership kind was accepted");
+    invalid = first;
+    invalid.insert("membership", QJsonArray{QJsonObject{
+        {"networkId", networkId}, {"entityId", newId}, {"kind", 1},
+        {"collectionIndex", 9}, {"inserted", false}}});
+    check(client.call("POST", path + "/save-events", invalid).status == 400,
+          "membership deletion without model tombstone accepted");
+    invalid = first;
+    invalid.insert("events", QJsonArray{eventFrame(
+        newUuid, QStringLiteral("hydraulic.junction.create"), std::nullopt,
+        QByteArrayLiteral("not a canonical junction"))});
+    check(client.call("POST", path + "/save-events", invalid).status == 400 &&
+          client.call("GET", path).json.value("generation") == QStringLiteral("0"),
+          "mismatched MODEL after-image was published");
+    const Response saved = client.call("POST", path + "/save-events", first);
+    check(saved.status == 200 && saved.json.value("generation") == QStringLiteral("1") &&
+          saved.json.value("eventCount") == QStringLiteral("1"),
+          "hydraulic entity and membership did not save atomically");
+    const Response replay = client.call("POST", path + "/save-events", first);
+    check(replay.status == 200 && replay.json.value("generation") == QStringLiteral("1"),
+          "hydraulic membership lost-response replay duplicated event");
+    const QJsonObject details = client.call("GET", path).json;
+    bool nativeChunk = false;
+    for (const QJsonValue& value : details.value("changes").toArray())
+        nativeChunk |= value.toObject().value("kind").toInt() == 101;
+    check(nativeChunk && details.value("events").toArray().size() == 1 &&
+          !details.value("changes").toArray().isEmpty(),
+          "hydraulic membership chunk not included in durable candidate overlay");
+    const QJsonObject deletion{{"uuid", oldId}, {"delete", true}};
+    const QJsonObject removal{{"networkId", networkId}, {"entityId", oldId},
+                              {"kind", 1}, {"collectionIndex", 9}, {"inserted", false}};
+    const QString secondEvent = eventFrame(oldUuid, QStringLiteral("hydraulic.junction.delete"),
+                                           native::ModelCodec<HydraulicNodeJunction>::encode(initial),
+                                           std::nullopt);
+    const QJsonObject second{{"sessionId", session}, {"fencingToken", token},
+                             {"expectedGeneration", "1"}, {"changes", QJsonArray{deletion}},
+                             {"events", QJsonArray{secondEvent}},
+                             {"membership", QJsonArray{removal}}};
+    check(client.call("POST", path + "/save-events", second).status == 200 &&
+          client.call("POST", path + "/save-events", second).status == 200 &&
+          client.call("GET", path).json.value("generation") == QStringLiteral("2") &&
+          service.optionalHeadV2(project.id, "main") == base,
+          "hydraulic deletion or replay modified committed HEAD");
+    server.stop();
+    const native::WorkingCopyInfoV1 persisted = service.workingCopyV1(
+        created.json.value("id").toString().toStdString());
+    check(persisted.generation == 2 && persisted.journal.size() == 2 &&
+          persisted.candidateChanges.size() >= 3,
+          "hydraulic member changes not durable as one candidate and journal");
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2230,6 +2372,9 @@ int main(int argc, char** argv) {
         exerciseRevisionBundleV2Http();
         exerciseUnbornProjectHttp();
         exerciseWorkingCopyHttp();
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+        exerciseHydraulicDraftMembershipHttp();
+#endif
         exerciseUuidv7HistoryHttp();
         exerciseExecutable(QString::fromLocal8Bit(argv[1]));
         std::cout << "HTTP project service tests passed\n";
