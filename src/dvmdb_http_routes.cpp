@@ -1199,6 +1199,11 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             requireInput(!items.isEmpty() && items.size() <= 128,
                          "event save requires 1..128 transactions");
             std::vector<Bytes> events;
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+            // Decoded once here; the membership checks below reuse them.
+            std::vector<aowis::model::ModelEditTransaction> transactions;
+            transactions.reserve(static_cast<std::size_t>(items.size()));
+#endif
             for (const QJsonValue& item : items) {
                 requireInput(item.isString(), "edit event must be base64");
                 const QByteArray encoded = item.toString().toLatin1();
@@ -1209,12 +1214,28 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                              "invalid edit event base64 encoding");
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
                 QString error;
-                requireInput(aowis::model::ModelEditTransactionCodec::decode(decoded, &error).has_value(),
-                             "invalid MODEL edit transaction");
+                std::optional<aowis::model::ModelEditTransaction> transaction =
+                    aowis::model::ModelEditTransactionCodec::decode(decoded, &error);
+                requireInput(transaction.has_value(), "invalid MODEL edit transaction");
+                transactions.push_back(std::move(*transaction));
 #endif
                 events.emplace_back(reinterpret_cast<const std::uint8_t*>(decoded.constData()),
                                     reinterpret_cast<const std::uint8_t*>(decoded.constData()) + decoded.size());
             }
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+            // Creating or removing an entity changes its network's membership.
+            // Without explicit membership intents the candidate would hold an
+            // entity record that no membership chunk lists (or a chunk that
+            // still lists a removed entity). Reject before reading the draft,
+            // independent of generation: a lost-response replay of an accepted
+            // request always carried its membership, so it is not affected.
+            if (!body.contains("membership")) {
+                for (const aowis::model::ModelEditTransaction& transaction : transactions)
+                    for (const aowis::model::ModelEntityEdit& edit : transaction.edits)
+                        requireInput(edit.before.has_value() && edit.after.has_value(),
+                                     "missing membership for created or removed entity");
+            }
+#endif
             std::vector<ModelChange> materialized = changes;
             std::optional<std::string> logicalRequestFingerprint;
             if (body.contains("membership")) {
@@ -1298,13 +1319,8 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                     std::set<Key> intentKeys;
                     for (const hydraulic::DraftMembershipIntent& intent : intents)
                         intentKeys.insert(intent.member);
-                    for (const Bytes& encoded : events) {
-                        const QByteArray frame(reinterpret_cast<const char*>(encoded.data()),
-                                               static_cast<qsizetype>(encoded.size()));
-                        const std::optional<aowis::model::ModelEditTransaction> event =
-                            aowis::model::ModelEditTransactionCodec::decode(frame);
-                        requireInput(event.has_value(), "invalid membership MODEL event");
-                        for (const aowis::model::ModelEntityEdit& edit : event->edits) {
+                    for (const aowis::model::ModelEditTransaction& transaction : transactions) {
+                        for (const aowis::model::ModelEntityEdit& edit : transaction.edits) {
                             const Key key = hydraulic::keyFromUuid(edit.entityId);
                             if ((!edit.before || !edit.after) && !intentKeys.contains(key))
                                 requireInput(false, "missing membership for created or removed entity");

@@ -2319,6 +2319,17 @@ void exerciseHydraulicDraftMembershipHttp() {
     check(client.call("POST", path + "/save-events", invalid).status == 400 &&
           client.call("GET", path).json.value("generation") == QStringLiteral("0"),
           "mismatched MODEL after-image was published");
+    // An entity creation without membership must never reach the candidate:
+    // the entity would exist as a record that no membership chunk lists.
+    invalid = first;
+    invalid.remove("membership");
+    const Response unlisted = client.call("POST", path + "/save-events", invalid);
+    check(unlisted.status == 400 &&
+          unlisted.json.value("error").toObject().value("message").toString()
+              .contains("missing membership") &&
+          client.call("GET", path).json.value("generation") == QStringLiteral("0") &&
+          client.call("GET", path).json.value("changes").toArray().isEmpty(),
+          "entity creation without membership was accepted");
     const Response saved = client.call("POST", path + "/save-events", first);
     check(saved.status == 200 && saved.json.value("generation") == QStringLiteral("1") &&
           saved.json.value("eventCount") == QStringLiteral("1"),
@@ -2343,6 +2354,11 @@ void exerciseHydraulicDraftMembershipHttp() {
                              {"expectedGeneration", "1"}, {"changes", QJsonArray{deletion}},
                              {"events", QJsonArray{secondEvent}},
                              {"membership", QJsonArray{removal}}};
+    QJsonObject unlistedRemoval = second;
+    unlistedRemoval.remove("membership");
+    check(client.call("POST", path + "/save-events", unlistedRemoval).status == 400 &&
+          client.call("GET", path).json.value("generation") == QStringLiteral("1"),
+          "entity removal without membership was accepted");
     check(client.call("POST", path + "/save-events", second).status == 200 &&
           client.call("POST", path + "/save-events", second).status == 200 &&
           client.call("GET", path).json.value("generation") == QStringLiteral("2") &&

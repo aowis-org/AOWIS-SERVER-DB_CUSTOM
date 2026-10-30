@@ -175,6 +175,15 @@ from canonical JSON of the original logical request, not the derived chunk
 records, so the immediately preceding identical request can be acknowledged
 after a lost response without reapplying its membership changes.
 
+A request whose events create or remove any entity **without** a
+`membership` array is rejected with 400 (`missing membership for created or
+removed entity`) before the draft is read; only attribute updates may omit
+it. Otherwise the candidate could hold an entity record that no membership
+chunk lists, or a chunk that still lists a removed entity. This check needs
+the MODEL decoder and therefore exists in the hydraulic-enabled HTTP build;
+native C++ callers of `saveWorkingCopyTransactionsV1` must uphold it
+themselves until a native membership-aware draft API exists.
+
 This endpoint intentionally requires the owning hydraulic network to exist in
 the pinned base or existing candidate. Creating a new network root, editing
 network-wide metadata, and committing candidate overlays are separate tasks.
