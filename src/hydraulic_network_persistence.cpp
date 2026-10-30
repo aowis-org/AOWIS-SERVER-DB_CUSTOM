@@ -1439,6 +1439,20 @@ std::optional<Revision> tryIndexedScalarEdits(
 
 } // namespace
 
+ModelChange emptyDraftHydraulicNetworkRoot(const QUuid& networkId, const QString& name) {
+    if (networkId.isNull() || name.trimmed().isEmpty() || name.size() > 255)
+        throw StorageError(StorageErrorKind::InvalidInput, "invalid new hydraulic network identity or name");
+    NetworkHydraulic network;
+    network.uuid = networkId;
+    network.id = name;
+    Manifest manifest = manifestFor(network);
+    ModelRecord root;
+    root.kind = hydraulicNetworkKind;
+    root.payload = bytesFromQByteArray(encodeManifest(manifest));
+    root.references = chunkKeys(manifest);
+    return ModelChange{keyFromUuid(networkId), std::move(root)};
+}
+
 void materializeDraftMembership(
     const std::function<std::optional<ModelRecord>(const Key&)>& readCurrent,
     const std::vector<DraftMembershipIntent>& intents,

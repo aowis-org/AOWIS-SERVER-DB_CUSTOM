@@ -2349,6 +2349,113 @@ void exerciseWorkingCopyHttp() {
 }
 
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+void exerciseUnbornNetworkInitializationHttp() {
+    namespace native = aowis::dvmdb;
+    TemporaryRoot root;
+    std::string draftId;
+    std::string projectId;
+    const QUuid networkUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+    const QString networkId = networkUuid.toString(QUuid::WithoutBraces);
+    const QUuid junctionUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+    const QString junctionId = junctionUuid.toString(QUuid::WithoutBraces);
+    {
+        native::ProjectService service(root.root());
+        const native::ProjectInfo project = service.createUnbornProjectV2("first hydraulic network");
+        projectId = project.id;
+        service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+        TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
+                                                       10000ULL, 1024ULL * 1024ULL});
+        Client client(server.port());
+        const QString session = QString::fromStdString(native::UuidV7::generate().toString());
+        const QString branchId = QString::fromStdString(service.branchId(project.id, "main")->toString());
+        const QString listPath = QStringLiteral("/dvmdb/v1/working-copies");
+        const Response created = client.call("POST", listPath,
+            QJsonObject{{"projectId", QString::fromStdString(project.id)},
+                        {"branchId", branchId}, {"baseRevision", QJsonValue::Null},
+                        {"sessionId", session}});
+        check(created.status == 201 && created.json.value("baseRevision").isNull(),
+              "unborn hydraulic draft could not be created");
+        draftId = created.json.value("id").toString().toStdString();
+        const QString path = listPath + "/" + QString::fromStdString(draftId);
+        const Response lease = client.call("POST", path + "/lease",
+            QJsonObject{{"sessionId", session}, {"seconds", 60}});
+        check(lease.status == 200, "unborn hydraulic draft lease failed");
+        const QString token = lease.json.value("token").toString();
+        const QJsonObject request{{"sessionId", session}, {"fencingToken", token},
+                                  {"expectedGeneration", QStringLiteral("0")},
+                                  {"networkId", networkId}, {"name", "new-network"}};
+        QJsonObject invalid = request;
+        invalid.insert("networkId", QUuid::createUuid().toString(QUuid::WithoutBraces));
+        check(client.call("POST", path + "/initialize-network", invalid).status == 400,
+              "first network accepted non-v7 UUID");
+        invalid = request;
+        invalid.insert("name", QStringLiteral(""));
+        check(client.call("POST", path + "/initialize-network", invalid).status == 400,
+              "first network accepted empty name");
+        const QJsonObject forged{{"sessionId", session}, {"fencingToken", token},
+            {"expectedGeneration", QStringLiteral("0")},
+            {"changes", QJsonArray{QJsonObject{{"uuid", networkId}, {"kind", 100},
+                {"references", QJsonArray{}}, {"payloadBase64", "AQID"}}}}};
+        check(client.call("POST", path + "/save", forged).status == 400,
+              "generic draft Save accepted forged hydraulic manifest bytes");
+        check(client.call("GET", path).json.value("generation") == QStringLiteral("0"),
+              "failed first-network initialization changed draft generation");
+        const Response initialized = client.call("POST", path + "/initialize-network", request);
+        check(initialized.status == 200 && initialized.json.value("generation") == QStringLiteral("1") &&
+              initialized.json.value("dirty").toBool() &&
+              initialized.json.value("changes").toArray().size() == 1 &&
+              initialized.json.value("changes").toArray().first().toObject()
+                  .value("kind").toInt() == 100 &&
+              initialized.json.value("events").toArray().isEmpty() &&
+              !service.optionalHeadV2(project.id, "main").has_value(),
+              "first network changed committed HEAD or did not save root in unborn draft");
+        const Response replay = client.call("POST", path + "/initialize-network", request);
+        check(replay.status == 200 && replay.json.value("generation") == QStringLiteral("1"),
+              "first network retry duplicated initialization");
+        invalid = request;
+        invalid.insert("name", "different-network");
+        check(client.call("POST", path + "/initialize-network", invalid).status == 409,
+              "first network conflicting replay was accepted");
+        HydraulicNodeJunction junction;
+        junction.uuid = junctionUuid;
+        junction.id = QStringLiteral("J1");
+        junction.elevation_m = 12;
+        const QByteArray bytes = native::ModelCodec<HydraulicNodeJunction>::encode(junction);
+        aowis::model::ModelEditTransaction event;
+        event.transactionId = QUuid(QString::fromStdString(native::UuidV7::generate().toString()));
+        event.operation = QStringLiteral("hydraulic.junction.create");
+        event.edits.append(aowis::model::ModelEntityEdit{
+            junctionUuid, QStringLiteral("HydraulicNodeJunction"), std::nullopt, bytes});
+        QString encodingError;
+        const QByteArray frame = aowis::model::ModelEditTransactionCodec::encode(event, &encodingError);
+        check(!frame.isEmpty(), "failed to encode first unborn junction event");
+        const QJsonObject save{{"sessionId", session}, {"fencingToken", token},
+            {"expectedGeneration", QStringLiteral("1")},
+            {"changes", QJsonArray{QJsonObject{{"uuid", junctionId}, {"kind", 1},
+                {"references", QJsonArray{}},
+                {"payloadBase64", QString::fromLatin1(bytes.toBase64())}}}},
+            {"membership", QJsonArray{QJsonObject{{"networkId", networkId},
+                {"entityId", junctionId}, {"kind", 1}, {"collectionIndex", 9},
+                {"inserted", true}}}},
+            {"events", QJsonArray{QString::fromLatin1(frame.toBase64())}}};
+        const Response saved = client.call("POST", path + "/save-events", save);
+        check(saved.status == 200 && saved.json.value("generation") == QStringLiteral("2") &&
+              !service.optionalHeadV2(project.id, "main").has_value(),
+              "first hydraulic member could not be saved into unborn draft");
+        const Response after = client.call("POST", path + "/initialize-network", request);
+        check(after.status == 409, "initialization replay was accepted after later edit");
+        server.stop();
+    }
+    {
+        native::ProjectService reopened(root.root());
+        const native::WorkingCopyInfoV1 draft = reopened.workingCopyV1(draftId);
+        check(!draft.baseRevision && draft.generation == 2 && draft.journal.size() == 1 &&
+              draft.candidateChanges.size() >= 3 &&
+              !reopened.optionalHeadV2(projectId, "main").has_value(),
+              "first hydraulic network and member did not survive service restart");
+    }
+}
+
 void exerciseHydraulicDraftMembershipHttp() {
     namespace native = aowis::dvmdb;
     TemporaryRoot root;
@@ -2520,6 +2627,7 @@ int main(int argc, char** argv) {
         exerciseUnbornCheckoutHttp();
         exerciseWorkingCopyHttp();
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+        exerciseUnbornNetworkInitializationHttp();
         exerciseHydraulicDraftMembershipHttp();
 #endif
         exerciseUuidv7HistoryHttp();

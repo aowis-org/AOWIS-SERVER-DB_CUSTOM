@@ -58,6 +58,7 @@ constexpr std::size_t maxHttpEntityIds = 10000;
 const char* const routeProjects = "/dvmdb/v1/projects";
 const char* const routeWorkingCopies = "/dvmdb/v1/working-copies";
 const char* const routeWorkingCopySave = "/dvmdb/v1/working-copies/:draft/save";
+const char* const routeWorkingCopyInitializeNetwork = "/dvmdb/v1/working-copies/:draft/initialize-network";
 const char* const routeWorkingCopyEventSave = "/dvmdb/v1/working-copies/:draft/save-events";
 const char* const routeWorkingCopyLease = "/dvmdb/v1/working-copies/:draft/lease";
 const char* const routeWorkingCopyRelease = "/dvmdb/v1/working-copies/:draft/release";
@@ -726,6 +727,7 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     const std::string& route = request.matched_route;
     if (route == routeProjects || route == routeBranches ||
         route == routeWorkingCopies || route == routeWorkingCopyLease ||
+        route == routeWorkingCopyInitializeNetwork ||
         route == routeWorkingCopyRelease) return maxJsonSmallBytes;
     if (route == routeWorkingCopySave || route == routeWorkingCopyEventSave) return maxJsonModelBytes;
     if (route == routeMergesV2 ||
@@ -1202,6 +1204,13 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const QJsonObject body = parseBody(request, maxJsonModelBytes);
             requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes"});
             const std::vector<ModelChange> changes = parseModelChangesV2(body);
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+            for (const ModelChange& change : changes)
+                requireInput(!change.record ||
+                             (change.record->kind != hydraulic::hydraulicNetworkKind &&
+                              change.record->kind != 101),
+                             "native hydraulic manifest/chunk writes are server-owned");
+#endif
             return Reply{200, workingCopyJson(service.saveWorkingCopyChangesV1(
                 pathParam(request, "draft"), requiredString(body, "sessionId"),
                 requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"), changes))};
@@ -1209,12 +1218,74 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     });
     // Atomic offline-event replay: event bytes and candidate records publish in
     // the same fsynced working-copy record. No event can be acknowledged alone.
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+    // Bootstrap the first hydraulic network in a private unborn working copy.
+    // The server owns manifest encoding. There is no implicit revision, no
+    // synthetic initial commit and no direct arbitrary kind-100 client write.
+    server.Post(routeWorkingCopyInitializeNetwork, [&service](const httplib::Request& request,
+                                                               httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonSmallBytes);
+            requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration",
+                               "networkId", "name"});
+            const std::string session = requiredString(body, "sessionId");
+            const std::string token = requiredString(body, "fencingToken");
+            const std::uint64_t expected = strictUint64(body, "expectedGeneration");
+            const std::string networkId = requiredString(body, "networkId");
+            requireInput(UuidV7::parse(networkId).has_value(),
+                         "new network identity must be UUIDv7");
+            const QString name = body.value("name").toString();
+            requireInput(body.value("name").isString() && !name.trimmed().isEmpty() &&
+                         name.size() <= 255, "invalid new hydraulic network name");
+            const ModelChange initial = hydraulic::emptyDraftHydraulicNetworkRoot(
+                QUuid(QString::fromStdString(networkId)), name);
+            const std::string draftId = pathParam(request, "draft");
+            const WorkingCopyInfoV1 draft = service.workingCopyV1(draftId);
+            requireInput(!draft.baseRevision.has_value(),
+                         "first-network initialization requires an unborn working copy");
+            // A successful response may be lost. Only the same still-leased
+            // writer with the exact same root at exactly generation+1 can
+            // recover it; an expired lease is never a valid acknowledgement.
+            const std::uint64_t nowMs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            if (expected < std::numeric_limits<std::uint64_t>::max() &&
+                draft.leaseExpiresAtMs > nowMs &&
+                draft.generation == expected + 1 &&
+                draft.leaseSessionId == std::optional<std::string>(session) &&
+                draft.leaseToken == std::optional<std::string>(token) &&
+                draft.journal.empty() && draft.candidateChanges.size() == 1 &&
+                draft.candidateChanges.front().key == initial.key &&
+                draft.candidateChanges.front().record.has_value() &&
+                initial.record.has_value() &&
+                draft.candidateChanges.front().record->kind == initial.record->kind &&
+                draft.candidateChanges.front().record->references == initial.record->references &&
+                draft.candidateChanges.front().record->payload == initial.record->payload) {
+                return Reply{200, workingCopyJson(draft)};
+            }
+            if (draft.generation != expected || !draft.candidateChanges.empty() ||
+                !draft.journal.empty())
+                throw ProjectError(ProjectErrorKind::Conflict,
+                                   "first network requires an untouched working copy");
+            const WorkingCopyInfoV1 saved = service.saveWorkingCopyChangesV1(
+                draftId, session, token, expected, {initial});
+            return Reply{200, workingCopyJson(saved)};
+        });
+    });
+#endif
     server.Post(routeWorkingCopyEventSave, [&service](const httplib::Request& request,
                                                       httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject body = parseBody(request, maxJsonModelBytes);
             requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes", "events", "membership"});
             const std::vector<ModelChange> changes = parseModelChangesV2(body);
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+            for (const ModelChange& change : changes)
+                requireInput(!change.record ||
+                             (change.record->kind != hydraulic::hydraulicNetworkKind &&
+                              change.record->kind != 101),
+                             "native hydraulic manifest/chunk writes are server-owned");
+#endif
             requireInput(body.value("events").isArray(), "missing edit events array");
             const QJsonArray items = body.value("events").toArray();
             requireInput(!items.isEmpty() && items.size() <= 128,

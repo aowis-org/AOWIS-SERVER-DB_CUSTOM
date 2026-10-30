@@ -133,6 +133,36 @@ paths:
       responses:
         '200': {description: Fresh token UUIDv7, expiresAtMs and generation as decimal strings}
         '409': {description: Draft has another active writer}
+  /working-copies/{draftId}/initialize-network:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: initializeUnbornDraftHydraulicNetwork
+      description: |
+        Create the first empty hydraulic network as server-owned manifest data
+        in an untouched private unborn draft. Requires the live fenced writer
+        and exact generation. The response contains the saved candidate overlay;
+        the branch HEAD remains null. Immediate same-writer retry of exactly the
+        same root returns the saved generation without another write. Conflicting
+        retry or any additional candidate/event write is a conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, fencingToken, expectedGeneration, networkId, name]
+              properties:
+                sessionId: {type: string, format: uuid}
+                fencingToken: {type: string, format: uuid}
+                expectedGeneration: {type: string, pattern: '^[0-9]{1,20}$'}
+                networkId: {type: string, format: uuid, description: UUIDv7}
+                name: {type: string, minLength: 1, maxLength: 255}
+      responses:
+        '200': {description: Unborn draft with durable empty network root and incremented generation}
+        '400': {description: Invalid identity, name or malformed request}
+        '409': {description: Stale writer, non-unborn draft or existing candidate data}
   /working-copies/{draftId}/save-events:
     parameters:
       - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
@@ -307,6 +337,29 @@ paths:
       responses:
         '200': {description: Existing matching or newly provisioned empty project}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/unborn-checkout:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    post:
+      operationId: provisionIdentityPreservingUnbornBranch
+      description: |
+        Provision an unborn root branch in an empty private clone target with
+        the source branch's exact UUIDv7 and a null HEAD. Does not create a
+        revision or fetch a bundle. Conflicting target/provenance is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [branchId, name]
+              properties:
+                branchId: {type: string, format: uuid, description: Original branch UUIDv7}
+                name: {type: string, minLength: 1, maxLength: 200}
+      responses:
+        '200': {description: Original branch UUID, name and null HEAD}
         '409': {$ref: '#/components/responses/Conflict'}
   /projects/{projectId}/branches/{branch}/bundle:
     parameters:

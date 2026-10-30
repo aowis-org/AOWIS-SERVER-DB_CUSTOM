@@ -30,6 +30,11 @@ struct DraftMembershipIntent final {
     bool inserted = false;
 };
 
+// Construct the server-owned empty membership manifest for a newly created
+// hydraulic network. This is an ordinary draft ModelChange, not a revision.
+// No external caller should manufacture kind-100 manifest bytes itself.
+ModelChange emptyDraftHydraulicNetworkRoot(const QUuid& networkId, const QString& name);
+
 // Add native root/chunk ModelChanges for a bounded batch of validated logical
 // membership intents. `readCurrent` returns the draft BEFORE the incoming
 // batch (candidate overlay first, immutable base second); `changes` initially
