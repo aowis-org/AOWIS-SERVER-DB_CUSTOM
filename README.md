@@ -19,10 +19,11 @@ The authoritative design is
 - A new project starts with **unborn `main`** and **no committed revision**.
 - A branch is a named development line with a **movable committed HEAD**;
   its origin branch and exact immutable fork revision are retained.
-- Editors use **independent private working copies**. A successful commit
-  creates a new immutable revision and moves the chosen branch HEAD only
-  if the submitted expected HEAD still matches.
-- A stale concurrent commit is rejected and the editor's draft is preserved
+- Editors use **independent private working copies**. The intended local
+  Commit creates a new immutable revision and conditionally moves only the
+  personal branch HEAD; the complete draft-to-Commit workflow is still an
+  outstanding integration milestone.
+- The required stale-commit behavior rejects the write and preserves the draft
   for explicit comparison/reconciliation. Creating a branch from a committed
   revision never manufactures another revision.
 - The GUI shows branch-oriented committed revision histories, not a tree
@@ -34,7 +35,8 @@ particular API or GUI control must be verified against its implemented code.
 See [GUI integration requirements](docs/gui-integration-requirements.md),
 [REST contract](docs/rest-api-design.md),
 [revision format](docs/uuidv7-identity-format-v2.md) and
-[engineering plan](docs/roadmap.md).
+[current implementation plan](docs/roadmap.md) and
+[documentation index](docs/README.md).
 
 ## System overview
 
@@ -146,14 +148,13 @@ Existing clients must change their URLs and C++ API references accordingly.
 identifiers, pack/index markers, project manifests and replication bundle
 framing remain in their original AOWIS formats. Renaming these would change
 canonical content hashes and corrupt access to existing AOWIS histories;
-they are not `DB_CUSTOM` branding. The DVMDB rename is an API and deployment
-migration, not an on-disk rewrite.
+they are not `DB_CUSTOM` branding. DVMDB uses one current AOWIS native format; no compatibility layer for
+experimental pre-release formats is required.
 
-**Existing deployments:** Stop writers, take a verified offline backup and
-point the renamed service at the verified existing data root (or restore it
-into a new root). The installed executable, configuration, systemd unit,
-public header paths, CMake aliases and HTTP base URL have changed. See
-[operations](docs/operations.md) and the [DVMDB migration notes](docs/dvmdb-rename-migration.md).
+**Repository relocation:** Stop writers and take a verified offline backup
+before changing the data root or restoring into a new location. See the
+[operations runbook](docs/operations.md). Unsupported pre-release layouts
+are rejected, not migrated automatically.
 
 When `AOWIS_DVMDB_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. The project catalogue and HTTP route integration suites are included when their dependencies are enabled.
 
@@ -201,7 +202,7 @@ The `aowis-dvmdb-upgrade-restore-tests` drill additionally checks a complete
 cold relocation containing frozen historical packs, divergent branches and
 post-upgrade writes, including a second backup/restore cycle.
 
-The binary repository format is not yet frozen for the first public release. An old pre-release pack/bundle fixture is retained only to test explicit rejection of unsupported branch formats; see [format compatibility](docs/format-compatibility.md). Back up important repositories separately; online backup, physical-controller power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
+The binary repository format is not yet frozen for the first public release. Unsupported experimental pack and bundle formats are rejected; see [format policy](docs/format-compatibility.md). Back up important repositories separately; online backup, physical-controller power-loss validation and production hardening remain outstanding work. Automated subprocess recovery tests cover simulated write failures, process termination and offline backup/restore for pack repositories; they do not simulate storage-device power failure.
 
 ## Offline repository synchronization
 
@@ -264,7 +265,7 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 
 | Document | Subject |
 |---|---|
-| [DVMDB migration](docs/dvmdb-rename-migration.md) | Public API and deployment rename; storage-format boundary |
+| [Documentation index](docs/README.md) | Start here: product contracts, API, current delivery plan and operational evidence |
 | [Architecture](docs/architecture.md) | Logical storage, physical formats, durability and limits |
 | [REST API design](docs/rest-api-design.md) | Agreed service boundaries, proposed resources and wire contracts |
 | [Roadmap](docs/roadmap.md) | Remaining implementation work |
@@ -282,7 +283,7 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [Portable sync](docs/offline-repository-synchronization.md) | Full and incremental bundles |
 | [Benchmarks](docs/benchmark-plan.md) | Reproducible workloads and measurement methodology |
 | [Engineering findings](docs/engineering-findings.md) | Measured storage and replication behavior, design tradeoffs and limitations |
-| [Format compatibility](docs/format-compatibility.md) | Frozen pre-release pack/bundle fixtures and upgrade policy |
+| [Format and integrity policy](docs/format-compatibility.md) | Single current format, validation and clean rejection of unsupported experimental data |
 | [Durability qualification](docs/durability-qualification.md) | SIGKILL, ENOSPC, optional QEMU VM power-cut and HTTP soak |
 
 `AOWIS-SERVER-MODEL` is the external model-definition submodule; its

@@ -50,7 +50,7 @@ are durable. A browser may additionally maintain temporary UI state, but
 browser memory/storage is not an authoritative DVMDB working repository.
 Offline edits on an HTTP-only client are not promised by this architecture.
 
-## Persistent repository identity (VC-03)
+## Persistent repository identity and role
 
 The DVMDB catalogue root persists a UUIDv7 in `repository.id` using the
 `AOWIS-REPOSITORY-1` marker. Existing catalogue roots acquire an identity
@@ -135,11 +135,10 @@ A personal repository must provide durable autosave and restart recovery
 for its own drafts, transactional local branch updates, and consistent
 snapshots across multi-entity hydraulic edits. Backup of private draft
 state is separate from committed-revision replication bundles. Retention,
-quota, lease TTL/renewal and draft-recovery policies require explicit
-user-facing controls and a documented operational policy at VC-04/VC-05.
-Existing repository history is preserved through versioned transactional
-metadata migrations, with verification and backup/rollback; new projects
-alone adopt unborn `main`. No historical R0 is silently deleted.
+quota, lease TTL/renewal and draft-recovery controls must be specified before
+an unrestricted editor workflow is enabled. New projects start with unborn
+`main`. Experimental pre-release formats need no migration and are rejected
+explicitly rather than silently rewritten.
 
 ## Acceptance scenarios
 

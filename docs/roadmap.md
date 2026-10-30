@@ -62,7 +62,7 @@ DVMDB/GUI specification update.
 | **DG-01: repository-qualified branch references** | VC-03, VC-06 | Each repository has its own UUIDv7. A *logical* project and branch keep the **same UUIDv7** when cloned/fetched into another repository; a genuinely new branch gets a fresh UUIDv7. Each repository maintains an **independent mutable HEAD** under `(repositoryId, projectId, branchId)`. Store explicit tracking of remote repository/project/branch identity and observed HEAD/null; never infer correspondence from a name or accidentally share a mutable ref across repositories. Reject identity collisions and wrong-repository/project targets. |
 | **DG-02: durable drafts and session concurrency** | VC-04 | One private DVMDB per intended user; independent draft UUIDv7 per editing session by default. Multiple sessions can read one draft but only **one active writer** may modify it. Use an expiring exclusive writer lease with **fencing token AND optimistic generation/version check**, verified atomically on every save. On expiration, permit explicit recovery/takeover, never deletion or stale overwrites. A successful Save is durable before acknowledgement. |
 | **DG-03: idempotent operations and recovery** | VC-05, VC-07 | Every Commit and Publish carries a caller-generated UUIDv7 operation ID, a request-payload digest and target-repository/operation scope. Record pending/succeeded/rejected durably with the immutable outcome; identical retries return the same outcome, a reused ID with a different payload is rejected. On timeout query authoritative status under the **same ID**, never issue a fresh write blindly. Status retention and crash recovery must keep results queryable for the documented supported recovery window; do not expire unresolved operations. |
-| **DG-04: existing-repository transition** | VC-01, VC-11 | Preserve all existing commits, UUIDv7s, hashes, parents, refs and provenance *as recorded*. Do not erase a previously created R0 to imitate an unborn branch or fabricate missing provenance. Introduce unborn project creation and drafts **prospectively**; use explicit, versioned, verified transactional metadata migration with backup/rollback and fail closed if unsafe. Test fixtures may be freshly initialized only by an explicit test action. |
+| **DG-04: pre-release format policy** | All stages | There is **no backward-compatibility or migration requirement** before AOWIS's first release. New formats may replace obsolete experimental formats cleanly; reject unsupported records explicitly instead of supporting transitional readers or retaining legacy layers. Do not silently corrupt data, rewrite a committed history or disguise a failing test fixture. Fresh test data may be initialized explicitly. |
 | **DG-05: initial reconciliation support** | VC-08 | Support explicit Fetch, safe fast-forward and **three-way merge** using a committed common ancestor and two ordered parents, with model-entity UUID comparisons, manual conflict resolution and whole hydraulic-model validation. Detect delete/edit, simultaneous edits and domain-invalid combinations. An unresolved merge stays a private draft. No automatic rebase/replay, force Push, octopus merges, silent last-writer-wins or implicit Publish in the initial release. |
 | **DG-06: initial remote publication** | VC-06, VC-07 | Clone keeps logical branch UUIDs. A locally created branch receives a new UUIDv7 and is explicitly provisioned on the selected remote **with that same UUIDv7**, using its verified project/source/fork identity and a durable idempotency key. First publication of an unborn branch uses `expectedRemoteHead: null`; branch absence is distinct from a branch whose HEAD is null. Reject UUID collisions, wrong target or stale HEAD atomically; do not synthesize remote branches after a failed Publish. |
 
@@ -74,6 +74,39 @@ Authentication and permissions are excluded from all VC milestones; do not
 introduce them as prerequisites for implementing or accepting VC-00–VC-11.
 Treat controlled deployment of unauthenticated HTTP repositories as separate
 operational guidance, not as a version-control deliverable.
+
+## Current implementation state and immediate delivery priority
+
+This section records the **source-level checkpoint**, not a claim that the full
+user workflow already works. Documentation and unit tests never substitute for
+an end-to-end checkout/edit/reopen/commit test against a real personal DVMDB.
+
+| Area | Available in the checked source | Not yet accepted end to end |
+|---|---|---|
+| Project and branch history (VC-01/02) | Unborn project creation, nullable committed HEAD, immutable branch fork provenance, native/REST readers, corresponding GUI graph/inspector tests | Real multiclient history/graph acceptance across all deployment modes |
+| Personal repository identity and checkout (VC-03/04) | Persistent repository UUID/roles, tracking metadata, private working-copy CRUD and fenced generation-checked saves; committed REST branch clone-to-private workflow | Complete unborn checkout, model hydration from pinned base plus candidate, all modes |
+| Hydraulic editing (VC-04) | MODEL-owned canonical codec and reversible transactions; GUI entity capture, durable local event queue, typed record/membership intent adapter; native atomic journal and DVMDB-owned membership materialization | GUI membership transport wiring, genuine editor session binding, durable restart/reload verification, global mutation coverage |
+| Local Commit (VC-05) | Immutable revision and model persistence primitives | Working-copy-to-revision CAS, recoverable operation ID/status, usable Projects-tab Commit |
+| Collaboration (VC-06–08) | History transfer, import, revision DAG and domain merge primitives | Unified user-facing Fetch/Publish/reconciliation acceptance using independent private repositories |
+| Presentation and qualification (VC-09–11) | Graph and inspector regression coverage; extensive DVMDB durability/sync tests | Integrated GUI/Standalone/browser scenarios and complete release evidence |
+
+**Next actionable work (in order):** (1) expose and verify the `membership`
+field in the GUI event-save client, including dropped-response recovery;
+(2) hydrate the selected pinned base plus persisted candidate and establish a
+real `HydraulicData` editor session; (3) capture/queue/flush supported edits,
+including creation/deletion, over interrupted network and restart; (4) add
+local working-copy Commit with expected local HEAD and idempotent status;
+(5) integrate the Commit action and prove first unborn commit end to end.
+Broader Fetch/Publish/Merge polish follows this usable local workflow. Do not
+mark VC-04 complete until a real editor can reopen an automatically saved
+model byte-for-byte after process restart.
+
+**Verification note:** Previously reported targeted GUI tests passed for
+`aowis-personal-working-copy-client`, `aowis-personal-edit-queue` and
+`aowis-hydraulic-edit-transaction`. DVMDB hydraulic membership HTTP code and
+fixture are present in the supplied snapshot, but this document does **not**
+claim its revised integration test passed unless that run is separately
+recorded. There is no claimed end-to-end local Commit acceptance yet.
 
 ## C. Required implementation sequence
 
@@ -95,21 +128,19 @@ changed files only, a fresh timestamp and reproducible tests per checkpoint.
   explicit DVMDB API baseline for coordinated integration.
 - Create a failing acceptance matrix for unborn `main`, first commit,
   shared HEADs, two-user concurrency, reload, restore and cross-repo sync.
-- Classify existing repositories by verified metadata-migration readiness,
-  read-only fallback or explicit test-only fresh initialization (DG-04).
-  Existing committed R0 and branch UUIDs are never silently rewritten.
+- Define the current pre-release format and reject obsolete experimental
+  storage explicitly; no compatibility decoder or migration work is required.
 
 **Done when:** current implementation gaps are listed against exact APIs and
-fixtures; both teams agree on the baseline, approved DG-04 migration policy,
-and test commands.
+fixtures; both teams agree on the current pre-release format policy and
+reproducible test commands.
 
-VC-00 baseline findings and reproducible read-only probe: see
-[`vc00-baseline.md`](vc00-baseline.md). The VC-01 acceptance criteria remain
-unsatisfied; no existing repository is rewritten by this audit.
+The [implementation status above](#current-implementation-state-and-immediate-delivery-priority)
+supersedes the initial audit; do not restart the initial inventory.
 
 ### VC-01 — Unborn projects, nullable committed HEADs and graph API
 
-**Dependency:** VC-00 and DG-04. **Lead:** DVMDB.
+**Dependency:** established domain contract. **Lead:** DVMDB.
 
 - Make `CreateProject` atomically create project UUIDv7 and `main` branch
   UUIDv7 with **explicit null committed HEAD**, zero revisions, no R0 object.
@@ -302,12 +333,13 @@ shared tips, divergent commits and two-parent merge without fake edges.
 **Done when:** real GUI integration tests exercise two independent private
 repos and one shared repo, including failed Push and later successful merge.
 
-### VC-11 — Storage migration, replication, qualification and release gates
+### VC-11 — Storage integrity, replication, qualification and release gates
 
-**Dependency:** VC-01 through VC-10; DG-04. **Lead:** DVMDB + GUI.
+**Dependency:** VC-01 through VC-10. **Lead:** DVMDB + GUI.
 
-- Freeze canonical format versions; test explicit conversion or fail-closed
-  unsupported pre-release data, backup/restore, reopen and compaction.
+- Freeze the first-release canonical format; reject unsupported pre-release
+  data clearly. Test backup/restore, reopen, compaction and power-loss recovery.
+  Do not add compatibility or migration infrastructure for experimental data.
 - Test full/incremental export/import of branch UUIDs, immutable fork UUID,
   null HEADs, record hashes, ordered ancestry and merge history. Draft backups
   are a separate workflow and never masquerade as committed bundles.
@@ -321,7 +353,7 @@ repos and one shared repo, including failed Push and later successful merge.
   results and failures instead of claiming unrun tests passed.
 
 **Done when:** documented acceptance matrix from `version-control-semantics.md`
-passes, no unsafe data migration is implicit, and test evidence is recorded.
+passes, unsupported data is rejected safely, and test evidence is recorded.
 
 **Scope boundary:** This roadmap ends at **VC-11**. Authentication,
 authorization, permissions, audit and public-service security qualification
@@ -390,7 +422,7 @@ should state its prerequisite milestone(s) and test status.
     original operation UUID reports one durable result, replays do not create
     duplicates, and mismatched payloads are rejected.
 15. Existing committed R0 remains valid after upgrade; new project creation
-    produces an unborn `main`. Unsupported migrations fail closed with
+    produces an unborn `main`. Unsupported pre-release formats fail closed with
     recoverable original records and an explicit backup.
 16. Two branches change the same hydraulic model from a common ancestor:
     manual three-way conflict resolution and whole-model validation are
@@ -422,7 +454,6 @@ thread, follow this handoff template:
    progress`, `Blocked` or `Verified` **and the evidence**. Never mark a
    milestone complete based on ZIP packaging or syntax checks alone.
 
-**Next recommended thread:** VC-00 baseline/format audit using the approved
-DG-04 migration policy, then
-VC-01 unborn projects with nullable committed HEAD across storage, service,
-REST, replication and GUI read-only display.
+**Next task:** Complete the current VC-04 private draft editing path as
+specified in the status section above. Then implement VC-05 local Commit,
+without restarting VC-00 or adding unrelated features.

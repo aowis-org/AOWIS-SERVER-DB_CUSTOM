@@ -76,3 +76,22 @@ Tests cover canonical encoding/decoding, branch-local immutable reads,
 private checkout ownership, concurrent edits against one base, stale-HEAD
 rejection, complete-domain merge validation, canonical SHA-256, UUIDv7
 identity preservation, and crash-safe HEAD publication.
+
+## Draft event membership materialization
+
+For an existing hydraulic network, the private working-copy
+`POST /dvmdb/v1/working-copies/{draftId}/save-events` route accepts
+canonical MODEL `events`, typed entity `changes`, and an optional bounded
+`membership` array describing inserts/removals (`networkId`, `entityId`,
+`kind`, `collectionIndex`, `inserted`). DVMDB, not the GUI, owns the native
+manifest and chunk format. It validates canonical member payloads and
+corresponding event before/after images, then includes affected native chunk
+changes in the same fenced, generation-checked durable draft replacement.
+
+This is **draft persistence**, not a commit or branch-head change. Membership
+materialization requires an existing network root in the pinned base or saved
+candidate. Network root creation and network-wide metadata edits require
+separate handling. The HTTP route and service implementation exist, but the
+full GUI hydration/queue/autosave/reopen integration is still incomplete; see
+[working-copy storage](working-copy-storage-v1.md) and the
+[current roadmap](roadmap.md).

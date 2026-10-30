@@ -329,9 +329,9 @@ is in [private working repositories](private-working-repositories.md):
   draft uses exclusive writer lease, fencing and version-checked durable Save.
 - UUIDv7 idempotency keys, payload digest and recoverable authoritative
   pending/success/rejection outcomes for local Commit and remote Publish.
-- Preserve existing committed history and UUIDv7 records. Apply unborn branch
-  and private draft lifecycle rules to **new** operations; migrate metadata
-  explicitly, transactionally and with verified backup/rollback.
+- The first release uses one coherent format. Obsolete experimental layouts
+  are not supported and need no migration. Invalid data is rejected, not
+  reinterpreted; immutable commits within a valid repository stay immutable.
 - Initially, Fetch, fast-forward and explicit hydraulic-validated three-way
   merge. No automatic rebase/force-push/silent merge.
 - New local branches retain their UUIDv7 at first explicit remote publication;

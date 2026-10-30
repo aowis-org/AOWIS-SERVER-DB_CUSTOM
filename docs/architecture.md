@@ -99,4 +99,5 @@ Portable `.aowbundle` files contain a complete reachable branch graph or a delta
 - `aowis::dvmdb::hydraulic` — complete networks, indexed editing, typed validation and hydraulic-aware merging.
 - Implemented `aowis-server-dvmdb` HTTP route handlers — thin REST adapters calling `AOWIS::DvmdbProjectService` and the native database, **not an independent persistence system**. The service also exposes hydraulic edits/merges and bounded full/incremental synchronization.
 
-The binary formats are not yet frozen for a public release. Stability and long-term format compatibility must be defined before that release. See the [format compatibility policy](format-compatibility.md) and [roadmap](roadmap.md).
+The binary formats are not yet frozen for a public release. Before the first release, freeze one canonical format; earlier experimental
+formats are not a compatibility target. See the [format compatibility policy](format-compatibility.md) and [roadmap](roadmap.md).

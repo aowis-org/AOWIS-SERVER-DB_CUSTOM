@@ -1,4 +1,4 @@
-# Provisional native access-policy subsystem
+# Deferred native access-policy notes
 
 **Current code, not the planned REST security design.** The repository includes `AccessPolicyStore` and the `aowis-dvmdb-access` utility. This is an optional standalone policy implementation, not a deployed HTTP security layer. The implemented REST server **does not enforce this policy**. Identity, authentication, authorization and HTTPS will be designed later as an AOWIS-wide system.
 

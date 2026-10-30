@@ -32,7 +32,7 @@ dirty flag durably, and acknowledges only after publishing the complete new
 record and syncing its directory. Reading the draft yields the full overlay.
 An empty batch still increments the generation but leaves the overlay intact.
 The validation state remains `unvalidated`: domain validation and loading a
-complete model from the pinned base are separate VC-04 work.
+complete model from the pinned base still require integration with the editor.
 
 ## On-disk format
 
@@ -106,8 +106,9 @@ changes a committed HEAD or creates a revision.
 The native and HTTP Save paths are durable and fenced, but do not yet implement
 historical checkout, materialization/verification of the entire base model,
 semantic validation of the assembled candidate, candidate discard, or the
-GUI editor workflow. These are remaining VC-04 tasks before enabling GUI
-editing. A local Commit is a separate VC-05 operation.
+GUI editor workflow. These are integration prerequisites before enabling
+unrestricted GUI editing. A local Commit is a separate operation that has not
+been accepted end to end.
 
 ## Provisioning a first-clone project for committed revisions
 
@@ -123,7 +124,7 @@ The first-clone process does not alter source HEADs or create a draft.
 Unborn branch transfer cannot use a nonempty revision bundle and requires
 an explicit UUID-preserving unborn-branch operation.
 
-## Atomic MODEL edit journal (VC-04)
+## Atomic MODEL edit journal
 
 `POST /dvmdb/v1/working-copies/{draftId}/save-events` accepts the active
 writer session and fencing token, decimal-string `expectedGeneration`, one or
@@ -146,8 +147,9 @@ An unjournalled `/save` operation is rejected once a journal exists.
 The native service verifies the MODEL frame size, SHA-256 and intrinsic UUIDv7;
 the Qt-enabled HTTP route additionally runs MODEL's complete transaction
 decoder. The native C++ caller must supply MODEL-validated event bytes and
-model-record changes that correspond to those events. Field-by-field semantic
-reconciliation is not yet provided by DVMDB. The working-copy record remains
+model-record changes that correspond to those events. The membership-aware HTTP path validates canonical member record payloads
+and event before/after bytes for insertion and deletion; this is **not** a
+complete field-by-field reconciliation of all ordinary update events. The working-copy record remains
 bounded to 8 MiB including the accumulated journal; segment/pack storage is
 needed before long-running heavy edit histories are supported. This is the
 first atomic acknowledgement boundary, not the complete undo/redo subsystem.

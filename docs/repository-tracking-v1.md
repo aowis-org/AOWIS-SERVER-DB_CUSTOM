@@ -1,4 +1,4 @@
-# VC-03 — Repository role and remote-tracking metadata (version 1)
+# Repository role and remote-tracking metadata
 
 This document defines a **metadata-only** prerequisite for independent personal
 and shared DVMDB repositories. It does not implement Fetch, Clone, Checkout,

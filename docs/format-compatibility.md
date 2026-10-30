@@ -1,47 +1,39 @@
-# Repository format and compatibility contract
+# Native format and integrity policy
 
-The native on-disk and portable transfer formats must preserve the AOWIS
-[version-control lifecycle](version-control-semantics.md). UUIDv7 identifies
-logical projects, branches, immutable revisions and private working copies;
-SHA-256 verifies canonical committed records and Merkle snapshots.
+The first AOWIS release has **one canonical native repository format**, not an
+accumulation of old experimental layouts. AOWIS is pre-release; existing test
+and development data do not create a backward-compatibility obligation.
+An unknown/obsolete format is rejected explicitly, never silently guessed,
+relabelled, or treated as an empty repository. There is no legacy decoder,
+implicit migration or format-conversion acceptance gate.
 
-## Storage invariants
+## Invariants
 
-- A project includes a UUIDv7 identity and a `main` branch UUIDv7 even
-  before its first commit. An unborn branch has **null committed HEAD** and
-  zero committed revisions; no empty-root revision is manufactured.
-- Branch records are addressed by UUIDv7, not human-readable names, and
-  bind nullable committed HEAD and immutable origin-branch/fork-revision UUIDs.
-- Committed revisions have fresh UUIDv7 IDs, canonical versioned records,
-  ordered parent IDs and SHA-256 integrity hashes. Immutable model records
-  and Merkle subtrees remain content-addressed and deduplicable.
-- Working copies are mutable, session-owned data and are never silently
-  serialized as immutable committed revisions.
-- Update publication is atomic and uses exact expected-HEAD checks;
-  cross-process readers must not see partially published branch records.
+- Projects, branches, revisions and draft working copies have UUIDv7 identities;
+  names never serve as storage keys. Repository identity is distinct from
+  logical project identity.
+- A newly created project has an unborn `main` (null committed HEAD), no
+  synthetic initial commit and no fabricated ancestry.
+- Immutable commits contain ordered parent IDs and integrity hashes; canonical
+  model records/Merkle roots bind their complete state. A branch ref can move
+  only under its specified concurrency rules.
+- Branch fork provenance (source branch UUID and exact committed fork UUID)
+  is metadata, **not** an additional graph ancestry edge.
+- A private draft carries an exact base, candidate overlay and MODEL edit
+  journal; saving it never creates a commit or changes a branch HEAD.
+- Import/export preserves identities, parent order, hashes and validated
+  closure. Wrong-repository, incomplete and corrupt transfers fail closed.
 
-## Export and import
+## Release qualification
 
-Native, CLI and HTTP bundle transfer must preserve logical UUIDv7 IDs,
-nullable unborn HEADs, branch names and origin UUIDs, fork point UUIDs,
-ordered revision parent IDs and complete canonical hash bindings. All
-transport implementations must reject missing, duplicate, noncanonical,
-corrupt or cross-project identity references.
+Verify fresh repository creation, unborn-first-commit, fork/rename, shared and
+non-leaf HEADs, merge ancestry, draft save/reopen, lost-response recovery,
+complete model restore, backup/restore, compaction, and crash/ENOSPC recovery.
+Compare native and REST behavior on the *same* canonical schema. See
+[version-control semantics](version-control-semantics.md),
+[repository verification](repository-verification.md), and
+[roadmap](roadmap.md).
 
-Incremental transfers name their exact immutable base UUID and integrity
-hash. Import refuses divergent HEADs or asks for an explicit validated
-merge; it never silently resets history or assigns new IDs to make a bundle
-appear compatible. See [replication](uuidv7-revision-replication-v2.md).
-
-## Versioning and recovery
-
-On-disk record and bundle schemas carry explicit format versions. Any format
-upgrade must have one documented atomic/recoverable transition, or fail
-closed when it encounters an unsupported schema. Integrity verification,
-backup, restore and compaction are required to preserve UUIDv7 identity,
-Merkle closure and committed parent ancestry.
-
-Validation includes an empty project, initial commit, shared committed
-history, divergent/two-parent merge, branch rename, fork provenance,
-concurrent HEAD updates and complete restore. A storage-format release is
-not complete until these invariants pass on native and REST paths.
+Internal format identifiers can still advance before first release. Each
+change should update code, tests and this contract together—**not** add
+compatibility shims for unreleased variants.

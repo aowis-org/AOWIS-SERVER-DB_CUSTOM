@@ -13,6 +13,7 @@ do not introduce format compatibility or independent code paths.
 
 The current encoding is deterministic binary, with strict enumerator/value
 checks. Pre-release formats may change without backward readers; this source
-migration deliberately retains the current bytes as a bounded refactor.
+refactoring must preserve the canonical invariants of the current format,
+not maintain a reader for superseded pre-release formats.
 
 The REST API uses the same canonical MODEL payload wrapped in JSON metadata.
