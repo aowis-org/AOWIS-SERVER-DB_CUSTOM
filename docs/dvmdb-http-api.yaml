@@ -80,7 +80,12 @@ paths:
         '200': {description: Array of workingCopies; each has UUIDv7 IDs, nullable baseRevision, string generation and candidate changes}
     post:
       operationId: createPrivateWorkingCopy
-      description: Create an uncommitted draft at the exact current HEAD of a local private repository. An unborn branch requires baseRevision:null. Never creates a revision.
+      description: |
+        Create an uncommitted draft at the exact current HEAD of a local private
+        repository. The branch is addressed by UUIDv7. An unborn branch requires
+        baseRevision:null. Never creates a revision. With a caller-chosen `id`
+        the request is idempotent: repeating it (e.g. after a lost response or
+        a transport resend) returns the same draft in its current state.
       requestBody:
         required: true
         content:
@@ -88,15 +93,17 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [projectId, branch, baseRevision, sessionId]
+              required: [projectId, branchId, baseRevision, sessionId]
               properties:
+                id: {type: string, format: uuid, description: Caller-chosen draft UUIDv7 (retry-safe creation)}
                 projectId: {type: string, format: uuid}
-                branch: {type: string, description: Existing local branch name}
+                branchId: {type: string, format: uuid, description: Existing local branch UUIDv7}
                 baseRevision: {type: [string, 'null'], format: uuid}
                 sessionId: {type: string, format: uuid}
       responses:
-        '201': {description: Persistent draft with UUIDv7 ID, pinned base and generation "0"}
-        '409': {description: Repository is not private or branch HEAD changed}
+        '201': {description: Persistent draft with UUIDv7 ID, pinned base and generation "0" (or the existing draft for a repeated id)}
+        '404': {description: Branch UUIDv7 not found}
+        '409': {description: Repository is not private, branch HEAD changed, or id names a different draft}
   /working-copies/{draftId}:
     parameters:
       - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
@@ -229,8 +236,8 @@ paths:
                 sessionId: {type: string, format: uuid}
                 fencingToken: {type: string, format: uuid}
       responses:
-        '200': {description: '{"released":true}'}
-        '409': {description: Lease token was superseded or released}
+        '200': {description: '{"released":true}; also when no lease is held any more (idempotent release)'}
+        '409': {description: Lease is held by another session or token}
   /projects:
     get:
       operationId: listProjects
@@ -252,6 +259,9 @@ paths:
         By default creates a project with a committed initial main revision
         for backward compatibility. Set unborn:true to create main with a
         durable UUIDv7 branch identity, explicit null HEAD and zero revisions.
+        A caller-chosen `id` (requires unborn:true) makes creation idempotent:
+        repeating the request returns the same project with 201; the same id
+        with another name is 409.
       requestBody:
         required: true
         content:
@@ -261,15 +271,17 @@ paths:
               additionalProperties: false
               required: [name]
               properties:
+                id: {type: string, format: uuid, description: Caller-chosen project UUIDv7 (retry-safe creation)}
                 name: {type: string, minLength: 1, maxLength: 200}
                 unborn: {type: boolean, default: false}
       responses:
         '201':
-          description: Project and initial main branch published (optionally unborn)
+          description: Project and initial main branch published (optionally unborn), or the existing project for a repeated id
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /projects/clone-target:
     post:
       operationId: provisionCloneTargetV2
@@ -381,7 +393,12 @@ paths:
                     items: {type: string}
     post:
       operationId: createUuidv7Branch
-      description: Create a UUIDv7 branch reference. No revision is created when forking from a branch or historical revision. A source-less branch is only permitted on an empty project.
+      description: |
+        Create a UUIDv7 branch reference from the branch identified by
+        fromBranchId (at its HEAD, or at a historical revision reachable from
+        it). No revision is created. With a caller-chosen `id` the request is
+        idempotent: repeating it returns the original creation result with
+        201; the id naming any other branch is 409.
       requestBody:
         required: true
         content:
@@ -389,11 +406,12 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [name]
+              required: [name, fromBranchId]
               properties:
+                id: {type: string, format: uuid, description: Caller-chosen UUIDv7 of the new branch (retry-safe creation)}
                 name: {type: string}
-                fromBranch: {type: string}
-                revision: {type: string, format: uuid, description: Historical revision UUIDv7; requires fromBranch}
+                fromBranchId: {type: string, format: uuid, description: Source branch UUIDv7}
+                revision: {type: string, format: uuid, description: Historical revision UUIDv7 reachable from the source}
       responses:
         '201':
           description: Atomic branch creation result; fork provenance is immutable metadata, not an ancestry edge
@@ -437,6 +455,29 @@ paths:
       responses:
         '200': {description: Renamed branch and unchanged HEAD}
         '409': {$ref: '#/components/responses/Conflict'}
+  /projects/{projectId}/branch-ids/{branchId}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+      - {name: branchId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: getUuidv7BranchById
+      description: The branch with this UUIDv7, whatever its current name. Same fields as a revision-graph HEAD.
+      responses:
+        '200':
+          description: Branch name, HEAD (null when unborn), record hash and creation provenance
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [branch, branchId, revision, recordHash, originBranchId, forkRevisionId]
+                properties:
+                  branch: {type: string}
+                  branchId: {type: string, format: uuid}
+                  revision: {type: [string, 'null'], format: uuid}
+                  recordHash: {type: [string, 'null']}
+                  originBranchId: {type: [string, 'null'], format: uuid}
+                  forkRevisionId: {type: [string, 'null'], format: uuid}
+        '404': {$ref: '#/components/responses/NotFound'}
   /projects/{projectId}/branches/{branch}/head:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}

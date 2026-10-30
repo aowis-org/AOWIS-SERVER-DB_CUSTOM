@@ -167,3 +167,22 @@ explicitly rather than silently rewritten.
 **Security limit:** Selecting a private HTTP repository in configuration
 is not access control. Until the dedicated [security plan](security-permissions-design.md)
 is implemented, deployment must isolate these repositories from other users.
+
+## Checkout of an unborn branch
+
+An unborn root branch has a real UUIDv7 branch identity but no revision, and
+therefore cannot be exported as a revision bundle. To checkout via HTTP, the
+client verifies the source repository ID and queries the branch by UUIDv7,
+requiring an explicit null HEAD and absent fork provenance. It provisions the
+logical project UUID in the private repository using `POST /dvmdb/v1/projects/clone-target`,
+then calls `POST /dvmdb/v1/projects/{projectId}/unborn-checkout` with JSON
+`{"branchId":"<UUIDv7>","name":"main"}`. This route requires the private
+repository role, a provisioned project and no conflicting branches; repeated
+identical requests return the same branch. It publishes neither a model record
+nor an initial revision. The caller verifies the resulting branch by UUID, then
+creates a draft with `baseRevision: null` through `POST /dvmdb/v1/working-copies`.
+
+This checkout copies only the root unborn branch. A branch with fork provenance
+is not silently flattened into an independent root. Full hydraulic network
+initialization, editor hydration, automatic Save and local Commit remain separate
+VC-04/VC-05 integration work.

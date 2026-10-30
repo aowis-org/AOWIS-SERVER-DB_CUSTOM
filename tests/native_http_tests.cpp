@@ -1757,6 +1757,24 @@ void exerciseUnbornProjectHttp() {
     const std::string project = created.json.value("id").toString().toStdString();
     check(created.status == 201 && native::ProjectId::parse(project).has_value(),
         "HTTP unborn project creation failed");
+    // Caller-chosen project id: a resent request returns the same project.
+    const QString chosenId = QString::fromStdString(native::ProjectId::generate().toString());
+    const QJsonObject chosen{{"name", "Retried project"}, {"unborn", true}, {"id", chosenId}};
+    const Response chosenFirst = client.call("POST", projects, chosen);
+    const Response chosenAgain = client.call("POST", projects, chosen);
+    check(chosenFirst.status == 201 && chosenFirst.json.value("id").toString() == chosenId &&
+          chosenAgain.status == 201 && chosenAgain.json == chosenFirst.json &&
+          client.call("POST", projects, QJsonObject{{"name", "Other name"}, {"unborn", true},
+                                                    {"id", chosenId}}).status == 409 &&
+          client.call("POST", projects, QJsonObject{{"name", "Committed"},
+                                                    {"id", QString::fromStdString(
+                                                        native::ProjectId::generate().toString())}}).status == 400 &&
+          client.call("GET", projects + "/" + chosenId + "/branches/main/head").json.value("id").isNull(),
+          "caller-chosen project creation is not idempotent or not unborn");
+    std::size_t retried = 0;
+    for (const native::ProjectInfo& info : service.listProjects())
+        retried += info.name == "Retried project" ? 1 : 0;
+    check(retried == 1, "repeated project creation published a second project");
     const QString prefix = projects + "/" + QString::fromStdString(project);
     const QString headPath = prefix + "/branches/main/head";
     const QString historyPath = prefix + "/branches/main/history";
@@ -1799,6 +1817,60 @@ void exerciseUnbornProjectHttp() {
           "HTTP graph did not expose first committed revision");
 }
 
+void exerciseUnbornCheckoutHttp() {
+    namespace native = aowis::dvmdb;
+    TemporaryRoot sourceRoot;
+    TemporaryRoot targetRoot;
+    native::ProjectService source(sourceRoot.root());
+    const native::ProjectInfo project = source.createUnbornProjectV2("Unborn network");
+    const std::optional<native::BranchId> sourceBranch = source.branchId(project.id, "main");
+    check(sourceBranch.has_value() && !source.optionalHeadV2(project.id, "main"),
+          "unborn source has no stable branch ID or has a revision");
+    native::ProjectService target(targetRoot.root());
+    target.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+    TestServer targetServer(target, native::BundleLimits{4ULL * 1024ULL * 1024ULL, 10000, 1024ULL * 1024ULL});
+    Client client(targetServer.port());
+    const QString prefix = QStringLiteral("/dvmdb/v1/projects/") + QString::fromStdString(project.id);
+    const QString path = prefix + QStringLiteral("/unborn-checkout");
+    const QString identity = QString::fromStdString(sourceBranch->toString());
+    const QJsonObject checkout{{"branchId", identity}, {"name", "main"}};
+    check(client.call("POST", path, checkout).status == 404,
+          "unborn checkout silently created a missing project");
+    check(client.call("POST", "/dvmdb/v1/projects/clone-target",
+          QJsonObject{{"projectId", QString::fromStdString(project.id)},
+                      {"name", "Unborn network"}}).status == 200,
+          "unborn checkout clone target provisioning failed");
+    const Response first = client.call("POST", path, checkout);
+    const Response retry = client.call("POST", path, checkout);
+    check(first.status == 200 && retry.status == 200 && first.json == retry.json &&
+          first.json.value("branchId") == identity && first.json.value("revision").isNull() &&
+          target.branchId(project.id, "main") == sourceBranch &&
+          !target.optionalHeadV2(project.id, "main"),
+          "unborn checkout lost source branch UUID, null HEAD, or retry safety");
+    check(client.call("POST", path,
+          QJsonObject{{"branchId", identity}, {"name", "renamed"}}).status == 409,
+          "unborn checkout reused an identity for a different branch");
+    check(client.call("POST", path,
+          QJsonObject{{"branchId", QString::fromStdString(native::BranchId::generate().toString())},
+                      {"name", "main"}}).status == 409,
+          "unborn checkout silently replaced an existing branch identity");
+    check(client.call("POST", path,
+          QJsonObject{{"branchId", "not-uuid"}, {"name", "main"}}).status == 400,
+          "unborn checkout accepted a malformed branch UUID");
+    const QString session = QString::fromStdString(native::UuidV7::generate().toString());
+    const QString draftId = QString::fromStdString(native::UuidV7::generate().toString());
+    const Response draft = client.call("POST", "/dvmdb/v1/working-copies",
+          QJsonObject{{"projectId", QString::fromStdString(project.id)},
+                      {"branchId", identity}, {"baseRevision", QJsonValue(QJsonValue::Null)},
+                      {"sessionId", session}, {"id", draftId}});
+    check(draft.status == 201 && draft.json.value("id") == draftId &&
+          draft.json.value("baseRevision").isNull() &&
+          target.workingCopyV1(draftId.toStdString()).baseRevision == std::nullopt &&
+          !target.optionalHeadV2(project.id, "main"),
+          "unborn checkout could not create a durable null-base working copy");
+    targetServer.stop();
+}
+
 void exerciseUuidv7HistoryHttp() {
     namespace native = aowis::dvmdb;
     TemporaryRoot temp;
@@ -1834,19 +1906,51 @@ void exerciseUuidv7HistoryHttp() {
     check(initial.status == 200 && initial.json.value("recordHash").toString().size() == 64 &&
           initial.json.value("parents").toArray().isEmpty(),
           "HTTP V2 root detail is invalid");
-    const Response feature = client.call("POST", basePath + "/branches",
-        QJsonObject{{"name", "feature"}, {"fromBranch", "main"}});
-    const Response initialGraph = client.call("GET", graphPath + "?limit=1");
-    QString mainBranchId;
-    for (const QJsonValue& value : initialGraph.json.value("heads").toArray()) {
-        const QJsonObject item = value.toObject();
-        if (item.value("branch").toString() == QStringLiteral("main"))
-            mainBranchId = item.value("branchId").toString();
-    }
-    check(initialGraph.status == 200 &&
-          native::BranchId::parse(mainBranchId.toStdString()).has_value(),
+    // Branches are addressed by UUIDv7 (DG-01): read main's identity first.
+    const std::function<QString(const QString&)> mainBranchIdOf = [&client](const QString& path) {
+        for (const QJsonValue& value : client.call("GET", path + "/revision-graph?limit=1")
+                                           .json.value("heads").toArray()) {
+            const QJsonObject item = value.toObject();
+            if (item.value("branch").toString() == QStringLiteral("main"))
+                return item.value("branchId").toString();
+        }
+        return QString();
+    };
+    const QString mainBranchId = mainBranchIdOf(basePath);
+    check(native::BranchId::parse(mainBranchId.toStdString()).has_value(),
           "HTTP V2 initial graph did not expose the main branch identity");
+    check(client.call("POST", basePath + "/branches",
+        QJsonObject{{"name", "by-name"}, {"fromBranch", "main"}}).status == 400,
+          "branch creation still accepted a source branch name");
+    const QString featureId = QString::fromStdString(native::BranchId::generate().toString());
+    const QJsonObject featureRequest{{"name", "feature"}, {"fromBranchId", mainBranchId},
+                                     {"id", featureId}};
+    const Response feature = client.call("POST", basePath + "/branches", featureRequest);
+    // A resent request (lost response, transport retry) gets the original
+    // answer instead of "branch already exists".
+    const Response featureAgain = client.call("POST", basePath + "/branches", featureRequest);
+    check(featureAgain.status == 201 && featureAgain.json == feature.json,
+          "repeated branch creation with the same id was not idempotent");
+    QJsonObject featureMisuse = featureRequest;
+    featureMisuse.insert("name", "feature-two");
+    check(client.call("POST", basePath + "/branches", featureMisuse).status == 409,
+          "branch id reused for a different branch was accepted");
+    check(client.call("POST", basePath + "/branches",
+        QJsonObject{{"name", "ghost"}, {"fromBranchId",
+            QString::fromStdString(native::BranchId::generate().toString())}}).status == 404,
+          "unknown source branch UUIDv7 was not reported as missing");
+    const Response featureById = client.call("GET", basePath + "/branch-ids/" + featureId);
+    check(featureById.status == 200 && featureById.json.value("branch") == "feature" &&
+          featureById.json.value("branchId").toString() == featureId &&
+          featureById.json.value("revision").toString() == rootId &&
+          featureById.json.value("recordHash").toString().size() == 64 &&
+          featureById.json.value("originBranchId").toString() == mainBranchId &&
+          featureById.json.value("forkRevisionId").toString() == rootId &&
+          client.call("GET", basePath + "/branch-ids/" +
+              QString::fromStdString(native::BranchId::generate().toString())).status == 404,
+          "branch lookup by UUIDv7 is incomplete");
     check(feature.status == 201 && feature.json.value("id").toString() == rootId &&
+          feature.json.value("branchId").toString() == featureId &&
           native::BranchId::parse(feature.json.value("branchId").toString().toStdString()) &&
           feature.json.value("originBranchId").toString() == mainBranchId &&
           feature.json.value("forkRevisionId").toString() == rootId,
@@ -1855,7 +1959,7 @@ void exerciseUuidv7HistoryHttp() {
         QJsonObject{{"name", "orphan"}}).status == 400,
           "source-less V2 fork allowed for nonempty project");
     check(client.call("POST", basePath + "/branches",
-        QJsonObject{{"name", "bad"}, {"fromBranch", "main"}, {"revision", "1234"}}).status == 400,
+        QJsonObject{{"name", "bad"}, {"fromBranchId", mainBranchId}, {"revision", "1234"}}).status == 400,
           "invalid historical UUID was accepted");
     const std::optional<native::ProjectId> id = native::ProjectId::parse(project);
     native::RevisionId mainTip = *native::RevisionId::parse(rootId.toStdString());
@@ -1897,8 +2001,11 @@ void exerciseUuidv7HistoryHttp() {
     check(history.status == 200 && history.json.value("revisions").toArray().size() == 1 &&
           history.json.value("revisions").toArray().at(0).toObject().value("id").toString() ==
           QString::fromStdString(mainTip.toString()), "V2 history did not begin at current HEAD");
-    const Response historic = client.call("POST", basePath + "/branches",
-        QJsonObject{{"name", "historic"}, {"fromBranch", "main"}, {"revision", rootId}});
+    const QJsonObject historicRequest{{"name", "historic"}, {"fromBranchId", mainBranchId},
+        {"revision", rootId}, {"id", QString::fromStdString(native::BranchId::generate().toString())}};
+    const Response historic = client.call("POST", basePath + "/branches", historicRequest);
+    check(client.call("POST", basePath + "/branches", historicRequest).json == historic.json,
+          "repeated historical branch creation was not idempotent");
     check(historic.status == 201 && historic.json.value("id").toString() == rootId &&
           native::BranchId::parse(historic.json.value("branchId").toString().toStdString()) &&
           historic.json.value("originBranchId").toString() == mainBranchId &&
@@ -1909,6 +2016,9 @@ void exerciseUuidv7HistoryHttp() {
     check(renamed.status == 200 &&
           client.call("GET", basePath + "/branches/archived/head").json.value("id").toString() == rootId,
           "V2 rename moved HEAD or lost branch");
+    const QString historicId = historic.json.value("branchId").toString();
+    check(client.call("GET", basePath + "/branch-ids/" + historicId).json.value("branch") == "archived",
+          "branch lookup by UUIDv7 did not follow the rename");
     check(client.call("PATCH", basePath + "/branches/archived",
         QJsonObject{{"name", "bad-again"}, {"expectedHead", newer}}).status == 409,
           "V2 stale rename did not conflict");
@@ -1923,8 +2033,9 @@ void exerciseUuidv7HistoryHttp() {
                               modelProject.json.value("id").toString();
     const QString modelRoot = client.call("GET", modelPath + "/branches/main/head")
                               .json.value("id").toString();
+    const QString modelMainId = mainBranchIdOf(modelPath);
     const Response modelFeature = client.call("POST", modelPath + "/branches",
-        QJsonObject{{"name", "feature"}, {"fromBranch", "main"}});
+        QJsonObject{{"name", "feature"}, {"fromBranchId", modelMainId}});
     check(modelFeature.status == 201 && modelFeature.json.value("id").toString() == modelRoot,
           "V2 model feature branch creation failed");
     const QString keyA = QStringLiteral("00000000-0000-0000-0000-000000000007");
@@ -1987,7 +2098,7 @@ void exerciseUuidv7HistoryHttp() {
           mergedDiff.json.value("changes").toArray().at(0).toObject().value("uuid").toString() == keyB,
           "V2 REST merged revision diff omitted source change");
     const Response otherBranch = client.call("POST", modelPath + "/branches",
-        QJsonObject{{"name", "competing"}, {"fromBranch", "main"}});
+        QJsonObject{{"name", "competing"}, {"fromBranchId", modelMainId}});
     check(otherBranch.status == 201 && otherBranch.json.value("id").toString() == mergedId,
           "V2 REST conflict test branch creation failed");
     const QJsonObject overwriteA{{"uuid", keyA}, {"kind", 31},
@@ -2076,19 +2187,34 @@ void exerciseWorkingCopyHttp() {
                                                          10000ULL, 1024ULL * 1024ULL});
         Client client(server.port());
         const QString listPath = QStringLiteral("/dvmdb/v1/working-copies");
+        const QString mainId = QString::fromStdString(
+            service.branchId(projectId, "main")->toString());
+        const QString chosenDraft = QString::fromStdString(native::UuidV7::generate().toString());
         const QJsonObject create{{"projectId", QString::fromStdString(projectId)},
-                                 {"branch", "main"}, {"baseRevision", QJsonValue::Null},
-                                 {"sessionId", firstSession}};
+                                 {"branchId", mainId}, {"baseRevision", QJsonValue::Null},
+                                 {"sessionId", firstSession}, {"id", chosenDraft}};
         check(client.call("POST", listPath, create).status == 409,
               "non-private repository accepted draft creation");
         service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
         check(client.call("POST", listPath,
               QJsonObject{{"projectId", QString::fromStdString(projectId)},
-                          {"branch", "main"}, {"sessionId", firstSession}}).status == 400,
+                          {"branchId", mainId}, {"sessionId", firstSession}}).status == 400,
               "draft creation accepted missing explicit unborn base");
+        check(client.call("POST", listPath,
+              QJsonObject{{"projectId", QString::fromStdString(projectId)}, {"branch", "main"},
+                          {"baseRevision", QJsonValue::Null}, {"sessionId", firstSession}}).status == 400,
+              "draft creation still accepted a branch name");
         const Response created = client.call("POST", listPath, create);
         const QString id = created.json.value("id").toString();
-        check(created.status == 201 && native::UuidV7::parse(id.toStdString()).has_value() &&
+        // A resent creation returns the same draft; a different request may
+        // not reuse its id.
+        const Response createdAgain = client.call("POST", listPath, create);
+        QJsonObject misuse = create;
+        misuse.insert("sessionId", otherSession);
+        check(createdAgain.status == 201 && createdAgain.json == created.json &&
+              client.call("POST", listPath, misuse).status == 409,
+              "draft creation with a caller-chosen id is not idempotent");
+        check(created.status == 201 && id == chosenDraft &&
               created.json.value("baseRevision").isNull() &&
               created.json.value("generation") == QStringLiteral("0") &&
               !created.json.value("dirty").toBool(),
@@ -2145,17 +2271,20 @@ void exerciseWorkingCopyHttp() {
               "HTTP draft save changed committed HEAD or lost candidate");
         const Response released = client.call("POST", detailPath + "/release",
             QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}});
+        // Releasing again (a resent request) is a no-op success.
         check(released.status == 200 && released.json.value("released") == QJsonValue(true) &&
               client.call("POST", detailPath + "/release",
-                  QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}}).status == 409,
-              "HTTP lease release did not fence stale token");
+                  QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}}).status == 200,
+              "HTTP lease release is not idempotent");
         const Response taken = client.call("POST", leasePath,
             QJsonObject{{"sessionId", otherSession}, {"seconds", 30}});
         check(taken.status == 200 && taken.json.value("token") != token &&
               taken.json.value("generation") == QStringLiteral("1") &&
               client.call("POST", savePath,
                   QJsonObject{{"sessionId", firstSession}, {"fencingToken", token},
-                              {"expectedGeneration", "1"}, {"changes", QJsonArray{entity}}}).status == 409,
+                              {"expectedGeneration", "1"}, {"changes", QJsonArray{entity}}}).status == 409 &&
+              client.call("POST", detailPath + "/release",
+                  QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}}).status == 409,
               "HTTP lease takeover did not fence original session");
         const native::Bytes event = native::test::editEvent(
             native::UuidV7::generate(), native::UuidV7::generate());
@@ -2260,7 +2389,8 @@ void exerciseHydraulicDraftMembershipHttp() {
     const QString listPath = QStringLiteral("/dvmdb/v1/working-copies");
     const Response created = client.call("POST", listPath,
         QJsonObject{{"projectId", QString::fromStdString(project.id)},
-                    {"branch", "main"}, {"baseRevision", QString::fromStdString(base.toString())},
+                    {"branchId", QString::fromStdString(service.branchId(project.id, "main")->toString())},
+                    {"baseRevision", QString::fromStdString(base.toString())},
                     {"sessionId", session}});
     check(created.status == 201, "hydraulic draft checkout failed");
     const QString path = listPath + "/" + created.json.value("id").toString();
@@ -2387,6 +2517,7 @@ int main(int argc, char** argv) {
         exerciseTransferStagingBudget();
         exerciseRevisionBundleV2Http();
         exerciseUnbornProjectHttp();
+        exerciseUnbornCheckoutHttp();
         exerciseWorkingCopyHttp();
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
         exerciseHydraulicDraftMembershipHttp();

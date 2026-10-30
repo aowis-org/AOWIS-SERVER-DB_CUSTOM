@@ -452,6 +452,22 @@ QByteArray graphSignature(const QByteArray& payload) {
     return QMessageAuthenticationCode::hash(payload, graphTokenKey(), QCryptographicHash::Sha256);
 }
 
+// One branch HEAD as the graph page and the branch-by-UUID route report it.
+QJsonObject branchHeadJsonV2(const RevisionGraphHeadV2& head) {
+    return QJsonObject{{"branch", QString::fromStdString(head.name)},
+        {"branchId", QString::fromStdString(head.branchId.toString())},
+        {"revision", head.revision
+            ? QJsonValue(revisionIdStringV2(*head.revision)) : QJsonValue(QJsonValue::Null)},
+        {"recordHash", head.revision
+            ? QJsonValue(hashString(head.recordHash)) : QJsonValue(QJsonValue::Null)},
+        {"originBranchId", head.originBranchId
+            ? QJsonValue(QString::fromStdString(head.originBranchId->toString()))
+            : QJsonValue(QJsonValue::Null)},
+        {"forkRevisionId", head.forkRevisionId
+            ? QJsonValue(revisionIdStringV2(*head.forkRevisionId))
+            : QJsonValue(QJsonValue::Null)}};
+}
+
 // V2 cursors pin both logical identities and content digests. Reuse the
 // process-local HMAC key so callers cannot forge a historical HEAD snapshot.
 QString graphTokenV2(const RevisionGraphCursorV2& cursor, const std::string& projectId) {
@@ -1140,16 +1156,21 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                                httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject body = parseBody(request, maxJsonSmallBytes);
-            requireKeys(body, {"projectId", "branch", "baseRevision", "sessionId"});
+            requireKeys(body, {"projectId", "branchId", "baseRevision", "sessionId", "id"});
             requireInput(body.contains("baseRevision"), "missing baseRevision (use null for unborn)");
             const QJsonValue base = body.value("baseRevision");
             requireInput(base.isNull() || base.isString(), "baseRevision must be UUIDv7 or null");
-            const std::optional<RevisionId> id = base.isString()
+            const std::optional<RevisionId> revision = base.isString()
                 ? std::optional<RevisionId>(parseRevisionIdV2(base.toString().toStdString()))
                 : std::nullopt;
-            return Reply{201, workingCopyJson(service.createWorkingCopyV1(
-                requiredString(body, "projectId"), requiredString(body, "branch"), id,
-                requiredString(body, "sessionId")))};
+            // Branch by UUIDv7 (DG-01). A caller-chosen draft `id` makes the
+            // creation idempotent: a resent request returns the same draft.
+            const std::optional<std::string> draftId = body.contains("id")
+                ? std::optional<std::string>(requiredString(body, "id")) : std::nullopt;
+            return Reply{201, workingCopyJson(service.createWorkingCopyForBranchV1(
+                requiredString(body, "projectId"), requiredString(body, "branchId"), revision,
+                requiredString(body, "sessionId"),
+                draftId ? std::optional<std::string_view>(*draftId) : std::nullopt))};
         });
     });
     server.Get("/dvmdb/v1/working-copies/:draft", [&service](const httplib::Request& request,
@@ -1403,10 +1424,18 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                           httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject object = parseBody(request, maxJsonSmallBytes);
-            requireKeys(object, {"name", "unborn"});
+            requireKeys(object, {"name", "unborn", "id"});
             const QJsonValue unborn = object.value("unborn");
             requireInput(unborn.isUndefined() || unborn.isBool(), "unborn must be a boolean");
             const std::string name = requiredString(object, "name");
+            // A caller-chosen UUIDv7 makes the creation idempotent: a resent
+            // request (lost response, transport retry) gets the same 201
+            // answer instead of creating a second project.
+            if (object.contains("id")) {
+                requireInput(unborn.toBool(false), "a caller-chosen project id requires unborn: true");
+                return Reply{201, projectJson(service.createUnbornProjectV2(
+                    name, requiredString(object, "id")))};
+            }
             return Reply{201, projectJson(unborn.toBool(false)
                 ? service.createUnbornProjectV2(name) : service.createProjectV2(name))};
         });
@@ -1419,6 +1448,22 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const std::string id = requiredString(object, "projectId");
             const std::string name = requiredString(object, "name");
             return Reply{200, projectJson(service.provisionCloneTargetV2(id, name))};
+        });
+    });
+    // An unborn branch has no revision to export as a bundle. Only an empty
+    // private clone target may acquire its original UUIDv7 and null HEAD.
+    server.Post("/dvmdb/v1/projects/:id/unborn-checkout",
+                [&service](const httplib::Request& request, httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject object = parseBody(request, maxJsonSmallBytes);
+            requireKeys(object, {"branchId", "name"});
+            const std::string project = pathParam(request, "id");
+            const std::string branchId = requiredString(object, "branchId");
+            const std::string name = requiredString(object, "name");
+            service.provisionUnbornBranchV2(project, name, branchId);
+            return Reply{200, QJsonObject{{"branchId", QString::fromStdString(branchId)},
+                {"branch", QString::fromStdString(name)},
+                {"revision", QJsonValue(QJsonValue::Null)}}};
         });
     });
     server.Get("/dvmdb/v1/projects/:id", [&service](const httplib::Request& request,
@@ -1442,20 +1487,23 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject object = parseBody(request, maxJsonSmallBytes);
-            requireKeys(object, {"name", "fromBranch", "revision"});
+            requireKeys(object, {"name", "fromBranchId", "revision", "id"});
             const std::string project = pathParam(request, "id");
             const std::string name = requiredString(object, "name");
-            std::optional<std::string> from;
-            if (object.contains("fromBranch")) from = requiredString(object, "fromBranch");
-            requireInput(!object.contains("revision") || from.has_value(),
-                         "revision requires fromBranch");
+            // The source is addressed by its UUIDv7, never by its renamable
+            // name (DG-01). `id` is the new branch's caller-chosen UUIDv7:
+            // repeating the request returns the original creation instead of
+            // a conflict. Without it the server chooses one (not retry-safe).
+            const std::string source = requiredString(object, "fromBranchId");
+            const std::string identity = object.contains("id")
+                ? requiredString(object, "id") : BranchId::generate().toString();
+            const std::optional<RevisionId> revision = object.contains("revision")
+                ? std::optional<RevisionId>(parseRevisionIdV2(requiredString(object, "revision")))
+                : std::nullopt;
             // Return the identity/provenance captured by the atomic native
             // branch write. Never re-resolve a mutable branch name afterward.
-            const BranchCreationResultV2 created = object.contains("revision")
-                ? service.createBranchAtRevisionWithIdentityV2(project, name, *from,
-                    parseRevisionIdV2(requiredString(object, "revision")))
-                : service.createBranchWithIdentityV2(project, name,
-                    from ? std::optional<std::string_view>(*from) : std::nullopt);
+            const BranchCreationResultV2 created =
+                service.createBranchFromIdV2(project, name, source, revision, identity);
             return Reply{201, QJsonObject{{"id", revisionIdStringV2(created.revisionId)},
                 {"branch", QString::fromStdString(name)},
                 {"branchId", QString::fromStdString(created.branchId.toString())},
@@ -1483,6 +1531,19 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             });
             return Reply{200, QJsonObject{{"name", QString::fromStdString(renamed)},
                                            {"head", revisionIdStringV2(expected)}}};
+        });
+    });
+    // A branch by UUIDv7 (DG-01): its current name, HEAD and provenance.
+    // Clients pin a branch by identity here, then use the name-addressed
+    // routes and verify the identity they return (e.g. a bundle header).
+    server.Get("/dvmdb/v1/projects/:id/branch-ids/:branchId",
+               [&service](const httplib::Request& request, httplib::Response& response) {
+        guarded(response, [&]() {
+            const std::optional<RevisionGraphHeadV2> head = service.branchByIdV2(
+                pathParam(request, "id"), pathParam(request, "branchId"));
+            if (!head) return errorReply(404, QStringLiteral("not_found"),
+                                         QStringLiteral("branch UUIDv7 not found"));
+            return Reply{200, branchHeadJsonV2(*head)};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/branches/:branch/head",
@@ -1553,18 +1614,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const RevisionGraphPageV2 page = service.revisionGraphV2(project, limit, std::move(cursor));
             QJsonArray heads;
             for (const RevisionGraphHeadV2& head : page.heads)
-                heads.append(QJsonObject{{"branch", QString::fromStdString(head.name)},
-                    {"branchId", QString::fromStdString(head.branchId.toString())},
-                    {"revision", head.revision
-                        ? QJsonValue(revisionIdStringV2(*head.revision)) : QJsonValue(QJsonValue::Null)},
-                    {"recordHash", head.revision
-                        ? QJsonValue(hashString(head.recordHash)) : QJsonValue(QJsonValue::Null)},
-                    {"originBranchId", head.originBranchId
-                        ? QJsonValue(QString::fromStdString(head.originBranchId->toString()))
-                        : QJsonValue(QJsonValue::Null)},
-                    {"forkRevisionId", head.forkRevisionId
-                        ? QJsonValue(revisionIdStringV2(*head.forkRevisionId))
-                        : QJsonValue(QJsonValue::Null)}});
+                heads.append(branchHeadJsonV2(head));
             QJsonArray revisions;
             for (const RevisionGraphRevisionV2& revision : page.revisions)
                 revisions.append(revisionJsonV2(revision));

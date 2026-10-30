@@ -83,6 +83,31 @@ void testUnbornNativeRefFoundation() {
               "first model commit did not publish unborn HEAD");
     }
 }
+void testIdentityPreservingUnbornCheckout() {
+    Temporary temp;
+    const ProjectId project = ProjectId::generate();
+    const BranchId source = BranchId::generate();
+    {
+        Repository target(temp.path);
+        target.provisionUnbornBranchV2(project, "main", source);
+        target.provisionUnbornBranchV2(project, "main", source);
+        check(target.branchId("main") == source &&
+              !target.optionalHeadV2(project, "main") &&
+              target.historyV2(project, "main").empty(),
+              "unborn checkout fabricated a revision or lost source branch UUID");
+        rejects([&] { target.provisionUnbornBranchV2(project, "different", source); },
+                StorageErrorKind::Conflict, "unborn checkout renamed existing source branch");
+        rejects([&] { target.provisionUnbornBranchV2(project, "main", BranchId::generate()); },
+                StorageErrorKind::Conflict, "unborn checkout overwrote a branch identity");
+    }
+    {
+        Repository reopened(temp.path);
+        check(reopened.branchId("main") == source &&
+              !reopened.optionalHeadV2(project, "main"),
+              "identity-preserving unborn checkout was not durable");
+    }
+}
+
 void testV2Publication() {
     Temporary temp;
     const ProjectId project = ProjectId::generate();
@@ -248,6 +273,7 @@ void testMixingRejected() {
 int main() {
     try {
         testUnbornNativeRefFoundation();
+        testIdentityPreservingUnbornCheckout();
         testV2Publication();
         testMixingRejected();
         testCorruptV2HeadRejected();

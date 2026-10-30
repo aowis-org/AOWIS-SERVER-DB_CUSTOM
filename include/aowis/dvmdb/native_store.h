@@ -344,6 +344,11 @@ public:
         const ProjectId& project, std::string_view name,
         std::optional<std::string_view> from = std::nullopt);
     void createUnbornBranchV2(const ProjectId& project, std::string_view name);
+    // Clone an unborn branch with its original UUIDv7 into a branchless project.
+    // A repeated identical request is safe after a lost acknowledgement.
+    // No initial revision, manifest or synthetic fork is created.
+    void provisionUnbornBranchV2(const ProjectId& project, std::string_view name,
+                                 const BranchId& identity);
     RevisionId headV2(const ProjectId& project, std::string_view branch);
     // VC-01 transition: optional committed HEAD contract; existing branches remain born.
     std::optional<RevisionId> optionalHeadV2(const ProjectId& project, std::string_view branch);
@@ -380,6 +385,18 @@ public:
                                  const RevisionId& candidate);
     RevisionId createBranchAtRevisionV2(const ProjectId& project, std::string_view name,
                                         std::string_view sourceBranch, const RevisionId& revision);
+    // The branch with this UUIDv7 regardless of its current (renamable) name;
+    // nullopt when no branch has it. An unborn branch has no revision.
+    std::optional<RevisionGraphHeadV2> branchByIdV2(const ProjectId& project, const BranchId& branch);
+    // Create `name` from the branch identified by `source`: at its HEAD, or
+    // at the exact `revision` reachable from it. `created` is the caller's
+    // new branch UUIDv7. Repeating the same request returns the original
+    // creation result instead of failing, so a retried request is safe;
+    // `created` naming any different branch is a Conflict.
+    BranchCreationResultV2 createBranchFromIdV2(const ProjectId& project, std::string_view name,
+                                                const BranchId& source,
+                                                std::optional<RevisionId> revision,
+                                                const BranchId& created);
     BranchCreationResultV2 createBranchAtRevisionWithIdentityV2(
         const ProjectId& project, std::string_view name,
         std::string_view sourceBranch, const RevisionId& revision);
@@ -634,6 +651,14 @@ private:
                                                    std::string_view branch);
     Hash branchHead(std::string_view name);
     std::optional<BranchId> branchIdLocked(std::string_view name);
+    BranchCreationResultV2 createBranchLockedV2(const ProjectId& project, std::string_view name,
+                                                std::optional<std::string_view> from,
+                                                const BranchId& createdId);
+    BranchCreationResultV2 createBranchAtRevisionLockedV2(const ProjectId& project,
+                                                          std::string_view name,
+                                                          std::string_view sourceBranch,
+                                                          const RevisionId& revision,
+                                                          const BranchId& createdId);
     void publishRef(std::string_view branch, const Hash& commitHash, bool mustBeAbsent,
                     std::optional<BranchId> requestedId = std::nullopt);
     TreeNode readNode(const Hash& hash);

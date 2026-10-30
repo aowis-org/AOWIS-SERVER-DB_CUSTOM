@@ -87,8 +87,13 @@ and `POST /working-copies/{draftId}/release`. Drafts are allowed only when the
 DVMDB repository is configured with functional role `private`; this role is
 not a user permission or a login.
 
-The create request requires `projectId`, existing branch name, originating
-`sessionId` UUIDv7 and explicit `baseRevision` (null for unborn). The Save
+The create request requires `projectId`, the existing branch's `branchId`
+UUIDv7 (never its renamable name), originating `sessionId` UUIDv7 and explicit
+`baseRevision` (null for unborn). An optional caller-chosen draft `id` makes
+creation idempotent: repeating the request returns the same draft, and the id
+naming a draft of another project, branch, base or session is 409. Releasing
+a lease that is no longer held succeeds (a resent release is harmless); a
+lease held by another session or token is never released. The Save
 request requires session UUIDv7, current fencing UUIDv7, decimal-string
 `expectedGeneration` and 1..128 changes. Generation and lease-expiration
 values are represented as **decimal strings**, preserving the complete uint64

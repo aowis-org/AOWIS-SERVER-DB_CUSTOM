@@ -2919,6 +2919,13 @@ BranchCreationResultV2 Repository::createBranchAtRevisionWithIdentityV2(
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
+    return createBranchAtRevisionLockedV2(project, name, sourceBranch, revision,
+                                          BranchId::generate());
+}
+
+BranchCreationResultV2 Repository::createBranchAtRevisionLockedV2(
+        const ProjectId& project, std::string_view name,
+        std::string_view sourceBranch, const RevisionId& revision, const BranchId& createdId) {
     checkBranch(name);
     require(Err::Conflict, !findStoredBranch(this->directory_, name), "branch already exists");
     const RevisionRecordV2 source = branchRevisionV2Locked(project, sourceBranch);
@@ -2946,7 +2953,6 @@ BranchCreationResultV2 Repository::createBranchAtRevisionWithIdentityV2(
     require(Err::InvalidInput, selectedHash.has_value(),
             "revision is not reachable from source branch");
     const BranchId sourceId = findStoredBranch(this->directory_, sourceBranch)->id;
-    const BranchId createdId = BranchId::generate();
     publishStoredBranch(this->directory_, StoredBranch{createdId,
             std::string(name), *selectedHash, revision, sourceId, revision}, true);
     return BranchCreationResultV2{createdId, revision, sourceId, revision};
@@ -3515,6 +3521,25 @@ void Repository::createUnbornBranchV2(const ProjectId& project, std::string_view
         BranchId::generate(), std::string(name), Hash{}, std::nullopt, std::nullopt, std::nullopt}, true);
 }
 
+void Repository::provisionUnbornBranchV2(const ProjectId& project, std::string_view name,
+                                         const BranchId& identity) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    checkBranch(name);
+    (void)project;
+    const std::vector<StoredBranch> branches = readStoredBranches(this->directory_);
+    if (branches.size() == 1 && branches.front().id == identity &&
+        branches.front().name == name && !branches.front().revisionV2 &&
+        isZero(branches.front().head) && !branches.front().originBranchId &&
+        !branches.front().forkRevisionId)
+        return;
+    require(Err::Conflict, branches.empty(),
+            "unborn checkout requires an empty target project or the identical unborn branch");
+    publishStoredBranch(this->directory_, StoredBranch{
+        identity, std::string(name), Hash{}, std::nullopt, std::nullopt, std::nullopt}, true);
+}
+
 std::optional<RevisionId> Repository::optionalHeadV2(
         const ProjectId& project, std::string_view branch) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
@@ -3717,6 +3742,12 @@ BranchCreationResultV2 Repository::createBranchWithIdentityV2(
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
+    return createBranchLockedV2(project, name, from, BranchId::generate());
+}
+
+BranchCreationResultV2 Repository::createBranchLockedV2(
+        const ProjectId& project, std::string_view name,
+        std::optional<std::string_view> from, const BranchId& createdId) {
     checkBranch(name);
     require(Err::Conflict, !findStoredBranch(this->directory_, name), "branch already exists");
     const std::vector<StoredBranch> branches = readStoredBranches(this->directory_);
@@ -3745,10 +3776,60 @@ BranchCreationResultV2 Repository::createBranchWithIdentityV2(
         ? std::optional<BranchId>(findStoredBranch(this->directory_, *from)->id) : std::nullopt;
     const std::optional<RevisionId> forkId = from
         ? std::optional<RevisionId>(id) : std::nullopt;
-    const BranchId createdId = BranchId::generate();
     publishStoredBranch(this->directory_, StoredBranch{createdId, std::string(name),
                                                         checksum, id, sourceId, forkId}, true);
     return BranchCreationResultV2{createdId, id, sourceId, forkId};
+}
+
+std::optional<RevisionGraphHeadV2> Repository::branchByIdV2(const ProjectId& project,
+                                                           const BranchId& branch) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    for (const StoredBranch& stored : readStoredBranches(this->directory_)) {
+        if (stored.id != branch) continue;
+        require(Err::Unavailable, stored.revisionV2.has_value() || isZero(stored.head),
+                "UUIDv7 branch lookup requires a v2 branch");
+        std::optional<RevisionId> revision;
+        Hash recordHash{};
+        if (stored.revisionV2) {
+            // Same integrity check as every other HEAD read: the stored
+            // digest must be the immutable record of the stored revision.
+            revision = branchRevisionV2Locked(project, stored.name).id;
+            recordHash = stored.head;
+        }
+        return RevisionGraphHeadV2{stored.id, stored.name, revision, recordHash,
+                                   stored.originBranchId, stored.forkRevisionId};
+    }
+    return std::nullopt;
+}
+
+BranchCreationResultV2 Repository::createBranchFromIdV2(
+        const ProjectId& project, std::string_view name, const BranchId& source,
+        std::optional<RevisionId> revision, const BranchId& created) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    checkBranch(name);
+    std::optional<StoredBranch> sourceBranch;
+    for (StoredBranch& stored : readStoredBranches(this->directory_)) {
+        if (stored.id == created) {
+            // A retried request (e.g. a transport that resent the POST after
+            // a lost response) finds its own branch: answer as the original
+            // creation did. Any other use of the identity is a conflict.
+            require(Err::Conflict, stored.name == name && stored.originBranchId == source &&
+                        (!revision || stored.forkRevisionId == revision) &&
+                        stored.forkRevisionId.has_value(),
+                    "branch UUIDv7 already identifies a different branch");
+            return BranchCreationResultV2{stored.id, *stored.forkRevisionId,
+                                          stored.originBranchId, stored.forkRevisionId};
+        }
+        if (stored.id == source) sourceBranch = std::move(stored);
+    }
+    require(Err::NotFound, sourceBranch.has_value(), "source branch UUIDv7 not found");
+    if (revision)
+        return createBranchAtRevisionLockedV2(project, name, sourceBranch->name, *revision, created);
+    return createBranchLockedV2(project, name, sourceBranch->name, created);
 }
 
 bool Repository::hasBranch(std::string_view branch) {

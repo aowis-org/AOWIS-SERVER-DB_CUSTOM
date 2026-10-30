@@ -120,10 +120,19 @@ public:
     // Canonical native service API: revision IDs are UUIDv7, never SHA-256.
     ProjectInfo createProject(std::string_view name);
     // Explicit opt-in until all clients support nullable initial HEADs.
-    ProjectInfo createUnbornProjectV2(std::string_view name);
+    // With a caller-chosen projectId (UUIDv7) the creation is idempotent: a
+    // repeated request returns the existing project of that ID and name, so
+    // a client may safely retry after a lost response; the same ID with a
+    // different name is a Conflict.
+    ProjectInfo createUnbornProjectV2(std::string_view name,
+                                      std::optional<std::string_view> projectId = std::nullopt);
     // Provision an empty catalogue project with an existing logical UUIDv7.
     // Only a full verified branch bundle may populate it. Safe to retry.
     ProjectInfo provisionCloneTargetV2(std::string_view projectId, std::string_view name);
+    // Import the exact identity of a root unborn branch into an empty private
+    // clone target. Does not make an initial revision. Safe to retry.
+    void provisionUnbornBranchV2(std::string_view projectId, std::string_view name,
+                                 std::string_view branchId);
     RevisionId createBranch(std::string_view projectId, std::string_view name,
                             std::optional<std::string_view> source = std::nullopt,
                             std::optional<RevisionId> fromRevision = std::nullopt);
@@ -166,6 +175,14 @@ public:
     BranchCreationResultV2 createBranchAtRevisionWithIdentityV2(
         std::string_view projectId, std::string_view name,
         std::string_view sourceBranch, const RevisionId& revision);
+    // Branches by UUIDv7, independent of renamable names (DG-01). See
+    // Repository::branchByIdV2() / createBranchFromIdV2(): the creation is
+    // idempotent for the caller-chosen `createdBranchId`.
+    std::optional<RevisionGraphHeadV2> branchByIdV2(std::string_view projectId,
+                                                    std::string_view branchId);
+    BranchCreationResultV2 createBranchFromIdV2(
+        std::string_view projectId, std::string_view name, std::string_view sourceBranchId,
+        std::optional<RevisionId> revision, std::string_view createdBranchId);
     MergeResultV2 mergeBranchesV2(std::string_view projectId, std::string_view target,
                                   std::string_view source,
                                   std::optional<RevisionId> expectedTarget = std::nullopt,
@@ -202,6 +219,13 @@ public:
     WorkingCopyInfoV1 createWorkingCopyV1(
         std::string_view projectId, std::string_view branch,
         std::optional<RevisionId> baseRevision, std::string_view sessionId);
+    // The same, addressing the branch by UUIDv7. With a caller-chosen draftId
+    // the creation is idempotent: a repeated request returns the existing
+    // draft if project, branch, base and session match; otherwise Conflict.
+    WorkingCopyInfoV1 createWorkingCopyForBranchV1(
+        std::string_view projectId, std::string_view branchId,
+        std::optional<RevisionId> baseRevision, std::string_view sessionId,
+        std::optional<std::string_view> draftId = std::nullopt);
     WorkingCopyInfoV1 workingCopyV1(std::string_view draftId) const;
     std::vector<WorkingCopyInfoV1> listWorkingCopiesV1() const;
     // Only one nonexpired writer may hold a draft lease. The same session
@@ -286,8 +310,10 @@ private:
     std::shared_ptr<Project> findProject(std::string_view id) const;
     std::shared_ptr<Repository> openRepository(Project& project) const;
     void ensureHealthy() const;
+    // requestedProjectId: caller-chosen UUIDv7, idempotent by (ID, name).
+    // With unborn == false it provisions a clone target (no branch at all).
     ProjectInfo createProjectImpl(std::string_view name, bool v2, bool unborn = false,
-                                  std::optional<std::string> cloneProjectId = std::nullopt);
+                                  std::optional<std::string> requestedProjectId = std::nullopt);
 
     std::filesystem::path root_;
     std::string repository_id_;

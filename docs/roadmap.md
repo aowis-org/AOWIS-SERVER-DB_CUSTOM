@@ -84,15 +84,15 @@ an end-to-end checkout/edit/reopen/commit test against a real personal DVMDB.
 | Area | Available in the checked source | Not yet accepted end to end |
 |---|---|---|
 | Project and branch history (VC-01/02) | Unborn project creation, nullable committed HEAD, immutable branch fork provenance, native/REST readers, corresponding GUI graph/inspector tests | Real multiclient history/graph acceptance across all deployment modes |
-| Personal repository identity and checkout (VC-03/04) | Persistent repository UUID/roles, tracking metadata, private working-copy CRUD and fenced generation-checked saves; committed REST branch clone-to-private workflow | Complete unborn checkout, model hydration from pinned base plus candidate, all modes |
-| Hydraulic editing (VC-04) | MODEL-owned canonical codec and reversible transactions; GUI entity capture, durable local event queue, typed record/membership intent adapter; native atomic journal and DVMDB-owned membership materialization | GUI membership transport wiring, genuine editor session binding, durable restart/reload verification, global mutation coverage |
+| Personal repository identity and checkout (VC-03/04) | Persistent repository UUID/roles, tracking metadata, private working-copy CRUD and fenced generation-checked saves; committed REST bundle transfer and identity-preserving unborn root checkout to a private clone target | Hydrate pinned base plus persisted candidate; embedded and remaining deployment modes |
+| Hydraulic editing (VC-04) | MODEL-owned canonical codec and reversible transactions; GUI event-save membership transport, durable event queue, typed record/membership adapter; native atomic journal and DVMDB-owned membership materialization | First-network draft initialization, genuine editor session binding, restart/reload verification, global mutation coverage |
 | Local Commit (VC-05) | Immutable revision and model persistence primitives | Working-copy-to-revision CAS, recoverable operation ID/status, usable Projects-tab Commit |
 | Collaboration (VC-06–08) | History transfer, import, revision DAG and domain merge primitives | Unified user-facing Fetch/Publish/reconciliation acceptance using independent private repositories |
 | Presentation and qualification (VC-09–11) | Graph and inspector regression coverage; extensive DVMDB durability/sync tests | Integrated GUI/Standalone/browser scenarios and complete release evidence |
 
-**Next actionable work (in order):** (1) expose and verify the `membership`
-field in the GUI event-save client, including dropped-response recovery;
-(2) hydrate the selected pinned base plus persisted candidate and establish a
+**Next actionable work (in order):** (1) initialize an empty hydraulic
+network root as a durable working-copy draft, not a revision; (2) hydrate
+the selected pinned base plus persisted candidate and establish a
 real `HydraulicData` editor session; (3) capture/queue/flush supported edits,
 including creation/deletion, over interrupted network and restart; (4) add
 local working-copy Commit with expected local HEAD and idempotent status;

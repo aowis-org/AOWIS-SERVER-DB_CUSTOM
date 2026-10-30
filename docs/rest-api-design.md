@@ -55,6 +55,19 @@ HEAD field is an invalid request, not a synonym for a first commit with
 expected null. A timed-out commit must be safely queryable by operation ID
 or idempotency key before retry.
 
+### Retry-safe creation and branch identity
+
+Clients choose the UUIDv7 of what they create (project with `unborn: true`,
+branch, private draft) and send it as `id`. The same request repeated returns
+the same `201` answer instead of creating a second object or failing with
+"already exists"; the id reused for anything else is `409`. This covers lost
+responses and transports that resend a request on their own (Qt before 6.10
+resends a POST whose connection closed before the status line, including Qt
+6.8 in Debian 13). Branches in requests are addressed by UUIDv7
+(`fromBranchId`, `branchId`); `GET /projects/{id}/branch-ids/{branchId}`
+returns a branch's current name and HEAD for name-addressed routes, whose
+results the client then verifies by identity (e.g. the bundle header).
+
 The server validates canonical UUIDs, hashes, complete model references,
 all ancestry edges and branch fork metadata before durable ref publication.
 Native and REST publish equivalent outcomes and verification fields.
