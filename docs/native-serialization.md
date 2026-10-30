@@ -1,13 +1,18 @@
-# Native-owned model serialization
+# Model serialization and DVMDB storage
 
-The AOWIS native database stores canonical serialized model bytes produced by `aowis::dvmdb::ModelCodec<T>`. The serializer, typed hydraulic reference validator and field-wise merge helpers live in this repository. Canonical type definitions come from the pinned `AOWIS-SERVER-MODEL` submodule and Qt6 Core. The low-level native object store works without Qt.
+AOWIS-SERVER-MODEL owns `aowis::model::ModelCodec<T>`, hydraulic reference
+validation, field-aware model merging and numeric value rules. DVMDB consumes
+MODEL as a dependency and does not build a competing codec. The Model target
+checks its 68-struct field manifest and enum/value rules at configure time.
 
-The model payload format contains internal binary-version markers, explicit field ordering and deterministic encoding. These markers do not belong in public namespaces or REST paths. Changing transport does not change canonical model bytes, SHA-256 object identities or revision IDs.
+DVMDB owns `ModelRecord` envelopes, storage validation, reverse-reference
+indexes, immutable revisions, durable working copies and HTTP transport.
+`aowis/dvmdb/hydraulic_network_persistence.h` bridges typed hydraulic networks
+to native records; its adapter aliases refer to the MODEL implementation and
+do not introduce format compatibility or independent code paths.
 
-CMake runs `tools/check_model_codec.py` against `docs/model_codec_fields.json` and the actual Model definitions. It currently checks **68 persisted structures**; field omissions must fail schema validation rather than silently lose model data.
+The current encoding is deterministic binary, with strict enumerator/value
+checks. Pre-release formats may change without backward readers; this source
+migration deliberately retains the current bytes as a bounded refactor.
 
-Key interfaces: `aowis/dvmdb/model_codec.h`, `aowis/dvmdb/model_validation.h`, `aowis/dvmdb/model_field_merge.h` and `aowis/dvmdb/hydraulic_network_persistence.h`.
-
-A `ModelRecord` wraps payload bytes and required UUID references. The storage engine validates generic existence/deletion safety and publishes a reverse-reference index. The hydraulic adapter performs the domain-specific typed and whole-network validation. See [canonical codec](canonical-model-codec.md), [model record format](model-records.md) and [hydraulic persistence](native-hydraulic-network.md).
-
-The implemented HTTP REST service uses this same codec and native library; canonical persistence bytes remain independent of transport.
+The REST API uses the same canonical MODEL payload wrapped in JSON metadata.

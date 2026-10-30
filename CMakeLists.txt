@@ -424,8 +424,8 @@ if(BUILD_TESTING)
     add_custom_target(aowis-dvmdb-tests DEPENDS aowis-dvmdb-working-copy-v1-tests aowis-dvmdb-canonical-project-service-tests aowis-dvmdb-revision-bundle-v2-large-tests aowis-dvmdb-revision-bundle-v2-tests aowis-dvmdb-revision-graph-v2-tests aowis-dvmdb-merge-v2-tests aowis-dvmdb-project-model-v2-tests aowis-dvmdb-packed-revision-v2-tests aowis-dvmdb-revision-resolver-v2-tests aowis-dvmdb-revision-record-v2-tests aowis-dvmdb-branch-id-tests aowis-dvmdb-object-id-tests aowis-dvmdb-revision-graph-tests aowis-dvmdb-vm-powercut-worker aowis-dvmdb-sigkill-restart-tests aowis-dvmdb-physical-enospc-tests aowis-dvmdb-offline-backup-tests aowis-dvmdb-transfer-staging-budget-tests aowis-dvmdb-index-scaling-benchmark aowis-dvmdb-pack-operational-stress-tests aowis-dvmdb-bundle-import-profile-tests aowis-dvmdb-replication-scaling-benchmark aowis-dvmdb-bundle-revision-marks-tests aowis-dvmdb-bundle-disk-index-tests aowis-dvmdb-merge-ancestry-tests aowis-dvmdb-bundle-limit-tests aowis-dvmdb-project-service-tests aowis-dvmdb-project-concurrency-tests aowis-dvmdb-recovery-tests aowis-dvmdb-scratch-tests aowis-dvmdb-error-kind-tests aowis-dvmdb-repository-verify-tests aowis-dvmdb-model-import-integrity-tests aowis-dvmdb-merkle-integrity-tests aowis-dvmdb-store-tests aowis-dvmdb-diff-scope-tests aowis-dvmdb-incremental-sync-tests aowis-dvmdb-sync-tests aowis-dvmdb-sync-cli-tests aowis-dvmdb-access-tests)
 endif()
 
-# Canonical AOWIS Model serialization is owned by this repository.
-# It depends on AOWIS-SERVER-MODEL and Qt Core, never on the SQL database.
+# Canonical AOWIS model serialization lives in AOWIS-SERVER-MODEL.
+# This optional layer contains only DVMDB storage adapters and benchmarks.
 # The standalone byte/object store can still build without Qt.
 option(AOWIS_DVMDB_WITH_MODEL_CODEC "Build native model serialization and hydraulic persistence" ON)
 if(AOWIS_DVMDB_WITH_MODEL_CODEC)
@@ -441,48 +441,8 @@ if(AOWIS_DVMDB_WITH_MODEL_CODEC)
             add_subdirectory("${AOWIS_DVMDB_MODEL_SOURCE_DIR}"
                 "${CMAKE_CURRENT_BINARY_DIR}/aowis-server-model")
         endif()
-        # Check all current Model fields against the explicitly maintained canonical model
-        # schema contract. A new field must never be silently ignored.
-        # The same check requires a value rule for every numeric field and
-        # generates the declared enumerators the codec accepts. Changing a
-        # Model header, the codec or the rules re-runs it.
-        find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        set(AOWIS_DVMDB_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-        file(GLOB_RECURSE AOWIS_DVMDB_MODEL_HEADERS
-            "${AOWIS_DVMDB_MODEL_SOURCE_DIR}/include/aowis/model/*.h")
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-            ${AOWIS_DVMDB_MODEL_HEADERS}
-            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_codec.py"
-            "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields.json"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/model_value_validation.cpp")
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_codec.py"
-                "${AOWIS_DVMDB_MODEL_SOURCE_DIR}/include/aowis/model"
-                "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields.json"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
-                --value-rules "${CMAKE_CURRENT_SOURCE_DIR}/src/model_value_validation.cpp"
-                --emit-enums "${AOWIS_DVMDB_GENERATED_DIR}/model_enum_values.inc"
-            RESULT_VARIABLE AOWIS_DVMDB_CODEC_SCHEMA_RESULT
-            OUTPUT_VARIABLE AOWIS_DVMDB_CODEC_SCHEMA_OUTPUT
-            ERROR_VARIABLE AOWIS_DVMDB_CODEC_SCHEMA_ERROR)
-        if(NOT AOWIS_DVMDB_CODEC_SCHEMA_RESULT EQUAL 0)
-            message(FATAL_ERROR "Native model serializer schema mismatch:\n${AOWIS_DVMDB_CODEC_SCHEMA_ERROR}")
-        endif()
-        message(STATUS "Native model serializer: ${AOWIS_DVMDB_CODEC_SCHEMA_OUTPUT}")
-        add_library(aowis-dvmdb-model-codec STATIC
-            src/model_codec.cpp
-            src/model_validation.cpp
-            src/model_value_validation.cpp)
-        target_include_directories(aowis-dvmdb-model-codec PRIVATE "${AOWIS_DVMDB_GENERATED_DIR}")
-        add_library(AOWIS::DvmdbModelCodec ALIAS aowis-dvmdb-model-codec)
-        target_compile_features(aowis-dvmdb-model-codec PUBLIC cxx_std_20)
-        target_include_directories(aowis-dvmdb-model-codec PUBLIC
-            "${CMAKE_CURRENT_SOURCE_DIR}/include")
-        target_link_libraries(aowis-dvmdb-model-codec PUBLIC
-            AOWIS::Model Qt6::Core)
-
+        # Canonical serialization, value checks and field-aware merges are
+        # compiled exactly once in AOWIS::Model, regardless of host target.
         add_library(aowis-dvmdb-hydraulic STATIC
             src/model_codec_adapter.cpp
             src/hydraulic_network_persistence.cpp)
@@ -491,7 +451,7 @@ if(AOWIS_DVMDB_WITH_MODEL_CODEC)
         target_include_directories(aowis-dvmdb-hydraulic PUBLIC
             "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(aowis-dvmdb-hydraulic PUBLIC
-            aowis-dvmdb-store AOWIS::DvmdbModelCodec)
+            aowis-dvmdb-store AOWIS::Model)
         add_executable(aowis-dvmdb-hydraulic-model-benchmark
             benchmarks/v5_model_benchmark.cpp)
         target_link_libraries(aowis-dvmdb-hydraulic-model-benchmark PRIVATE aowis-dvmdb-hydraulic)
@@ -524,13 +484,13 @@ if(AOWIS_DVMDB_WITH_MODEL_CODEC)
             set_tests_properties(aowis-dvmdb-hydraulic-network-tests PROPERTIES LABELS "aowis")
             add_executable(aowis-dvmdb-model-value-rules-tests tests/model_value_rules_tests.cpp)
             target_link_libraries(aowis-dvmdb-model-value-rules-tests PRIVATE aowis-dvmdb-hydraulic)
-            target_include_directories(aowis-dvmdb-model-value-rules-tests PRIVATE "${AOWIS_DVMDB_GENERATED_DIR}")
+            get_target_property(AOWIS_DVMDB_MODEL_ENUM_DIR AOWIS::Model AOWIS_MODEL_ENUM_DIR)
+            if(NOT AOWIS_DVMDB_MODEL_ENUM_DIR)
+                message(FATAL_ERROR "MODEL target must expose the enum verification directory")
+            endif()
+            target_include_directories(aowis-dvmdb-model-value-rules-tests PRIVATE "${AOWIS_DVMDB_MODEL_ENUM_DIR}")
             add_test(NAME aowis-dvmdb-model-value-rules-tests COMMAND aowis-dvmdb-model-value-rules-tests)
             set_tests_properties(aowis-dvmdb-model-value-rules-tests PROPERTIES LABELS "aowis")
-            add_test(NAME aowis-dvmdb-model-codec-check-tests
-                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_model_codec_tests.py"
-                    "${CMAKE_CURRENT_SOURCE_DIR}")
-            set_tests_properties(aowis-dvmdb-model-codec-check-tests PROPERTIES LABELS "aowis")
             add_dependencies(aowis-dvmdb-tests aowis-dvmdb-model-codec-tests aowis-dvmdb-hydraulic-network-tests
                 aowis-dvmdb-model-value-rules-tests)
         endif()

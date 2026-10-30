@@ -1,6 +1,6 @@
 // Review finding F8: no undeclared enum value, NaN, infinity or physically
 // impossible number is ever stored or read. Covers the codec (both
-// directions), the value rules (docs/model-value-rules.md) and every
+// directions), the value rules (AOWIS-SERVER-MODEL/docs/model-value-rules.md) and every
 // hydraulic save and edit path, including the indexed fast paths.
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
 

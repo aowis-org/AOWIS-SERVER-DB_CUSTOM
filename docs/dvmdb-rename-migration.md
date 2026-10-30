@@ -15,7 +15,7 @@ former database project identifier; the canonical deployment and tools use
 | Server executable | `aowis-server-dvmdb` |
 | C++ public namespace | `aowis::dvmdb` |
 | Public headers | `include/aowis/dvmdb/` |
-| Public CMake aliases | `AOWIS::DvmdbProjectService`, `AOWIS::DvmdbModelCodec`, `AOWIS::DvmdbHydraulic` |
+| Public CMake aliases | `AOWIS::DvmdbProjectService`, `AOWIS::Model`, `AOWIS::DvmdbHydraulic` |
 | HTTP route prefix | `/dvmdb/v1` |
 | OpenAPI contract | `docs/dvmdb-http-api.yaml` |
 | Source snapshot | `dvmdb.zip`, created by `tools/zip_dvmdb.sh` |

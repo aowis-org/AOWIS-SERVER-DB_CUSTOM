@@ -66,7 +66,7 @@ The storage engine and hydraulic-model APIs can be called **directly from C++**.
 | Native storage | Immutable SHA-256 objects, copy-on-write Merkle UUID index, durable branch refs, recoverable index, integrity verification, offline compaction |
 | Physical storage | One append-only content-addressed object pack, with a reconstructible sidecar index |
 | Model serialization | Native-owned `ModelCodec<T>` for AOWIS model definitions; configure-time schema coverage check for 68 persisted structures |
-| Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, physical value rules ([model value rules](docs/model-value-rules.md)), indexed lookup/edit/delete |
+| Hydraulic data | Complete `NetworkHydraulic` persistence, all 18 top-level entity collections, ordered chunked membership, typed relationship validation, physical value rules ([model value rules](external/AOWIS-SERVER-MODEL/docs/model-value-rules.md)), indexed lookup/edit/delete |
 | History | Immutable revisions with up to two parents, branches, paginated history, historical reads, Merkle diffs |
 | Merging | Three-way native merges, hydraulic field-level merges, explicit conflict choices, coordinated membership reconciliation, semantic validation before publishing a divergent hydraulic merge |
 | Replication | Portable full/incremental `.aowbundle` exchange, SHA-256, object graph, canonical Merkle trie and model-reference index verification, fast-forward-only import, divergence protection |
@@ -157,7 +157,7 @@ public header paths, CMake aliases and HTTP base URL have changed. See
 
 When `AOWIS_DVMDB_WITH_MODEL_CODEC=ON` (the default), CMake requires Qt6 Core and the Model submodule; use `-DAOWIS_DVMDB_WITH_MODEL_CODEC=OFF` for an explicitly native-only build. With Qt available, the tests cover the native store, model codec, hydraulic persistence, offline synchronization and the optional access-policy library. The project catalogue and HTTP route integration suites are included when their dependencies are enabled.
 
-Useful CMake targets include `AOWIS::DvmdbModelCodec` and `AOWIS::DvmdbHydraulic`. The public namespaces are `aowis::dvmdb` and `aowis::dvmdb::hydraulic`.
+Useful CMake targets include `AOWIS::Model` and `AOWIS::DvmdbHydraulic`. The public namespaces are `aowis::dvmdb` and `aowis::dvmdb::hydraulic`.
 
 ### Native C++ API
 
@@ -273,7 +273,7 @@ The project/branch/revision, hydraulic edit/merge and bounded binary synchroniza
 | [OpenAPI](docs/dvmdb-http-api.yaml) | Actual implemented HTTP route/schema contract |
 | [Operations](docs/operations.md) | Coordinated backups, restore verification, disk-full response and maintenance |
 | [Hydraulic model](docs/native-hydraulic-network.md) | Persistence, entity queries, indexed editing, validation |
-| [Canonical serialization](docs/canonical-model-codec.md) | Model codec/schema contract |
+| [Canonical serialization](docs/canonical-model-codec.md) | DVMDB model adapter; canonical codec owned by MODEL |
 | [Model records](docs/model-records.md) | Generic typed envelope and reference index |
 | [Version-control semantics](docs/version-control-semantics.md) | Agreed branch/HEAD/revision model, all-branches graph and API gaps |
 | [Revision history](docs/native-revision-history.md) | Historical reads and branching |
