@@ -122,13 +122,20 @@ for whitelisted existing-member scalar updates (pipe hydraulic scalars,
 junction elevations and map-label text), physical/operating updates to
 reservoirs, tanks, pumps and valves, existing catalogue payload updates,
 independent existing-pipe endpoint rewires, and typed reference updates for
-existing demand points and controls.
-These paths check MODEL value rules, canonical references where applicable,
-immutable-revision ownership and expected HEAD, preserve the membership
-manifest, and return the existing revision on no-op. Ineligible or mixed topology
-and dependency edits fall back to complete-network validation. New/deleted
-entities and structural membership still take full-network validation on the
-UUIDv7 path. Remaining indexed paths, merge qualifications and legacy suite
+existing demand points and controls. The bounded structural membership engine
+is now shared by the SHA-only qualification adapter and the UUIDv7 API; eligible
+insertions and dependent removals use immutable revision-pinned entity,
+reverse-reference and membership-chunk reads, with one atomic project-scoped
+commit of changed entity records, chunks and network root. The insertion path
+runs MODEL physical-value checks before committing.
+These paths preserve MODEL value rules, canonical references where applicable,
+immutable-revision ownership and expected HEAD. Nonstructural indexed edits
+preserve the membership manifest and return the existing revision on no-op.
+Ineligible or mixed structural edits still take complete-network validation.
+The additional UUIDv7 structural tests cover same-batch references, cascaded
+removal, invalid targets, stale HEAD, unchanged source branch and compaction /
+reopen recovery; they require execution in the DVMDB test suite before this
+checkpoint is accepted. The remaining merge qualifications and legacy suite
 migration are still required. Do not add production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 

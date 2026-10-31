@@ -1066,12 +1066,37 @@ std::optional<Revision> tryIndexedPipeRewires(
 // checked separately: they do not appear in the model reverse-reference index.
 //
 // Bounded membership chunks allow edits without scanning existing members.
-std::optional<Revision> tryIndexedMembershipEdits(
-    Repository& repository, std::string_view branch, const QUuid& networkUuid,
-    const std::vector<HydraulicEntityChange>& changes, const Revision& starting,
+struct ValidateMembershipEntity {
+    template<typename T>
+    aowis::dvmdb::ModelValidationReport operator()(const T& entity) const {
+        return aowis::dvmdb::validateHydraulicEntityValues(entity);
+    }
+};
+
+struct EncodeMembershipEntity {
+    template<typename T>
+    QByteArray operator()(const T& entity) const {
+        return ModelCodec<T>::encode(entity);
+    }
+};
+
+struct MembershipEntityUuid {
+    template<typename T>
+    QUuid operator()(const T& entity) const {
+        return entity.uuid;
+    }
+};
+
+template<typename RevisionType>
+std::optional<RevisionType> tryIndexedMembershipEditsUsing(
+    const std::function<std::optional<ModelRecord>(const Key&)>& readModel,
+    const std::function<std::vector<Key>(const Key&)>& readReferrers,
+    const std::function<std::optional<Key>(const Key&)>& findOwner,
+    const std::function<RevisionType(std::vector<ModelChange>)>& commit,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
     HydraulicEditDiagnostics* diagnostics) {
     const Key networkKey = keyFromUuid(networkUuid);
-    const std::optional<ModelRecord> networkRoot = repository.getModel(branch, networkKey);
+    const std::optional<ModelRecord> networkRoot = readModel(networkKey);
     if (!networkRoot || networkRoot->kind != hydraulicNetworkKind) return std::nullopt;
     Manifest manifest = decodeManifest(qByteArrayFromBytes(networkRoot->payload));
     if (manifest.metadata.uuid != networkUuid) return std::nullopt;
@@ -1095,7 +1120,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
         const Key key = keyFromUuid(change.uuid);
         if (change.value) {
             if (change.value->valueless_by_exception() ||
-                std::visit([](const auto& entity) { return entity.uuid; }, *change.value) != change.uuid)
+                std::visit(MembershipEntityUuid{}, *change.value) != change.uuid)
                 return std::nullopt;
             if (change.value->index() >= 8 &&
                 !std::holds_alternative<HydraulicNodeReservoir>(*change.value) &&
@@ -1108,10 +1133,15 @@ std::optional<Revision> tryIndexedMembershipEdits(
                 !std::holds_alternative<HydraulicControlSimple>(*change.value) &&
                 !std::holds_alternative<HydraulicControlRule>(*change.value) &&
                 !std::holds_alternative<HydraulicMapLabel>(*change.value)) return std::nullopt;
-            if (repository.getModel(branch, key)) return std::nullopt;
+            if (readModel(key)) return std::nullopt;
+            const aowis::dvmdb::ModelValidationReport values =
+                std::visit(ValidateMembershipEntity{}, *change.value);
+            if (!values.valid())
+                throw StorageError(StorageErrorKind::InvalidInput,
+                                   "invalid hydraulic membership insertion: " + values.summary().toStdString());
             insertions.emplace(key, &change);
         } else {
-            const std::optional<ModelRecord> old = repository.getModel(branch, key);
+            const std::optional<ModelRecord> old = readModel(key);
             if (!old) return std::nullopt;
             std::size_t collection = 0;
             std::optional<HydraulicEntity> decoded;
@@ -1172,7 +1202,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
                     default: return std::nullopt;
                 }
             } else return std::nullopt;
-            const std::optional<Key> owning = ownerChunk(repository, branch, networkUuid, key);
+            const std::optional<Key> owning = findOwner(key);
             if (!owning || !manifest.chunks[collection].contains(uuidFromKey(*owning)) ||
                 (decoded && old->references != membershipReferences(*decoded))) return std::nullopt;
             removals.emplace(key, Removal{*owning, collection});
@@ -1192,7 +1222,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
     }
     for (const std::pair<const Key, Removal>& removal : removals) {
         if (metadataReferences.contains(uuidFromKey(removal.first))) return std::nullopt;
-        const std::vector<Key> incoming = repository.referencingModel(branch, removal.first);
+        const std::vector<Key> incoming = readReferrers(removal.first);
         if (std::find(incoming.begin(), incoming.end(), removal.second.owner) == incoming.end())
             return std::nullopt;
         for (const Key& referring : incoming) {
@@ -1215,15 +1245,15 @@ std::optional<Revision> tryIndexedMembershipEdits(
             const std::size_t index = added->second->value->index();
             return std::find(accepted.begin(), accepted.end(), kinds[index]) != accepted.end();
         }
-        const std::optional<ModelRecord> target = repository.getModel(branch, key);
+        const std::optional<ModelRecord> target = readModel(key);
         if (!target || std::find(accepted.begin(), accepted.end(), target->kind) == accepted.end())
             return false;
-        return ownerChunk(repository, branch, networkUuid, key).has_value();
+        return findOwner(key).has_value();
     };
-    const auto nodeTarget = [&](const QUuid& id) {
+    const std::function<bool(const QUuid&)> nodeTarget = [&](const QUuid& id) {
         return validTarget(id, {junctionKind, 2, 3});
     };
-    const auto patternTarget = [&](const QUuid& id) {
+    const std::function<bool(const QUuid&)> patternTarget = [&](const QUuid& id) {
         return validTarget(id, {9});
     };
     for (const std::pair<const Key, const HydraulicEntityChange*>& entry : insertions) {
@@ -1276,7 +1306,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
                         if (inserted != insertions.end()) {
                             pipe = std::get_if<HydraulicLinkPipe>(&*inserted->second->value);
                         } else {
-                            const std::optional<ModelRecord> record = repository.getModel(branch, pipeKey);
+                            const std::optional<ModelRecord> record = readModel(pipeKey);
                             if (!record || record->kind != pipeKind) return std::nullopt;
                             existingPipe = ModelCodec<HydraulicLinkPipe>::decode(
                                 qByteArrayFromBytes(record->payload));
@@ -1317,10 +1347,11 @@ std::optional<Revision> tryIndexedMembershipEdits(
     }
 
     std::map<Key, std::optional<MemberChunk>> modifiedChunks;
-    const auto mutableChunk = [&](const Key& key, std::size_t collection) -> MemberChunk& {
+    const std::function<MemberChunk&(const Key&, std::size_t)> mutableChunk =
+        [&](const Key& key, std::size_t collection) -> MemberChunk& {
         std::map<Key, std::optional<MemberChunk>>::iterator found = modifiedChunks.find(key);
         if (found == modifiedChunks.end()) {
-            const std::optional<ModelRecord> record = repository.getModel(branch, key);
+            const std::optional<ModelRecord> record = readModel(key);
             if (!record) throw StorageError(StorageErrorKind::Corruption, "missing chunk while editing membership");
             found = modifiedChunks.emplace(key, decodeChunk(*record, networkUuid, collection)).first;
         }
@@ -1339,7 +1370,7 @@ std::optional<Revision> tryIndexedMembershipEdits(
                 if (manifest.nextChunk[collection] == std::numeric_limits<quint32>::max())
                     throw StorageError(StorageErrorKind::LimitExceeded, "hydraulic chunk serial exhausted");
                 const QUuid id = chunkUuid(networkUuid, collection, manifest.nextChunk[collection]++);
-                if (repository.getModel(branch, keyFromUuid(id)) || modifiedChunks.contains(keyFromUuid(id)))
+                if (readModel(keyFromUuid(id)) || modifiedChunks.contains(keyFromUuid(id)))
                     throw StorageError(StorageErrorKind::Internal, "hydraulic membership chunk ID collision");
                 ids.append(id);
                 modifiedChunks.emplace(keyFromUuid(id), MemberChunk{networkUuid, collection, {}});
@@ -1347,10 +1378,8 @@ std::optional<Revision> tryIndexedMembershipEdits(
             mutableChunk(keyFromUuid(ids.last()), collection).members.append(change.uuid);
             ModelRecord record;
             record.kind = kinds[collection];
-            std::visit([&record](const auto& entity) {
-                using T = std::decay_t<decltype(entity)>;
-                record.payload = bytesFromQByteArray(ModelCodec<T>::encode(entity));
-            }, *change.value);
+            record.payload = bytesFromQByteArray(
+                std::visit(EncodeMembershipEntity{}, *change.value));
             if (record.payload.empty()) throw StorageError(StorageErrorKind::Internal, "cannot encode inserted entity");
             record.references = membershipReferences(*change.value);
             pending.push_back(ModelChange{key, std::move(record)});
@@ -1380,12 +1409,55 @@ std::optional<Revision> tryIndexedMembershipEdits(
         root.references = chunkKeys(manifest);
         pending.push_back(ModelChange{networkKey, std::move(root)});
     }
-    const Revision result = repository.commitModel(branch, std::move(pending), starting.id);
+    const RevisionType result = commit(std::move(pending));
     if (diagnostics) {
         diagnostics->indexedMembershipFastPath = true;
         diagnostics->validatedEntities = changes.size();
     }
     return result;
+}
+
+// SHA-only test adapter pending complete migration. The membership engine and
+// canonical validation are shared with the project-scoped UUIDv7 path.
+std::optional<Revision> tryIndexedMembershipEdits(
+    Repository& repository, std::string_view branch, const QUuid& networkUuid,
+    const std::vector<HydraulicEntityChange>& changes, const Revision& starting,
+    HydraulicEditDiagnostics* diagnostics) {
+    return tryIndexedMembershipEditsUsing<Revision>(
+        [&repository, branch](const Key& key) {
+            return repository.getModel(branch, key);
+        },
+        [&repository, branch](const Key& key) {
+            return repository.referencingModel(branch, key);
+        },
+        [&repository, branch, &networkUuid](const Key& key) {
+            return ownerChunk(repository, branch, networkUuid, key);
+        },
+        [&repository, branch, &starting](std::vector<ModelChange> pending) {
+            return repository.commitModel(branch, std::move(pending), starting.id);
+        }, networkUuid, changes, diagnostics);
+}
+
+// All reads and reverse-reference lookups belong to the same immutable UUIDv7
+// revision. commitModelV2 atomically verifies the expected HEAD and publishes
+// root, chunks and entity records as a single revision or publishes nothing.
+std::optional<RevisionId> tryIndexedUuidMembershipEdits(
+    Repository& repository, const ProjectId& project, std::string_view branch,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
+    const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
+    return tryIndexedMembershipEditsUsing<RevisionId>(
+        [&repository, &project, &expectedHead](const Key& key) {
+            return repository.getModelAtRevisionV2(project, expectedHead, key);
+        },
+        [&repository, &project, &expectedHead](const Key& key) {
+            return repository.referencingModelAtRevisionV2(project, expectedHead, key);
+        },
+        [&repository, &project, &expectedHead, &networkUuid](const Key& key) {
+            return ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key);
+        },
+        [&repository, &project, branch, &expectedHead](std::vector<ModelChange> pending) {
+            return repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+        }, networkUuid, changes, diagnostics);
 }
 
 // Return nullopt if any change needs full-network validation. This routine
@@ -3097,6 +3169,9 @@ RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project
                 repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
             return *indexed;
         if (const std::optional<RevisionId> indexed = tryIndexedUuidDependentUpdates(
+                repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
+            return *indexed;
+        if (const std::optional<RevisionId> indexed = tryIndexedUuidMembershipEdits(
                 repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
             return *indexed;
     }

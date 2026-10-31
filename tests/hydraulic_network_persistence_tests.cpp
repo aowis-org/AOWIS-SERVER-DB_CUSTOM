@@ -3019,6 +3019,184 @@ void exerciseUuidV7IndexedReferences() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+// Project-scoped UUIDv7 bounded membership qualification. Structural edits
+// update only the affected chunks, use immutable pinned reads and preserve
+// the original branch. Unsafe dependencies must fall back to full validation.
+void exerciseUuidV7IndexedMembership() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    const NetworkHydraulic baseline = completeNetwork();
+    native::RevisionId membershipHead = native::RevisionId::generate();
+    NetworkHydraulic expected = baseline;
+    try {
+        {
+            native::Repository repository(folder);
+            const native::RevisionId genesis = repository.createBranchV2(project, "main");
+            const native::RevisionId saved = hydraulic::saveHydraulicNetwork(
+                repository, project, "main", baseline, genesis);
+            require(repository.createBranchV2(project, "uuid-membership", "main") == saved,
+                    "UUIDv7 membership branch did not inherit baseline");
+            const HydraulicNodeJunction addedNode = item<HydraulicNodeJunction>(31110);
+            HydraulicLinkPipe addedPipe = item<HydraulicLinkPipe>(31111);
+            addedPipe.node_uuid_from = uuid(19);
+            addedPipe.node_uuid_to = addedNode.uuid;
+            addedPipe.material_uuid = uuid(10);
+            HydraulicMapLabel addedLabel = item<HydraulicMapLabel>(31112);
+            addedLabel.anchor_node_uuid = addedNode.uuid;
+            addedLabel.text = QStringLiteral("UUIDv7 new junction");
+            const std::vector<hydraulic::HydraulicEntityChange> insertions{
+                {addedPipe.uuid, hydraulic::HydraulicEntity{addedPipe}},
+                {addedNode.uuid, hydraulic::HydraulicEntity{addedNode}},
+                {addedLabel.uuid, hydraulic::HydraulicEntity{addedLabel}}};
+            hydraulic::HydraulicEditDiagnostics stats;
+            const native::ModelRecord oldRoot = *repository.getModelAtRevisionV2(
+                project, saved, hydraulic::keyFromUuid(baseline.uuid));
+            membershipHead = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-membership", baseline.uuid,
+                insertions, saved, &stats);
+            require(membershipHead != saved && stats.indexedMembershipFastPath &&
+                    stats.validatedEntities == insertions.size() &&
+                    repository.headV2(project, "main") == saved,
+                    "UUIDv7 insertion missed bounded membership path or changed source HEAD");
+            expected.nodes_junctions.append(addedNode);
+            expected.links_pipes.append(addedPipe);
+            expected.map_labels.append(addedLabel);
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, membershipHead, baseline.uuid));
+            const native::ModelRecord insertedRoot = *repository.getModelAtRevisionV2(
+                project, membershipHead, hydraulic::keyFromUuid(baseline.uuid));
+            // The root stores chunk identities, not inline entity UUIDs. These
+            // three insertions fit into existing chunks, so the root must stay
+            // unchanged while the affected chunk records gain new members.
+            require(native::encodeModelRecord(insertedRoot) == native::encodeModelRecord(oldRoot),
+                    "UUIDv7 bounded insertion unnecessarily rewrote the root manifest");
+            const std::set<native::Key> insertedKeys{
+                hydraulic::keyFromUuid(addedNode.uuid),
+                hydraulic::keyFromUuid(addedPipe.uuid),
+                hydraulic::keyFromUuid(addedLabel.uuid)};
+            std::set<native::Key> observedInsertedKeys;
+            std::size_t updatedChunkCount = 0;
+            for (const native::Key& chunkKey : insertedRoot.references) {
+                const std::optional<native::ModelRecord> oldChunk =
+                    repository.getModelAtRevisionV2(project, saved, chunkKey);
+                const std::optional<native::ModelRecord> newChunk =
+                    repository.getModelAtRevisionV2(project, membershipHead, chunkKey);
+                require(newChunk.has_value(), "UUIDv7 insertion left a missing membership chunk");
+                if (!oldChunk || native::encodeModelRecord(*oldChunk) !=
+                                 native::encodeModelRecord(*newChunk)) {
+                    ++updatedChunkCount;
+                    for (const native::Key& memberKey : newChunk->references) {
+                        if (insertedKeys.contains(memberKey))
+                            observedInsertedKeys.insert(memberKey);
+                    }
+                }
+            }
+            require(updatedChunkCount == 3 && observedInsertedKeys == insertedKeys,
+                    "UUIDv7 insertion did not update the three affected membership chunks");
+            const std::vector<native::Key> incoming = repository.referencingModelAtRevisionV2(
+                project, membershipHead, hydraulic::keyFromUuid(addedNode.uuid));
+            require(std::find(incoming.begin(), incoming.end(),
+                             hydraulic::keyFromUuid(addedPipe.uuid)) != incoming.end() &&
+                    std::find(incoming.begin(), incoming.end(),
+                             hydraulic::keyFromUuid(addedLabel.uuid)) != incoming.end(),
+                    "UUIDv7 membership insertion lost dependent reference edges");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-membership",
+                    baseline.uuid, insertions, saved, &stats);
+            }), "UUIDv7 membership insertion accepted stale expected HEAD");
+
+            HydraulicLinkPipe invalidPipe = item<HydraulicLinkPipe>(31113);
+            invalidPipe.node_uuid_from = uuid(10); // A material is not a node.
+            invalidPipe.node_uuid_to = addedNode.uuid;
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-membership",
+                    baseline.uuid, {{invalidPipe.uuid, hydraulic::HydraulicEntity{invalidPipe}}},
+                    membershipHead, &stats);
+            }) && !stats.indexedMembershipFastPath &&
+                repository.headV2(project, "uuid-membership") == membershipHead,
+                "UUIDv7 invalid inserted endpoint changed HEAD");
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-membership",
+                    baseline.uuid, {{addedNode.uuid, std::nullopt}}, membershipHead, &stats);
+            }) && !stats.indexedMembershipFastPath &&
+                repository.headV2(project, "uuid-membership") == membershipHead,
+                "UUIDv7 membership deleted a node with live incoming references");
+            HydraulicNodeJunction invalidValue = item<HydraulicNodeJunction>(31115);
+            invalidValue.elevation_m = std::numeric_limits<double>::infinity();
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-membership",
+                    baseline.uuid, {{invalidValue.uuid, hydraulic::HydraulicEntity{invalidValue}}},
+                    membershipHead, &stats);
+            }) && !stats.indexedMembershipFastPath &&
+                repository.headV2(project, "uuid-membership") == membershipHead,
+                "UUIDv7 indexed membership accepted invalid physical values");
+
+            const native::RevisionId afterLabel = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-membership", baseline.uuid,
+                {{addedLabel.uuid, std::nullopt}}, membershipHead, &stats);
+            require(afterLabel != membershipHead && stats.indexedMembershipFastPath &&
+                    !repository.getModelAtRevisionV2(
+                        project, afterLabel, hydraulic::keyFromUuid(addedLabel.uuid)),
+                    "UUIDv7 independent label deletion missed indexed membership path");
+            expected.map_labels.removeLast();
+            membershipHead = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-membership", baseline.uuid,
+                {{addedNode.uuid, std::nullopt}, {addedPipe.uuid, std::nullopt}},
+                afterLabel, &stats);
+            require(membershipHead != afterLabel && stats.indexedMembershipFastPath &&
+                    stats.validatedEntities == 2,
+                    "UUIDv7 dependent pipe-and-node removal missed indexed membership path");
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, membershipHead, baseline.uuid));
+            require(!repository.getModelAtRevisionV2(
+                        project, membershipHead, hydraulic::keyFromUuid(addedPipe.uuid)) &&
+                    !repository.getModelAtRevisionV2(
+                        project, membershipHead, hydraulic::keyFromUuid(addedNode.uuid)),
+                    "UUIDv7 deleted membership records remain reachable");
+            // Both added hydraulic members have now been removed. The next
+            // mixed edit starts from the restored baseline, not the earlier
+            // insertion expectation.
+            expected = baseline;
+            // Mixed existing-record update and insertion is not a membership
+            // fast path; it must use the complete canonical validator.
+            HydraulicMapLabel mixedLabel = item<HydraulicMapLabel>(31114);
+            mixedLabel.anchor_node_uuid = uuid(20);
+            HydraulicNodeJunction changedNode = baseline.nodes_junctions[0];
+            changedNode.metadata.description = QStringLiteral("mixed batch");
+            const native::RevisionId mixedHead = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-membership", baseline.uuid,
+                {{mixedLabel.uuid, hydraulic::HydraulicEntity{mixedLabel}},
+                 {changedNode.uuid, hydraulic::HydraulicEntity{changedNode}}},
+                membershipHead, &stats);
+            require(mixedHead != membershipHead && !stats.indexedMembershipFastPath,
+                    "UUIDv7 mixed structural batch bypassed full validation");
+            expected.nodes_junctions[0] = changedNode;
+            expected.map_labels.append(mixedLabel);
+            membershipHead = mixedHead;
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, membershipHead, baseline.uuid));
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, saved, baseline.uuid));
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            require(reopened.headV2(project, "uuid-membership") == membershipHead,
+                    "UUIDv7 membership HEAD changed after reopen/compaction");
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, membershipHead, baseline.uuid));
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 void exerciseUuidV7HydraulicMerges() {
     const std::filesystem::path folder = tempDir();
     const native::ProjectId project = native::ProjectId::generate();
@@ -3146,6 +3324,7 @@ int main(int argc, char** argv) {
         exerciseCallerPinnedWrites();
         exerciseUuidV7Hydraulic();
         exerciseUuidV7IndexedReferences();
+        exerciseUuidV7IndexedMembership();
         exerciseUuidV7HydraulicMerges();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
