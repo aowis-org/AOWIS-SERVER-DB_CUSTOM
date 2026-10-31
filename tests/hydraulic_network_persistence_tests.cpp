@@ -3649,6 +3649,189 @@ void exerciseUuidV7MergeChoiceQualification() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+
+// UUIDv7 replacement for the SHA-only caller-pinned write qualification.
+// Even an empty edit must validate the caller's pinned branch tip before it
+// decides there is nothing to publish.
+void exerciseUuidV7CallerPinnedWrites() {
+    const std::filesystem::path folder = tempDir();
+    try {
+        native::Repository repository(folder);
+        const native::ProjectId project = native::ProjectId::generate();
+        const NetworkHydraulic network = completeNetwork();
+        const native::RevisionId raw = repository.createBranchV2(project, "main");
+        const native::RevisionId initial = hydraulic::saveHydraulicNetwork(
+            repository, project, "main", network, raw);
+        require(initial != raw && repository.headV2(project, "main") == initial,
+                "UUIDv7 first pinned network save did not commit");
+        require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+            (void)hydraulic::saveHydraulicNetwork(repository, project, "main", network, raw);
+        }) && repository.headV2(project, "main") == initial,
+                "UUIDv7 full-network save accepted stale HEAD");
+
+        HydraulicNodeJunction junction = network.nodes_junctions[0];
+        junction.elevation_m += 2.0;
+        const std::vector<hydraulic::HydraulicEntityChange> changes{
+            {junction.uuid, hydraulic::HydraulicEntity{junction}}};
+        const native::RevisionId edited = hydraulic::editHydraulicNetwork(
+            repository, project, "main", network.uuid, changes, initial);
+        require(edited != initial && repository.headV2(project, "main") == edited,
+                "UUIDv7 caller-pinned indexed edit did not commit");
+        require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+            (void)hydraulic::editHydraulicNetwork(repository, project, "main",
+                network.uuid, changes, initial);
+        }) && throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+            (void)hydraulic::editHydraulicNetwork(repository, project, "main",
+                network.uuid, {}, initial);
+        }) && repository.headV2(project, "main") == edited,
+                "UUIDv7 stale edit or empty edit accepted an outdated HEAD");
+        const std::uint64_t packBefore = repository.packSize();
+        const native::RevisionId noop = hydraulic::editHydraulicNetwork(
+            repository, project, "main", network.uuid, {}, edited);
+        require(noop == edited && repository.headV2(project, "main") == edited &&
+                repository.packSize() == packBefore,
+                "UUIDv7 pinned empty edit created a revision");
+        NetworkHydraulic expected = network;
+        expected.nodes_junctions[0] = junction;
+        const std::optional<NetworkHydraulic> restored = hydraulic::loadHydraulicNetworkAtRevision(
+            repository, project, edited, network.uuid);
+        require(restored.has_value(), "UUIDv7 pinned edit network missing");
+        compareNetworks(expected, *restored);
+        (void)repository.verifyRepository();
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+// UUIDv7 replacement for the SHA-only concurrent-snapshot qualification.
+// Readers pin one immutable revision before loading the complete aggregate,
+// its bounded membership and a targeted indexed entity. The writer changes
+// both root metadata and membership, so mixing revisions would be observable.
+void exerciseUuidV7ConcurrentSnapshots() {
+    const std::filesystem::path folder = tempDir();
+    try {
+        const native::ProjectId project = native::ProjectId::generate();
+        NetworkHydraulic baseline = completeNetwork();
+        baseline.title_line_1 = QStringLiteral("2");
+        baseline.nodes_junctions[0].metadata.description = QStringLiteral("2");
+        baseline.map_labels[0].text = QStringLiteral("2");
+        HydraulicMapLabel secondLabel = item<HydraulicMapLabel>(9102);
+        secondLabel.text = QStringLiteral("2");
+        secondLabel.anchor_node_uuid = baseline.nodes_junctions[1].uuid;
+        baseline.map_labels.append(secondLabel);
+        {
+            native::Repository repository(folder);
+            const native::RevisionId raw = repository.createBranchV2(project, "main");
+            const native::RevisionId base = hydraulic::saveHydraulicNetwork(
+                repository, project, "main", baseline, raw);
+            std::atomic<bool> begin{false};
+            std::atomic<int> checks{0};
+            std::exception_ptr failure;
+            std::mutex failureMutex;
+            const std::function<void(std::exception_ptr)> reportFailure =
+                [&failure, &failureMutex](std::exception_ptr error) {
+                    std::lock_guard<std::mutex> guard(failureMutex);
+                    if (!failure) failure = error;
+                };
+            const std::function<void()> reader = [&]() {
+                try {
+                    while (!begin.load()) std::this_thread::yield();
+                    for (int index = 0; index < 80; ++index) {
+                        const native::RevisionId pinned = repository.headV2(project, "main");
+                        const std::optional<NetworkHydraulic> observed =
+                            hydraulic::loadHydraulicNetworkAtRevision(
+                                repository, project, pinned, baseline.uuid);
+                        require(observed.has_value(), "UUIDv7 concurrent snapshot missing");
+                        const QString marker = observed->title_line_1;
+                        bool valid = false;
+                        const int generation = marker.toInt(&valid);
+                        require(valid && generation >= 2 && generation <= 24 &&
+                                observed->nodes_junctions[0].metadata.description == marker &&
+                                observed->map_labels[0].text == marker &&
+                                observed->map_labels.size() == (generation % 2 == 0 ? 2 : 1),
+                                "UUIDv7 pinned aggregate mixed generations");
+                        const std::optional<QList<QUuid>> ids =
+                            hydraulic::listHydraulicEntityIdsAtRevisionLimited(
+                                repository, project, pinned, baseline.uuid,
+                                hydraulic::HydraulicEntityType::MapLabel, 2);
+                        const std::optional<hydraulic::HydraulicEntity> label =
+                            hydraulic::loadHydraulicEntityAtRevision(
+                                repository, project, pinned, baseline.uuid,
+                                baseline.map_labels[0].uuid);
+                        require(ids && ids->size() == observed->map_labels.size() &&
+                                ids->front() == baseline.map_labels[0].uuid &&
+                                label && std::holds_alternative<HydraulicMapLabel>(*label) &&
+                                std::get<HydraulicMapLabel>(*label).text == marker,
+                                "UUIDv7 revision-pinned indexed readers mixed generations");
+                        ++checks;
+                        std::this_thread::yield();
+                    }
+                } catch (...) { reportFailure(std::current_exception()); }
+            };
+            std::thread first(reader);
+            std::thread second(reader);
+            std::thread writer([&]() {
+                try {
+                    native::RevisionId expectedHead = base;
+                    NetworkHydraulic next = baseline;
+                    begin.store(true);
+                    for (int generation = 3; generation <= 24; ++generation) {
+                        const QString marker = QString::number(generation);
+                        next.title_line_1 = marker;
+                        next.nodes_junctions[0].metadata.description = marker;
+                        next.map_labels[0].text = marker;
+                        if (generation % 2 != 0) next.map_labels.removeLast();
+                        else if (next.map_labels.size() == 1) {
+                            secondLabel.text = marker;
+                            next.map_labels.append(secondLabel);
+                        } else {
+                            next.map_labels[1].text = marker;
+                        }
+                        expectedHead = hydraulic::saveHydraulicNetwork(
+                            repository, project, "main", next, expectedHead);
+                        std::this_thread::yield();
+                    }
+                } catch (...) { reportFailure(std::current_exception()); }
+            });
+            first.join();
+            second.join();
+            writer.join();
+            if (failure) std::rethrow_exception(failure);
+            require(checks == 160, "UUIDv7 concurrent snapshot readers did not finish");
+            const std::optional<NetworkHydraulic> original =
+                hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, project, base, baseline.uuid);
+            require(original.has_value(), "UUIDv7 original snapshot disappeared");
+            compareNetworks(baseline, *original);
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            const native::RevisionId latest = reopened.headV2(project, "main");
+            const std::optional<NetworkHydraulic> last =
+                hydraulic::loadHydraulicNetworkAtRevision(
+                    reopened, project, latest, baseline.uuid);
+            require(last && last->title_line_1 == QStringLiteral("24") &&
+                    last->nodes_junctions[0].metadata.description == QStringLiteral("24") &&
+                    last->map_labels.size() == 2 &&
+                    last->map_labels[0].text == QStringLiteral("24"),
+                    "UUIDv7 concurrent writer result missing after compaction/reopen");
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3671,6 +3854,8 @@ int main(int argc, char** argv) {
         exerciseUuidV7HydraulicMerges();
         exerciseUuidV7CoordinatedMembershipMerges();
         exerciseUuidV7MergeChoiceQualification();
+        exerciseUuidV7CallerPinnedWrites();
+        exerciseUuidV7ConcurrentSnapshots();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
     } catch (const std::exception& failure) {

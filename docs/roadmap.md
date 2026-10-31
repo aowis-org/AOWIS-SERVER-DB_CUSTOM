@@ -148,8 +148,10 @@ automatically equivalent UUIDv7 performance baselines. UUIDv7 merge-choice
 qualification now covers pinned target-side field resolution, rejection of
 stale/duplicate/unused field choices, delete-vs-modify whole-object choices
 on either side, immutable two-parent ancestry, and compaction/reopen recovery.
-The new choice cases are pending compilation and test acceptance. Remaining
-SHA-only test-suite migration is required. Do not add
+The field/object merge-choice regression passed on 2026-10-31 (1/1).
+The UUIDv7 caller-pinned write and concurrent immutable snapshot-read
+qualifications have now been added; acceptance awaits the hydraulic-network
+test run. Remaining SHA-only test-suite migration is required. Do not add
 production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 
