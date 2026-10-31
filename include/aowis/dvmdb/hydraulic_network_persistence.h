@@ -250,8 +250,9 @@ Revision editHydraulicNetworkLegacy(Repository& repository, std::string_view bra
 
 // Canonical project-scoped UUIDv7 hydraulic operations. All reads pin an
 // immutable revision; saves/edits compare expected HEAD during atomic commit.
-// Whitelisted scalar-only edits use indexed revision records and preserve the
-// unchanged network membership manifest; other edits use canonical full-network
+// Whitelisted scalar, physical-value and catalogue edits use indexed revision
+// records and preserve the unchanged network membership manifest; other edits
+// use canonical full-network
 // validation and replacement until additional indexed paths are migrated.
 // No SHA-revision fallback is permitted.
 RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project,

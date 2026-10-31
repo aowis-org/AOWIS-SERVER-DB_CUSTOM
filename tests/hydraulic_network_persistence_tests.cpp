@@ -2522,7 +2522,11 @@ void exerciseUuidV7Hydraulic() {
         native::RevisionId saved = initial;
         native::RevisionId edited = initial;
         native::RevisionId scalarRewire = initial;
+        native::RevisionId physicalHead = initial;
+        native::RevisionId catalogueHead = initial;
         NetworkHydraulic scalarExpectedAfter = baseline;
+        NetworkHydraulic physicalExpectedAfter = baseline;
+        NetworkHydraulic catalogueExpectedAfter = baseline;
         {
             native::Repository repository(folder);
             initial = repository.createBranchV2(project, "main");
@@ -2552,13 +2556,112 @@ void exerciseUuidV7Hydraulic() {
             require(!hydraulic::loadHydraulicEntityAtRevision(
                 repository, project, saved, baseline.uuid, uuid(10000)),
                 "UUIDv7 indexed lookup found an unowned entity");
+            // UUIDv7 indexed physical updates must preserve the membership
+            // manifest and reference index. A no-op retains the exact HEAD;
+            // invalid values and stale HEADs cannot publish partial changes.
+            require(repository.createBranchV2(project, "indexed-physical", "main") == saved,
+                    "UUIDv7 physical branch did not inherit saved HEAD");
+            const native::ModelRecord manifestBefore = *repository.getModelAtRevisionV2(
+                project, saved, hydraulic::keyFromUuid(baseline.uuid));
+            NetworkHydraulic physicalNetwork = baseline;
+            physicalNetwork.nodes_reservoirs[0].hydraulic_head_m += 12.5;
+            physicalNetwork.nodes_tanks[0].terrain_elevation_m += 2.0;
+            const std::vector<hydraulic::HydraulicEntityChange> physicalChanges{
+                {physicalNetwork.nodes_reservoirs[0].uuid,
+                 hydraulic::HydraulicEntity{physicalNetwork.nodes_reservoirs[0]}},
+                {physicalNetwork.nodes_tanks[0].uuid,
+                 hydraulic::HydraulicEntity{physicalNetwork.nodes_tanks[0]}}};
+            hydraulic::HydraulicEditDiagnostics physicalStats;
+            physicalHead = hydraulic::editHydraulicNetwork(
+                repository, project, "indexed-physical", baseline.uuid,
+                physicalChanges, saved, &physicalStats);
+            require(physicalHead != saved && physicalStats.indexedPhysicalFastPath &&
+                    physicalStats.validatedEntities == physicalChanges.size(),
+                    "UUIDv7 physical update did not use immutable indexed records");
+            const native::ModelRecord physicalManifest = *repository.getModelAtRevisionV2(
+                project, physicalHead, hydraulic::keyFromUuid(baseline.uuid));
+            require(native::encodeModelRecord(manifestBefore) ==
+                        native::encodeModelRecord(physicalManifest),
+                    "UUIDv7 indexed physical update rewrote network membership");
+            compareNetworks(physicalNetwork, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, physicalHead, baseline.uuid));
+            require(hydraulic::editHydraulicNetwork(repository, project, "indexed-physical",
+                    baseline.uuid, physicalChanges, physicalHead, &physicalStats) == physicalHead &&
+                    physicalStats.indexedPhysicalFastPath,
+                    "UUIDv7 no-op physical edit created a revision");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "indexed-physical",
+                    baseline.uuid, physicalChanges, saved, &physicalStats);
+            }), "UUIDv7 physical edit accepted stale expected HEAD");
+            HydraulicNodeReservoir invalidPhysical = physicalNetwork.nodes_reservoirs[0];
+            invalidPhysical.hydraulic_head_m = std::numeric_limits<double>::infinity();
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "indexed-physical",
+                    baseline.uuid, {{invalidPhysical.uuid, hydraulic::HydraulicEntity{invalidPhysical}}},
+                    physicalHead, &physicalStats);
+            }) && repository.headV2(project, "indexed-physical") == physicalHead,
+                    "UUIDv7 invalid physical value advanced HEAD");
+            HydraulicLinkPump invalidRewire = physicalNetwork.links_pumps[0];
+            invalidRewire.node_uuid_to = uuid(9999);
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "indexed-physical",
+                    baseline.uuid, {{invalidRewire.uuid, hydraulic::HydraulicEntity{invalidRewire}}},
+                    physicalHead, &physicalStats);
+            }) && !physicalStats.indexedPhysicalFastPath &&
+                repository.headV2(project, "indexed-physical") == physicalHead,
+                "UUIDv7 physical edit bypassed topology validation");
+            physicalExpectedAfter = physicalNetwork;
+
+            // Existing catalogue payload updates require no structural writes.
+            // Verify canonical replay and that a wrong-kind update falls back
+            // to complete-network validation without publishing anything.
+            require(repository.createBranchV2(project, "indexed-catalogue", "main") == saved,
+                    "UUIDv7 catalogue branch did not inherit saved HEAD");
+            NetworkHydraulic catalogueNetwork = baseline;
+            catalogueNetwork.patterns_time[0].multipliers = {1.0, 1.15, 0.9};
+            const std::vector<hydraulic::HydraulicEntityChange> catalogueChanges{
+                {catalogueNetwork.patterns_time[0].uuid,
+                 hydraulic::HydraulicEntity{catalogueNetwork.patterns_time[0]}}};
+            hydraulic::HydraulicEditDiagnostics catalogueStats;
+            catalogueHead = hydraulic::editHydraulicNetwork(
+                repository, project, "indexed-catalogue", baseline.uuid,
+                catalogueChanges, saved, &catalogueStats);
+            require(catalogueHead != saved && catalogueStats.indexedCatalogueFastPath &&
+                    catalogueStats.validatedEntities == catalogueChanges.size(),
+                    "UUIDv7 catalogue update did not use immutable indexed records");
+            const native::ModelRecord catalogueManifest = *repository.getModelAtRevisionV2(
+                project, catalogueHead, hydraulic::keyFromUuid(baseline.uuid));
+            require(native::encodeModelRecord(manifestBefore) ==
+                        native::encodeModelRecord(catalogueManifest),
+                    "UUIDv7 indexed catalogue update rewrote network membership");
+            compareNetworks(catalogueNetwork, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, catalogueHead, baseline.uuid));
+            require(hydraulic::editHydraulicNetwork(repository, project, "indexed-catalogue",
+                    baseline.uuid, catalogueChanges, catalogueHead, &catalogueStats) == catalogueHead &&
+                    catalogueStats.indexedCatalogueFastPath,
+                    "UUIDv7 no-op catalogue edit created a revision");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "indexed-catalogue",
+                    baseline.uuid, catalogueChanges, saved, &catalogueStats);
+            }), "UUIDv7 catalogue edit accepted stale expected HEAD");
+            HydraulicPipeMaterial wrongKind = catalogueNetwork.pipe_materials[0];
+            wrongKind.uuid = catalogueNetwork.patterns_time[0].uuid;
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "indexed-catalogue",
+                    baseline.uuid, {{wrongKind.uuid, hydraulic::HydraulicEntity{wrongKind}}},
+                    catalogueHead, &catalogueStats);
+            }) && !catalogueStats.indexedCatalogueFastPath &&
+                repository.headV2(project, "indexed-catalogue") == catalogueHead,
+                "UUIDv7 catalogue edit changed entity type");
+            catalogueExpectedAfter = catalogueNetwork;
+
             // The canonical UUIDv7 API must preserve bounded indexed scalar
             // editing rather than rewrite the entire network on every value
             // update. Membership/root bytes and the source branch remain
             // unchanged; both changed and no-op batches retain exact IDs.
             require(repository.createBranchV2(project, "indexed-scalars", "main") == saved,
                     "UUIDv7 scalar branch did not inherit saved HEAD");
-            const native::ModelRecord manifestBefore = *repository.getModelAtRevisionV2(
+            const native::ModelRecord scalarManifestBefore = *repository.getModelAtRevisionV2(
                 project, saved, hydraulic::keyFromUuid(baseline.uuid));
             NetworkHydraulic scalarNetwork = baseline;
             scalarNetwork.links_pipes[0].diameter_mm = 143.25;
@@ -2582,7 +2685,7 @@ void exerciseUuidV7Hydraulic() {
                     "UUIDv7 scalar edit moved unrelated branch HEAD");
             const native::ModelRecord manifestAfter = *repository.getModelAtRevisionV2(
                 project, scalarHead, hydraulic::keyFromUuid(baseline.uuid));
-            require(native::encodeModelRecord(manifestBefore) ==
+            require(native::encodeModelRecord(scalarManifestBefore) ==
                         native::encodeModelRecord(manifestAfter),
                     "UUIDv7 indexed scalar edit rewrote membership manifest");
             compareNetworks(scalarNetwork, *hydraulic::loadHydraulicNetworkAtRevision(
@@ -2660,10 +2763,16 @@ void exerciseUuidV7Hydraulic() {
             native::Repository reopened(folder);
             require(reopened.headV2(project, "main") == edited &&
                     reopened.headV2(project, "history") == saved &&
-                    reopened.headV2(project, "indexed-scalars") == scalarRewire,
+                    reopened.headV2(project, "indexed-scalars") == scalarRewire &&
+                    reopened.headV2(project, "indexed-physical") == physicalHead &&
+                    reopened.headV2(project, "indexed-catalogue") == catalogueHead,
                     "UUIDv7 hydraulic HEAD identities changed after reopen/compaction");
             compareNetworks(scalarExpectedAfter, *hydraulic::loadHydraulicNetworkAtRevision(
                 reopened, project, scalarRewire, baseline.uuid));
+            compareNetworks(physicalExpectedAfter, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, physicalHead, baseline.uuid));
+            compareNetworks(catalogueExpectedAfter, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, catalogueHead, baseline.uuid));
             compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
                 reopened, project, saved, baseline.uuid));
             (void)reopened.verifyRepository();

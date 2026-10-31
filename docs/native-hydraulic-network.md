@@ -49,12 +49,17 @@ The canonical native C++ entry points are `saveHydraulicNetwork`,
 Their write interfaces require a pinned expected committed HEAD; an unborn
 project is edited through a private draft rather than by inventing a commit.
 
-Currently the committed UUIDv7 edit implementation validates and re-encodes
-the full network. The older SHA-revision indexed-edit suite still tests
-bounded entity and membership updates, but those optimizations must be
-ported to the project-scoped API before the older implementation is removed.
-Full-network save and targeted edit must ultimately share one validated
-candidate/write engine without losing indexed-update behavior or tests.
+The committed UUIDv7 edit implementation performs bounded indexed updates
+for whitelisted scalar changes, physical/operating values of existing
+reservoirs, tanks, pumps and valves, and updates to existing catalogue
+records. These paths pin a UUIDv7 revision, check entity ownership and
+canonical value/reference constraints, preserve the membership manifest,
+and atomically compare the branch HEAD. Other edits currently reconstruct
+and validate the full network. The older SHA-revision indexed-edit suite
+still tests topology, dependent-reference and structural membership paths;
+those optimizations must be ported and qualified before the SHA implementation
+is removed. Full-network save and targeted edit must ultimately share one
+validated candidate/write engine without losing indexed-update behavior.
 
 ## Commit and concurrency
 

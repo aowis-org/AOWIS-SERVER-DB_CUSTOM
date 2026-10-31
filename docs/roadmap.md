@@ -95,9 +95,9 @@ initial revisions are introduced.
    references, stale-HEAD rejection, restart recovery and corrupt-data reads.
 2. Transfer the proven *indexed* edit engine (scalar, topology, physical,
    dependencies, catalogue and bounded membership) to the UUIDv7 revision
-   storage API. The current UUIDv7 edit implementation reconstructs and
-   re-saves the entire aggregate; merely deleting the SHA engine would lose
-   tested behavior and invalidate edit-performance comparisons.
+   storage API. Some whitelisted paths now use indexed commits, but the
+   remaining edits still reconstruct and re-save the aggregate; deleting the
+   SHA engine early would lose tested behavior and performance baselines.
 3. Carry over the full hydraulic merge matrix: concurrent inserts/deletes,
    field/object choices, stale pins, invalid candidates, fast-forward
    validation, two-parent ancestry and unchanged source branches.
@@ -119,9 +119,11 @@ migration. This is an intermediate code state, **not completed consolidation**:
 the SHA implementation still exists solely to preserve extensive qualification
 coverage. The canonical UUIDv7 edit path now uses the immutable revision index
 for whitelisted existing-member scalar updates (pipe hydraulic scalars,
-junction elevations and map-label text); it checks canonical value rules,
-reference identity and expected HEAD, preserves the membership manifest,
-and returns the existing revision on no-op. Topology, catalogues, dependent
+junction elevations and map-label text), physical/operating updates to
+reservoirs, tanks, pumps and valves, and existing catalogue payload updates.
+These paths check MODEL value rules, canonical references where applicable,
+immutable-revision ownership and expected HEAD, preserve the membership
+manifest, and return the existing revision on no-op. Topology, dependent
 entities and structural membership still take full-network validation on the
 UUIDv7 path. Remaining indexed paths, merge qualifications and legacy suite
 migration are still required. Do not add production callers to the SHA API

@@ -1437,6 +1437,129 @@ std::optional<Revision> tryIndexedScalarEdits(
     return result;
 }
 
+// Keep the UUIDv7 fast paths independent of the legacy moving-branch readers.
+// Encoding and physical validation use the same MODEL codec/rules as full saves.
+struct EncodeIndexedEntity {
+    template<typename T>
+    QByteArray operator()(const T& entity) const {
+        return ModelCodec<T>::encode(entity);
+    }
+};
+
+struct ValidateIndexedEntity {
+    template<typename T>
+    aowis::dvmdb::ModelValidationReport operator()(const T& entity) const {
+        return aowis::dvmdb::validateHydraulicEntityValues(entity);
+    }
+};
+
+struct IndexedEntityUuid {
+    template<typename T>
+    QUuid operator()(const T& entity) const {
+        return entity.uuid;
+    }
+};
+
+// These edits do not change collection membership or any outgoing reference.
+// Every record and membership ownership proof is read at expectedHead; the
+// atomic model commit rechecks that exact HEAD before publishing.
+std::optional<RevisionId> tryIndexedUuidPhysicalEdits(
+    Repository& repository, const ProjectId& project, std::string_view branch,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
+    const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception() ||
+            std::visit(IndexedEntityUuid{}, *change.value) != change.uuid)
+            return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second ||
+            !ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!old || !physicalOnlyChange(*change.value, *old, change.uuid) ||
+            old->references != physicalReferences(*change.value))
+            return std::nullopt;
+        const aowis::dvmdb::ModelValidationReport values =
+            std::visit(ValidateIndexedEntity{}, *change.value);
+        if (!values.valid())
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid hydraulic physical edit: " + values.summary().toStdString());
+        ModelRecord updated = *old;
+        updated.payload = bytesFromQByteArray(std::visit(EncodeIndexedEntity{}, *change.value));
+        if (updated.payload.empty()) return std::nullopt;
+        if (updated.payload != old->payload)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    RevisionId result = expectedHead;
+    if (pending.empty()) {
+        if (repository.headV2(project, branch) != expectedHead)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "branch head changed during UUIDv7 hydraulic physical edit");
+    } else {
+        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+    }
+    if (diagnostics) {
+        diagnostics->indexedPhysicalFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
+// Catalogues have no outgoing references. Their payloads may be replaced
+// without decoding the aggregate, provided the stored kind and canonical
+// identity are unchanged and the current revision proves network ownership.
+std::optional<RevisionId> tryIndexedUuidCatalogueEdits(
+    Repository& repository, const ProjectId& project, std::string_view branch,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
+    const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception() || change.value->index() >= 8 ||
+            std::visit(IndexedEntityUuid{}, *change.value) != change.uuid)
+            return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second ||
+            !ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!old || old->kind != 8 + change.value->index() ||
+            !validCatalogueRecord(*old, change.uuid))
+            return std::nullopt;
+        const aowis::dvmdb::ModelValidationReport values =
+            std::visit(ValidateIndexedEntity{}, *change.value);
+        if (!values.valid())
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid hydraulic catalogue edit: " + values.summary().toStdString());
+        ModelRecord updated = *old;
+        updated.payload = bytesFromQByteArray(std::visit(EncodeIndexedEntity{}, *change.value));
+        if (updated.payload.empty()) return std::nullopt;
+        if (updated.payload != old->payload)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    RevisionId result = expectedHead;
+    if (pending.empty()) {
+        if (repository.headV2(project, branch) != expectedHead)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "branch head changed during UUIDv7 hydraulic catalogue edit");
+    } else {
+        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+    }
+    if (diagnostics) {
+        diagnostics->indexedCatalogueFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
 // UUIDv7 indexed scalar-edit counterpart. All ownership and payload reads are
 // pinned to one immutable project revision; commitModelV2() atomically checks
 // the same expected HEAD before publishing. An ineligible batch returns
@@ -2757,12 +2880,18 @@ RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project
         throw StorageError(StorageErrorKind::LimitExceeded, "hydraulic edit exceeds 128 changes");
     if (repository.headV2(project, branch) != expectedHead)
         throw StorageError(StorageErrorKind::Conflict, "branch head changed since edit was prepared");
-    // The indexed helper validates scalar values before any indexed commit.
-    // Other batches retain the complete-network validator below.
+    // Every fast path validates its entire batch before an indexed commit.
+    // Mixed or reference-changing batches fall through to full validation.
     if (!changes.empty()) {
-        const std::optional<RevisionId> indexed = tryIndexedUuidScalarEdits(
-            repository, project, branch, networkUuid, changes, expectedHead, diagnostics);
-        if (indexed) return *indexed;
+        if (const std::optional<RevisionId> indexed = tryIndexedUuidScalarEdits(
+                repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
+            return *indexed;
+        if (const std::optional<RevisionId> indexed = tryIndexedUuidPhysicalEdits(
+                repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
+            return *indexed;
+        if (const std::optional<RevisionId> indexed = tryIndexedUuidCatalogueEdits(
+                repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
+            return *indexed;
     }
     std::optional<NetworkHydraulic> network =
         loadHydraulicNetworkAtRevision(repository, project, expectedHead, networkUuid);
