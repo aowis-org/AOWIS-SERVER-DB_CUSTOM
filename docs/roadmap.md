@@ -138,9 +138,14 @@ reopen recovery; the focused hydraulic-network suite passed after the test
 fixture fixes (2026-10-31, 1/1). The UUIDv7 merge qualification is now being
 expanded to cover concurrent same-chunk append/delete, simultaneous first-chunk
 creation, reordered membership conflicts, two-parent ancestry and compaction /
-reopen recovery. This newly added qualification still needs its first compiled
-test run; it is not yet an accepted milestone. The remaining merge choices,
-benchmark migration and SHA-only test-suite migration are still required. Do not add production callers to the SHA API
+reopen recovery; that targeted UUIDv7 merge suite passed on 2026-10-31 (1/1).
+The canonical hydraulic edit benchmark and its CTest workload-smoke runner
+now use UUIDv7 revision IDs, immutable base reads, expected-HEAD commits and
+project-qualified revision diffs/merges. The benchmark migration still needs
+its first compiled run and performance comparison; its former SHA results are
+not automatically equivalent UUIDv7 performance baselines. Remaining merge
+choices and SHA-only test-suite migration are still required. Do not add
+production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 
 ## Current implementation state and immediate delivery priority

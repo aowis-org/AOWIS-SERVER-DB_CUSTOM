@@ -1,4 +1,5 @@
 #include <aowis/dvmdb/hydraulic_network_persistence.h>
+#include <aowis/dvmdb/revision_record_v2.h>
 
 #include <QCoreApplication>
 
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <iostream>
 #include <stdexcept>
@@ -104,10 +106,23 @@ int main(int argc, char** argv) {
         physicalValve.node_uuid_to = physicalTank.uuid;
         network.links_valves.append(physicalValve);
         native::Repository repository(directory);
-        repository.createBranch("main");
+        const native::ProjectId project = native::ProjectId::generate();
+        const native::RevisionId genesis = repository.createBranchV2(project, "main");
         const std::chrono::steady_clock::time_point importStart = std::chrono::steady_clock::now();
-        hydraulic::saveHydraulicNetworkLegacy(repository, "main", network);
+        native::RevisionId mainHead = hydraulic::saveHydraulicNetwork(
+            repository, project, "main", network, genesis);
         const double importMs = elapsedMs(importStart);
+        // Keep the precise expected HEAD after each indexed write, rather
+        // than reading a moving branch reference as part of each timed call.
+        const std::function<native::RevisionId(
+            const std::vector<hydraulic::HydraulicEntityChange>&,
+            hydraulic::HydraulicEditDiagnostics*)> editMain =
+            [&](const std::vector<hydraulic::HydraulicEntityChange>& changes,
+                hydraulic::HydraulicEditDiagnostics* diagnostics) -> native::RevisionId {
+                mainHead = hydraulic::editHydraulicNetwork(
+                    repository, project, "main", network.uuid, changes, mainHead, diagnostics);
+                return mainHead;
+            };
         const std::uint64_t importPackBytes = repository.packSize();
         const std::uint64_t importIndexBytes = std::filesystem::file_size(directory / "objects.idx");
 
@@ -116,7 +131,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < scalarEdits; ++i) {
             edited.diameter_mm += 1.0;
             hydraulic::HydraulicEditDiagnostics diagnostic;
-            hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+            editMain(
                 {{edited.uuid, hydraulic::HydraulicEntity{edited}}}, &diagnostic);
             if (!diagnostic.indexedScalarFastPath || diagnostic.validatedEntities != 1)
                 throw std::runtime_error("expected bounded indexed validation");
@@ -127,7 +142,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < topologyEdits; ++i) {
             edited.node_uuid_from = network.nodes_junctions[1 + (i % 2)].uuid;
             hydraulic::HydraulicEditDiagnostics diagnostic;
-            hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+            editMain(
                 {{edited.uuid, hydraulic::HydraulicEntity{edited}}}, &diagnostic);
             if (!diagnostic.indexedTopologyFastPath || diagnostic.indexedScalarFastPath ||
                 diagnostic.validatedEntities != 1)
@@ -137,7 +152,8 @@ int main(int argc, char** argv) {
         // Later dependent fixtures must use the pipe's *current* endpoints,
         // not the original endpoints in the imported network snapshot.
         const std::optional<hydraulic::HydraulicEntity> storedEditedPipe =
-            hydraulic::loadHydraulicEntity(repository, "main", network.uuid, edited.uuid);
+            hydraulic::loadHydraulicEntityAtRevision(repository, project, mainHead,
+                network.uuid, edited.uuid);
         if (!storedEditedPipe ||
             !std::holds_alternative<HydraulicLinkPipe>(*storedEditedPipe) ||
             std::get<HydraulicLinkPipe>(*storedEditedPipe).node_uuid_from != edited.node_uuid_from ||
@@ -157,7 +173,7 @@ int main(int argc, char** argv) {
         newLabel.anchor_node_uuid = newNode.uuid;
         const std::chrono::steady_clock::time_point insertStart = std::chrono::steady_clock::now();
         hydraulic::HydraulicEditDiagnostics membershipStats;
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{newPipe.uuid, hydraulic::HydraulicEntity{newPipe}},
              {newNode.uuid, hydraulic::HydraulicEntity{newNode}},
              {newLabel.uuid, hydraulic::HydraulicEntity{newLabel}}}, &membershipStats);
@@ -165,13 +181,13 @@ int main(int argc, char** argv) {
             throw std::runtime_error("expected indexed membership insertion");
         const double insertionMs = elapsedMs(insertStart);
         const std::chrono::steady_clock::time_point removalStart = std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{newLabel.uuid, std::nullopt}}, &membershipStats);
         if (!membershipStats.indexedMembershipFastPath || membershipStats.validatedEntities != 1)
             throw std::runtime_error("expected indexed label removal");
         const double removalMs = elapsedMs(removalStart);
         const std::chrono::steady_clock::time_point deleteBatchStart = std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{newNode.uuid, std::nullopt}, {newPipe.uuid, std::nullopt}}, &membershipStats);
         if (!membershipStats.indexedMembershipFastPath || membershipStats.validatedEntities != 2)
             throw std::runtime_error("expected indexed pipe/junction deletion batch");
@@ -181,7 +197,7 @@ int main(int argc, char** argv) {
         hydraulic::HydraulicEditDiagnostics catalogStats;
         for (int i = 0; i < scalarEdits; ++i) {
             updatedMaterial.id = QStringLiteral("benchmark-material-%1").arg(i);
-            hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+            editMain(
                 {{updatedMaterial.uuid, hydraulic::HydraulicEntity{updatedMaterial}}}, &catalogStats);
             if (!catalogStats.indexedCatalogueFastPath || catalogStats.validatedEntities != 1)
                 throw std::runtime_error("expected indexed catalogue update");
@@ -194,7 +210,7 @@ int main(int argc, char** argv) {
         HydraulicCurveGeneric addedGeneric;
         addedGeneric.uuid = uuid(5000003);
         const std::chrono::steady_clock::time_point catalogInsertStart = std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedMaterial.uuid, hydraulic::HydraulicEntity{addedMaterial}},
              {addedPattern.uuid, hydraulic::HydraulicEntity{addedPattern}},
              {addedGeneric.uuid, hydraulic::HydraulicEntity{addedGeneric}}}, &catalogStats);
@@ -202,7 +218,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("expected indexed catalogue insertion");
         const double catalogInsertMs = elapsedMs(catalogInsertStart);
         const std::chrono::steady_clock::time_point catalogDeleteStart = std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedPattern.uuid, std::nullopt}, {addedMaterial.uuid, std::nullopt},
              {addedGeneric.uuid, std::nullopt}}, &catalogStats);
         if (!catalogStats.indexedMembershipFastPath || catalogStats.validatedEntities != 3)
@@ -218,7 +234,7 @@ int main(int argc, char** argv) {
                 3.0 + 0.25 * static_cast<double>((i % 24) + 1);
             physicalPump.initial_speed_ratio += 0.01;
             physicalValve.setting_pressure_head_m += 0.25;
-            hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+            editMain(
                 {{physicalReservoir.uuid, hydraulic::HydraulicEntity{physicalReservoir}},
                  {physicalTank.uuid, hydraulic::HydraulicEntity{physicalTank}},
                  {physicalPump.uuid, hydraulic::HydraulicEntity{physicalPump}},
@@ -242,7 +258,7 @@ int main(int argc, char** argv) {
         addedValve.node_uuid_from = addedTank.uuid;
         addedValve.node_uuid_to = network.nodes_junctions[0].uuid;
         const std::chrono::steady_clock::time_point physicalInsertStart = std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedPump.uuid, hydraulic::HydraulicEntity{addedPump}},
              {addedValve.uuid, hydraulic::HydraulicEntity{addedValve}},
              {addedTank.uuid, hydraulic::HydraulicEntity{addedTank}},
@@ -251,7 +267,7 @@ int main(int argc, char** argv) {
         if (!physicalStats.indexedMembershipFastPath || physicalStats.validatedEntities != 4)
             throw std::runtime_error("expected indexed structural insertion");
         const std::chrono::steady_clock::time_point physicalDeleteStart = std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedPump.uuid, std::nullopt}, {addedValve.uuid, std::nullopt},
              {addedTank.uuid, std::nullopt}, {addedReservoir.uuid, std::nullopt}}, &physicalStats);
         const double physicalDeleteMs = elapsedMs(physicalDeleteStart);
@@ -282,7 +298,7 @@ int main(int argc, char** argv) {
         hydraulic::HydraulicEditDiagnostics dependencyStats;
         const std::chrono::steady_clock::time_point dependentInsertStart =
             std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedDemandPoint.uuid, hydraulic::HydraulicEntity{addedDemandPoint}},
              {addedSimpleControl.uuid, hydraulic::HydraulicEntity{addedSimpleControl}},
              {addedRuleControl.uuid, hydraulic::HydraulicEntity{addedRuleControl}}}, &dependencyStats);
@@ -300,7 +316,7 @@ int main(int argc, char** argv) {
         addedRuleControl.actions_then[0].link_uuid = physicalValve.uuid;
         const std::chrono::steady_clock::time_point dependentUpdateStart =
             std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedDemandPoint.uuid, hydraulic::HydraulicEntity{addedDemandPoint}},
              {addedSimpleControl.uuid, hydraulic::HydraulicEntity{addedSimpleControl}},
              {addedRuleControl.uuid, hydraulic::HydraulicEntity{addedRuleControl}}}, &dependencyStats);
@@ -309,7 +325,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("expected indexed existing demand/control update");
         const std::chrono::steady_clock::time_point dependentDeleteStart =
             std::chrono::steady_clock::now();
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
+        editMain(
             {{addedDemandPoint.uuid, std::nullopt},
              {addedSimpleControl.uuid, std::nullopt},
              {addedRuleControl.uuid, std::nullopt}}, &dependencyStats);
@@ -324,8 +340,8 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now();
         for (int sample = 0; sample < readSamples; ++sample) {
             const std::optional<hydraulic::HydraulicEntity> entity =
-                hydraulic::loadHydraulicEntity(repository, "main", network.uuid,
-                    network.links_pipes[sample % pipeCount].uuid);
+                hydraulic::loadHydraulicEntityAtRevision(repository, project, mainHead,
+                    network.uuid, network.links_pipes[sample % pipeCount].uuid);
             if (!entity || !std::holds_alternative<HydraulicLinkPipe>(*entity))
                 throw std::runtime_error("targeted canonical pipe read failed");
         }
@@ -333,7 +349,7 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point fullReadStart =
             std::chrono::steady_clock::now();
         const std::optional<NetworkHydraulic> reconstructed =
-            hydraulic::loadHydraulicNetwork(repository, "main", network.uuid);
+            hydraulic::loadHydraulicNetworkAtRevision(repository, project, mainHead, network.uuid);
         const double fullReadMs = elapsedMs(fullReadStart);
         if (!reconstructed || reconstructed->links_pipes.size() != pipeCount ||
             reconstructed->nodes_junctions.size() != pipeCount + 1)
@@ -342,34 +358,47 @@ int main(int argc, char** argv) {
         // Two branches change DIFFERENT fields of the same existing pipe.
         // Validate the real hydraulic three-way merger, not the generic
         // object-level conflict resolver. The immutable baseline must survive.
-        repository.createBranch("baseline", "main");
-        repository.createBranch("feature", "main");
-        const native::Hash baselineId = repository.head("baseline").id;
+        const native::RevisionId baselineId = mainHead;
+        if (repository.createBranchV2(project, "baseline", "main") != baselineId ||
+            repository.createBranchV2(project, "feature", "main") != baselineId)
+            throw std::runtime_error("UUIDv7 benchmark branch fork changed base revision");
+        native::RevisionId featureHead = baselineId;
         HydraulicLinkPipe targetPipe = edited;
         HydraulicLinkPipe featurePipe = edited;
         targetPipe.diameter_mm += 2.0;
         featurePipe.length_calculated_m += 10.0;
-        hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
-            {{targetPipe.uuid, hydraulic::HydraulicEntity{targetPipe}}});
-        hydraulic::editHydraulicNetworkLegacy(repository, "feature", network.uuid,
-            {{featurePipe.uuid, hydraulic::HydraulicEntity{featurePipe}}});
+        editMain(
+            {{targetPipe.uuid, hydraulic::HydraulicEntity{targetPipe}}}, nullptr);
+        featureHead = hydraulic::editHydraulicNetwork(repository, project, "feature", network.uuid,
+            {{featurePipe.uuid, hydraulic::HydraulicEntity{featurePipe}}}, featureHead);
         const std::chrono::steady_clock::time_point diffStart =
             std::chrono::steady_clock::now();
         const std::vector<native::Difference> differences =
-            repository.diff("main", "feature");
+            repository.diffRevisionsV2(project, mainHead, featureHead, 1000000);
         const double diffMs = elapsedMs(diffStart);
         if (differences.empty())
             throw std::runtime_error("divergent hydraulic branches unexpectedly have no diff");
         const std::chrono::steady_clock::time_point mergeStart =
             std::chrono::steady_clock::now();
-        const native::MergeResult merged =
-            hydraulic::mergeHydraulicBranchesLegacy(repository, "main", "feature");
+        const native::MergeResultV2 merged = hydraulic::mergeHydraulicBranches(
+            repository, project, "main", "feature",
+            hydraulic::HydraulicMergeSelections{mainHead, featureHead, {}, {}});
         const double mergeMs = elapsedMs(mergeStart);
-        if (merged.status != native::MergeStatus::Merged ||
-            merged.revision.parents.size() != 2)
-            throw std::runtime_error("expected a canonical two-parent hydraulic merge");
+        if (merged.status != native::MergeStatus::Merged || !merged.resultHead ||
+            repository.headV2(project, "feature") != featureHead)
+            throw std::runtime_error("expected an immutable UUIDv7 hydraulic merge");
+        mainHead = *merged.resultHead;
+        const std::optional<native::Bytes> mergeBytes = repository.readRevisionV2(project, mainHead);
+        if (!mergeBytes)
+            throw std::runtime_error("missing committed UUIDv7 merge revision");
+        const native::RevisionRecordV2 mergeRecord = native::decodeRevisionRecordV2(*mergeBytes);
+        if (mergeRecord.parents.size() != 2 || !merged.targetBefore || !merged.sourceHead ||
+            mergeRecord.parents[0].id != *merged.targetBefore ||
+            mergeRecord.parents[1].id != *merged.sourceHead)
+            throw std::runtime_error("UUIDv7 merge lost its two immutable parents");
         const std::optional<hydraulic::HydraulicEntity> mergedPipe =
-            hydraulic::loadHydraulicEntity(repository, "main", network.uuid, edited.uuid);
+            hydraulic::loadHydraulicEntityAtRevision(repository, project, mainHead,
+                network.uuid, edited.uuid);
         if (!mergedPipe || !std::holds_alternative<HydraulicLinkPipe>(*mergedPipe))
             throw std::runtime_error("merged canonical pipe is missing");
         const HydraulicLinkPipe& finalPipe = std::get<HydraulicLinkPipe>(*mergedPipe);
@@ -377,8 +406,8 @@ int main(int argc, char** argv) {
             finalPipe.length_calculated_m != featurePipe.length_calculated_m)
             throw std::runtime_error("hydraulic merge lost a nonconflicting field");
         const std::optional<hydraulic::HydraulicEntity> historicalPipe =
-            hydraulic::loadHydraulicEntityAtRevisionLegacy(
-                repository, baselineId, network.uuid, edited.uuid);
+            hydraulic::loadHydraulicEntityAtRevision(
+                repository, project, baselineId, network.uuid, edited.uuid);
         if (!historicalPipe || !std::holds_alternative<HydraulicLinkPipe>(*historicalPipe) ||
             std::get<HydraulicLinkPipe>(*historicalPipe).diameter_mm != edited.diameter_mm ||
             std::get<HydraulicLinkPipe>(*historicalPipe).length_calculated_m !=
@@ -391,8 +420,8 @@ int main(int argc, char** argv) {
         if (finalPackBytes < importPackBytes || finalIndexBytes < importIndexBytes)
             throw std::runtime_error("append-only pack or index unexpectedly shrank");
         repository.verifyPack();
-        const std::optional<native::ModelRecord> networkRoot = repository.getModel(
-            "main", hydraulic::keyFromUuid(network.uuid));
+        const std::optional<native::ModelRecord> networkRoot = repository.getModelAtRevisionV2(
+            project, mainHead, hydraulic::keyFromUuid(network.uuid));
         if (!networkRoot || networkRoot->kind != hydraulic::hydraulicNetworkKind)
             throw std::runtime_error("missing indexed network root");
         const std::uint64_t peakRssKiB = peakResidentKiB();
@@ -424,7 +453,7 @@ int main(int argc, char** argv) {
                   << "divergent_diff_ms=" << diffMs << '\n'
                   << "divergent_diff_entities=" << differences.size() << '\n'
                   << "canonical_merge_ms=" << mergeMs << '\n'
-                  << "merge_parents=" << merged.revision.parents.size() << '\n'
+                  << "merge_parents=" << mergeRecord.parents.size() << '\n'
                   << "pack_bytes_after_import=" << importPackBytes << '\n'
                   << "pack_bytes_final=" << finalPackBytes << '\n'
                   << "pack_growth_bytes=" << finalPackBytes - importPackBytes << '\n'

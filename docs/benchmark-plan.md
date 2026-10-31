@@ -207,9 +207,14 @@ publishing a deployment resource envelope.
 
 ## Representative canonical hydraulic workload qualification
 
-The existing `aowis-dvmdb-hydraulic-edit-benchmark` uses **real serialized
-NetworkHydraulic objects**, not the synthetic model-record topology benchmark.
-It now also measures indexed pipe reads, complete network reconstruction,
+The `aowis-dvmdb-hydraulic-edit-benchmark` uses **real serialized
+NetworkHydraulic objects** on one project-scoped UUIDv7 revision DAG, not
+SHA-based legacy branches or a synthetic model-record topology benchmark.
+Every measured edit passes the precise expected UUIDv7 HEAD; branch diff and
+hydraulic merge operate on immutable project-qualified revision IDs. The
+`engine=pack` metric remains unchanged for existing qualification tooling; it
+identifies the pack storage engine, **not** the revision-ID type.
+The benchmark also measures indexed pipe reads, complete network reconstruction,
 divergent-branch diff, a validated two-parent hydraulic field merge, and
 pack/index growth from initial import to completion. It verifies that
 nonconflicting fields survive merging and that an immutable pre-merge revision
