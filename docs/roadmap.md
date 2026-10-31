@@ -150,8 +150,11 @@ stale/duplicate/unused field choices, delete-vs-modify whole-object choices
 on either side, immutable two-parent ancestry, and compaction/reopen recovery.
 The field/object merge-choice regression passed on 2026-10-31 (1/1).
 The UUIDv7 caller-pinned write and concurrent immutable snapshot-read
-qualifications have now been added; acceptance awaits the hydraulic-network
-test run. Remaining SHA-only test-suite migration is required. Do not add
+qualifications passed the hydraulic-network test on 2026-10-31 (1/1).
+UUIDv7 qualification now also includes the legacy 256-member chunk-boundary
+regression (chunk retirement, ordered listing, compaction/reopen) and successful
+fast-forward/up-to-date merge behavior. These two new cases await their C++
+acceptance run. Remaining SHA-only test-suite migration is required. Do not add
 production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 

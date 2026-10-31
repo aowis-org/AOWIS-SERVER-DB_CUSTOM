@@ -3832,6 +3832,172 @@ void exerciseUuidV7ConcurrentSnapshots() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+
+// Canonical UUIDv7 qualification for the bounded 256-member chunk boundary.
+// The SHA-only test will be removed with its obsolete hydraulic API; these
+// assertions protect the same multi-chunk ownership and retirement behavior.
+void exerciseUuidV7ChunkBoundaries() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    NetworkHydraulic baseline;
+    baseline.uuid = uuid(800000);
+    baseline.id = QStringLiteral("uuidv7-chunk-boundaries");
+    for (int index = 0; index < 514; ++index) {
+        baseline.nodes_junctions.append(item<HydraulicNodeJunction>(801000 + index));
+        if (index > 0) {
+            HydraulicLinkPipe pipe = item<HydraulicLinkPipe>(802000 + index);
+            pipe.node_uuid_from = baseline.nodes_junctions[index - 1].uuid;
+            pipe.node_uuid_to = baseline.nodes_junctions[index].uuid;
+            baseline.links_pipes.append(pipe);
+        }
+    }
+    for (int index = 0; index < 260; ++index)
+        baseline.map_labels.append(item<HydraulicMapLabel>(803000 + index));
+    require(aowis::dvmdb::validateHydraulicNetwork(baseline).valid(),
+            "UUIDv7 chunk fixture failed MODEL validation");
+    native::RevisionId saved = native::RevisionId::generate();
+    native::RevisionId finalHead = native::RevisionId::generate();
+    NetworkHydraulic expected = baseline;
+    try {
+        {
+            native::Repository repository(folder);
+            const native::RevisionId genesis = repository.createBranchV2(project, "main");
+            saved = hydraulic::saveHydraulicNetwork(repository, project, "main", baseline, genesis);
+            const std::optional<native::ModelRecord> originalRoot = repository.getModelAtRevisionV2(
+                project, saved, hydraulic::keyFromUuid(baseline.uuid));
+            require(originalRoot && originalRoot->references.size() == 8,
+                    "UUIDv7 membership did not split 514/513/260 entities into bounded chunks");
+            require(repository.createBranchV2(project, "feature", "main") == saved,
+                    "UUIDv7 chunked branch did not retain immutable base");
+            HydraulicNodeJunction addedNode = item<HydraulicNodeJunction>(804000);
+            HydraulicLinkPipe addedPipe = item<HydraulicLinkPipe>(804001);
+            addedPipe.node_uuid_from = baseline.nodes_junctions[0].uuid;
+            addedPipe.node_uuid_to = addedNode.uuid;
+            hydraulic::HydraulicEditDiagnostics stats;
+            finalHead = hydraulic::editHydraulicNetwork(
+                repository, project, "feature", baseline.uuid,
+                {{addedNode.uuid, hydraulic::HydraulicEntity{addedNode}},
+                 {addedPipe.uuid, hydraulic::HydraulicEntity{addedPipe}}}, saved, &stats);
+            require(stats.indexedMembershipFastPath, "UUIDv7 bounded member insertion missed indexed path");
+            expected.nodes_junctions.append(addedNode);
+            expected.links_pipes.append(addedPipe);
+            for (int index = 0; index < 7; ++index) {
+                finalHead = hydraulic::editHydraulicNetwork(
+                    repository, project, "feature", baseline.uuid,
+                    {{baseline.map_labels[index].uuid, std::nullopt}}, finalHead, &stats);
+                require(stats.indexedMembershipFastPath, "UUIDv7 chunk label deletion missed indexed path");
+                expected.map_labels.removeFirst();
+            }
+            std::vector<hydraulic::HydraulicEntityChange> finalChunkRemoval;
+            for (int index = 256; index < 260; ++index)
+                finalChunkRemoval.push_back({baseline.map_labels[index].uuid, std::nullopt});
+            finalHead = hydraulic::editHydraulicNetwork(
+                repository, project, "feature", baseline.uuid, finalChunkRemoval, finalHead, &stats);
+            require(stats.indexedMembershipFastPath, "UUIDv7 empty final chunk missed indexed retirement");
+            for (int index = 0; index < 4; ++index) expected.map_labels.removeLast();
+            const std::optional<native::ModelRecord> root = repository.getModelAtRevisionV2(
+                project, finalHead, hydraulic::keyFromUuid(baseline.uuid));
+            require(root && root->references.size() == 7,
+                    "UUIDv7 empty chunk descriptor was not retired");
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, finalHead, baseline.uuid));
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, saved, baseline.uuid));
+            const std::optional<QList<QUuid>> labels = hydraulic::listHydraulicEntityIdsAtRevisionLimited(
+                repository, project, finalHead, baseline.uuid, hydraulic::HydraulicEntityType::MapLabel, 255);
+            require(labels && labels->size() == expected.map_labels.size() &&
+                    labels->first() == expected.map_labels.first().uuid,
+                    "UUIDv7 chunked membership order was not preserved");
+            require(throwsStorageError(native::StorageErrorKind::LimitExceeded, [&] {
+                (void)hydraulic::listHydraulicEntityIdsAtRevisionLimited(
+                    repository, project, saved, baseline.uuid, hydraulic::HydraulicEntityType::Junction, 256);
+            }), "UUIDv7 bounded list accepted more than 256 members");
+            HydraulicLinkPipe rewired = expected.links_pipes[0];
+            rewired.node_uuid_to = expected.nodes_junctions[2].uuid;
+            finalHead = hydraulic::editHydraulicNetwork(
+                repository, project, "feature", baseline.uuid,
+                {{rewired.uuid, hydraulic::HydraulicEntity{rewired}}}, finalHead, &stats);
+            require(stats.indexedTopologyFastPath,
+                    "UUIDv7 chunked owner lookup blocked independent indexed rewire");
+            expected.links_pipes[0] = rewired;
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, finalHead, baseline.uuid));
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            require(reopened.headV2(project, "main") == saved &&
+                    reopened.headV2(project, "feature") == finalHead,
+                    "UUIDv7 chunked branch HEAD changed after compaction/reopen");
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, saved, baseline.uuid));
+            compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, finalHead, baseline.uuid));
+            require(hydraulic::loadHydraulicEntityAtRevision(
+                reopened, project, finalHead, baseline.uuid, uuid(804000)).has_value(),
+                "UUIDv7 added member disappeared after reopen");
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
+// Explicitly qualify the two valid fast-forward outcomes. Corrupt source
+// snapshots and stale pins are already covered by exerciseUuidV7HydraulicMerges.
+void exerciseUuidV7FastForward() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    try {
+        native::Repository repository(folder);
+        const native::RevisionId genesis = repository.createBranchV2(project, "main");
+        const NetworkHydraulic baseline = completeNetwork();
+        const native::RevisionId base = hydraulic::saveHydraulicNetwork(
+            repository, project, "main", baseline, genesis);
+        require(repository.createBranchV2(project, "target", "main") == base &&
+                repository.createBranchV2(project, "source", "main") == base,
+                "UUIDv7 fast-forward fixture branches did not share an immutable base");
+        HydraulicNodeJunction updated = baseline.nodes_junctions[0];
+        updated.elevation_m += 5.0;
+        const native::RevisionId sourceTip = hydraulic::editHydraulicNetwork(
+            repository, project, "source", baseline.uuid,
+            {{updated.uuid, hydraulic::HydraulicEntity{updated}}}, base);
+        const std::uint64_t bytesBefore = repository.packSize();
+        const native::MergeResultV2 fastForward = hydraulic::mergeHydraulicBranches(
+            repository, project, "target", "source",
+            hydraulic::HydraulicMergeSelections{base, sourceTip, {}, {}});
+        require(fastForward.status == native::MergeStatus::FastForward &&
+                fastForward.resultHead && *fastForward.resultHead == sourceTip &&
+                repository.headV2(project, "target") == sourceTip &&
+                repository.headV2(project, "source") == sourceTip &&
+                repository.packSize() == bytesBefore,
+                "UUIDv7 hydraulic fast-forward did not reuse immutable source revision");
+        NetworkHydraulic expected = baseline;
+        expected.nodes_junctions[0] = updated;
+        compareNetworks(expected, *hydraulic::loadHydraulicNetworkAtRevision(
+            repository, project, sourceTip, baseline.uuid));
+        const native::MergeResultV2 current = hydraulic::mergeHydraulicBranches(
+            repository, project, "target", "source",
+            hydraulic::HydraulicMergeSelections{sourceTip, sourceTip, {}, {}});
+        require(current.status == native::MergeStatus::UpToDate &&
+                repository.headV2(project, "target") == sourceTip &&
+                repository.packSize() == bytesBefore,
+                "UUIDv7 same-tip hydraulic merge unexpectedly appended objects");
+        (void)repository.verifyRepository();
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3856,6 +4022,8 @@ int main(int argc, char** argv) {
         exerciseUuidV7MergeChoiceQualification();
         exerciseUuidV7CallerPinnedWrites();
         exerciseUuidV7ConcurrentSnapshots();
+        exerciseUuidV7ChunkBoundaries();
+        exerciseUuidV7FastForward();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
     } catch (const std::exception& failure) {
