@@ -134,9 +134,13 @@ preserve the membership manifest and return the existing revision on no-op.
 Ineligible or mixed structural edits still take complete-network validation.
 The additional UUIDv7 structural tests cover same-batch references, cascaded
 removal, invalid targets, stale HEAD, unchanged source branch and compaction /
-reopen recovery; they require execution in the DVMDB test suite before this
-checkpoint is accepted. The remaining merge qualifications and legacy suite
-migration are still required. Do not add production callers to the SHA API
+reopen recovery; the focused hydraulic-network suite passed after the test
+fixture fixes (2026-10-31, 1/1). The UUIDv7 merge qualification is now being
+expanded to cover concurrent same-chunk append/delete, simultaneous first-chunk
+creation, reordered membership conflicts, two-parent ancestry and compaction /
+reopen recovery. This newly added qualification still needs its first compiled
+test run; it is not yet an accepted milestone. The remaining merge choices,
+benchmark migration and SHA-only test-suite migration are still required. Do not add production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 
 ## Current implementation state and immediate delivery priority

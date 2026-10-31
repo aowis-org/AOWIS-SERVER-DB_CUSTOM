@@ -3306,6 +3306,173 @@ void exerciseUuidV7HydraulicMerges() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+
+// UUIDv7 equivalent of the coordinated membership merge qualification. This
+// intentionally uses only project-scoped immutable heads and pinned selections:
+// no SHA branch history or implicit, moving-head hydraulic reads.
+void exerciseUuidV7CoordinatedMembershipMerges() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    const NetworkHydraulic baseline = completeNetwork();
+    native::RevisionId mergedAppendHead = native::RevisionId::generate();
+    native::RevisionId mergedDeleteHead = native::RevisionId::generate();
+    native::RevisionId mergedInitialChunkHead = native::RevisionId::generate();
+    try {
+        {
+            native::Repository repository(folder);
+            const native::RevisionId raw = repository.createBranchV2(project, "main");
+            const native::RevisionId base = hydraulic::saveHydraulicNetwork(
+                repository, project, "main", baseline, raw);
+            require(repository.createBranchV2(project, "append-left", "main") == base &&
+                    repository.createBranchV2(project, "append-right", "main") == base,
+                    "UUIDv7 membership merge branches did not share the same base");
+
+            HydraulicMapLabel labelA = item<HydraulicMapLabel>(8501);
+            HydraulicMapLabel labelB = item<HydraulicMapLabel>(8502);
+            labelA.text = QStringLiteral("uuidv7 left append");
+            labelB.text = QStringLiteral("uuidv7 right append");
+            labelA.anchor_node_uuid = baseline.nodes_junctions[0].uuid;
+            labelB.anchor_node_uuid = baseline.nodes_junctions[0].uuid;
+            const native::RevisionId leftHead = hydraulic::editHydraulicNetwork(
+                repository, project, "append-left", baseline.uuid,
+                {{labelA.uuid, hydraulic::HydraulicEntity{labelA}}}, base);
+            const native::RevisionId rightHead = hydraulic::editHydraulicNetwork(
+                repository, project, "append-right", baseline.uuid,
+                {{labelB.uuid, hydraulic::HydraulicEntity{labelB}}}, base);
+            const native::MergeResultV2 appended = hydraulic::mergeHydraulicBranches(
+                repository, project, "append-left", "append-right",
+                hydraulic::HydraulicMergeSelections{leftHead, rightHead, {}, {}});
+            require(appended.status == native::MergeStatus::Merged && appended.resultHead &&
+                    repository.headV2(project, "append-right") == rightHead,
+                    "UUIDv7 concurrent appends failed or changed the source branch");
+            mergedAppendHead = *appended.resultHead;
+            const std::optional<native::Bytes> appendRecordBytes =
+                repository.readRevisionV2(project, mergedAppendHead);
+            require(appendRecordBytes.has_value(), "UUIDv7 merge revision missing");
+            const native::RevisionRecordV2 appendRecord =
+                native::decodeRevisionRecordV2(*appendRecordBytes);
+            require(appendRecord.parents.size() == 2 &&
+                    appendRecord.parents[0].id == leftHead &&
+                    appendRecord.parents[1].id == rightHead,
+                    "UUIDv7 concurrent append merge lost parent ancestry");
+            NetworkHydraulic combined = baseline;
+            combined.map_labels.append(labelA);
+            combined.map_labels.append(labelB);
+            const std::optional<NetworkHydraulic> mergedAppend =
+                hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, project, mergedAppendHead, baseline.uuid);
+            require(mergedAppend.has_value(), "UUIDv7 appended network is missing");
+            compareNetworks(combined, *mergedAppend);
+            const std::optional<NetworkHydraulic> immutableBase =
+                hydraulic::loadHydraulicNetworkAtRevision(repository, project, base, baseline.uuid);
+            require(immutableBase.has_value(), "UUIDv7 append mutated the pinned base");
+            compareNetworks(baseline, *immutableBase);
+
+            require(repository.createBranchV2(project, "remove-left", "append-left") ==
+                    mergedAppendHead &&
+                    repository.createBranchV2(project, "remove-right", "append-left") ==
+                    mergedAppendHead, "UUIDv7 delete branches did not fork from merged head");
+            const native::RevisionId removedLeft = hydraulic::editHydraulicNetwork(
+                repository, project, "remove-left", baseline.uuid,
+                {{labelA.uuid, std::nullopt}}, mergedAppendHead);
+            const native::RevisionId removedRight = hydraulic::editHydraulicNetwork(
+                repository, project, "remove-right", baseline.uuid,
+                {{labelB.uuid, std::nullopt}}, mergedAppendHead);
+            const native::MergeResultV2 removed = hydraulic::mergeHydraulicBranches(
+                repository, project, "remove-left", "remove-right",
+                hydraulic::HydraulicMergeSelections{removedLeft, removedRight, {}, {}});
+            require(removed.status == native::MergeStatus::Merged && removed.resultHead &&
+                    repository.headV2(project, "remove-right") == removedRight,
+                    "UUIDv7 independent deletions did not reconcile");
+            mergedDeleteHead = *removed.resultHead;
+            const std::optional<NetworkHydraulic> mergedDelete =
+                hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, project, mergedDeleteHead, baseline.uuid);
+            require(mergedDelete.has_value(), "UUIDv7 deleted network is missing");
+            compareNetworks(baseline, *mergedDelete);
+
+            // Both new branches create the same deterministic first chunk ID,
+            // but with distinct contents. The merge must reconcile membership.
+            require(repository.createBranchV2(project, "empty-labels", "main") == base,
+                    "UUIDv7 empty-label branch has an unexpected base");
+            NetworkHydraulic withoutLabels = baseline;
+            withoutLabels.map_labels.clear();
+            const native::RevisionId emptyLabelsHead = hydraulic::saveHydraulicNetwork(
+                repository, project, "empty-labels", withoutLabels, base);
+            require(repository.createBranchV2(project, "first-left", "empty-labels") ==
+                    emptyLabelsHead &&
+                    repository.createBranchV2(project, "first-right", "empty-labels") ==
+                    emptyLabelsHead, "UUIDv7 initial-chunk branches have different bases");
+            const native::RevisionId firstLeftHead = hydraulic::editHydraulicNetwork(
+                repository, project, "first-left", baseline.uuid,
+                {{labelA.uuid, hydraulic::HydraulicEntity{labelA}}}, emptyLabelsHead);
+            const native::RevisionId firstRightHead = hydraulic::editHydraulicNetwork(
+                repository, project, "first-right", baseline.uuid,
+                {{labelB.uuid, hydraulic::HydraulicEntity{labelB}}}, emptyLabelsHead);
+            const native::MergeResultV2 firstChunk = hydraulic::mergeHydraulicBranches(
+                repository, project, "first-left", "first-right",
+                hydraulic::HydraulicMergeSelections{firstLeftHead, firstRightHead, {}, {}});
+            require(firstChunk.status == native::MergeStatus::Merged && firstChunk.resultHead &&
+                    repository.headV2(project, "first-right") == firstRightHead,
+                    "UUIDv7 concurrent initial membership chunks did not reconcile");
+            mergedInitialChunkHead = *firstChunk.resultHead;
+            withoutLabels.map_labels.append(labelA);
+            withoutLabels.map_labels.append(labelB);
+            const std::optional<NetworkHydraulic> mergedInitialChunk =
+                hydraulic::loadHydraulicNetworkAtRevision(
+                    repository, project, mergedInitialChunkHead, baseline.uuid);
+            require(mergedInitialChunk.has_value(), "UUIDv7 initial-chunk network missing");
+            compareNetworks(withoutLabels, *mergedInitialChunk);
+
+            // The conflicting branch changes list order rather than merely
+            // appending; do not discard its change during append reconciliation.
+            require(repository.createBranchV2(project, "order-left", "append-left") ==
+                    mergedAppendHead &&
+                    repository.createBranchV2(project, "order-right", "append-left") ==
+                    mergedAppendHead, "UUIDv7 reorder branches have different bases");
+            NetworkHydraulic reordered = combined;
+            reordered.map_labels.swapItemsAt(0, 1);
+            const native::RevisionId orderLeft = hydraulic::saveHydraulicNetwork(
+                repository, project, "order-left", reordered, mergedAppendHead);
+            HydraulicMapLabel labelC = item<HydraulicMapLabel>(8503);
+            labelC.anchor_node_uuid = baseline.nodes_junctions[1].uuid;
+            const native::RevisionId orderRight = hydraulic::editHydraulicNetwork(
+                repository, project, "order-right", baseline.uuid,
+                {{labelC.uuid, hydraulic::HydraulicEntity{labelC}}}, mergedAppendHead);
+            const std::uint64_t beforeConflict = repository.packSize();
+            const native::MergeResultV2 orderConflict = hydraulic::mergeHydraulicBranches(
+                repository, project, "order-left", "order-right",
+                hydraulic::HydraulicMergeSelections{orderLeft, orderRight, {}, {}});
+            require(orderConflict.status == native::MergeStatus::Conflicts &&
+                    repository.headV2(project, "order-left") == orderLeft &&
+                    repository.headV2(project, "order-right") == orderRight &&
+                    repository.packSize() == beforeConflict,
+                    "UUIDv7 membership reordering was silently discarded or published");
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            require(reopened.headV2(project, "append-left") == mergedAppendHead &&
+                    reopened.headV2(project, "remove-left") == mergedDeleteHead &&
+                    reopened.headV2(project, "first-left") == mergedInitialChunkHead,
+                    "UUIDv7 membership merges lost their HEADs after reopening");
+            const std::optional<NetworkHydraulic> removed =
+                hydraulic::loadHydraulicNetworkAtRevision(
+                    reopened, project, mergedDeleteHead, baseline.uuid);
+            require(removed.has_value(), "UUIDv7 merged removal missing after reopen");
+            compareNetworks(baseline, *removed);
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3326,6 +3493,7 @@ int main(int argc, char** argv) {
         exerciseUuidV7IndexedReferences();
         exerciseUuidV7IndexedMembership();
         exerciseUuidV7HydraulicMerges();
+        exerciseUuidV7CoordinatedMembershipMerges();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
     } catch (const std::exception& failure) {
