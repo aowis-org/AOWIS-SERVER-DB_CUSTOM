@@ -307,6 +307,15 @@ private:
     std::shared_ptr<Project> findProject(std::string_view id) const;
     std::shared_ptr<Repository> openRepository(Project& project) const;
     void ensureHealthy() const;
+    // Short catalogue-mutex sections for working-copy operations. Draft and
+    // local-commit file I/O never runs under the catalogue mutex.
+    void checkHealthy() const;
+    void requirePrivateRepository(const char* message) const;
+    void markUncertain();
+    // Serializes all writers of one draft record (lease, saves, release,
+    // the draft side of a local Commit). Readers need no lock: records are
+    // replaced atomically. Lock order: project operation, draft, catalogue.
+    std::shared_ptr<std::mutex> draftLock(std::string_view draftId) const;
     // requestedProjectId: caller-chosen UUIDv7, idempotent by (ID, name).
     // With unborn == false it provisions a clone target (no branch at all).
     ProjectInfo createProjectImpl(std::string_view name, bool unborn = false,
@@ -323,6 +332,8 @@ private:
     int lockFd_ = -1;
     const std::size_t maxPending_;
     mutable std::mutex mutex_;                   // catalogue: entries_, uncertain_
+    mutable std::mutex draftLocksMutex_;         // guards draftLocks_ only
+    mutable std::map<std::string, std::weak_ptr<std::mutex>> draftLocks_;
     bool uncertain_ = false;
     std::map<std::string, std::shared_ptr<Project>> entries_;
 };

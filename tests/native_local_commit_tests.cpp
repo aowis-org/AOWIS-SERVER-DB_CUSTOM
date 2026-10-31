@@ -2,7 +2,11 @@
 #include "aowis/dvmdb/object_id.h"
 
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <thread>
 #include <fstream>
 #include <iostream>
@@ -12,6 +16,9 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 namespace {
@@ -282,6 +289,219 @@ void testRejectedOperationIsDurable() {
                 "rejected Commit unexpectedly deleted saved draft");
     }
 }
+// R4: a session that took over an expired lease is the writer: it can save
+// AND commit, while the creating session's stale token can do neither.
+void testLeaseTakeoverCanCommit() {
+    TempRoot root;
+    ProjectService service(root.path);
+    const std::string projectId = service.createUnbornProject("lease takeover").id;
+    service.configureRepositoryRole(RepositoryRole::Private);
+    const std::string creator = UuidV7::generate().toString();
+    const std::string successor = UuidV7::generate().toString();
+    const std::string draftId = service.createWorkingCopy(
+        projectId, "main", std::nullopt, creator).id;
+    const std::string staleToken = service.acquireWorkingCopyLease(draftId, creator, 1).token;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    const std::string token = service.acquireWorkingCopyLease(draftId, successor, 120).token;
+    expectConflict([&]() {
+        (void)service.saveWorkingCopyChanges(draftId, creator, staleToken, 0, {changeWithValue(3)});
+    });
+    require(service.saveWorkingCopyChanges(draftId, successor, token, 0,
+                                           {changeWithValue(4)}).generation == 1,
+            "lease successor could not save");
+    expectConflict([&]() {
+        (void)service.commitWorkingCopy(UuidV7::generate().toString(), draftId, creator,
+                                        staleToken, 1, std::nullopt);
+    });
+    const LocalCommitInfo committed = service.commitWorkingCopy(
+        UuidV7::generate().toString(), draftId, successor, token, 1, std::nullopt);
+    require(committed.state == LocalCommitState::Succeeded &&
+            service.optionalHead(projectId, "main") ==
+                RevisionId::parse(committed.reservedRevisionId),
+            "lease successor could save but not Commit the recovered draft");
+}
+
+// Commits a one-record candidate from a fresh draft at the current HEAD.
+LocalCommitInfo commitFreshDraft(ProjectService& service, const std::string& projectId,
+                                 const std::string& operationId, const ModelChange& change) {
+    const std::string session = UuidV7::generate().toString();
+    const std::optional<RevisionId> head = service.optionalHead(projectId, "main");
+    const std::string draftId = service.createWorkingCopy(projectId, "main", head, session).id;
+    const std::string token = service.acquireWorkingCopyLease(draftId, session, 120).token;
+    service.saveWorkingCopyChanges(draftId, session, token, 0, {change});
+    return service.commitWorkingCopy(operationId, draftId, session, token, 1, head);
+}
+
+// R5: a Commit that failed with an I/O error before HEAD publication stays
+// pending only while HEAD is still at its base. Once another Commit moves
+// HEAD, the outcome is decided: status and retries converge to Rejected.
+void testFailedCommitIsRejectedOnceHeadMoves() {
+    TempRoot root;
+    const std::string session = UuidV7::generate().toString();
+    const std::string operationId = UuidV7::generate().toString();
+    std::string projectId;
+    std::string draftId;
+    std::string token;
+    std::optional<RevisionId> base;
+    {
+        ProjectService service(root.path);
+        projectId = service.createUnbornProject("decidable pending Commit").id;
+        service.configureRepositoryRole(RepositoryRole::Private);
+        // A large first revision makes the pack far bigger than any draft
+        // or ledger record, so a file-size limit only hits the pack append.
+        ModelChange large = changeWithValue(1);
+        large.key[15] = 1;
+        large.record->payload.assign(256 * 1024, 0x5a);
+        require(commitFreshDraft(service, projectId, UuidV7::generate().toString(), large).state ==
+                    LocalCommitState::Succeeded, "large base Commit failed");
+        base = service.optionalHead(projectId, "main");
+        draftId = service.createWorkingCopy(projectId, "main", base, session).id;
+        token = service.acquireWorkingCopyLease(draftId, session, 120).token;
+        ModelChange small = changeWithValue(2);
+        small.record->payload.assign(64 * 1024, 0x33); // unique, not deduplicated
+        service.saveWorkingCopyChanges(draftId, session, token, 0, {small});
+
+        const std::filesystem::path pack =
+            root.path / "projects" / projectId / "repository" / "objects.pack";
+        struct rlimit previous{};
+        require(::getrlimit(RLIMIT_FSIZE, &previous) == 0, "getrlimit failed");
+        void (*const oldHandler)(int) = std::signal(SIGXFSZ, SIG_IGN);
+        struct rlimit limited = previous;
+        limited.rlim_cur = static_cast<rlim_t>(std::filesystem::file_size(pack) + 1024);
+        require(::setrlimit(RLIMIT_FSIZE, &limited) == 0, "setrlimit failed");
+        bool failed = false;
+        try {
+            (void)service.commitWorkingCopy(operationId, draftId, session, token, 1, base);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        require(::setrlimit(RLIMIT_FSIZE, &previous) == 0, "restoring RLIMIT_FSIZE failed");
+        std::signal(SIGXFSZ, oldHandler);
+        require(failed, "file-size limit did not make the pack write fail");
+        require(service.optionalHead(projectId, "main") == base,
+                "failed Commit moved HEAD");
+        require(service.localCommitStatus(operationId).state == LocalCommitState::Pending,
+                "an undecided Commit (HEAD still at its base) must stay pending");
+
+        // Another Commit moves HEAD; the failed operation is now decidable.
+        const LocalCommitInfo other = commitFreshDraft(
+            service, projectId, UuidV7::generate().toString(), changeWithValue(9));
+        require(other.state == LocalCommitState::Succeeded, "competing Commit failed");
+        const LocalCommitInfo status = service.localCommitStatus(operationId);
+        require(status.state == LocalCommitState::Rejected && status.rejection == "conflict",
+                "status of an undecidable-no-longer Commit did not converge to Rejected");
+        const LocalCommitInfo retry = service.commitWorkingCopy(
+            operationId, draftId, session, token, 1, base);
+        require(retry.state == LocalCommitState::Rejected &&
+                retry.reservedRevisionId == status.reservedRevisionId,
+                "retry of a decided Commit did not return its rejected outcome");
+    }
+    ProjectService reopened(root.path);
+    require(reopened.localCommitStatus(operationId).state == LocalCommitState::Rejected,
+            "rejected outcome was not durable");
+    require(reopened.workingCopy(draftId).dirty, "rejected Commit lost the saved draft");
+}
+
+// Holds the repository's file lock from a second descriptor, so every
+// repository operation of that project blocks inside the engine.
+class RepositoryLockHold {
+public:
+    explicit RepositoryLockHold(const std::filesystem::path& repository)
+        : fd_(::open((repository / "repo.lock").c_str(), O_RDWR | O_CLOEXEC)) {
+        require(this->fd_ >= 0 && ::flock(this->fd_, LOCK_EX) == 0, "cannot hold repository lock");
+    }
+    ~RepositoryLockHold() { this->release(); }
+    RepositoryLockHold(const RepositoryLockHold&) = delete;
+    RepositoryLockHold& operator=(const RepositoryLockHold&) = delete;
+    void release() {
+        if (this->fd_ >= 0) {
+            (void)::flock(this->fd_, LOCK_UN);
+            (void)::close(this->fd_);
+            this->fd_ = -1;
+        }
+    }
+private:
+    int fd_ = -1;
+};
+
+// Runs `action` on a thread and reports whether it finished within `limit`.
+bool finishesWithin(const std::function<void()>& action, std::chrono::milliseconds limit,
+                    std::future<void>& pending) {
+    pending = std::async(std::launch::async, action);
+    return pending.wait_for(limit) == std::future_status::ready;
+}
+
+// R3: a local Commit (and a status lookup) blocked inside the repository of
+// project A must not stall the catalogue, other projects, other drafts of
+// A, or draft reads. Only the committing draft itself waits.
+void testCommitDoesNotHoldCatalogue() {
+    TempRoot root;
+    ProjectService service(root.path);
+    const std::string a = service.createUnbornProject("blocked project").id;
+    const std::string b = service.createUnbornProject("independent project").id;
+    service.configureRepositoryRole(RepositoryRole::Private);
+    require(commitFreshDraft(service, a, UuidV7::generate().toString(), changeWithValue(1)).state ==
+                LocalCommitState::Succeeded, "fixture Commit failed");
+    const std::optional<RevisionId> head = service.optionalHead(a, "main");
+    const std::string session = UuidV7::generate().toString();
+    const std::string committing = service.createWorkingCopy(a, "main", head, session).id;
+    const std::string token = service.acquireWorkingCopyLease(committing, session, 120).token;
+    service.saveWorkingCopyChanges(committing, session, token, 0, {changeWithValue(2)});
+    const std::string sibling = service.createWorkingCopy(a, "main", head, session).id;
+    const std::string siblingToken = service.acquireWorkingCopyLease(sibling, session, 120).token;
+    const std::string other = service.createWorkingCopy(b, "main", std::nullopt, session).id;
+    const std::string otherToken = service.acquireWorkingCopyLease(other, session, 120).token;
+    const std::string operationId = UuidV7::generate().toString();
+
+    RepositoryLockHold hold(root.path / "projects" / a / "repository");
+    std::future<void> commit = std::async(std::launch::async, [&]() {
+        require(service.commitWorkingCopy(operationId, committing, session, token, 1, head).state ==
+                    LocalCommitState::Succeeded, "blocked Commit did not succeed after release");
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    require(commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
+            "repository lock fixture did not block the Commit");
+    std::future<void> independent;
+    const bool responsive = finishesWithin([&]() {
+        (void)service.project(b);
+        (void)service.listProjects();
+        (void)service.listWorkingCopies();
+        (void)service.workingCopy(committing);
+        require(service.saveWorkingCopyChanges(sibling, session, siblingToken, 0,
+                                               {changeWithValue(3)}).generation == 1,
+                "sibling draft save failed");
+        require(service.saveWorkingCopyChanges(other, session, otherToken, 0,
+                                               {changeWithValue(4)}).generation == 1,
+                "other project's draft save failed");
+    }, std::chrono::seconds(5), independent);
+    std::future<void> sameDraft;
+    const bool sameDraftWaited = !finishesWithin([&]() {
+        (void)service.acquireWorkingCopyLease(committing, session, 120);
+    }, std::chrono::milliseconds(200), sameDraft);
+    hold.release();
+    commit.get();
+    independent.get();
+    sameDraft.get();
+    require(responsive, "a Commit blocked in one repository stalled the catalogue or other drafts");
+    require(sameDraftWaited, "the committing draft was not protected against concurrent writers");
+
+    // The status lookup takes the same path; it must not block either.
+    RepositoryLockHold statusHold(root.path / "projects" / a / "repository");
+    std::future<void> status = std::async(std::launch::async, [&]() {
+        require(service.localCommitStatus(operationId).state == LocalCommitState::Succeeded,
+                "status after release is wrong");
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::future<void> catalogue;
+    const bool available = finishesWithin([&]() {
+        (void)service.project(b);
+        (void)service.listWorkingCopies();
+    }, std::chrono::seconds(5), catalogue);
+    statusHold.release();
+    status.get();
+    catalogue.get();
+    require(available, "a blocked status lookup stalled the catalogue");
+}
 }
 
 int main() {
@@ -289,6 +509,9 @@ int main() {
         testLocalCommitRecovery();
         testConcurrentFirstCommitIsSerialized();
         testRejectedOperationIsDurable();
+        testLeaseTakeoverCanCommit();
+        testFailedCommitIsRejectedOnceHeadMoves();
+        testCommitDoesNotHoldCatalogue();
         std::cout << "VC-05 durable local Commit tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << "VC-05 durable local Commit tests failed: " << error.what() << '\n';

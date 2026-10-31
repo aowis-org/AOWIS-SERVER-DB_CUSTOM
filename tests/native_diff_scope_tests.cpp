@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iterator>
 #include <functional>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -324,9 +325,16 @@ void testReachabilityIsLinear() {
     const std::function<double(unsigned)> timeWalk = [&](unsigned commits) {
         for (unsigned i = 0; i < commits; ++i)
             (void)repository.commit("main", {Change{key, Bytes{static_cast<std::uint8_t>(i)}}});
-        const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-        expect(onBranch(repository, "main", first), "root not reachable");
-        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        // The fastest of several walks filters out scheduling noise from
+        // parallel test runs; a quadratic walk is slow on every attempt.
+        double fastest = std::numeric_limits<double>::max();
+        for (unsigned attempt = 0; attempt < 7; ++attempt) {
+            const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            expect(onBranch(repository, "main", first), "root not reachable");
+            fastest = std::min(fastest, std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count());
+        }
+        return fastest;
     };
     const double shorter = timeWalk(100);  // history 101
     const double longer = timeWalk(300);   // history 401: 4x the revisions

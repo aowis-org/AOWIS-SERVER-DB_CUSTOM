@@ -157,8 +157,13 @@ explicitly rather than silently rewritten.
   across repositories; local and shared branch HEADs advance independently
   even while both use the same logical branch UUIDv7.
 - Two sessions reopen one saved draft: only the live leased/fenced writer
-  with the expected generation can Save; expiration/takeover invalidates
-  stale writes without losing the last durable content.
+  with the expected generation can Save or local Commit; expiration/takeover
+  invalidates stale writes without losing the last durable content. A session
+  that took over an expired lease is that writer and may also Commit.
+- A local Commit that failed with an I/O error before HEAD publication stays
+  `pending` only while HEAD is still at its base. Once HEAD has moved without
+  the reserved revision, status lookups and retries report it as
+  `rejected` (`conflict`), because it can no longer be applied.
 - A Publish response is lost after success: status lookup by original
   operation UUID reports the single successful remote HEAD advancement.
 - Existing projects with previously committed initial R0 retain R0 after

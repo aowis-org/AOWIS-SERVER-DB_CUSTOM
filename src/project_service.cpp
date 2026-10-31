@@ -1047,6 +1047,41 @@ void ProjectService::ensureHealthy() const {
         "catalogue publication status is uncertain; restart the database server");
 }
 
+void ProjectService::checkHealthy() const {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+}
+
+// The role is configured once and never changes afterwards, so a check
+// under the catalogue mutex stays valid for the rest of the operation.
+void ProjectService::requirePrivateRepository(const char* message) const {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    ensureHealthy();
+    if (this->repository_role_ != RepositoryRole::Private)
+        throw ProjectError(ProjectErrorKind::Conflict, message);
+}
+
+void ProjectService::markUncertain() {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    this->uncertain_ = true;
+}
+
+std::shared_ptr<std::mutex> ProjectService::draftLock(std::string_view draftId) const {
+    std::lock_guard<std::mutex> guard(this->draftLocksMutex_);
+    for (std::map<std::string, std::weak_ptr<std::mutex>>::iterator entry = this->draftLocks_.begin();
+         entry != this->draftLocks_.end();) {
+        if (entry->second.expired()) entry = this->draftLocks_.erase(entry);
+        else ++entry;
+    }
+    std::weak_ptr<std::mutex>& slot = this->draftLocks_[std::string(draftId)];
+    std::shared_ptr<std::mutex> lock = slot.lock();
+    if (!lock) {
+        lock = std::make_shared<std::mutex>();
+        slot = lock;
+    }
+    return lock;
+}
+
 std::string ProjectService::repositoryId() const {
     return this->repository_id_;
 }
@@ -1182,13 +1217,7 @@ void ProjectService::provisionUnbornBranch(std::string_view projectId,
     if (!project || !identity || !validBranchName(name))
         throw ProjectError(ProjectErrorKind::InvalidInput,
                            "unborn checkout requires valid project, branch and name");
-    {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
-        if (this->repository_role_ != RepositoryRole::Private)
-            throw ProjectError(ProjectErrorKind::Conflict,
-                               "unborn checkout requires a private repository");
-    }
+    requirePrivateRepository("unborn checkout requires a private repository");
     withRepository(projectId, [&](Repository& repository) {
         repository.provisionUnbornBranch(*project, name, *identity);
     });
@@ -1318,13 +1347,7 @@ WorkingCopyInfo ProjectService::createWorkingCopyForBranch(
     if (!UuidV7::parse(sessionId).has_value() || !BranchId::parse(branchId).has_value() ||
         (draftId && !UuidV7::parse(*draftId).has_value()))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft, session or branch UUIDv7");
-    {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
-        if (this->repository_role_ != RepositoryRole::Private)
-            throw ProjectError(ProjectErrorKind::Conflict,
-                               "working copies require an explicitly private repository");
-    }
+    requirePrivateRepository("working copies require an explicitly private repository");
     // This first VC-04 slice supports exact HEAD checkout only. A concurrent
     // commit after this read cannot change the immutable pinned draft base.
     const std::optional<RevisionGraphHead> branch = branchById(projectId, branchId);
@@ -1336,8 +1359,9 @@ WorkingCopyInfo ProjectService::createWorkingCopyForBranch(
     draft.branchId = branch->branchId.toString();
     draft.baseRevision = baseRevision;
     draft.sessionId = std::string(sessionId);
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
+    const std::shared_ptr<std::mutex> lock = draftLock(draft.id);
+    std::lock_guard<std::mutex> guard(*lock);
+    checkHealthy();
     const std::filesystem::path existing = workingCopyDirectory(this->root_) / draft.id;
     if (draftId && (std::filesystem::exists(existing) || std::filesystem::is_symlink(existing))) {
         // Repeated request (e.g. a transport resent the POST after a lost
@@ -1353,15 +1377,14 @@ WorkingCopyInfo ProjectService::createWorkingCopyForBranch(
         throw ProjectError(ProjectErrorKind::Conflict,
                            "working-copy base must match current local HEAD");
     try { createWorkingCopyRecord(this->root_, draft); }
-    catch (...) { this->uncertain_ = true; throw; }
+    catch (...) { markUncertain(); throw; }
     return draft;
 }
 
 WorkingCopyInfo ProjectService::workingCopy(std::string_view draftId) const {
     if (!UuidV7::parse(draftId).has_value())
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid working-copy UUIDv7");
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
+    checkHealthy();
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
@@ -1369,8 +1392,7 @@ WorkingCopyInfo ProjectService::workingCopy(std::string_view draftId) const {
 }
 
 std::vector<WorkingCopyInfo> ProjectService::listWorkingCopies() const {
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
+    checkHealthy();
     std::vector<WorkingCopyInfo> result;
     const std::filesystem::path directory = workingCopyDirectory(this->root_);
     if (!std::filesystem::exists(directory) && !std::filesystem::is_symlink(directory))
@@ -1402,10 +1424,9 @@ WorkingCopyLease ProjectService::acquireWorkingCopyLease(
     if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
         seconds < 1 || seconds > 120)
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft lease parameters");
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
-    if (this->repository_role_ != RepositoryRole::Private)
-        throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
+    const std::shared_ptr<std::mutex> lock = draftLock(draftId);
+    std::lock_guard<std::mutex> guard(*lock);
+    requirePrivateRepository("draft requires a private repository");
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
@@ -1418,7 +1439,7 @@ WorkingCopyLease ProjectService::acquireWorkingCopyLease(
     draft.leaseToken = UuidV7::generate().toString();
     draft.leaseExpiresAtMs = now + static_cast<std::uint64_t>(seconds) * 1000;
     try { replaceWorkingCopyRecord(this->root_, draft); }
-    catch (...) { this->uncertain_ = true; throw; }
+    catch (...) { markUncertain(); throw; }
     return WorkingCopyLease{*draft.leaseToken, draft.leaseExpiresAtMs, draft.generation};
 }
 
@@ -1429,10 +1450,9 @@ WorkingCopyInfo ProjectService::saveWorkingCopyChanges(
     if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
         !UuidV7::parse(fencingToken).has_value() || changes.size() > workingCopyMaxChanges)
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft save parameters");
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
-    if (this->repository_role_ != RepositoryRole::Private)
-        throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
+    const std::shared_ptr<std::mutex> lock = draftLock(draftId);
+    std::lock_guard<std::mutex> guard(*lock);
+    requirePrivateRepository("draft requires a private repository");
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
@@ -1464,7 +1484,7 @@ WorkingCopyInfo ProjectService::saveWorkingCopyChanges(
     // Serialization and size/record validation is done BEFORE publishing.
     (void)draftBody(draft);
     try { replaceWorkingCopyRecord(this->root_, draft); }
-    catch (...) { this->uncertain_ = true; throw; }
+    catch (...) { markUncertain(); throw; }
     return draft;
 }
 
@@ -1494,10 +1514,9 @@ WorkingCopyInfo ProjectService::saveWorkingCopyTransactions(
              return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
          })))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid logical event request fingerprint");
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
-    if (this->repository_role_ != RepositoryRole::Private)
-        throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
+    const std::shared_ptr<std::mutex> lock = draftLock(draftId);
+    std::lock_guard<std::mutex> guard(*lock);
+    requirePrivateRepository("draft requires a private repository");
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
@@ -1535,9 +1554,43 @@ WorkingCopyInfo ProjectService::saveWorkingCopyTransactions(
     ++draft.generation;
     (void)draftBody(draft); // Validate complete overlay + journal before publishing.
     try { replaceWorkingCopyRecord(this->root_, draft); }
-    catch (...) { this->uncertain_ = true; throw; }
+    catch (...) { markUncertain(); throw; }
     return draft;
 }
+
+namespace {
+// Decides a pending operation from the branch alone, under the project's
+// operation mutex (no concurrent attempt) and the fact that a HEAD never
+// returns to an older revision:
+// - the reserved revision is HEAD or reachable from it: Succeeded;
+// - HEAD differs from the expected base: the reserved revision can never
+//   become HEAD (Commit requires exactly that base), so Rejected/conflict;
+// - the branch no longer exists: Rejected/not-found.
+// Persists a decided outcome and returns true when the operation is no
+// longer pending; false means "pending, HEAD still at the expected base".
+bool resolvePendingLocalCommit(Repository& repository, PersistedLocalCommit& operation,
+                               const std::filesystem::path& root,
+                               const std::function<void()>& markUncertain) {
+    if (operation.info.state != LocalCommitState::Pending) return true;
+    if (translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
+        operation.info.state = LocalCommitState::Succeeded;
+    } else {
+        const std::optional<ProjectId> project = ProjectId::parse(operation.info.projectId);
+        const std::optional<BranchId> branch = BranchId::parse(operation.info.branchId);
+        const std::optional<RevisionGraphHead> current =
+            translated<std::optional<RevisionGraphHead>>([&]() {
+                return repository.branchById(*project, *branch);
+            });
+        if (current && current->revision == operation.info.expectedHead) return false;
+        operation.info.state = LocalCommitState::Rejected;
+        operation.info.rejection = current ? "conflict" : "not-found";
+    }
+    try { persistLocalCommit(root, operation, false); }
+    catch (...) { markUncertain(); throw; }
+    return true;
+}
+
+} // namespace
 
 LocalCommitInfo ProjectService::commitWorkingCopy(
         std::string_view operationId, std::string_view draftId,
@@ -1551,35 +1604,31 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local commit operation identity");
     const std::filesystem::path operationPath = localCommitDirectory(this->root_) /
         std::string(operationId);
+    requirePrivateRepository("local Commit requires a private repository");
+    // The project of an operation or draft is immutable, so it can be read
+    // before taking any lock.
     std::string projectId;
-    {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
-        if (this->repository_role_ != RepositoryRole::Private)
-            throw ProjectError(ProjectErrorKind::Conflict,
-                               "local Commit requires a private repository");
-        if (std::filesystem::exists(operationPath) || std::filesystem::is_symlink(operationPath)) {
-            projectId = readLocalCommit(operationPath).info.projectId;
-        } else {
-            const std::filesystem::path draftPath = workingCopyDirectory(this->root_) /
-                std::string(draftId);
-            if (!std::filesystem::exists(draftPath) && !std::filesystem::is_symlink(draftPath))
-                throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
-            projectId = readWorkingCopy(draftPath).projectId;
-        }
+    if (std::filesystem::exists(operationPath) || std::filesystem::is_symlink(operationPath)) {
+        projectId = readLocalCommit(operationPath).info.projectId;
+    } else {
+        const std::filesystem::path draftPath = workingCopyDirectory(this->root_) /
+            std::string(draftId);
+        if (!std::filesystem::exists(draftPath) && !std::filesystem::is_symlink(draftPath))
+            throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
+        projectId = readWorkingCopy(draftPath).projectId;
     }
     const std::string requestDigest = localRequestDigest(
         this->repository_id_, draftId, sessionId, fencingToken,
         expectedGeneration, expectedLocalHead);
     LocalCommitInfo outcome;
-    // Keep the project's operation mutex across the complete intent/commit/
-    // outcome sequence, and the catalogue mutex across draft+ledger access.
-    // No concurrent Save can replace the candidate during local Commit.
+    // The project's operation mutex covers the complete intent/commit/outcome
+    // sequence and every ledger record of the project; the draft lock keeps
+    // a concurrent Save from replacing the candidate. Neither is the
+    // catalogue mutex, so other projects and the catalogue stay available.
     withRepository(projectId, [&](Repository& repository) {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
-        if (this->repository_role_ != RepositoryRole::Private)
-            throw ProjectError(ProjectErrorKind::Conflict, "not a private repository");
+        const std::shared_ptr<std::mutex> lock = draftLock(draftId);
+        std::lock_guard<std::mutex> guard(*lock);
+        requirePrivateRepository("not a private repository");
         const bool exists = std::filesystem::exists(operationPath) ||
                             std::filesystem::is_symlink(operationPath);
         PersistedLocalCommit operation;
@@ -1596,7 +1645,10 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
             if (!std::filesystem::exists(draftPath) && !std::filesystem::is_symlink(draftPath))
                 throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
             const WorkingCopyInfo draft = readWorkingCopy(draftPath);
-            if (draft.projectId != projectId || draft.sessionId != sessionId ||
+            // Authorized by the live lease and its fencing token, exactly as
+            // a Save is: a session that took over an expired lease may also
+            // Commit, and the creating session's stale token may not.
+            if (draft.projectId != projectId ||
                 draft.baseRevision != expectedLocalHead ||
                 !draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
                 !draft.leaseToken || *draft.leaseToken != fencingToken ||
@@ -1612,12 +1664,8 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
             if (!project || !branch)
                 throw ProjectError(ProjectErrorKind::InvalidInput,
                                    "local Commit requires UUIDv7 project and branch");
-            const std::optional<RevisionGraphHead> current =
-                translated<std::optional<RevisionGraphHead>>([&]() {
-                    return repository.branchById(*project, *branch);
-                });
-            // HEAD is checked again below, after durable intent creation.
-            // Even a stale valid request gets a permanent rejected outcome.
+            // HEAD is checked below, after durable intent creation, so even a
+            // stale valid request gets a permanent rejected outcome.
             operation.info.id = std::string(operationId);
             operation.info.repositoryId = this->repository_id_;
             operation.info.projectId = draft.projectId;
@@ -1632,18 +1680,15 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
                 saveBatchFingerprint(operation.changes, {}) + "\n");
             // Persist the complete candidate snapshot and reserved UUID first.
             try { persistLocalCommit(this->root_, operation, true); }
-            catch (...) { this->uncertain_ = true; throw; }
+            catch (...) { markUncertain(); throw; }
         }
-        if (operation.info.state == LocalCommitState::Pending &&
-            translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
-            operation.info.state = LocalCommitState::Succeeded;
-            try { persistLocalCommit(this->root_, operation, false); }
-            catch (...) { this->uncertain_ = true; throw; }
-        }
-        if (operation.info.state != LocalCommitState::Pending) {
+        if (resolvePendingLocalCommit(repository, operation, this->root_,
+                                      [this]() { markUncertain(); })) {
             outcome = operation.info;
             return;
         }
+        // Still pending and HEAD equals the expected base: the reserved
+        // revision was never published, so (re)apply it.
         const std::optional<ProjectId> project = ProjectId::parse(operation.info.projectId);
         const std::optional<BranchId> branch = BranchId::parse(operation.info.branchId);
         const std::optional<RevisionId> reserved =
@@ -1652,19 +1697,6 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
             translated<std::optional<RevisionGraphHead>>([&]() {
                 return repository.branchById(*project, *branch);
             });
-        // If HEAD has moved to something other than the expected base, do not
-        // reapply an ambiguous pending write. The same ID remains queryable.
-        if (!current || current->revision != operation.info.expectedHead) {
-            if (exists)
-                throw ProjectError(ProjectErrorKind::Conflict,
-                                   "local Commit pending; branch advanced without this revision");
-            operation.info.state = LocalCommitState::Rejected;
-            operation.info.rejection = current ? "conflict" : "not-found";
-            try { persistLocalCommit(this->root_, operation, false); }
-            catch (...) { this->uncertain_ = true; throw; }
-            outcome = operation.info;
-            return;
-        }
         try {
             (void)repository.commitModel(*project, current->name, operation.changes,
                                            operation.info.expectedHead, true, reserved);
@@ -1683,7 +1715,7 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
             }
         }
         try { persistLocalCommit(this->root_, operation, false); }
-        catch (...) { this->uncertain_ = true; throw; }
+        catch (...) { markUncertain(); throw; }
         outcome = operation.info;
     });
     return outcome;
@@ -1694,28 +1726,19 @@ LocalCommitInfo ProjectService::localCommitStatus(std::string_view operationId) 
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local Commit operation ID");
     const std::filesystem::path path = localCommitDirectory(this->root_) /
         std::string(operationId);
-    std::string projectId;
-    {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
-        if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
-            throw ProjectError(ProjectErrorKind::NotFound, "local Commit operation not found");
-        projectId = readLocalCommit(path).info.projectId;
-    }
+    checkHealthy();
+    if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
+        throw ProjectError(ProjectErrorKind::NotFound, "local Commit operation not found");
+    const std::string projectId = readLocalCommit(path).info.projectId;
     LocalCommitInfo outcome;
     withRepository(projectId, [&](Repository& repository) {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
+        checkHealthy();
         PersistedLocalCommit operation = readLocalCommit(path);
         if (operation.info.repositoryId != this->repository_id_)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "local Commit belongs to another repository");
-        if (operation.info.state == LocalCommitState::Pending &&
-            translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
-            operation.info.state = LocalCommitState::Succeeded;
-            try { persistLocalCommit(this->root_, operation, false); }
-            catch (...) { this->uncertain_ = true; throw; }
-        }
+        (void)resolvePendingLocalCommit(repository, operation, this->root_,
+                                        [this]() { markUncertain(); });
         outcome = operation.info;
     });
     return outcome;
@@ -1727,8 +1750,9 @@ void ProjectService::releaseWorkingCopyLease(
     if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
         !UuidV7::parse(fencingToken).has_value())
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft lease identifiers");
-    std::lock_guard<std::mutex> guard(this->mutex_);
-    ensureHealthy();
+    const std::shared_ptr<std::mutex> lock = draftLock(draftId);
+    std::lock_guard<std::mutex> guard(*lock);
+    checkHealthy();
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
@@ -1744,7 +1768,7 @@ void ProjectService::releaseWorkingCopyLease(
     draft.leaseToken.reset();
     draft.leaseExpiresAtMs = 0;
     try { replaceWorkingCopyRecord(this->root_, draft); }
-    catch (...) { this->uncertain_ = true; throw; }
+    catch (...) { markUncertain(); throw; }
 }
 
 std::vector<ProjectInfo> ProjectService::listProjects() const {
@@ -1937,13 +1961,7 @@ RevisionId ProjectService::commitModelAtExpectedHead(
         std::string_view projectId, std::string_view branch,
         std::vector<ModelChange> changes,
         std::optional<RevisionId> expectedLocalHead) {
-    {
-        std::lock_guard<std::mutex> guard(this->mutex_);
-        ensureHealthy();
-        if (this->repository_role_ != RepositoryRole::Private)
-            throw ProjectError(ProjectErrorKind::Conflict,
-                               "local commit requires a private repository");
-    }
+    requirePrivateRepository("local commit requires a private repository");
     if (!validBranchName(branch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
