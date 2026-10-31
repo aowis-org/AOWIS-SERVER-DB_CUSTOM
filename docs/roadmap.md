@@ -141,10 +141,15 @@ creation, reordered membership conflicts, two-parent ancestry and compaction /
 reopen recovery; that targeted UUIDv7 merge suite passed on 2026-10-31 (1/1).
 The canonical hydraulic edit benchmark and its CTest workload-smoke runner
 now use UUIDv7 revision IDs, immutable base reads, expected-HEAD commits and
-project-qualified revision diffs/merges. The benchmark migration still needs
-its first compiled run and performance comparison; its former SHA results are
-not automatically equivalent UUIDv7 performance baselines. Remaining merge
-choices and SHA-only test-suite migration are still required. Do not add
+project-qualified revision diffs/merges. The migrated benchmark compiled successfully and its four targeted workload /
+hydraulic tests passed on 2026-10-31. A direct performance comparison with
+the prior SHA implementation remains outstanding; its former results are not
+automatically equivalent UUIDv7 performance baselines. UUIDv7 merge-choice
+qualification now covers pinned target-side field resolution, rejection of
+stale/duplicate/unused field choices, delete-vs-modify whole-object choices
+on either side, immutable two-parent ancestry, and compaction/reopen recovery.
+The new choice cases are pending compilation and test acceptance. Remaining
+SHA-only test-suite migration is required. Do not add
 production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 

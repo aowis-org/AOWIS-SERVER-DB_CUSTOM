@@ -3473,6 +3473,182 @@ void exerciseUuidV7CoordinatedMembershipMerges() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+
+// Project-scoped UUIDv7 replacement for the SHA-only interactive field and
+// whole-object merge-selection qualification. Rejected selections must never
+// move a branch tip or append a pack record.
+void exerciseUuidV7MergeChoiceQualification() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    const NetworkHydraulic baseline = completeNetwork();
+    try {
+        {
+            native::Repository repository(folder);
+            const native::RevisionId root = repository.createBranchV2(project, "main");
+            const native::RevisionId base = hydraulic::saveHydraulicNetwork(
+                repository, project, "main", baseline, root);
+            const std::function<void(const std::string&, const native::RevisionId&)> fork =
+                [&repository, &project](const std::string& name, const native::RevisionId& parent) {
+                    require(repository.createBranchAtRevisionV2(project, name, "main", parent) == parent,
+                            "UUIDv7 merge-choice branch origin was not preserved");
+                };
+            const std::function<void(const std::string&, const std::string&,
+                                     const hydraulic::HydraulicMergeSelections&, const char*)> reject =
+                [&repository, &project](const std::string& target, const std::string& source,
+                                        const hydraulic::HydraulicMergeSelections& choice,
+                                        const char* message) {
+                    const native::RevisionId targetHead = repository.headV2(project, target);
+                    const native::RevisionId sourceHead = repository.headV2(project, source);
+                    const std::uint64_t bytesBefore = repository.packSize();
+                    bool rejected = false;
+                    try {
+                        (void)hydraulic::mergeHydraulicBranches(repository, project,
+                                                                target, source, choice);
+                    } catch (const std::exception&) {
+                        rejected = true;
+                    }
+                    require(rejected && repository.headV2(project, target) == targetHead &&
+                            repository.headV2(project, source) == sourceHead &&
+                            repository.packSize() == bytesBefore, message);
+                };
+
+            // Concurrent changes to one field require a pinned, precise choice;
+            // non-conflicting changes on the source must still be incorporated.
+            fork("field-left", base);
+            fork("field-right", base);
+            HydraulicLinkPipe leftPipe = baseline.links_pipes[0];
+            HydraulicLinkPipe rightPipe = baseline.links_pipes[0];
+            leftPipe.diameter_mm = 190.0;
+            rightPipe.diameter_mm = 200.0;
+            rightPipe.length_calculated_m = 45.0;
+            const native::RevisionId fieldLeft = hydraulic::editHydraulicNetwork(
+                repository, project, "field-left", baseline.uuid,
+                {{leftPipe.uuid, hydraulic::HydraulicEntity{leftPipe}}}, base);
+            const native::RevisionId fieldRight = hydraulic::editHydraulicNetwork(
+                repository, project, "field-right", baseline.uuid,
+                {{rightPipe.uuid, hydraulic::HydraulicEntity{rightPipe}}}, base);
+            hydraulic::HydraulicMergeSelections targetChoice{fieldLeft, fieldRight, {}, {}};
+            targetChoice.fields.push_back({leftPipe.uuid, QStringLiteral("diameter_mm"),
+                                           hydraulic::HydraulicMergeSide::Target});
+            hydraulic::HydraulicMergeSelections stale = targetChoice;
+            stale.expectedSourceHead = base;
+            reject("field-left", "field-right", stale, "stale UUIDv7 field choice committed");
+            hydraulic::HydraulicMergeSelections duplicate = targetChoice;
+            duplicate.fields.push_back(targetChoice.fields[0]);
+            reject("field-left", "field-right", duplicate, "duplicate UUIDv7 field choice committed");
+            hydraulic::HydraulicMergeSelections unused = targetChoice;
+            unused.fields[0].field = QStringLiteral("length_calculated_m");
+            reject("field-left", "field-right", unused, "nonconflicting UUIDv7 field choice committed");
+            const native::MergeResultV2 fieldMerge = hydraulic::mergeHydraulicBranches(
+                repository, project, "field-left", "field-right", targetChoice);
+            require(fieldMerge.status == native::MergeStatus::Merged && fieldMerge.resultHead &&
+                    repository.headV2(project, "field-right") == fieldRight,
+                    "UUIDv7 target-side field choice did not merge");
+            NetworkHydraulic fieldExpected = baseline;
+            fieldExpected.links_pipes[0] = rightPipe;
+            fieldExpected.links_pipes[0].diameter_mm = leftPipe.diameter_mm;
+            const std::optional<NetworkHydraulic> fieldActual = hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, *fieldMerge.resultHead, baseline.uuid);
+            require(fieldActual.has_value(), "UUIDv7 field choice network missing");
+            compareNetworks(fieldExpected, *fieldActual);
+            const native::RevisionRecordV2 fieldParents = native::decodeRevisionRecordV2(
+                *repository.readRevisionV2(project, *fieldMerge.resultHead));
+            require(fieldParents.parents.size() == 2 && fieldParents.parents[0].id == fieldLeft &&
+                    fieldParents.parents[1].id == fieldRight,
+                    "UUIDv7 chosen field merge lost parent ancestry");
+            reject("field-left", "field-right", targetChoice,
+                   "already applied UUIDv7 field choice was replayed");
+
+            // Delete-versus-modify conflicts require an explicit object choice.
+            // Test both keeping the modified object and keeping its deletion.
+            fork("object-deleted", base);
+            fork("object-modified", base);
+            HydraulicMapLabel modifiedLabel = baseline.map_labels[0];
+            modifiedLabel.text = QStringLiteral("edited label retained");
+            const native::RevisionId deleted = hydraulic::editHydraulicNetwork(
+                repository, project, "object-deleted", baseline.uuid,
+                {{modifiedLabel.uuid, std::nullopt}}, base);
+            const native::RevisionId modified = hydraulic::editHydraulicNetwork(
+                repository, project, "object-modified", baseline.uuid,
+                {{modifiedLabel.uuid, hydraulic::HydraulicEntity{modifiedLabel}}}, base);
+            hydraulic::HydraulicMergeSelections deleteChoice{deleted, modified, {}, {}};
+            deleteChoice.objects.push_back({modifiedLabel.uuid, hydraulic::HydraulicMergeSide::Target});
+            hydraulic::HydraulicMergeSelections duplicateObject = deleteChoice;
+            duplicateObject.objects.push_back(deleteChoice.objects[0]);
+            reject("object-deleted", "object-modified", duplicateObject,
+                   "duplicate UUIDv7 object choice was accepted");
+            hydraulic::HydraulicMergeSelections overlapping = deleteChoice;
+            overlapping.fields.push_back({modifiedLabel.uuid, QStringLiteral("text"),
+                                          hydraulic::HydraulicMergeSide::Source});
+            reject("object-deleted", "object-modified", overlapping,
+                   "UUIDv7 field and object choice overlapped");
+            hydraulic::HydraulicMergeSelections unknownObject = deleteChoice;
+            unknownObject.objects[0].entityUuid = uuid(9992);
+            reject("object-deleted", "object-modified", unknownObject,
+                   "unknown UUIDv7 object choice was accepted");
+            const native::MergeResultV2 deleteMerge = hydraulic::mergeHydraulicBranches(
+                repository, project, "object-deleted", "object-modified", deleteChoice);
+            require(deleteMerge.status == native::MergeStatus::Merged && deleteMerge.resultHead &&
+                    repository.headV2(project, "object-modified") == modified,
+                    "UUIDv7 delete-side object selection failed");
+            NetworkHydraulic withoutLabel = baseline;
+            withoutLabel.map_labels.clear();
+            const std::optional<NetworkHydraulic> deletion = hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, *deleteMerge.resultHead, baseline.uuid);
+            require(deletion.has_value(), "UUIDv7 deleted label network missing");
+            compareNetworks(withoutLabel, *deletion);
+
+            fork("object-keep", base);
+            fork("object-remove", base);
+            const native::RevisionId kept = hydraulic::editHydraulicNetwork(
+                repository, project, "object-keep", baseline.uuid,
+                {{modifiedLabel.uuid, hydraulic::HydraulicEntity{modifiedLabel}}}, base);
+            const native::RevisionId removed = hydraulic::editHydraulicNetwork(
+                repository, project, "object-remove", baseline.uuid,
+                {{modifiedLabel.uuid, std::nullopt}}, base);
+            hydraulic::HydraulicMergeSelections keepChoice{kept, removed, {}, {}};
+            keepChoice.objects.push_back({modifiedLabel.uuid, hydraulic::HydraulicMergeSide::Target});
+            const native::MergeResultV2 keepMerge = hydraulic::mergeHydraulicBranches(
+                repository, project, "object-keep", "object-remove", keepChoice);
+            require(keepMerge.status == native::MergeStatus::Merged && keepMerge.resultHead &&
+                    repository.headV2(project, "object-remove") == removed,
+                    "UUIDv7 surviving-side object selection failed");
+            NetworkHydraulic withLabel = baseline;
+            withLabel.map_labels[0] = modifiedLabel;
+            const std::optional<NetworkHydraulic> surviving = hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, *keepMerge.resultHead, baseline.uuid);
+            require(surviving.has_value(), "UUIDv7 kept label network missing");
+            compareNetworks(withLabel, *surviving);
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            const native::RevisionId deletedHead = reopened.headV2(project, "object-deleted");
+            const native::RevisionId keptHead = reopened.headV2(project, "object-keep");
+            const std::optional<NetworkHydraulic> deletedNetwork =
+                hydraulic::loadHydraulicNetworkAtRevision(reopened, project, deletedHead, baseline.uuid);
+            const std::optional<NetworkHydraulic> keptNetwork =
+                hydraulic::loadHydraulicNetworkAtRevision(reopened, project, keptHead, baseline.uuid);
+            require(deletedNetwork.has_value() && keptNetwork.has_value(),
+                    "UUIDv7 chosen merge result disappeared after compaction");
+            NetworkHydraulic withoutLabel = baseline;
+            withoutLabel.map_labels.clear();
+            compareNetworks(withoutLabel, *deletedNetwork);
+            NetworkHydraulic withLabel = baseline;
+            withLabel.map_labels[0].text = QStringLiteral("edited label retained");
+            compareNetworks(withLabel, *keptNetwork);
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3494,6 +3670,7 @@ int main(int argc, char** argv) {
         exerciseUuidV7IndexedMembership();
         exerciseUuidV7HydraulicMerges();
         exerciseUuidV7CoordinatedMembershipMerges();
+        exerciseUuidV7MergeChoiceQualification();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;
     } catch (const std::exception& failure) {
