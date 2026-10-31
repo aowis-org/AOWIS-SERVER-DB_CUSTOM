@@ -890,7 +890,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             const std::string target = requiredString(object, "target");
             const std::string source = requiredString(object, "source");
             requireInput(target != source, "hydraulic merge requires different branches");
-            hydraulic::HydraulicMergeSelectionsV2 selections{
+            hydraulic::HydraulicMergeSelections selections{
                 parseRevisionIdV2(requiredString(object, "expectedTargetHead")),
                 parseRevisionIdV2(requiredString(object, "expectedSourceHead")), {}, {}};
             requireInput(!object.contains("fieldChoices") || object.value("fieldChoices").isArray(),
@@ -921,7 +921,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             }
             MergeResultV2 result;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
-                result = hydraulic::mergeHydraulicBranchesV2(
+                result = hydraulic::mergeHydraulicBranches(
                     repository, project, target, source, selections);
             });
             return Reply{result.status == MergeStatus::Conflicts ? 409 : 200, mergeJsonV2(result)};
@@ -940,7 +940,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
                                                                pathParam(request, "branch"), request);
                 requireModelIndexedV2(repository, project, revision, "hydraulic network not found");
                 const std::optional<NetworkHydraulic> network =
-                    hydraulic::loadHydraulicNetworkAtRevisionV2(repository, project, revision, networkUuid);
+                    hydraulic::loadHydraulicNetworkAtRevision(repository, project, revision, networkUuid);
                 if (!network) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
                 result = QJsonObject{{"revision", revisionIdStringV2(revision)},
                                      {"uuid", uuidString(networkUuid)},
@@ -965,7 +965,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
                 const std::string branch = pathParam(request, "branch");
                 requireBranch(repository, branch);
-                committed = hydraulic::saveHydraulicNetworkV2(repository, project, branch, *network, expected);
+                committed = hydraulic::saveHydraulicNetwork(repository, project, branch, *network, expected);
             });
             return Reply{201, QJsonObject{{"id", revisionIdStringV2(committed)}}};
         });
@@ -984,7 +984,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
                 const RevisionId revision = revisionForReadV2(repository, project,
                                                                pathParam(request, "branch"), request);
                 requireModelIndexedV2(repository, project, revision, "hydraulic network not found");
-                const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevisionLimitedV2(
+                const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevisionLimited(
                     repository, project, revision, networkUuid,
                     static_cast<hydraulic::HydraulicEntityType>(type), maxHttpEntityIds);
                 if (!ids) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
@@ -1007,7 +1007,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
                 const RevisionId revision = revisionForReadV2(repository, project,
                                                                pathParam(request, "branch"), request);
                 requireModelIndexedV2(repository, project, revision, "hydraulic network not found");
-                const std::optional<HydraulicEntity> item = hydraulic::loadHydraulicEntityAtRevisionV2(
+                const std::optional<HydraulicEntity> item = hydraulic::loadHydraulicEntityAtRevision(
                     repository, project, revision, networkUuid, entity);
                 if (!item) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic entity not found");
                 result = QJsonObject{{"revision", revisionIdStringV2(revision)},
@@ -1028,7 +1028,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
                 const std::string branch = pathParam(request, "branch");
                 requireBranch(repository, branch);
-                committed = hydraulic::editHydraulicNetworkV2(repository, project, branch, networkUuid,
+                committed = hydraulic::editHydraulicNetwork(repository, project, branch, networkUuid,
                                                                changes, expected);
             });
             return Reply{200, QJsonObject{{"id", revisionIdStringV2(committed)}}};

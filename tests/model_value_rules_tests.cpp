@@ -483,19 +483,19 @@ void testPersistencePaths() {
         NetworkHydraulic broken = network;
         broken.links_pipes[0].diameter_mm = -5;
         expectInvalidInput("save with negative diameter",
-                           [&] { (void)hydraulic::saveHydraulicNetwork(repository, "main", broken); });
+                           [&] { (void)hydraulic::saveHydraulicNetworkLegacy(repository, "main", broken); });
         broken = network;
         broken.options_hydraulic.accuracy = 0;
         expectInvalidInput("save with zero accuracy",
-                           [&] { (void)hydraulic::saveHydraulicNetwork(repository, "main", broken); });
-        const native::Revision saved = hydraulic::saveHydraulicNetwork(repository, "main", network);
+                           [&] { (void)hydraulic::saveHydraulicNetworkLegacy(repository, "main", broken); });
+        const native::Revision saved = hydraulic::saveHydraulicNetworkLegacy(repository, "main", network);
 
         const std::function<void(const std::string&, hydraulic::HydraulicEntity)> rejected =
             [&](const std::string& label, hydraulic::HydraulicEntity entity) {
                 const QUuid id = std::visit([](const auto& value) { return value.uuid; }, entity);
                 hydraulic::HydraulicEditDiagnostics diagnostics;
                 expectInvalidInput(label, [&] {
-                    (void)hydraulic::editHydraulicNetwork(repository, "main", network.uuid,
+                    (void)hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
                                                           {{id, std::move(entity)}}, &diagnostics);
                 });
                 expect(repository.head("main").id == saved.id, label + ": repository changed");
@@ -527,7 +527,7 @@ void testPersistencePaths() {
         // Valid edits still take their fast paths.
         HydraulicLinkValve goodValve = valve; goodValve.diameter_mm = 200;
         hydraulic::HydraulicEditDiagnostics diagnostics;
-        const native::Revision edited = hydraulic::editHydraulicNetwork(
+        const native::Revision edited = hydraulic::editHydraulicNetworkLegacy(
             repository, "main", network.uuid, {{goodValve.uuid, hydraulic::HydraulicEntity{goodValve}}}, &diagnostics);
         expect(edited.id != saved.id && diagnostics.indexedPhysicalFastPath, "valid physical edit not on its fast path");
         (void)repository.verifyRepository();

@@ -1,6 +1,6 @@
 # Hydraulic-aware three-way branch merges
 
-`aowis::dvmdb::hydraulic::mergeHydraulicBranches(repository, target, source)` builds
+`aowis::dvmdb::hydraulic::mergeHydraulicBranches(repository, project, target, source)` builds
 on the native two-parent revision/merge API while validating the combined
 hydraulic model **before any bytes are appended or the target branch ref moves**.
 The operation returns `MergeStatus::Conflicts` with diagnostics on rejected
@@ -15,19 +15,19 @@ canonical seven-field metadata merge already defined by `ModelCodec`.
 
 ## Explicit conflict resolution
 
-In the examples, `namespace hydraulic = aowis::dvmdb::hydraulic;`.
+In the examples, `namespace hydraulic = aowis::dvmdb::hydraulic;`,
+`project` is the selected project UUID, and `targetHead` / `sourceHead`
+are pinned during conflict preview, not refreshed after the user chooses.
 
-The optional third argument, `HydraulicMergeSelections`, allows the AOWIS UI to
+The mandatory fifth argument, `HydraulicMergeSelections`, allows the AOWIS UI to
 resolve individual fields after previewing a conflict:
 
 ```cpp
-hydraulic::HydraulicMergeSelections selections;
-selections.expectedTargetHead = preview.targetBefore;
-selections.expectedSourceHead = preview.sourceHead;
+hydraulic::HydraulicMergeSelections selections{targetHead, sourceHead, {}, {}};
 selections.fields.push_back({pipeUuid, QStringLiteral("diameter_mm"),
     hydraulic::HydraulicMergeSide::Source});
-const native::MergeResult result =
-    hydraulic::mergeHydraulicBranches(repository, "main", "feature", selections);
+const native::MergeResultV2 result =
+    hydraulic::mergeHydraulicBranches(repository, project, "main", "feature", selections);
 ```
 
 Each selection identifies a canonical entity UUID, an **exact conflicting field
@@ -36,7 +36,7 @@ non-conflicting edits still merge automatically; unspecified conflicting fields
 are reported, not guessed. A conflict on `metadata.description` can be selected
 independently from other metadata fields.
 
-With any explicit choices, **both previewed branch head hashes are required**.
+With any explicit choices, **both previewed branch head revision UUIDs are required**.
 The native repository checks them inside the same lock as publication. If either
 branch has advanced, the operation throws without modifying the repository;
 re-preview and obtain new conflict diagnostics before choosing again. Duplicate,
@@ -51,12 +51,10 @@ modification and incompatible topology rewires, AOWIS may instead choose one
 **complete object** from either branch:
 
 ```cpp
-hydraulic::HydraulicMergeSelections choices;
-choices.expectedTargetHead = preview.targetBefore;
-choices.expectedSourceHead = preview.sourceHead;
+hydraulic::HydraulicMergeSelections choices{targetHead, sourceHead, {}, {}};
 choices.objects.push_back({pipeUuid, hydraulic::HydraulicMergeSide::Source});
-const native::MergeResult merged =
-    hydraulic::mergeHydraulicBranches(repository, "main", "feature", choices);
+const native::MergeResultV2 merged =
+    hydraulic::mergeHydraulicBranches(repository, project, "main", "feature", choices);
 ```
 
 An object choice deliberately discards the other side's changes to *that one

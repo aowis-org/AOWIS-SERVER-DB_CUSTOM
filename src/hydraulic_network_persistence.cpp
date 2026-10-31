@@ -1681,7 +1681,7 @@ void materializeDraftMembership(
 }
 
 
-std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedLegacy(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
     HydraulicEntityType type, std::size_t maxCount) {
     const std::size_t index = static_cast<std::size_t>(type);
@@ -1702,7 +1702,7 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
 std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevision(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
     HydraulicEntityType type) {
-    return listHydraulicEntityIdsAtRevisionLimited(
+    return listHydraulicEntityIdsAtRevisionLimitedLegacy(
         repository, revisionId, networkUuid, type, std::numeric_limits<std::size_t>::max());
 }
 
@@ -1720,7 +1720,7 @@ std::optional<QList<QUuid>> listHydraulicEntityIds(
     return listHydraulicEntityIdsAtRevision(repository, snapshot.id, networkUuid, type);
 }
 
-std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
+std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionLegacy(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
     const QUuid& entityUuid) {
     if (networkUuid.isNull() || entityUuid.isNull() || networkUuid == entityUuid) {
@@ -1761,7 +1761,7 @@ std::optional<HydraulicEntity> loadHydraulicEntity(
         // An untouched branch contains no models, not a malformed network.
         return std::nullopt;
     }
-    return loadHydraulicEntityAtRevision(repository, snapshot.id, networkUuid, entityUuid);
+    return loadHydraulicEntityAtRevisionLegacy(repository, snapshot.id, networkUuid, entityUuid);
 }
 
 // The candidate is a private, lazy copy-on-write view held under the native
@@ -2226,9 +2226,9 @@ std::invoke_result_t<Callback, const MergeOptions&> mergeHydraulicWithChoices(
 }
 
 
-MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,
+MergeResult mergeHydraulicBranchesLegacy(Repository& repository, std::string_view target,
                                    std::string_view source,
-                                   const HydraulicMergeSelections& selections) {
+                                   const HydraulicMergeSelectionsLegacy& selections) {
     if ((!selections.fields.empty() || !selections.objects.empty()) &&
         (!selections.expectedTargetHead || !selections.expectedSourceHead))
         throw StorageError(StorageErrorKind::InvalidInput,
@@ -2242,9 +2242,9 @@ MergeResult mergeHydraulicBranches(Repository& repository, std::string_view targ
         });
 }
 
-MergeResultV2 mergeHydraulicBranchesV2(Repository& repository, const ProjectId& project,
+MergeResultV2 mergeHydraulicBranches(Repository& repository, const ProjectId& project,
                                        std::string_view target, std::string_view source,
-                                       const HydraulicMergeSelectionsV2& selections) {
+                                       const HydraulicMergeSelections& selections) {
     return mergeHydraulicWithChoices(selections.fields, selections.objects,
         [&](const MergeOptions& options) {
             return repository.mergeBranchesV2(project, target, source,
@@ -2252,7 +2252,7 @@ MergeResultV2 mergeHydraulicBranchesV2(Repository& repository, const ProjectId& 
         });
 }
 
-Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
+Revision saveHydraulicNetworkLegacy(Repository& repository, std::string_view branch,
                               const NetworkHydraulic& network, std::optional<Hash> expectedHeadFromCaller) {
     // Read a stable logical starting point. commitModel() verifies this head
     // again under its repository lock, preventing lost updates between the
@@ -2332,7 +2332,7 @@ Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
 }
 
 
-Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
+Revision editHydraulicNetworkLegacy(Repository& repository, std::string_view branch,
                               const QUuid& networkUuid,
                               const std::vector<HydraulicEntityChange>& changes,
                               HydraulicEditDiagnostics* diagnostics,
@@ -2390,7 +2390,7 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
     // The whole-network loader checks all stored UUIDs, kinds, reference edges and
     // network semantics; damage it finds propagates as a typed StorageError.
     std::optional<NetworkHydraulic> network =
-        loadHydraulicNetworkAtRevision(repository, startingRevision.id, networkUuid);
+        loadHydraulicNetworkAtRevisionLegacy(repository, startingRevision.id, networkUuid);
     if (!network) {
         throw StorageError(StorageErrorKind::NotFound,
                            "cannot edit hydraulic network " + networkUuid.toString().toStdString() + ": not found");
@@ -2476,7 +2476,7 @@ Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
     return repository.commitModel(branch, std::move(pending), startingRevision.id);
 }
 
-std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(Repository& repository,
+std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionLegacy(Repository& repository,
                                                                const Hash& revisionId,
                                                                const QUuid& networkUuid) {
     const std::optional<ModelRecord> root =
@@ -2524,13 +2524,13 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
         // An untouched branch contains no models, not a malformed network.
         return std::nullopt;
     }
-    return loadHydraulicNetworkAtRevision(repository, snapshot.id, networkUuid);
+    return loadHydraulicNetworkAtRevisionLegacy(repository, snapshot.id, networkUuid);
 }
 
 // UUIDv7 hydraulic operations deliberately use the same manifest codec,
 // membership chunks, canonical entity payloads and semantic validator as V1.
 // There is no translation of revision UUIDs into content-address identities.
-std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedV2(
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid, HydraulicEntityType type, std::size_t maxCount) {
     const std::size_t index = static_cast<std::size_t>(type);
@@ -2547,7 +2547,7 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedV2(
     return manifest.members[index];
 }
 
-std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionV2(
+std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid, const QUuid& entityUuid) {
     if (networkUuid.isNull() || entityUuid.isNull() || networkUuid == entityUuid)
@@ -2576,7 +2576,7 @@ std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionV2(
     return decoded;
 }
 
-std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionV2(
+std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid) {
     const std::optional<ModelRecord> root =
@@ -2612,7 +2612,7 @@ std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionV2(
     return network;
 }
 
-RevisionId saveHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project,
                                   std::string_view branch, const NetworkHydraulic& network,
                                   const RevisionId& expectedHead) {
     if (network.uuid.isNull())
@@ -2678,7 +2678,7 @@ RevisionId saveHydraulicNetworkV2(Repository& repository, const ProjectId& proje
     return repository.commitModelV2(project, branch, std::move(changes), expectedHead);
 }
 
-RevisionId editHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project,
                                   std::string_view branch, const QUuid& networkUuid,
                                   const std::vector<HydraulicEntityChange>& changes,
                                   const RevisionId& expectedHead) {
@@ -2689,7 +2689,7 @@ RevisionId editHydraulicNetworkV2(Repository& repository, const ProjectId& proje
     if (repository.headV2(project, branch) != expectedHead)
         throw StorageError(StorageErrorKind::Conflict, "branch head changed since edit was prepared");
     std::optional<NetworkHydraulic> network =
-        loadHydraulicNetworkAtRevisionV2(repository, project, expectedHead, networkUuid);
+        loadHydraulicNetworkAtRevision(repository, project, expectedHead, networkUuid);
     if (!network) throw StorageError(StorageErrorKind::NotFound, "hydraulic network not found");
     const Manifest previous = manifestFor(*network);
     const std::map<Key, std::size_t> owners = collectionOwners(previous);
@@ -2727,7 +2727,7 @@ RevisionId editHydraulicNetworkV2(Repository& repository, const ProjectId& proje
             throw StorageError(StorageErrorKind::Conflict, "branch head changed during hydraulic edit");
         return expectedHead;
     }
-    return saveHydraulicNetworkV2(repository, project, branch, *network, expectedHead);
+    return saveHydraulicNetwork(repository, project, branch, *network, expectedHead);
 }
 
 } // namespace aowis::dvmdb::hydraulic

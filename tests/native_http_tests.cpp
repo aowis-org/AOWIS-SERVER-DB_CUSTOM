@@ -791,7 +791,7 @@ void exerciseBoundsAndScoping(Client& client, aowis::dvmdb::ProjectService& serv
             network.nodes_junctions.append(junction);
         }
         removable = network.nodes_junctions.last().uuid;
-        bigHead = native::hydraulic::saveHydraulicNetwork(repository, "large", network).id;
+        bigHead = native::hydraulic::saveHydraulicNetworkLegacy(repository, "large", network).id;
     });
     const QString listing = prefix + "/branches/large/networks/" +
                             networkUuid.toString(QUuid::WithoutBraces) + "/entities?type=9";
@@ -800,7 +800,7 @@ void exerciseBoundsAndScoping(Client& client, aowis::dvmdb::ProjectService& serv
           overList.json.value("error").toObject().value("code").toString() == "limit_exceeded",
           "10001-entity listing was not rejected with 413 limit_exceeded");
     service.withRepository(id.toStdString(), [&](native::Repository& repository) {
-        native::hydraulic::editHydraulicNetwork(repository, "large", networkUuid,
+        native::hydraulic::editHydraulicNetworkLegacy(repository, "large", networkUuid,
             {native::hydraulic::HydraulicEntityChange{removable, std::nullopt}}, nullptr, bigHead);
     });
     const Response fullList = client.call("GET", listing);
@@ -2549,7 +2549,7 @@ void exerciseHydraulicDraftMembershipHttp() {
           "first hydraulic fixture commit did not establish the HEAD");
     native::RevisionId base = head;
     service.withRepository(project.id, [&](native::Repository& repository) {
-        base = native::hydraulic::saveHydraulicNetworkV2(repository, projectUuid,
+        base = native::hydraulic::saveHydraulicNetwork(repository, projectUuid,
                                                          "main", network, head);
     });
     service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);

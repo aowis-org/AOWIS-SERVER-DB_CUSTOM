@@ -75,6 +75,52 @@ introduce them as prerequisites for implementing or accepting VC-00–VC-11.
 Treat controlled deployment of unauthenticated HTTP repositories as separate
 operational guidance, not as a version-control deliverable.
 
+## Hydraulic API consolidation gate — before VC-05
+
+**One public hydraulic revision model:** all committed hydraulic operations use
+`ProjectId` + UUIDv7 `RevisionId` and explicit expected HEAD. The C++ API
+names have no version suffix: `saveHydraulicNetwork`, `editHydraulicNetwork`,
+`loadHydraulicNetworkAtRevision`, `listHydraulicEntityIdsAtRevisionLimited`,
+`loadHydraulicEntityAtRevision`, and `mergeHydraulicBranches`, with
+`HydraulicMergeSelections` for pinned merge choices. Draft Save and local
+Commit remain separate operations; no SHA-identified commits or synthetic
+initial revisions are introduced.
+
+**Acceptance prerequisites before deleting the previous SHA code:**
+
+1. Port the existing hydraulic persistence qualification suite, value-rule
+   tests, HTTP fixtures and edit benchmarks to project-scoped UUIDv7 projects,
+   branches and immutable revisions. Preserve the assertions for every one of
+   the 18 entity collections, physical/topological validation, cross-entity
+   references, stale-HEAD rejection, restart recovery and corrupt-data reads.
+2. Transfer the proven *indexed* edit engine (scalar, topology, physical,
+   dependencies, catalogue and bounded membership) to the UUIDv7 revision
+   storage API. The current UUIDv7 edit implementation reconstructs and
+   re-saves the entire aggregate; merely deleting the SHA engine would lose
+   tested behavior and invalidate edit-performance comparisons.
+3. Carry over the full hydraulic merge matrix: concurrent inserts/deletes,
+   field/object choices, stale pins, invalid candidates, fast-forward
+   validation, two-parent ancestry and unchanged source branches.
+4. Unify the encoder/manifest and validator helpers shared by draft and
+   committed persistence. Keep project-qualified immutable readers and their
+   record-identity checks. No fallback to SHA IDs or old repository branches.
+5. Remove the SHA-only functions, selectors, diagnostics and obsolete test
+   fixtures. Check **all** code, tests, benchmarks, HTTP routes, headers and
+   docs for leftover old signatures or `*V2` hydraulic names. No compatibility
+   wrappers remain in the released API.
+6. Require the dedicated hydraulic persistence, value-validation, HTTP and
+   merge tests, plus relevant benchmark comparisons, to pass after the old
+   implementation is gone. Re-run full DVMDB qualification before VC-05.
+
+**Current source checkpoint:** the project-scoped entry points have their
+canonical unsuffixed names, and the SHA-based test/benchmark calls carry a
+`Legacy` suffix to keep the two architectures distinguishable during test
+migration. This is an intermediate code state, **not completed consolidation**:
+the SHA implementation still exists solely to preserve extensive qualification
+coverage. Do not add production callers to it or declare the gate satisfied
+until the preceding acceptance items have been completed and the SHA API
+removed.
+
 ## Current implementation state and immediate delivery priority
 
 This section records the **source-level checkpoint**, not a claim that the full

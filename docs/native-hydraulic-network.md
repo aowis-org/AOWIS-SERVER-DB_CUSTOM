@@ -41,11 +41,20 @@ Checkout pins project UUIDv7, branch UUIDv7, committed base revision UUIDv7
 owner/session. Multiple users may base independent working copies on the
 same committed revision. Each editor's edits change only their own copy.
 
-An implementation may perform efficient UUID-indexed entity editing,
-copy-on-write membership updates and Merkle-subtree reuse. A full-network
-save may re-encode the whole aggregate, while targeted edits reuse unchanged
-records. Both paths must produce a complete, deterministically validated
-candidate state, not partially publish independent entity mutations.
+DVMDB uses project-scoped UUIDv7 revisions for committed hydraulic operations.
+The canonical native C++ entry points are `saveHydraulicNetwork`,
+`editHydraulicNetwork`, `loadHydraulicNetworkAtRevision`,
+`listHydraulicEntityIdsAtRevisionLimited`,
+`loadHydraulicEntityAtRevision` and `mergeHydraulicBranches`.
+Their write interfaces require a pinned expected committed HEAD; an unborn
+project is edited through a private draft rather than by inventing a commit.
+
+Currently the committed UUIDv7 edit implementation validates and re-encodes
+the full network. The older SHA-revision indexed-edit suite still tests
+bounded entity and membership updates, but those optimizations must be
+ported to the project-scoped API before the older implementation is removed.
+Full-network save and targeted edit must ultimately share one validated
+candidate/write engine without losing indexed-update behavior or tests.
 
 ## Commit and concurrency
 

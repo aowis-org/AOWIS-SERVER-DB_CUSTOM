@@ -55,15 +55,18 @@ void materializeDraftMembership(
     std::vector<ModelChange>& changes);
 
 
+// Test-only SHA-revision interface pending migration of the indexed edit
+// qualification suite to project-scoped UUIDv7 revisions. Not for new callers.
 // Replaces one complete hydraulic network inside the branch in ONE atomic
 // model commit. Other networks in the branch are unaffected. All 18 top-level
 // entity lists are stored as individually addressable canonical model records.
 // Validation is the native canonical hydraulic-model validator, including typed refs.
 // Throws StorageError (InvalidInput, Conflict, ...) on validation, ownership or storage failures.
-Revision saveHydraulicNetwork(Repository& repository, std::string_view branch,
+Revision saveHydraulicNetworkLegacy(Repository& repository, std::string_view branch,
                               const NetworkHydraulic& network,
                               std::optional<Hash> expectedHead = std::nullopt);
 
+// SHA-revision historical/branch readers retained for existing qualification tests.
 // Load APIs: a missing network or entity returns nullopt. Every failure
 // throws StorageError with its kind (Corruption for malformed stored data,
 // InvalidInput for a bad selector or revision, Io/ResourceExhausted for
@@ -78,10 +81,10 @@ std::optional<NetworkHydraulic> loadHydraulicNetwork(Repository& repository,
 
 // Load a historical immutable snapshot, independent of any branch movement.
 // The revision must identify a model-indexed revision stored in this repository.
-std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(
+std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionLegacy(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid);
 
-// Exactly the 18 top-level types persisted by saveHydraulicNetwork().
+// Exactly the 18 top-level types persisted by saveHydraulicNetworkLegacy().
 // The alternative order follows the manifest's collection order.
 using HydraulicEntity = std::variant<
     HydraulicPipeMaterial, HydraulicPatternTime, HydraulicCurveTankVolume,
@@ -130,7 +133,7 @@ std::optional<QList<QUuid>> listHydraulicEntityIds(
 // Bounded listing for untrusted callers. Missing network -> nullopt. Failures
 // throw StorageError; a collection with more than maxCount members throws
 // LimitExceeded after decoding at most one membership chunk beyond the limit.
-std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedLegacy(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
     HydraulicEntityType type, std::size_t maxCount);
 
@@ -140,7 +143,7 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
 // full-network semantic validation. Missing/unowned UUID -> nullopt;
 // malformed records throw. Branch reads pin a single revision.
 // The historical counterpart also pins ownership and reverse-reference reads.
-std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
+std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionLegacy(
     Repository& repository, const Hash& revisionId, const QUuid& networkUuid,
     const QUuid& entityUuid);
 
@@ -184,7 +187,7 @@ struct HydraulicObjectChoice {
     // whole-network validation if membership changes are incompatible.
     HydraulicMergeSide side = HydraulicMergeSide::Target;
 };
-struct HydraulicMergeSelections {
+struct HydraulicMergeSelectionsLegacy {
     // Required together when choices are supplied. They pin the previewed
     // branch tips, preventing a stale GUI dialog from merging newer changes.
     std::optional<Hash> expectedTargetHead;
@@ -193,6 +196,8 @@ struct HydraulicMergeSelections {
     std::vector<HydraulicObjectChoice> objects;
 };
 
+// SHA-revision merge retained temporarily to preserve the existing
+// reconciliation qualification suite until its UUIDv7 migration.
 // Three-way merge with canonical model field reconciliation and full candidate
 // hydraulic validation before publication. Field choices resolve only actual
 // same-field conflicts of unchanged-reference existing entities. Whole-object
@@ -203,23 +208,24 @@ struct HydraulicMergeSelections {
 // reordered membership and unsafe combinations remain conflicts.
 // The default native object merge is unaffected. Invalid or stale choices
 // throw without changing either branch or appending pack objects.
-MergeResult mergeHydraulicBranches(Repository& repository, std::string_view target,
+MergeResult mergeHydraulicBranchesLegacy(Repository& repository, std::string_view target,
                                    std::string_view source,
-                                   const HydraulicMergeSelections& selections = {});
+                                   const HydraulicMergeSelectionsLegacy& selections = {});
 
-// UUIDv7-only hydraulic merge; both immutable branch-tip UUIDs pin every
-// interactive selection. The same canonical field/membership reconciliation
-// and whole-network preflight are used as in the native SHA merge.
-struct HydraulicMergeSelectionsV2 {
+// Canonical project-scoped UUIDv7 hydraulic merge. Both immutable branch-tip
+// UUIDs pin every interactive selection; full-network validation is mandatory.
+struct HydraulicMergeSelections {
     RevisionId expectedTargetHead;
     RevisionId expectedSourceHead;
     std::vector<HydraulicFieldChoice> fields;
     std::vector<HydraulicObjectChoice> objects;
 };
-MergeResultV2 mergeHydraulicBranchesV2(Repository& repository, const ProjectId& project,
+MergeResultV2 mergeHydraulicBranches(Repository& repository, const ProjectId& project,
                                        std::string_view target, std::string_view source,
-                                       const HydraulicMergeSelectionsV2& selections);
+                                       const HydraulicMergeSelections& selections);
 
+// SHA-only indexed edit implementation retained to migrate its qualification
+// and benchmark coverage onto the canonical project-scoped API.
 // Incremental *write* path for one existing network. Each change is encoded
 // individually; unchanged entities and membership chunks are not rewritten.
 // Existing scalar-only edits, eligible pipe rewires, whitelisted
@@ -236,29 +242,31 @@ MergeResultV2 mergeHydraulicBranchesV2(Repository& repository, const ProjectId& 
 // Other edits use full canonical validation and cost O(network size).
 // Both paths commit atomically with an expected-head check.
 // Empty or semantically unchanged batches do not create a new revision.
-Revision editHydraulicNetwork(Repository& repository, std::string_view branch,
+Revision editHydraulicNetworkLegacy(Repository& repository, std::string_view branch,
                               const QUuid& networkUuid,
                               const std::vector<HydraulicEntityChange>& changes,
                               HydraulicEditDiagnostics* diagnostics = nullptr,
                               std::optional<Hash> expectedHead = std::nullopt);
 
-// UUIDv7 revision-aware hydraulic operations. All reads pin a project-scoped
-// immutable snapshot; saves/edits compare their expected HEAD again during
-// the native atomic model commit. No SHA-revision fallback is permitted.
-RevisionId saveHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+// Canonical project-scoped UUIDv7 hydraulic operations. All reads pin an
+// immutable revision; saves/edits compare expected HEAD during atomic commit.
+// The current edit implementation validates and re-encodes the complete network;
+// bounded indexed updates must be migrated before deleting the SHA test path.
+// No SHA-revision fallback is permitted.
+RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project,
                                   std::string_view branch, const NetworkHydraulic& network,
                                   const RevisionId& expectedHead);
-RevisionId editHydraulicNetworkV2(Repository& repository, const ProjectId& project,
+RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project,
                                   std::string_view branch, const QUuid& networkUuid,
                                   const std::vector<HydraulicEntityChange>& changes,
                                   const RevisionId& expectedHead);
-std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevisionV2(
+std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid);
-std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimitedV2(
+std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid, HydraulicEntityType type, std::size_t maxCount);
-std::optional<HydraulicEntity> loadHydraulicEntityAtRevisionV2(
+std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid, const QUuid& entityUuid);
 

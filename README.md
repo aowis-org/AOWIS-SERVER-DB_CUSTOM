@@ -168,10 +168,12 @@ Useful CMake targets include `AOWIS::Model` and `AOWIS::DvmdbHydraulic`. The pub
 
 // Use the native repository directly from C++.
 aowis::dvmdb::Repository repository("/path/to/repository");
-repository.createBranch("main");
-// Use aowis::dvmdb::hydraulic::saveHydraulicNetwork(),
-// loadHydraulicNetwork(), editHydraulicNetwork() and mergeHydraulicBranches()
-// with the canonical AOWIS NetworkHydraulic model.
+const aowis::dvmdb::ProjectId project = aowis::dvmdb::ProjectId::generate();
+repository.createBranchV2(project, "main");
+// The canonical hydraulic C++ APIs take ProjectId and immutable RevisionId
+// selectors; saves and edits require an expected committed HEAD RevisionId.
+// Unborn branches use the private working-copy draft lifecycle instead.
+// See docs/native-hydraulic-network.md for the complete workflow.
 ```
 
 Engine failures, including hydraulic load failures, are `aowis::dvmdb::StorageError` exceptions (see `include/aowis/dvmdb/storage_error.h`); classify them by `StorageErrorKind`, never by message text. Load functions return `std::nullopt` only for "not found".
