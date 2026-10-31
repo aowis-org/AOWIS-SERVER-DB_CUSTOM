@@ -117,9 +117,15 @@ canonical unsuffixed names, and the SHA-based test/benchmark calls carry a
 `Legacy` suffix to keep the two architectures distinguishable during test
 migration. This is an intermediate code state, **not completed consolidation**:
 the SHA implementation still exists solely to preserve extensive qualification
-coverage. Do not add production callers to it or declare the gate satisfied
-until the preceding acceptance items have been completed and the SHA API
-removed.
+coverage. The canonical UUIDv7 edit path now uses the immutable revision index
+for whitelisted existing-member scalar updates (pipe hydraulic scalars,
+junction elevations and map-label text); it checks canonical value rules,
+reference identity and expected HEAD, preserves the membership manifest,
+and returns the existing revision on no-op. Topology, catalogues, dependent
+entities and structural membership still take full-network validation on the
+UUIDv7 path. Remaining indexed paths, merge qualifications and legacy suite
+migration are still required. Do not add production callers to the SHA API
+or declare the gate satisfied until those requirements and SHA removal pass.
 
 ## Current implementation state and immediate delivery priority
 

@@ -2521,6 +2521,8 @@ void exerciseUuidV7Hydraulic() {
         native::RevisionId initial = native::RevisionId::generate();
         native::RevisionId saved = initial;
         native::RevisionId edited = initial;
+        native::RevisionId scalarRewire = initial;
+        NetworkHydraulic scalarExpectedAfter = baseline;
         {
             native::Repository repository(folder);
             initial = repository.createBranchV2(project, "main");
@@ -2550,6 +2552,75 @@ void exerciseUuidV7Hydraulic() {
             require(!hydraulic::loadHydraulicEntityAtRevision(
                 repository, project, saved, baseline.uuid, uuid(10000)),
                 "UUIDv7 indexed lookup found an unowned entity");
+            // The canonical UUIDv7 API must preserve bounded indexed scalar
+            // editing rather than rewrite the entire network on every value
+            // update. Membership/root bytes and the source branch remain
+            // unchanged; both changed and no-op batches retain exact IDs.
+            require(repository.createBranchV2(project, "indexed-scalars", "main") == saved,
+                    "UUIDv7 scalar branch did not inherit saved HEAD");
+            const native::ModelRecord manifestBefore = *repository.getModelAtRevisionV2(
+                project, saved, hydraulic::keyFromUuid(baseline.uuid));
+            NetworkHydraulic scalarNetwork = baseline;
+            scalarNetwork.links_pipes[0].diameter_mm = 143.25;
+            scalarNetwork.nodes_junctions[0].elevation_m = 17.0;
+            scalarNetwork.map_labels[0].text = QStringLiteral("UUIDv7 indexed label");
+            const std::vector<hydraulic::HydraulicEntityChange> scalarChanges{
+                {scalarNetwork.links_pipes[0].uuid,
+                 hydraulic::HydraulicEntity{scalarNetwork.links_pipes[0]}},
+                {scalarNetwork.nodes_junctions[0].uuid,
+                 hydraulic::HydraulicEntity{scalarNetwork.nodes_junctions[0]}},
+                {scalarNetwork.map_labels[0].uuid,
+                 hydraulic::HydraulicEntity{scalarNetwork.map_labels[0]}}};
+            hydraulic::HydraulicEditDiagnostics scalarStats;
+            const native::RevisionId scalarHead = hydraulic::editHydraulicNetwork(
+                repository, project, "indexed-scalars", baseline.uuid,
+                scalarChanges, saved, &scalarStats);
+            require(scalarHead != saved && scalarStats.indexedScalarFastPath &&
+                    scalarStats.validatedEntities == 3,
+                    "UUIDv7 safe scalar edit did not use indexed records");
+            require(repository.headV2(project, "main") == saved,
+                    "UUIDv7 scalar edit moved unrelated branch HEAD");
+            const native::ModelRecord manifestAfter = *repository.getModelAtRevisionV2(
+                project, scalarHead, hydraulic::keyFromUuid(baseline.uuid));
+            require(native::encodeModelRecord(manifestBefore) ==
+                        native::encodeModelRecord(manifestAfter),
+                    "UUIDv7 indexed scalar edit rewrote membership manifest");
+            compareNetworks(scalarNetwork, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, scalarHead, baseline.uuid));
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, saved, baseline.uuid));
+            require(hydraulic::editHydraulicNetwork(repository, project, "indexed-scalars",
+                    baseline.uuid, scalarChanges, scalarHead, &scalarStats) == scalarHead &&
+                    scalarStats.indexedScalarFastPath,
+                    "UUIDv7 no-op scalar edit created another revision");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project,
+                    "indexed-scalars", baseline.uuid, scalarChanges, saved, &scalarStats);
+            }), "UUIDv7 indexed scalar edit accepted stale expected HEAD");
+            HydraulicLinkPipe invalidScalarTopology = scalarNetwork.links_pipes[0];
+            invalidScalarTopology.node_uuid_to = uuid(9999);
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project,
+                    "indexed-scalars", baseline.uuid,
+                    {{invalidScalarTopology.uuid,
+                      hydraulic::HydraulicEntity{invalidScalarTopology}}},
+                    scalarHead, &scalarStats);
+            }) && !scalarStats.indexedScalarFastPath &&
+                    repository.headV2(project, "indexed-scalars") == scalarHead,
+                    "UUIDv7 topology edit incorrectly bypassed canonical validation");
+            HydraulicLinkPipe validScalarTopology = scalarNetwork.links_pipes[0];
+            validScalarTopology.node_uuid_from = uuid(18);
+            const native::RevisionId rewireHead = hydraulic::editHydraulicNetwork(
+                repository, project, "indexed-scalars", baseline.uuid,
+                {{validScalarTopology.uuid, hydraulic::HydraulicEntity{validScalarTopology}}},
+                scalarHead, &scalarStats);
+            require(rewireHead != scalarHead && !scalarStats.indexedScalarFastPath,
+                    "UUIDv7 topology edit incorrectly used scalar fast path");
+            scalarNetwork.links_pipes[0] = validScalarTopology;
+            scalarRewire = rewireHead;
+            scalarExpectedAfter = scalarNetwork;
+            compareNetworks(scalarNetwork, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, rewireHead, baseline.uuid));
             HydraulicNodeJunction updated = baseline.nodes_junctions.front();
             updated.metadata.description = QStringLiteral("UUIDv7 updated junction");
             const std::vector<hydraulic::HydraulicEntityChange> changes{
@@ -2588,8 +2659,11 @@ void exerciseUuidV7Hydraulic() {
         {
             native::Repository reopened(folder);
             require(reopened.headV2(project, "main") == edited &&
-                    reopened.headV2(project, "history") == saved,
+                    reopened.headV2(project, "history") == saved &&
+                    reopened.headV2(project, "indexed-scalars") == scalarRewire,
                     "UUIDv7 hydraulic HEAD identities changed after reopen/compaction");
+            compareNetworks(scalarExpectedAfter, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, scalarRewire, baseline.uuid));
             compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
                 reopened, project, saved, baseline.uuid));
             (void)reopened.verifyRepository();

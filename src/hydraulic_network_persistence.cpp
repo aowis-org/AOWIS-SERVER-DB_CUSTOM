@@ -1437,6 +1437,73 @@ std::optional<Revision> tryIndexedScalarEdits(
     return result;
 }
 
+// UUIDv7 indexed scalar-edit counterpart. All ownership and payload reads are
+// pinned to one immutable project revision; commitModelV2() atomically checks
+// the same expected HEAD before publishing. An ineligible batch returns
+// nullopt WITHOUT applying any of its changes, so the caller can use the
+// complete-network validator instead.
+std::optional<RevisionId> tryIndexedUuidScalarEdits(
+    Repository& repository, const ProjectId& project, std::string_view branch,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
+    const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    for (const HydraulicEntityChange& change : changes) {
+        if (!change.value || change.value->valueless_by_exception() ||
+            change.uuid.isNull() || change.uuid == networkUuid) return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second) return std::nullopt;
+        // Only the three scalar-whitelisted entity types are eligible.
+        // Use concrete types, never an unchecked variant alternative.
+        const HydraulicLinkPipe* pipe = std::get_if<HydraulicLinkPipe>(&*change.value);
+        const HydraulicNodeJunction* junction =
+            std::get_if<HydraulicNodeJunction>(&*change.value);
+        const HydraulicMapLabel* label = std::get_if<HydraulicMapLabel>(&*change.value);
+        if ((!pipe || pipe->uuid != change.uuid) &&
+            (!junction || junction->uuid != change.uuid) &&
+            (!label || label->uuid != change.uuid)) return std::nullopt;
+        if (!ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!old || !scalarOnlyChange(*change.value, *old, change.uuid))
+            return std::nullopt;
+        if (old->references != scalarReferences(*change.value)) return std::nullopt;
+        aowis::dvmdb::ModelValidationReport values;
+        ModelRecord updated = *old;
+        if (pipe) {
+            values = aowis::dvmdb::validateHydraulicEntityValues(*pipe);
+            updated.payload = bytesFromQByteArray(ModelCodec<HydraulicLinkPipe>::encode(*pipe));
+        } else if (junction) {
+            values = aowis::dvmdb::validateHydraulicEntityValues(*junction);
+            updated.payload = bytesFromQByteArray(ModelCodec<HydraulicNodeJunction>::encode(*junction));
+        } else {
+            values = aowis::dvmdb::validateHydraulicEntityValues(*label);
+            updated.payload = bytesFromQByteArray(ModelCodec<HydraulicMapLabel>::encode(*label));
+        }
+        if (!values.valid())
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid hydraulic scalar edit: " + values.summary().toStdString());
+        if (updated.payload.empty()) return std::nullopt;
+        if (updated.payload != old->payload)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    RevisionId result = expectedHead;
+    if (pending.empty()) {
+        if (repository.headV2(project, branch) != expectedHead)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "branch head changed during UUIDv7 hydraulic scalar edit");
+    } else {
+        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+    }
+    if (diagnostics) {
+        diagnostics->indexedScalarFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
 } // namespace
 
 ModelChange emptyDraftHydraulicNetworkRoot(const QUuid& networkId, const QString& name) {
@@ -2681,13 +2748,22 @@ RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project
 RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project,
                                   std::string_view branch, const QUuid& networkUuid,
                                   const std::vector<HydraulicEntityChange>& changes,
-                                  const RevisionId& expectedHead) {
+                                  const RevisionId& expectedHead,
+                                  HydraulicEditDiagnostics* diagnostics) {
+    if (diagnostics) *diagnostics = HydraulicEditDiagnostics{};
     if (networkUuid.isNull())
         throw StorageError(StorageErrorKind::InvalidInput, "hydraulic network UUID is null");
     if (changes.size() > 128)
         throw StorageError(StorageErrorKind::LimitExceeded, "hydraulic edit exceeds 128 changes");
     if (repository.headV2(project, branch) != expectedHead)
         throw StorageError(StorageErrorKind::Conflict, "branch head changed since edit was prepared");
+    // The indexed helper validates scalar values before any indexed commit.
+    // Other batches retain the complete-network validator below.
+    if (!changes.empty()) {
+        const std::optional<RevisionId> indexed = tryIndexedUuidScalarEdits(
+            repository, project, branch, networkUuid, changes, expectedHead, diagnostics);
+        if (indexed) return *indexed;
+    }
     std::optional<NetworkHydraulic> network =
         loadHydraulicNetworkAtRevision(repository, project, expectedHead, networkUuid);
     if (!network) throw StorageError(StorageErrorKind::NotFound, "hydraulic network not found");
