@@ -120,10 +120,13 @@ the SHA implementation still exists solely to preserve extensive qualification
 coverage. The canonical UUIDv7 edit path now uses the immutable revision index
 for whitelisted existing-member scalar updates (pipe hydraulic scalars,
 junction elevations and map-label text), physical/operating updates to
-reservoirs, tanks, pumps and valves, and existing catalogue payload updates.
+reservoirs, tanks, pumps and valves, existing catalogue payload updates,
+independent existing-pipe endpoint rewires, and typed reference updates for
+existing demand points and controls.
 These paths check MODEL value rules, canonical references where applicable,
 immutable-revision ownership and expected HEAD, preserve the membership
-manifest, and return the existing revision on no-op. Topology, dependent
+manifest, and return the existing revision on no-op. Ineligible or mixed topology
+and dependency edits fall back to complete-network validation. New/deleted
 entities and structural membership still take full-network validation on the
 UUIDv7 path. Remaining indexed paths, merge qualifications and legacy suite
 migration are still required. Do not add production callers to the SHA API

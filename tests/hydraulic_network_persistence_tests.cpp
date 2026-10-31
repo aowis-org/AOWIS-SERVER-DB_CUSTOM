@@ -2786,6 +2786,239 @@ void exerciseUuidV7Hydraulic() {
     std::filesystem::remove_all(folder, ignored);
 }
 
+// UUIDv7 indexed topology/dependent qualification: immutable revision reads,
+// reverse edges, bounded network ownership, full-validator fallbacks, stale
+// pins, no-op edits and complete reconstruction after reopen/compaction.
+void exerciseUuidV7IndexedReferences() {
+    const std::filesystem::path folder = tempDir();
+    const native::ProjectId project = native::ProjectId::generate();
+    const NetworkHydraulic baseline = completeNetwork();
+    native::RevisionId topologyHead = native::RevisionId::generate();
+    native::RevisionId dependentHead = native::RevisionId::generate();
+    NetworkHydraulic topologyExpected = baseline;
+    NetworkHydraulic dependentExpected = baseline;
+    try {
+        {
+            native::Repository repository(folder);
+            const native::RevisionId genesis = repository.createBranchV2(project, "main");
+            const native::RevisionId saved = hydraulic::saveHydraulicNetwork(
+                repository, project, "main", baseline, genesis);
+            require(repository.createBranchV2(project, "uuid-topology", "main") == saved,
+                    "UUIDv7 topology fixture branch did not inherit HEAD");
+            // A control depends on the original pipe. Such a rewire is
+            // ineligible for the indexed shortcut, even when canonical full
+            // validation can accept the resulting network.
+            require(repository.createBranchV2(project, "uuid-referenced-pipe", "main") == saved,
+                    "UUIDv7 referenced topology fixture branch did not inherit HEAD");
+            HydraulicLinkPipe referencedPipe = baseline.links_pipes[0];
+            referencedPipe.node_uuid_from = uuid(18);
+            hydraulic::HydraulicEditDiagnostics referencedStats;
+            const native::RevisionId referencedHead = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-referenced-pipe", baseline.uuid,
+                {{referencedPipe.uuid, hydraulic::HydraulicEntity{referencedPipe}}},
+                saved, &referencedStats);
+            require(referencedHead != saved && !referencedStats.indexedTopologyFastPath,
+                    "UUIDv7 topology bypassed an incoming dependent control");
+            NetworkHydraulic referencedExpected = baseline;
+            referencedExpected.links_pipes[0] = referencedPipe;
+            compareNetworks(referencedExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, referencedHead, baseline.uuid));
+            // The baseline has a control referring to its pipe. Removing that
+            // control is a full-network operation and permits an independent
+            // rewire to take the bounded indexed path.
+            topologyExpected.controls_simple.clear();
+            const native::RevisionId topologyBase = hydraulic::saveHydraulicNetwork(
+                repository, project, "uuid-topology", topologyExpected, saved);
+            const native::ModelRecord topologyRoot = *repository.getModelAtRevisionV2(
+                project, topologyBase, hydraulic::keyFromUuid(baseline.uuid));
+            topologyExpected.links_pipes[0].node_uuid_from = uuid(18);
+            const HydraulicLinkPipe rewire = topologyExpected.links_pipes[0];
+            const std::vector<hydraulic::HydraulicEntityChange> topologyChanges{
+                {rewire.uuid, hydraulic::HydraulicEntity{rewire}}};
+            hydraulic::HydraulicEditDiagnostics topologyStats;
+            topologyHead = hydraulic::editHydraulicNetwork(repository, project, "uuid-topology",
+                baseline.uuid, topologyChanges, topologyBase, &topologyStats);
+            require(topologyHead != topologyBase && topologyStats.indexedTopologyFastPath &&
+                    topologyStats.validatedEntities == 1,
+                    "UUIDv7 independent pipe rewire missed indexed fast path");
+            require(native::encodeModelRecord(topologyRoot) == native::encodeModelRecord(
+                *repository.getModelAtRevisionV2(project, topologyHead,
+                    hydraulic::keyFromUuid(baseline.uuid))),
+                    "UUIDv7 indexed topology edit rewrote membership root");
+            compareNetworks(topologyExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, topologyHead, baseline.uuid));
+            const std::vector<native::Key> oldIncoming = repository.referencingModelAtRevisionV2(
+                project, topologyHead, hydraulic::keyFromUuid(uuid(19)));
+            require(std::find(oldIncoming.begin(), oldIncoming.end(),
+                        hydraulic::keyFromUuid(rewire.uuid)) == oldIncoming.end(),
+                    "UUIDv7 indexed topology kept old endpoint reference");
+            const std::vector<native::Key> newIncoming = repository.referencingModelAtRevisionV2(
+                project, topologyHead, hydraulic::keyFromUuid(uuid(18)));
+            require(std::find(newIncoming.begin(), newIncoming.end(),
+                        hydraulic::keyFromUuid(rewire.uuid)) != newIncoming.end(),
+                    "UUIDv7 indexed topology lost new endpoint reference");
+            require(hydraulic::editHydraulicNetwork(repository, project, "uuid-topology",
+                        baseline.uuid, topologyChanges, topologyHead, &topologyStats) == topologyHead &&
+                    (topologyStats.indexedTopologyFastPath || topologyStats.indexedScalarFastPath),
+                    "UUIDv7 no-op topology edit generated another revision");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-topology",
+                    baseline.uuid, topologyChanges, topologyBase, &topologyStats);
+            }), "UUIDv7 topology edit accepted stale expected HEAD");
+            HydraulicLinkPipe wrongKind = rewire;
+            wrongKind.node_uuid_from = uuid(10); // Existing material, not a node.
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-topology",
+                    baseline.uuid, {{wrongKind.uuid, hydraulic::HydraulicEntity{wrongKind}}},
+                    topologyHead, &topologyStats);
+            }) && !topologyStats.indexedTopologyFastPath &&
+                    repository.headV2(project, "uuid-topology") == topologyHead,
+                    "UUIDv7 topology accepted wrong-type endpoint");
+            HydraulicLinkPipe missing = rewire;
+            missing.node_uuid_from = uuid(9009);
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-topology",
+                    baseline.uuid, {{missing.uuid, hydraulic::HydraulicEntity{missing}}},
+                    topologyHead, &topologyStats);
+            }) && !topologyStats.indexedTopologyFastPath,
+                    "UUIDv7 topology accepted missing endpoint");
+            HydraulicLinkPipe metadata = rewire;
+            metadata.id = QStringLiteral("Full validation required");
+            const native::RevisionId fullHead = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-topology", baseline.uuid,
+                {{metadata.uuid, hydraulic::HydraulicEntity{metadata}}},
+                topologyHead, &topologyStats);
+            require(fullHead != topologyHead && !topologyStats.indexedTopologyFastPath,
+                    "UUIDv7 topology fast path accepted metadata changes");
+            topologyExpected.links_pipes[0] = metadata;
+            topologyHead = fullHead;
+            compareNetworks(topologyExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, topologyHead, baseline.uuid));
+
+            require(repository.createBranchV2(project, "uuid-dependent", "main") == saved,
+                    "UUIDv7 dependent fixture branch did not inherit HEAD");
+            const native::ModelRecord dependentRoot = *repository.getModelAtRevisionV2(
+                project, saved, hydraulic::keyFromUuid(baseline.uuid));
+            HydraulicDemandPoint point = baseline.demand_points[0];
+            point.attachment.type = HydraulicDemandPointAttachmentType::Pipe;
+            point.attachment.pipe_uuid = uuid(23);
+            point.attachment.pipe_position = 0.65;
+            point.attachment.pipe_allocation_mode =
+                HydraulicDemandPointPipeAllocationMode::AssignedJunction;
+            point.attachment.pipe_assigned_junction_uuid = uuid(20);
+            HydraulicDemand demand;
+            demand.pattern_uuid = uuid(11);
+            point.demands.append(demand);
+            HydraulicControlSimple control = baseline.controls_simple[0];
+            control.link_uuid = uuid(25);
+            control.trigger_node_uuid = uuid(21);
+            HydraulicControlRule rule = baseline.controls_rules[0];
+            HydraulicControlRulePremise premise;
+            premise.object = HydraulicControlRuleObject::Node;
+            premise.object_uuid = uuid(18);
+            rule.premises.append(premise);
+            rule.actions_then[0].link_uuid = uuid(23);
+            HydraulicControlRuleAction elseAction;
+            elseAction.link_uuid = uuid(25);
+            rule.actions_else.append(elseAction);
+            const std::vector<hydraulic::HydraulicEntityChange> dependentChanges{
+                {rule.uuid, hydraulic::HydraulicEntity{rule}},
+                {point.uuid, hydraulic::HydraulicEntity{point}},
+                {control.uuid, hydraulic::HydraulicEntity{control}}};
+            hydraulic::HydraulicEditDiagnostics dependentStats;
+            dependentHead = hydraulic::editHydraulicNetwork(repository, project, "uuid-dependent",
+                baseline.uuid, dependentChanges, saved, &dependentStats);
+            require(dependentHead != saved && dependentStats.indexedDependentUpdateFastPath &&
+                    dependentStats.validatedEntities == dependentChanges.size(),
+                    "UUIDv7 dependent changes missed indexed fast path");
+            dependentExpected.demand_points[0] = point;
+            dependentExpected.controls_simple[0] = control;
+            dependentExpected.controls_rules[0] = rule;
+            require(native::validateHydraulicNetwork(dependentExpected).valid(),
+                    "UUIDv7 indexed dependent fixture violates canonical validation");
+            compareNetworks(dependentExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, dependentHead, baseline.uuid));
+            require(native::encodeModelRecord(dependentRoot) == native::encodeModelRecord(
+                *repository.getModelAtRevisionV2(project, dependentHead,
+                    hydraulic::keyFromUuid(baseline.uuid))),
+                    "UUIDv7 indexed dependent edit rewrote membership root");
+            const std::vector<native::Key> pipeIncoming = repository.referencingModelAtRevisionV2(
+                project, dependentHead, hydraulic::keyFromUuid(uuid(23)));
+            require(std::find(pipeIncoming.begin(), pipeIncoming.end(),
+                        hydraulic::keyFromUuid(point.uuid)) != pipeIncoming.end(),
+                    "UUIDv7 dependent edit omitted pipe attachment reference");
+            require(hydraulic::editHydraulicNetwork(repository, project, "uuid-dependent",
+                        baseline.uuid, dependentChanges, dependentHead, &dependentStats) == dependentHead &&
+                    dependentStats.indexedDependentUpdateFastPath,
+                    "UUIDv7 no-op dependent edit generated a revision");
+            require(throwsStorageError(native::StorageErrorKind::Conflict, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-dependent",
+                    baseline.uuid, dependentChanges, saved, &dependentStats);
+            }), "UUIDv7 dependent update accepted stale expected HEAD");
+            HydraulicDemandPoint invalid = point;
+            invalid.attachment.pipe_assigned_junction_uuid = uuid(21); // Not a pipe endpoint.
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-dependent",
+                    baseline.uuid, {{invalid.uuid, hydraulic::HydraulicEntity{invalid}}},
+                    dependentHead, &dependentStats);
+            }) && !dependentStats.indexedDependentUpdateFastPath &&
+                    repository.headV2(project, "uuid-dependent") == dependentHead,
+                    "UUIDv7 dependent path accepted invalid assigned junction");
+            // A mixed dependent/property batch cannot bypass whole-model
+            // validation, and a rejected batch must not publish its valid part.
+            HydraulicMapLabel changedLabel = dependentExpected.map_labels[0];
+            changedLabel.text = QStringLiteral("UUIDv7 reference fallback");
+            HydraulicControlSimple changedControl = control;
+            changedControl.trigger_node_uuid = uuid(20);
+            const native::RevisionId mixedHead = hydraulic::editHydraulicNetwork(
+                repository, project, "uuid-dependent", baseline.uuid,
+                {{changedControl.uuid, hydraulic::HydraulicEntity{changedControl}},
+                 {changedLabel.uuid, hydraulic::HydraulicEntity{changedLabel}}},
+                dependentHead, &dependentStats);
+            require(mixedHead != dependentHead && !dependentStats.indexedDependentUpdateFastPath,
+                    "UUIDv7 mixed dependent batch bypassed canonical validation");
+            dependentExpected.controls_simple[0] = changedControl;
+            dependentExpected.map_labels[0] = changedLabel;
+            dependentHead = mixedHead;
+            compareNetworks(dependentExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, dependentHead, baseline.uuid));
+            HydraulicControlSimple invalidControl = changedControl;
+            invalidControl.link_uuid = uuid(20); // A node is not a link.
+            HydraulicDemandPoint validChangedPoint = point;
+            validChangedPoint.attachment.pipe_position = 0.4;
+            require(throwsStorageError(native::StorageErrorKind::InvalidInput, [&] {
+                (void)hydraulic::editHydraulicNetwork(repository, project, "uuid-dependent",
+                    baseline.uuid,
+                    {{validChangedPoint.uuid, hydraulic::HydraulicEntity{validChangedPoint}},
+                     {invalidControl.uuid, hydraulic::HydraulicEntity{invalidControl}}},
+                    dependentHead, &dependentStats);
+            }) && repository.headV2(project, "uuid-dependent") == dependentHead,
+                    "UUIDv7 invalid dependent batch committed its valid edit");
+            compareNetworks(baseline, *hydraulic::loadHydraulicNetworkAtRevision(
+                repository, project, saved, baseline.uuid));
+            (void)repository.verifyRepository();
+            (void)repository.compact();
+        }
+        {
+            native::Repository reopened(folder);
+            require(reopened.headV2(project, "uuid-topology") == topologyHead &&
+                    reopened.headV2(project, "uuid-dependent") == dependentHead,
+                    "UUIDv7 indexed references changed HEAD after compaction/reopen");
+            compareNetworks(topologyExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, topologyHead, baseline.uuid));
+            compareNetworks(dependentExpected, *hydraulic::loadHydraulicNetworkAtRevision(
+                reopened, project, dependentHead, baseline.uuid));
+            (void)reopened.verifyRepository();
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove_all(folder, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+}
+
 void exerciseUuidV7HydraulicMerges() {
     const std::filesystem::path folder = tempDir();
     const native::ProjectId project = native::ProjectId::generate();
@@ -2912,6 +3145,7 @@ int main(int argc, char** argv) {
         exerciseSnapshotReads();
         exerciseCallerPinnedWrites();
         exerciseUuidV7Hydraulic();
+        exerciseUuidV7IndexedReferences();
         exerciseUuidV7HydraulicMerges();
         std::cout << "Complete hydraulic network persistence tests passed\n";
         return 0;

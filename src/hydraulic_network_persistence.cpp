@@ -763,8 +763,8 @@ std::optional<Revision> tryIndexedDependentUpdates(
     std::set<Key> seen;
     std::vector<ModelChange> pending;
     pending.reserve(changes.size());
-    const auto validTarget = [&](const QUuid& id,
-                                 std::initializer_list<std::uint16_t> accepted) -> bool {
+    const std::function<bool(const QUuid&, std::initializer_list<std::uint16_t>)> validTarget =
+        [&](const QUuid& id, std::initializer_list<std::uint16_t> accepted) -> bool {
         if (id.isNull()) return true; // Same policy as the canonical validator.
         const Key key = keyFromUuid(id);
         const std::optional<ModelRecord> target = repository.getModel(branch, key);
@@ -998,7 +998,7 @@ std::optional<Revision> tryIndexedPipeRewires(
     std::vector<ModelChange> pending;
     pending.reserve(changes.size());
     // A typed target must be an existing node owned by this same network.
-    const auto validTarget = [&](const QUuid& target, bool material) -> bool {
+    const std::function<bool(const QUuid&, bool)> validTarget = [&](const QUuid& target, bool material) -> bool {
         if (target.isNull()) return true; // The canonical validator permits null references.
         const Key key = keyFromUuid(target);
         const std::optional<ModelRecord> record = repository.getModel(branch, key);
@@ -1205,8 +1205,8 @@ std::optional<Revision> tryIndexedMembershipEdits(
     // regardless of whether the target already exists or is another insertion
     // in this same atomic batch. A reference into this batch's removals is
     // always illegal. Null references are allowed by the canonical validator.
-    const auto validTarget = [&](const QUuid& id,
-                                 std::initializer_list<std::uint16_t> accepted) -> bool {
+    const std::function<bool(const QUuid&, std::initializer_list<std::uint16_t>)> validTarget =
+        [&](const QUuid& id, std::initializer_list<std::uint16_t> accepted) -> bool {
         if (id.isNull()) return true;
         const Key key = keyFromUuid(id);
         if (removals.contains(key)) return false;
@@ -1555,6 +1555,207 @@ std::optional<RevisionId> tryIndexedUuidCatalogueEdits(
     }
     if (diagnostics) {
         diagnostics->indexedCatalogueFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
+// An existing pipe may change endpoints without decoding every member of a
+// large network, but only when its membership chunk is the sole incoming
+// reference. A dependent demand point or control forces complete validation.
+// Every lookup is pinned to the same immutable UUIDv7 revision.
+std::optional<RevisionId> tryIndexedUuidPipeRewires(
+    Repository& repository, const ProjectId& project, std::string_view branch,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
+    const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    const std::function<bool(const QUuid&, bool)> validTarget = [&](const QUuid& target, bool material) -> bool {
+        if (target.isNull()) return true;
+        const Key key = keyFromUuid(target);
+        const std::optional<ModelRecord> record =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!record) return false;
+        if (material) {
+            if (record->kind != 8) return false;
+        } else if (record->kind != junctionKind && record->kind != 2 && record->kind != 3) {
+            return false;
+        }
+        return ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key).has_value();
+    };
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception()) return std::nullopt;
+        const HydraulicLinkPipe* proposed = std::get_if<HydraulicLinkPipe>(&*change.value);
+        if (!proposed || proposed->uuid != change.uuid) return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second) return std::nullopt;
+        const std::optional<Key> owning =
+            ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key);
+        if (!owning) return std::nullopt;
+        const std::vector<Key> incoming =
+            repository.referencingModelAtRevisionV2(project, expectedHead, key);
+        if (incoming.size() != 1 || incoming.front() != *owning) return std::nullopt;
+        const std::optional<ModelRecord> old =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!old || old->kind != pipeKind) return std::nullopt;
+        const std::optional<HydraulicLinkPipe> prior =
+            ModelCodec<HydraulicLinkPipe>::decode(qByteArrayFromBytes(old->payload));
+        if (!prior || prior->uuid != change.uuid ||
+            !pipeEndpointOnlyChange(*proposed, *prior) ||
+            old->references != scalarReferences(HydraulicEntity{*prior})) return std::nullopt;
+        if (!validTarget(proposed->node_uuid_from, false) ||
+            !validTarget(proposed->node_uuid_to, false) ||
+            !validTarget(proposed->material_uuid, true)) return std::nullopt;
+        const aowis::dvmdb::ModelValidationReport values =
+            aowis::dvmdb::validateHydraulicEntityValues(*proposed);
+        if (!values.valid())
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid hydraulic topology edit: " + values.summary().toStdString());
+        ModelRecord updated = *old;
+        updated.payload = bytesFromQByteArray(ModelCodec<HydraulicLinkPipe>::encode(*proposed));
+        if (updated.payload.empty()) return std::nullopt;
+        updated.references = scalarReferences(HydraulicEntity{*proposed});
+        if (updated.payload != old->payload || updated.references != old->references)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    RevisionId result = expectedHead;
+    if (pending.empty()) {
+        if (repository.headV2(project, branch) != expectedHead)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "branch head changed during UUIDv7 hydraulic topology edit");
+    } else {
+        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+    }
+    if (diagnostics) {
+        diagnostics->indexedTopologyFastPath = true;
+        diagnostics->validatedEntities = changes.size();
+    }
+    return result;
+}
+
+// Reference-changing edits for existing demand points and controls use typed
+// target reads pinned to expectedHead. The previous persisted reference index
+// must exactly match the decoded old entity before it can be updated. Mixed
+// changes and new entities are handled by the full-network validator.
+std::optional<RevisionId> tryIndexedUuidDependentUpdates(
+    Repository& repository, const ProjectId& project, std::string_view branch,
+    const QUuid& networkUuid, const std::vector<HydraulicEntityChange>& changes,
+    const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
+    std::set<Key> seen;
+    std::vector<ModelChange> pending;
+    pending.reserve(changes.size());
+    const std::function<bool(const QUuid&, std::initializer_list<std::uint16_t>)> validTarget =
+        [&](const QUuid& id, std::initializer_list<std::uint16_t> accepted) -> bool {
+        if (id.isNull()) return true;
+        const Key key = keyFromUuid(id);
+        const std::optional<ModelRecord> target =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!target || std::find(accepted.begin(), accepted.end(), target->kind) == accepted.end())
+            return false;
+        return ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key).has_value();
+    };
+    const std::function<bool(const QUuid&)> nodeTarget = [&](const QUuid& id) -> bool {
+        return validTarget(id, {junctionKind, 2, 3});
+    };
+    for (const HydraulicEntityChange& change : changes) {
+        if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
+            change.value->valueless_by_exception() ||
+            (!std::holds_alternative<HydraulicDemandPoint>(*change.value) &&
+             !std::holds_alternative<HydraulicControlSimple>(*change.value) &&
+             !std::holds_alternative<HydraulicControlRule>(*change.value)) ||
+            std::visit(IndexedEntityUuid{}, *change.value) != change.uuid)
+            return std::nullopt;
+        const Key key = keyFromUuid(change.uuid);
+        if (!seen.insert(key).second ||
+            !ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            return std::nullopt;
+        const std::optional<ModelRecord> old =
+            repository.getModelAtRevisionV2(project, expectedHead, key);
+        if (!old) return std::nullopt;
+        std::optional<HydraulicEntity> previous;
+        const QByteArray oldBytes = qByteArrayFromBytes(old->payload);
+        if (std::holds_alternative<HydraulicDemandPoint>(*change.value) && old->kind == 7) {
+            const std::optional<HydraulicDemandPoint> decoded = ModelCodec<HydraulicDemandPoint>::decode(oldBytes);
+            if (decoded && decoded->uuid == change.uuid) previous = HydraulicEntity{*decoded};
+        } else if (std::holds_alternative<HydraulicControlSimple>(*change.value) && old->kind == 16) {
+            const std::optional<HydraulicControlSimple> decoded = ModelCodec<HydraulicControlSimple>::decode(oldBytes);
+            if (decoded && decoded->uuid == change.uuid) previous = HydraulicEntity{*decoded};
+        } else if (std::holds_alternative<HydraulicControlRule>(*change.value) && old->kind == 17) {
+            const std::optional<HydraulicControlRule> decoded = ModelCodec<HydraulicControlRule>::decode(oldBytes);
+            if (decoded && decoded->uuid == change.uuid) previous = HydraulicEntity{*decoded};
+        }
+        if (!previous || old->references != dependentReferences(*previous)) return std::nullopt;
+        if (const HydraulicDemandPoint* point = std::get_if<HydraulicDemandPoint>(&*change.value)) {
+            for (const HydraulicDemand& demand : point->demands)
+                if (!validTarget(demand.pattern_uuid, {9})) return std::nullopt;
+            if (point->attachment.type == HydraulicDemandPointAttachmentType::Pipe) {
+                const QUuid pipeUuid = point->attachment.pipe_uuid;
+                if (!validTarget(pipeUuid, {pipeKind}) ||
+                    !std::isfinite(point->attachment.pipe_position) ||
+                    point->attachment.pipe_position < 0.0 || point->attachment.pipe_position > 1.0)
+                    return std::nullopt;
+                if (point->attachment.pipe_allocation_mode ==
+                    HydraulicDemandPointPipeAllocationMode::AssignedJunction) {
+                    const QUuid junctionUuid = point->attachment.pipe_assigned_junction_uuid;
+                    if (!validTarget(junctionUuid, {junctionKind})) return std::nullopt;
+                    if (!pipeUuid.isNull() && !junctionUuid.isNull()) {
+                        const std::optional<ModelRecord> pipeRecord = repository.getModelAtRevisionV2(
+                            project, expectedHead, keyFromUuid(pipeUuid));
+                        if (!pipeRecord || pipeRecord->kind != pipeKind) return std::nullopt;
+                        const std::optional<HydraulicLinkPipe> pipe = ModelCodec<HydraulicLinkPipe>::decode(
+                            qByteArrayFromBytes(pipeRecord->payload));
+                        if (!pipe || pipe->uuid != pipeUuid ||
+                            pipeRecord->references != scalarReferences(HydraulicEntity{*pipe}) ||
+                            (pipe->node_uuid_from != junctionUuid && pipe->node_uuid_to != junctionUuid))
+                            return std::nullopt;
+                    }
+                }
+            } else if (point->attachment.type == HydraulicDemandPointAttachmentType::Junction) {
+                if (!validTarget(point->attachment.junction_uuid, {junctionKind})) return std::nullopt;
+            } else if (point->attachment.type != HydraulicDemandPointAttachmentType::None) {
+                return std::nullopt;
+            }
+        } else if (const HydraulicControlSimple* control =
+                   std::get_if<HydraulicControlSimple>(&*change.value)) {
+            if (!validTarget(control->link_uuid, {pipeKind, 5, 6}) ||
+                !nodeTarget(control->trigger_node_uuid)) return std::nullopt;
+        } else if (const HydraulicControlRule* rule =
+                   std::get_if<HydraulicControlRule>(&*change.value)) {
+            for (const HydraulicControlRulePremise& premise : rule->premises) {
+                if (premise.object == HydraulicControlRuleObject::Node &&
+                    !nodeTarget(premise.object_uuid)) return std::nullopt;
+                if (premise.object == HydraulicControlRuleObject::Link &&
+                    !validTarget(premise.object_uuid, {pipeKind, 5, 6})) return std::nullopt;
+            }
+            for (const HydraulicControlRuleAction& action : rule->actions_then)
+                if (!validTarget(action.link_uuid, {pipeKind, 5, 6})) return std::nullopt;
+            for (const HydraulicControlRuleAction& action : rule->actions_else)
+                if (!validTarget(action.link_uuid, {pipeKind, 5, 6})) return std::nullopt;
+        }
+        const aowis::dvmdb::ModelValidationReport values =
+            std::visit(ValidateIndexedEntity{}, *change.value);
+        if (!values.valid())
+            throw StorageError(StorageErrorKind::InvalidInput,
+                               "invalid hydraulic dependent edit: " + values.summary().toStdString());
+        ModelRecord updated = *old;
+        updated.payload = bytesFromQByteArray(std::visit(EncodeIndexedEntity{}, *change.value));
+        if (updated.payload.empty()) return std::nullopt;
+        updated.references = dependentReferences(*change.value);
+        if (updated.payload != old->payload || updated.references != old->references)
+            pending.push_back(ModelChange{key, std::move(updated)});
+    }
+    RevisionId result = expectedHead;
+    if (pending.empty()) {
+        if (repository.headV2(project, branch) != expectedHead)
+            throw StorageError(StorageErrorKind::Conflict,
+                               "branch head changed during UUIDv7 hydraulic dependent edit");
+    } else {
+        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+    }
+    if (diagnostics) {
+        diagnostics->indexedDependentUpdateFastPath = true;
         diagnostics->validatedEntities = changes.size();
     }
     return result;
@@ -2890,6 +3091,12 @@ RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project
                 repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
             return *indexed;
         if (const std::optional<RevisionId> indexed = tryIndexedUuidCatalogueEdits(
+                repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
+            return *indexed;
+        if (const std::optional<RevisionId> indexed = tryIndexedUuidPipeRewires(
+                repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
+            return *indexed;
+        if (const std::optional<RevisionId> indexed = tryIndexedUuidDependentUpdates(
                 repository, project, branch, networkUuid, changes, expectedHead, diagnostics))
             return *indexed;
     }
