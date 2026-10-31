@@ -260,7 +260,7 @@ paths:
                       inserted: {type: boolean}
       responses:
         '200': {description: Durable candidate and event journal; exact event UUIDs preserved}
-        '400': {description: Malformed event frame, duplicate edit or invalid model change}
+        '400': {description: 'Malformed event frame, duplicate edit, invalid model change, or events that do not describe the candidate (a before-image differs from the draft state, or a candidate record is not the final after-image)'}
         '409': {description: Conflicting generation, event UUID or writer lease}
         '413': {description: 'Event journal (4096 events) or candidate (20000 changes) is full; a local Commit empties both'}
   /working-copies/{draftId}/save:

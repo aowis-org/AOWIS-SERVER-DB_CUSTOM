@@ -1854,7 +1854,8 @@ void exerciseWorkingCopyHttp() {
     std::string draftId;
     const QString firstSession = QString::fromStdString(native::UuidV7::generate().toString());
     const QString otherSession = QString::fromStdString(native::UuidV7::generate().toString());
-    const QString modelUuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // MODEL edit events require UUIDv7 entity IDs, so the edited model record uses one.
+    const QString modelUuid = QString::fromStdString(native::UuidV7::generate().toString());
     {
         native::ProjectService service(root.root());
         const native::ProjectInfo project = service.createUnbornProject("private working-copy HTTP");
@@ -1962,8 +1963,16 @@ void exerciseWorkingCopyHttp() {
               client.call("POST", detailPath + "/release",
                   QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}}).status == 409,
               "HTTP lease takeover did not fence original session");
+        // The event and the candidate agree: the saved entity changes from
+        // {1,2,3} (generation 1) to {4,5,6}.
+        native::Key edited{};
+        const QByteArray editedBytes = QUuid(modelUuid).toRfc4122();
+        for (std::size_t i = 0; i < edited.size(); ++i)
+            edited[i] = static_cast<std::uint8_t>(editedBytes.at(static_cast<qsizetype>(i)));
+        const QJsonObject changedEntity{{"uuid", modelUuid}, {"kind", 4},
+                                        {"references", QJsonArray{}}, {"payloadBase64", "BAUG"}};
         const native::Bytes event = native::test::editEvent(
-            native::UuidV7::generate(), native::UuidV7::generate());
+            native::UuidV7::generate(), edited, native::Bytes{1, 2, 3}, native::Bytes{4, 5, 6});
         const QByteArray eventBytes(reinterpret_cast<const char*>(event.data()),
                                     static_cast<qsizetype>(event.size()));
         const QString encodedEvent = QString::fromLatin1(eventBytes.toBase64());
@@ -1971,8 +1980,28 @@ void exerciseWorkingCopyHttp() {
         const QJsonObject eventSave{{"sessionId", otherSession},
                                     {"fencingToken", taken.json.value("token")},
                                     {"expectedGeneration", "1"},
-                                    {"changes", QJsonArray{entity}},
+                                    {"changes", QJsonArray{changedEntity}},
                                     {"events", QJsonArray{encodedEvent}}};
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+        // R8: the journal must describe exactly the saved candidate.
+        const native::Bytes wrongBefore = native::test::editEvent(
+            native::UuidV7::generate(), edited, native::Bytes{9}, native::Bytes{4, 5, 6});
+        const native::Bytes wrongAfter = native::test::editEvent(
+            native::UuidV7::generate(), edited, native::Bytes{1, 2, 3}, native::Bytes{7});
+        for (const native::Bytes& inconsistent : {wrongBefore, wrongAfter}) {
+            QJsonObject mismatched = eventSave;
+            mismatched.insert("events", QJsonArray{QString::fromLatin1(QByteArray(
+                reinterpret_cast<const char*>(inconsistent.data()),
+                static_cast<qsizetype>(inconsistent.size())).toBase64())});
+            check(client.call("POST", eventSavePath, mismatched).status == 400 &&
+                  client.call("GET", detailPath).json.value("generation") == QStringLiteral("1"),
+                  "HTTP event save accepted a journal that disagrees with the candidate");
+        }
+        QJsonObject unrelated = eventSave;
+        unrelated.insert("changes", QJsonArray{entity});
+        check(client.call("POST", eventSavePath, unrelated).status == 400,
+              "HTTP event save accepted a candidate that is not the MODEL after-image");
+#endif
         const Response savedEvents = client.call("POST", eventSavePath, eventSave);
         check(savedEvents.status == 200 &&
               savedEvents.json.value("generation") == QStringLiteral("2") &&
@@ -2007,7 +2036,7 @@ void exerciseWorkingCopyHttp() {
         check(draft.generation == 2 && draft.dirty && draft.journal.size() == 1 &&
               draft.candidateChanges.size() == 1 &&
               draft.candidateChanges.front().record.has_value() &&
-              draft.candidateChanges.front().record->payload == native::Bytes{1, 2, 3} &&
+              draft.candidateChanges.front().record->payload == native::Bytes{4, 5, 6} &&
               !reopened.optionalHead(projectId, "main").has_value(),
               "HTTP draft candidate did not survive repository restart");
         TestServer server(reopened, native::BundleLimits{4ULL * 1024ULL * 1024ULL,

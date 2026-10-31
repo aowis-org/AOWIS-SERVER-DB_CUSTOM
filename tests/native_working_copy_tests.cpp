@@ -2,7 +2,9 @@
 #include "aowis/dvmdb/project_service.h"
 #include "aowis/dvmdb/object_id.h"
 
+#include <atomic>
 #include <filesystem>
+#include <functional>
 #include <chrono>
 #include <thread>
 #include <fstream>
@@ -332,11 +334,111 @@ void testAtomicJournalAndIdempotentReplay() {
 
 }
 
+// R9: leases granted by this process are enforced against a monotonic
+// deadline, so a wall-clock step neither extends nor cuts them short. After
+// a restart only the persisted wall-clock expiry is known and is used.
+void testLeasesIgnoreWallClockSteps() {
+    TemporaryRoot root;
+    std::atomic<std::uint64_t> wall{1'800'000'000'000ULL};
+    std::atomic<std::int64_t> steadyOffsetMs{0};
+    const std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
+    const aowis::dvmdb::LeaseClock clock{
+        [&wall]() { return wall.load(); },
+        [&origin, &steadyOffsetMs]() {
+            return origin + std::chrono::milliseconds(steadyOffsetMs.load());
+        }};
+    const std::string holder = UuidV7::generate().toString();
+    const std::string other = UuidV7::generate().toString();
+    std::string projectId;
+    std::string draftId;
+    {
+        ProjectService service(root.path, 4, clock);
+        projectId = service.createUnbornProject("lease clock").id;
+        service.configureRepositoryRole(RepositoryRole::Private);
+        draftId = service.createWorkingCopy(projectId, "main", std::nullopt, holder).id;
+
+        // Wall clock jumps an hour ahead right after the lease was granted:
+        // the 30 s lease is still held, takeover is refused, saves work.
+        const std::string token = service.acquireWorkingCopyLease(draftId, holder, 30).token;
+        wall += 3'600'000ULL;
+        expectError([&]() { (void)service.acquireWorkingCopyLease(draftId, other, 30); },
+                    ProjectErrorKind::Conflict);
+        require(service.saveWorkingCopyChanges(draftId, holder, token, 0, {simpleChange()})
+                    .generation == 1, "a forward wall-clock step cut a live lease short");
+
+        // Wall clock jumps two hours back: the lease still ends after its
+        // 30 monotonic seconds, then another session may take over.
+        wall -= 7'200'000ULL;
+        steadyOffsetMs += 31'000;
+        require(!service.workingCopyLeaseLive(service.workingCopy(draftId)),
+                "a backward wall-clock step extended an expired lease");
+        expectError([&]() {
+            (void)service.saveWorkingCopyChanges(draftId, holder, token, 1, {simpleChange()});
+        }, ProjectErrorKind::Conflict);
+        const std::string taken = service.acquireWorkingCopyLease(draftId, other, 30).token;
+        require(service.saveWorkingCopyChanges(draftId, other, taken, 1, {simpleChange()})
+                    .generation == 2, "lease takeover after monotonic expiry failed");
+    }
+    {
+        // A restarted service only knows the persisted wall-clock expiry,
+        // which was written as (wall at grant + 30 s).
+        ProjectService reopened(root.path, 4, clock);
+        require(reopened.workingCopyLeaseLive(reopened.workingCopy(draftId)),
+                "persisted wall-clock expiry was not honoured after restart");
+        wall += 31'000ULL;
+        require(!reopened.workingCopyLeaseLive(reopened.workingCopy(draftId)),
+                "an expired persisted lease was still live after restart");
+    }
+}
+
+// R11: crash remnants of the catalogue's no-replace publication are removed
+// when the service opens; nothing published is touched, and a retry of an
+// interrupted caller-chosen project creation succeeds instead of staying Busy.
+void testCatalogueRemnantsAreRemovedOnOpen() {
+    TemporaryRoot root;
+    std::string draftId;
+    {
+        ProjectService service(root.path);
+        const std::string projectId = service.createUnbornProject("remnants").id;
+        service.configureRepositoryRole(RepositoryRole::Private);
+        draftId = service.createWorkingCopy(projectId, "main", std::nullopt,
+                                            UuidV7::generate().toString()).id;
+    }
+    const std::string chosen = aowis::dvmdb::ProjectId::generate().toString();
+    std::filesystem::create_directories(root.path / "local-commits");
+    std::filesystem::create_directories(root.path / "projects" / (".creating-" + chosen) / "repository");
+    const std::vector<std::filesystem::path> remnants{
+        root.path / (".repository-id-creating-" + UuidV7::generate().toString()),
+        root.path / "working-copies" / (".creating-" + UuidV7::generate().toString()),
+        root.path / "working-copies" / (".updating-" + UuidV7::generate().toString()),
+        root.path / "local-commits" / (".creating-" + UuidV7::generate().toString()),
+        root.path / "local-commits" / (".updating-" + UuidV7::generate().toString()),
+        root.path / "projects" / (".creating-" + chosen) / "project.meta"};
+    for (const std::filesystem::path& path : remnants) {
+        std::ofstream output(path, std::ios::binary);
+        output << "interrupted";
+        require(output.good(), "cannot create remnant fixture");
+    }
+    ProjectService reopened(root.path);
+    for (const std::filesystem::path& path : remnants)
+        require(!std::filesystem::exists(path), "a crash remnant survived opening the catalogue");
+    require(!std::filesystem::exists(root.path / "projects" / (".creating-" + chosen)),
+            "an unpublished project directory survived opening the catalogue");
+    require(reopened.listWorkingCopies().size() == 1 &&
+            reopened.workingCopy(draftId).id == draftId &&
+            reopened.listProjects().size() == 1,
+            "remnant cleanup touched published drafts or projects");
+    require(reopened.createUnbornProject("retried", chosen).id == chosen,
+            "retry of an interrupted caller-chosen project creation did not succeed");
+}
+
 int main() {
     try {
         testWorkingCopyCreationAndRecovery();
         testLeasedTransactionalCandidateSaves();
         testAtomicJournalAndIdempotentReplay();
+        testLeasesIgnoreWallClockSteps();
+        testCatalogueRemnantsAreRemovedOnOpen();
         std::cout << "VC-04 persistent working-copy bootstrap passed\n";
     } catch (const std::exception& error) {
         std::cerr << "VC-04 working-copy bootstrap failed: " << error.what() << '\n';

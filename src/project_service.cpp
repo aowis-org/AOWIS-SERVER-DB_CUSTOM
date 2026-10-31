@@ -103,6 +103,45 @@ void syncDirectory(const std::filesystem::path& path) {
     syscallChecked(status == 0, "sync project directory");
 }
 
+// Removes entries with one of `prefixes` from `directory`: files and
+// symlinks by unlinking (never following), staged directories recursively
+// when `directories` is set. Returns whether anything was removed.
+bool removePrefixed(const std::filesystem::path& directory,
+                    const std::vector<std::string_view>& prefixes, bool directories) {
+    if (std::filesystem::is_symlink(directory) || !std::filesystem::is_directory(directory))
+        return false;
+    bool removed = false;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(directory)) {
+        const std::string name = entry.path().filename().string();
+        if (std::none_of(prefixes.begin(), prefixes.end(),
+                         [&name](std::string_view prefix) { return name.starts_with(prefix); }))
+            continue;
+        if (!entry.is_symlink() && entry.is_directory()) {
+            if (!directories) continue;
+            std::filesystem::remove_all(entry.path());
+        } else {
+            syscallChecked(::unlink(entry.path().c_str()) == 0 || errno == ENOENT,
+                           "remove staged catalogue entry");
+        }
+        removed = true;
+    }
+    return removed;
+}
+
+// Crash remnants of the no-replace publication protocol: staged repository
+// identity, drafts, local Commit records and unpublished project directories.
+// None was ever visible, so removing them loses nothing; it also lets a retry
+// of an interrupted caller-chosen project creation proceed.
+void removeCatalogueRemnants(const std::filesystem::path& root) {
+    if (removePrefixed(root, {".repository-id-creating-"}, false)) syncDirectory(root);
+    for (const char* subdirectory : {"working-copies", "local-commits"}) {
+        if (removePrefixed(root / subdirectory, {".creating-", ".updating-"}, false))
+            syncDirectory(root / subdirectory);
+    }
+    if (removePrefixed(root / "projects", {".creating-"}, true)) syncDirectory(root / "projects");
+}
+
 void writeManifest(const std::filesystem::path& path, const ProjectInfo& info) {
     const std::string body = "AOWIS-PROJECT-1\n" + info.id + "\n" +
         "pack\n" +
@@ -453,7 +492,7 @@ std::vector<std::string> publishedDraftIds(const std::filesystem::path& director
     return ids;
 }
 
-std::uint64_t nowEpochMs() {
+std::uint64_t systemEpochMs() {
     const std::int64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     check(millis > 0, "invalid system clock", StorageErrorKind::Unavailable);
@@ -1017,9 +1056,13 @@ ProjectService::Operation::~Operation() {
     if (this->project_) this->project_->pending.fetch_sub(1);
 }
 
-ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendingOperations)
+ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendingOperations,
+                               LeaseClock leaseClock)
     : root_(std::filesystem::absolute(std::move(root)).lexically_normal()),
-      projects_(this->root_ / "projects"), maxPending_(maxPendingOperations) {
+      projects_(this->root_ / "projects"), maxPending_(maxPendingOperations),
+      leaseClock_(std::move(leaseClock)) {
+    if (!this->leaseClock_.wallMs) this->leaseClock_.wallMs = systemEpochMs;
+    if (!this->leaseClock_.steady) this->leaseClock_.steady = []() { return std::chrono::steady_clock::now(); };
     if (this->maxPending_ == 0) throw ProjectError(ProjectErrorKind::InvalidInput,
                                                     "at least one pending operation per project is required");
     std::filesystem::create_directories(this->projects_);
@@ -1035,6 +1078,9 @@ ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendin
                            "another database server owns this project root");
     }
     try {
+        // This process owns catalogue.lock exclusively for its lifetime, so
+        // no staged catalogue, draft, ledger or project entry can be in use.
+        removeCatalogueRemnants(this->root_);
         this->repository_id_ = loadRepositoryIdentity(this->root_);
         const TrackingStateOnDisk tracking = loadTrackingState(this->root_, this->repository_id_);
         this->repository_role_ = tracking.role;
@@ -1043,9 +1089,6 @@ ProjectService::ProjectService(std::filesystem::path root, std::size_t maxPendin
         for (const std::filesystem::directory_entry& entry :
              std::filesystem::directory_iterator(this->projects_)) {
             const std::string id = entry.path().filename().string();
-            // A crash during creation may leave a staging directory. Never
-            // advertise it as a project and never reuse its name.
-            if (id.starts_with(".creating-")) continue;
             check(validProjectId(id) && !entry.is_symlink() && entry.is_directory(),
                   "unexpected entry in project catalogue: " + entry.path().string());
             this->entries_.emplace(id, std::make_shared<Project>(readManifest(entry.path())));
@@ -1070,6 +1113,37 @@ ProjectService::~ProjectService() {
 void ProjectService::ensureHealthy() const {
     if (this->uncertain_) throw ProjectError(ProjectErrorKind::Unavailable,
         "catalogue publication status is uncertain; restart the database server");
+}
+
+std::uint64_t ProjectService::wallClockMs() const {
+    const std::uint64_t now = this->leaseClock_.wallMs();
+    check(now > 0, "invalid system clock", StorageErrorKind::Unavailable);
+    return now;
+}
+
+bool ProjectService::workingCopyLeaseLive(const WorkingCopyInfo& draft) const {
+    if (!draft.leaseSessionId || !draft.leaseToken) return false;
+    {
+        std::lock_guard<std::mutex> guard(this->leaseDeadlinesMutex_);
+        const std::map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>>::const_iterator
+            granted = this->leaseDeadlines_.find(draft.id);
+        if (granted != this->leaseDeadlines_.end() && granted->second.first == *draft.leaseToken)
+            return this->leaseClock_.steady() < granted->second.second;
+    }
+    // Granted by an earlier process (or another handle): only the persisted
+    // wall-clock expiry is known.
+    return draft.leaseExpiresAtMs > wallClockMs();
+}
+
+void ProjectService::rememberLease(const WorkingCopyInfo& draft, std::uint32_t seconds) {
+    std::lock_guard<std::mutex> guard(this->leaseDeadlinesMutex_);
+    this->leaseDeadlines_[draft.id] = {*draft.leaseToken,
+        this->leaseClock_.steady() + std::chrono::seconds(seconds)};
+}
+
+void ProjectService::forgetLease(std::string_view draftId) {
+    std::lock_guard<std::mutex> guard(this->leaseDeadlinesMutex_);
+    this->leaseDeadlines_.erase(std::string(draftId));
 }
 
 void ProjectService::checkHealthy() const {
@@ -1464,12 +1538,13 @@ void ProjectService::discardWorkingCopy(std::string_view draftId, std::string_vi
     const WorkingCopyInfo draft = readWorkingCopy(path);
     if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
         !draft.leaseToken || *draft.leaseToken != fencingToken ||
-        draft.leaseExpiresAtMs <= nowEpochMs() || draft.generation != expectedGeneration)
+        !workingCopyLeaseLive(draft) || draft.generation != expectedGeneration)
         throw ProjectError(ProjectErrorKind::Conflict, "draft lease, fencing token or generation changed");
     try {
         syscallChecked(::unlink(path.c_str()) == 0, "discard working-copy record");
         syncDirectory(directory);
     } catch (...) { markUncertain(); throw; }
+    forgetLease(draftId);
 }
 
 WorkingCopyLease ProjectService::acquireWorkingCopyLease(
@@ -1484,15 +1559,15 @@ WorkingCopyLease ProjectService::acquireWorkingCopyLease(
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
     WorkingCopyInfo draft = readWorkingCopy(path);
-    const std::uint64_t now = nowEpochMs();
-    if (draft.leaseSessionId && draft.leaseExpiresAtMs > now &&
-        *draft.leaseSessionId != sessionId)
+    const std::uint64_t now = wallClockMs();
+    if (workingCopyLeaseLive(draft) && *draft.leaseSessionId != sessionId)
         throw ProjectError(ProjectErrorKind::Conflict, "draft held by another writer session");
     draft.leaseSessionId = std::string(sessionId);
     draft.leaseToken = UuidV7::generate().toString();
     draft.leaseExpiresAtMs = now + static_cast<std::uint64_t>(seconds) * 1000;
     try { replaceWorkingCopyRecord(this->root_, draft); }
     catch (...) { markUncertain(); throw; }
+    rememberLease(draft, seconds);
     return WorkingCopyLease{*draft.leaseToken, draft.leaseExpiresAtMs, draft.generation};
 }
 
@@ -1515,7 +1590,7 @@ WorkingCopyInfo ProjectService::saveWorkingCopyChanges(
                            "journalled draft requires atomic event saves");
     if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
         !draft.leaseToken || *draft.leaseToken != fencingToken ||
-        draft.leaseExpiresAtMs <= nowEpochMs() || draft.generation != expectedGeneration)
+        !workingCopyLeaseLive(draft) || draft.generation != expectedGeneration)
         throw ProjectError(ProjectErrorKind::Conflict, "draft lease, fencing token or generation changed");
     if (draft.generation == std::numeric_limits<std::uint64_t>::max())
         throw ProjectError(ProjectErrorKind::Conflict, "draft generation exhausted");
@@ -1576,7 +1651,7 @@ WorkingCopyInfo ProjectService::saveWorkingCopyTransactions(
     WorkingCopyInfo draft = readWorkingCopy(path);
     if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
         !draft.leaseToken || *draft.leaseToken != fencingToken ||
-        draft.leaseExpiresAtMs <= nowEpochMs())
+        !workingCopyLeaseLive(draft))
         throw ProjectError(ProjectErrorKind::Conflict, "stale draft writer lease");
     // Lost HTTP acknowledgements are resolved without repeating a Save.
     if (expectedGeneration < std::numeric_limits<std::uint64_t>::max() &&
@@ -1737,7 +1812,7 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
                 draft.baseRevision != expectedLocalHead ||
                 !draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
                 !draft.leaseToken || *draft.leaseToken != fencingToken ||
-                draft.leaseExpiresAtMs <= nowEpochMs() ||
+                !workingCopyLeaseLive(draft) ||
                 draft.generation != expectedGeneration)
                 throw ProjectError(ProjectErrorKind::Conflict,
                                    "local Commit draft/base/lease/generation changed");
@@ -1859,6 +1934,7 @@ void ProjectService::releaseWorkingCopyLease(
     draft.leaseExpiresAtMs = 0;
     try { replaceWorkingCopyRecord(this->root_, draft); }
     catch (...) { markUncertain(); throw; }
+    forgetLease(draftId);
 }
 
 std::vector<ProjectInfo> ProjectService::listProjects() const {

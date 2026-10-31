@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -84,6 +85,16 @@ struct WorkingCopyInfo {
     std::uint64_t leaseExpiresAtMs = 0;
 };
 
+// Clocks for draft leases. A lease's expiry is persisted as wall-clock
+// epoch milliseconds (it survives a restart and is shown to clients). While
+// the granting process runs, the lease is enforced against a monotonic
+// deadline instead, so a wall-clock step neither extends nor cuts it short.
+// Defaults are the system and steady clocks; tests may inject their own.
+struct LeaseClock {
+    std::function<std::uint64_t()> wallMs;
+    std::function<std::chrono::steady_clock::time_point()> steady;
+};
+
 // One page of drafts in draft-UUID order. `next` is the last returned draft
 // UUID when more drafts follow; pass it as `after` to continue.
 struct WorkingCopyPage {
@@ -137,7 +148,8 @@ public:
     // maxPendingOperations: scoped operations per project that may wait or
     // run at the same time (>= 1). Keep it below the server's worker count,
     // so one busy project can never occupy every worker.
-    explicit ProjectService(std::filesystem::path root, std::size_t maxPendingOperations = 4);
+    explicit ProjectService(std::filesystem::path root, std::size_t maxPendingOperations = 4,
+                            LeaseClock leaseClock = {});
     ~ProjectService();
     ProjectService(const ProjectService&) = delete;
     ProjectService& operator=(const ProjectService&) = delete;
@@ -246,6 +258,8 @@ public:
     WorkingCopyPage listWorkingCopies(std::optional<std::string_view> projectId,
                                       std::size_t limit,
                                       std::optional<std::string_view> after) const;
+    // Whether the draft's current lease is still held (see LeaseClock).
+    bool workingCopyLeaseLive(const WorkingCopyInfo& draft) const;
     // Removes a draft for good. Fenced like a Save: the live lease holder,
     // its token and the current generation. Local Commit records keep their
     // own snapshot, so discarding never affects a committed or pending
@@ -352,6 +366,13 @@ private:
     int lockFd_ = -1;
     const std::size_t maxPending_;
     mutable std::mutex mutex_;                   // catalogue: entries_, uncertain_
+    std::uint64_t wallClockMs() const;
+    void rememberLease(const WorkingCopyInfo& draft, std::uint32_t seconds);
+    void forgetLease(std::string_view draftId);
+    LeaseClock leaseClock_;
+    mutable std::mutex leaseDeadlinesMutex_;     // guards leaseDeadlines_ only
+    // Draft UUID -> (lease token, monotonic deadline) of leases granted here.
+    std::map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>> leaseDeadlines_;
     mutable std::mutex draftLocksMutex_;         // guards draftLocks_ only
     mutable std::map<std::string, std::weak_ptr<std::mutex>> draftLocks_;
     bool uncertain_ = false;

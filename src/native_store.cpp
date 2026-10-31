@@ -1015,6 +1015,23 @@ void syncDirectory(const std::filesystem::path& directory) {
     systemCall(status == 0, "fsync directory");
 }
 
+// Removes unpublished ".stage-*" files (never their targets: symlinks and
+// non-regular entries are left for verification to report).
+void removeStageRemnants(const std::filesystem::path& directory) {
+    if (std::filesystem::is_symlink(directory) || !std::filesystem::is_directory(directory)) return;
+    bool removed = false;
+    for (const std::filesystem::directory_entry& entry :
+            std::filesystem::directory_iterator(directory)) {
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with(".stage-") || entry.is_symlink() || !entry.is_regular_file()) continue;
+        if (::unlink(entry.path().c_str()) != 0 && errno != ENOENT)
+            throwSystemError("remove leftover staged record " + name);
+        removed = true;
+    }
+    if (removed) syncDirectory(directory);
+}
+
+
 // A single atomic pointer is the only authoritative choice between complete
 // pack generations. The legacy name is the initial generation (empty token).
 // Never silently fall back if the pointer is malformed or files are missing.
@@ -1957,6 +1974,10 @@ Repository::Repository(std::filesystem::path directory)
                                 flags | O_CREAT, 0644);
         systemCall(this->indexFd_ >= 0, "open active content index");
         refreshIndex();
+        // Staged branch records and revision bindings are only ever written
+        // under repo.lock (held here), so a remaining one is a crash leftover.
+        removeStageRemnants(this->directory_ / "refs" / "heads");
+        removeStageRemnants(this->directory_ / "revision-v2" / "ids");
         (void)readStoredBranches(this->directory_); // Validate every branch record on open.
         syncDirectory(this->directory_);
         syncDirectory(this->directory_ / "refs");

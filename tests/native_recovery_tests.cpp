@@ -803,8 +803,37 @@ void runBackend() {
 }
 } // namespace
 
+// R11: staged branch records and revision bindings left by a crash are
+// removed when the repository opens; published records are untouched.
+void testStageRemnantsRemovedOnOpen() {
+    TestDirectory directory("stage-remnants");
+    const std::filesystem::path path = directory.path / "repo";
+    RevisionId head = RevisionId::generate();
+    {
+        ProjectRepository repository(path);
+        repository.createBranch("main");
+        head = repository.commit("main", {{key(1), Bytes{1}}});
+    }
+    const std::vector<std::filesystem::path> remnants{
+        path / "refs" / "heads" / (".stage-" + aowis::dvmdb::UuidV7::generate().toString()),
+        path / "revision-v2" / "ids" / (".stage-" + aowis::dvmdb::UuidV7::generate().toString())};
+    for (const std::filesystem::path& remnant : remnants) {
+        std::ofstream output(remnant, std::ios::binary);
+        output << "interrupted";
+        expect(output.good(), "cannot create staged remnant fixture");
+    }
+    ProjectRepository reopened(path);
+    for (const std::filesystem::path& remnant : remnants)
+        expect(!std::filesystem::exists(remnant), "a staged remnant survived repository open");
+    expect(reopened.head("main") == head && reopened.get("main", key(1)) == Bytes{1},
+           "remnant cleanup touched published branch state");
+    const aowis::dvmdb::VerificationReport report = reopened.verifyRepository();
+    expect(report.revisions == 1, "repository verification changed after remnant cleanup");
+}
+
 int main() {
     try {
+        testStageRemnantsRemovedOnOpen();
         runBackend();
         std::cout << "Recovery, torn pack tails, stale generations, injected ENOSPC/crashes and locking: passed on pack storage\n";
         return 0;

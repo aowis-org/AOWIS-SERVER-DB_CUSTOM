@@ -168,6 +168,14 @@ explicitly rather than silently rewritten.
   draft for good (fenced like a Save; committed history and local Commit
   records are unaffected). `GET /working-copies` is paged (`limit`, `after`,
   optional `projectId`) and returns `nextCursor`.
+- `save-events` checks that the MODEL event journal describes exactly the
+  saved candidate: applied in order, each edit's before-image must equal the
+  entity's current draft (or base) state, and every edited entity's candidate
+  record must be its final after-image (a tombstone for a removal).
+- Lease expiry is persisted as wall-clock milliseconds and shown to clients,
+  but while the granting server runs a lease is enforced against a monotonic
+  deadline, so wall-clock steps neither extend nor shorten it. After a server
+  restart only the persisted expiry is known.
 - A local Commit that failed with an I/O error before HEAD publication stays
   `pending` only while HEAD is still at its base. Once HEAD has moved without
   the reserved revision, status lookups and retries report it as

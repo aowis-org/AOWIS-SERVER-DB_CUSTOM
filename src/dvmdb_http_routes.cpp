@@ -738,6 +738,58 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     return std::nullopt;
 }
 
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+// The MODEL event journal is the undo/redo history of exactly the saved
+// candidate, so both must agree. Applied in order, every edit's before-image
+// must equal the entity's current state (earlier edit of this batch, else the
+// draft candidate, else the pinned base), and the final state of every edited
+// entity must be the batch's candidate record (deleted: a tombstone).
+void verifyEditImages(ProjectService& service, const WorkingCopyInfo& draft,
+                      const std::vector<aowis::model::ModelEditTransaction>& transactions,
+                      const std::vector<ModelChange>& changes) {
+    std::map<Key, std::optional<ModelRecord>> candidate;
+    for (const ModelChange& change : draft.candidateChanges) candidate.emplace(change.key, change.record);
+    const std::function<std::optional<Bytes>(const Key&)> stored =
+        [&service, &draft, &candidate](const Key& key) -> std::optional<Bytes> {
+        const std::map<Key, std::optional<ModelRecord>>::const_iterator overlay = candidate.find(key);
+        if (overlay != candidate.end())
+            return overlay->second ? std::optional<Bytes>(overlay->second->payload) : std::nullopt;
+        if (!draft.baseRevision) return std::nullopt;
+        const std::optional<ModelRecord> base =
+            service.getModelAtRevision(draft.projectId, *draft.baseRevision, key);
+        return base ? std::optional<Bytes>(base->payload) : std::nullopt;
+    };
+    std::map<Key, std::optional<Bytes>> state;
+    for (const aowis::model::ModelEditTransaction& transaction : transactions) {
+        for (const aowis::model::ModelEntityEdit& edit : transaction.edits) {
+            const Key key = hydraulic::keyFromUuid(edit.entityId);
+            const std::map<Key, std::optional<Bytes>>::const_iterator known = state.find(key);
+            const std::optional<Bytes> current = known != state.end() ? known->second : stored(key);
+            if (edit.before) {
+                requireInput(current && *current == hydraulic::bytesFromQByteArray(*edit.before),
+                             "MODEL event before-image differs from the saved draft");
+            } else {
+                requireInput(!current, "MODEL event creates an entity that already exists");
+            }
+            state[key] = edit.after ? std::optional<Bytes>(hydraulic::bytesFromQByteArray(*edit.after))
+                                    : std::nullopt;
+        }
+    }
+    for (const std::pair<const Key, std::optional<Bytes>>& entry : state) {
+        const std::vector<ModelChange>::const_iterator change =
+            std::find_if(changes.begin(), changes.end(),
+                         [&entry](const ModelChange& item) { return item.key == entry.first; });
+        requireInput(change != changes.end(), "candidate record missing for an entity edited by MODEL events");
+        if (entry.second) {
+            requireInput(change->record && change->record->payload == *entry.second,
+                         "candidate record differs from MODEL after-image");
+        } else {
+            requireInput(!change->record, "candidate keeps an entity that MODEL events removed");
+        }
+    }
+}
+#endif
+
 void registerBundleRoutes(httplib::Server& server, ProjectService& service, BundleLimits limits,
                           const std::shared_ptr<TransferStagingBudget>& stagingBudget) {
     // Only AOWREV21/22 bundles are exposed over HTTP. The catalogue project
@@ -1330,11 +1382,8 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             // A successful response may be lost. Only the same still-leased
             // writer with the exact same root at exactly generation+1 can
             // recover it; an expired lease is never a valid acknowledgement.
-            const std::uint64_t nowMs = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
             if (expected < std::numeric_limits<std::uint64_t>::max() &&
-                draft.leaseExpiresAtMs > nowMs &&
+                service.workingCopyLeaseLive(draft) &&
                 draft.generation == expected + 1 &&
                 draft.leaseSessionId == std::optional<std::string>(session) &&
                 draft.leaseToken == std::optional<std::string>(token) &&
@@ -1412,6 +1461,13 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                      "missing membership for created or removed entity");
             }
 #endif
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+            // One read of the draft serves both image checks. A concurrent
+            // Save changes the generation, which the Save below rejects.
+            const WorkingCopyInfo current = service.workingCopy(pathParam(request, "draft"));
+            if (current.generation == strictUint64(body, "expectedGeneration"))
+                verifyEditImages(service, current, transactions, changes);
+#endif
             std::vector<ModelChange> materialized = changes;
             std::optional<std::string> logicalRequestFingerprint;
             if (body.contains("membership")) {
@@ -1453,8 +1509,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 const QByteArray requestBytes = QJsonDocument(body).toJson(QJsonDocument::Compact);
                 logicalRequestFingerprint = QCryptographicHash::hash(
                     requestBytes, QCryptographicHash::Sha256).toHex().toStdString();
-                const std::string draftId = pathParam(request, "draft");
-                const WorkingCopyInfo draft = service.workingCopy(draftId);
+                const WorkingCopyInfo& draft = current;
                 const std::uint64_t expected = strictUint64(body, "expectedGeneration");
                 if (draft.generation == expected && !intents.empty()) {
                     std::map<Key, std::optional<ModelRecord>> existing;
