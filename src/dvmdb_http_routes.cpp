@@ -63,6 +63,7 @@ const char* const routeWorkingCopyInitializeNetwork = "/dvmdb/v1/working-copies/
 const char* const routeWorkingCopyEventSave = "/dvmdb/v1/working-copies/:draft/save-events";
 const char* const routeWorkingCopyLease = "/dvmdb/v1/working-copies/:draft/lease";
 const char* const routeWorkingCopyRelease = "/dvmdb/v1/working-copies/:draft/release";
+const char* const routeWorkingCopyDiscard = "/dvmdb/v1/working-copies/:draft/discard";
 const char* const routeBranches = "/dvmdb/v1/projects/:id/branches";
 const char* const routeRevisionBundle = "/dvmdb/v1/projects/:id/branches/:branch/bundle";
 const char* const revisionBundleMime = "application/vnd.aowis.revision-bundle-v2";
@@ -729,7 +730,7 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     if (route == routeProjects || route == routeBranches ||
         route == routeRepositoryRole || route == routeWorkingCopies || route == routeWorkingCopyLease ||
         route == routeWorkingCopyInitializeNetwork ||
-        route == routeWorkingCopyRelease) return maxJsonSmallBytes;
+        route == routeWorkingCopyRelease || route == routeWorkingCopyDiscard) return maxJsonSmallBytes;
     if (route == routeWorkingCopySave || route == routeWorkingCopyEventSave) return maxJsonModelBytes;
     if (route == routeMerges ||
         route == routeHydraulicMerges) return maxJsonMergeBytes;
@@ -1170,14 +1171,32 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     });
     // VC-04: private, persistent working copies. These are draft operations,
     // not revision-graph commits. Repository role is checked in the native API.
-    server.Get(routeWorkingCopies, [&service](const httplib::Request&, httplib::Response& response) {
+    // Paged in draft-UUID order: ?limit=1..1000 (default 100), ?after=<draft
+    // UUIDv7> from the previous page's nextCursor, optional ?projectId=.
+    server.Get(routeWorkingCopies, [&service](const httplib::Request& request,
+                                              httplib::Response& response) {
         guarded(response, [&]() {
-            const std::vector<WorkingCopyInfo> drafts = service.listWorkingCopies();
-            requireInput(drafts.size() <= 1000, "too many working copies for one HTTP response");
+            for (const httplib::Params::value_type& item : request.params)
+                requireInput(item.first == "limit" || item.first == "after" ||
+                             item.first == "projectId", "unknown working-copy list query parameter");
+            std::size_t limit = 100;
+            if (const std::optional<std::string> value = queryValue(request, "limit")) {
+                bool ok = false;
+                const unsigned number = QString::fromStdString(*value).toUInt(&ok);
+                requireInput(ok && number > 0 && number <= 1000, "invalid working-copy page limit");
+                limit = number;
+            }
+            const std::optional<std::string> after = queryValue(request, "after");
+            const std::optional<std::string> projectId = queryValue(request, "projectId");
+            const WorkingCopyPage page = service.listWorkingCopies(
+                projectId ? std::optional<std::string_view>(*projectId) : std::nullopt, limit,
+                after ? std::optional<std::string_view>(*after) : std::nullopt);
             QJsonArray items;
-            for (const WorkingCopyInfo& draft : drafts)
+            for (const WorkingCopyInfo& draft : page.workingCopies)
                 items.append(workingCopyJson(draft, false));
-            return Reply{200, QJsonObject{{"workingCopies", items}}};
+            return Reply{200, QJsonObject{{"workingCopies", items},
+                {"nextCursor", page.next ? QJsonValue(QString::fromStdString(*page.next))
+                                         : QJsonValue(QJsonValue::Null)}}};
         });
     });
     server.Post(routeWorkingCopies, [&service](const httplib::Request& request,
@@ -1547,6 +1566,18 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             service.releaseWorkingCopyLease(pathParam(request, "draft"),
                 requiredString(body, "sessionId"), requiredString(body, "fencingToken"));
             return Reply{200, QJsonObject{{"released", true}}};
+        });
+    });
+    // Fenced like a Save. A repeated request after success answers 404.
+    server.Post(routeWorkingCopyDiscard, [&service](const httplib::Request& request,
+                                                    httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonSmallBytes);
+            requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration"});
+            service.discardWorkingCopy(pathParam(request, "draft"),
+                requiredString(body, "sessionId"), requiredString(body, "fencingToken"),
+                strictUint64(body, "expectedGeneration"));
+            return Reply{200, QJsonObject{{"discarded", true}}};
         });
     });
     server.Get(routeProjects, [&service](const httplib::Request&, httplib::Response& response) {

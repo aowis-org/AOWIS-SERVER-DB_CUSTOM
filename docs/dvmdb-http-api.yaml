@@ -98,9 +98,17 @@ paths:
   /working-copies:
     get:
       operationId: listPrivateWorkingCopies
-      description: List persisted private draft metadata (candidate overlays omitted from this listing). No fencing token is returned.
+      description: |
+        List persisted private draft metadata in draft-UUID order (candidate
+        overlays omitted from this listing). No fencing token is returned.
+        Paged: pass the previous page's nextCursor as `after`.
+      parameters:
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+        - {name: after, in: query, required: false, schema: {type: string, format: uuid}, description: Last draft UUIDv7 of the previous page}
+        - {name: projectId, in: query, required: false, schema: {type: string, format: uuid}, description: Only drafts of this project}
       responses:
-        '200': {description: Array of workingCopies; each has UUIDv7 IDs, nullable baseRevision, string generation and candidate changes}
+        '200': {description: 'workingCopies (each with UUIDv7 IDs, nullable baseRevision and string generation) and nextCursor (draft UUIDv7, or null on the last page)'}
+        '400': {description: Invalid limit, cursor, project or unknown query parameter}
     post:
       operationId: createPrivateWorkingCopy
       description: |
@@ -254,6 +262,7 @@ paths:
         '200': {description: Durable candidate and event journal; exact event UUIDs preserved}
         '400': {description: Malformed event frame, duplicate edit or invalid model change}
         '409': {description: Conflicting generation, event UUID or writer lease}
+        '413': {description: 'Event journal (4096 events) or candidate (20000 changes) is full; a local Commit empties both'}
   /working-copies/{draftId}/save:
     parameters:
       - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
@@ -308,6 +317,33 @@ paths:
       responses:
         '200': {description: '{"released":true}; also when no lease is held any more (idempotent release)'}
         '409': {description: Lease is held by another session or token}
+  /working-copies/{draftId}/discard:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: discardPrivateWorkingCopy
+      description: |
+        Remove a draft for good. Fenced like a Save (live lease holder, token,
+        current generation). Committed revisions and local Commit records are
+        unaffected. After a successful Commit the draft is rebased onto the new
+        HEAD (generation + 1, empty candidate and event journal), so it can be
+        kept and edited further instead of discarded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, fencingToken, expectedGeneration]
+              properties:
+                sessionId: {type: string, format: uuid}
+                fencingToken: {type: string, format: uuid}
+                expectedGeneration: {type: string, pattern: '^[0-9]+$'}
+      responses:
+        '200': {description: '{"discarded":true}'}
+        '404': {description: Draft not found (also for a repeated request after success)}
+        '409': {description: Stale lease, fencing token or generation}
   /projects:
     get:
       operationId: listProjects

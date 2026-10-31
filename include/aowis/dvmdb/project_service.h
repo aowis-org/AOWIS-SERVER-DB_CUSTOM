@@ -84,6 +84,13 @@ struct WorkingCopyInfo {
     std::uint64_t leaseExpiresAtMs = 0;
 };
 
+// One page of drafts in draft-UUID order. `next` is the last returned draft
+// UUID when more drafts follow; pass it as `after` to continue.
+struct WorkingCopyPage {
+    std::vector<WorkingCopyInfo> workingCopies;
+    std::optional<std::string> next;
+};
+
 // VC-05 local Commit operation. The reserved revision UUID is durable before
 // HEAD publication. Pending means the caller must query/retry with the SAME ID;
 // it does not mean that the commit definitely failed.
@@ -231,7 +238,20 @@ public:
         std::optional<RevisionId> baseRevision, std::string_view sessionId,
         std::optional<std::string_view> draftId = std::nullopt);
     WorkingCopyInfo workingCopy(std::string_view draftId) const;
+    // Every draft of the root (offline tools and tests).
     std::vector<WorkingCopyInfo> listWorkingCopies() const;
+    // Bounded listing: at most `limit` (1..1000) drafts after the draft UUID
+    // `after`, optionally only those of one project. Reads only the records
+    // it returns plus, with a project filter, the records it skips.
+    WorkingCopyPage listWorkingCopies(std::optional<std::string_view> projectId,
+                                      std::size_t limit,
+                                      std::optional<std::string_view> after) const;
+    // Removes a draft for good. Fenced like a Save: the live lease holder,
+    // its token and the current generation. Local Commit records keep their
+    // own snapshot, so discarding never affects a committed or pending
+    // operation. A repeated request after success answers NotFound.
+    void discardWorkingCopy(std::string_view draftId, std::string_view sessionId,
+                            std::string_view fencingToken, std::uint64_t expectedGeneration);
     // Only one nonexpired writer may hold a draft lease. The same session
     // may reacquire, invalidating its previous token. Expired leases may be
     // explicitly taken over by a different session; no candidate is lost.

@@ -428,6 +428,31 @@ std::filesystem::path workingCopyDirectory(const std::filesystem::path& root) {
     return root / "working-copies";
 }
 
+// Published draft UUIDs in ascending order. Unpublished crash remnants
+// (.creating-*, .updating-*) are checked and skipped, never advertised.
+std::vector<std::string> publishedDraftIds(const std::filesystem::path& directory) {
+    std::vector<std::string> ids;
+    if (!std::filesystem::exists(directory) && !std::filesystem::is_symlink(directory))
+        return ids;
+    check(!std::filesystem::is_symlink(directory) && std::filesystem::is_directory(directory),
+          "invalid working-copy directory");
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(directory)) {
+        const std::string id = entry.path().filename().string();
+        if (id.starts_with(".creating-") || id.starts_with(".updating-")) {
+            const std::string_view prefix = id.starts_with(".creating-") ?
+                std::string_view(".creating-") : std::string_view(".updating-");
+            check(UuidV7::parse(std::string_view(id).substr(prefix.size())).has_value() &&
+                  !entry.is_symlink() && entry.is_regular_file(),
+                  "unsafe staged working-copy record");
+            continue;
+        }
+        ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
 std::uint64_t nowEpochMs() {
     const std::int64_t millis = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1395,28 +1420,56 @@ std::vector<WorkingCopyInfo> ProjectService::listWorkingCopies() const {
     checkHealthy();
     std::vector<WorkingCopyInfo> result;
     const std::filesystem::path directory = workingCopyDirectory(this->root_);
-    if (!std::filesystem::exists(directory) && !std::filesystem::is_symlink(directory))
-        return result;
-    check(!std::filesystem::is_symlink(directory) && std::filesystem::is_directory(directory),
-          "invalid working-copy directory");
-    for (const std::filesystem::directory_entry& entry :
-         std::filesystem::directory_iterator(directory)) {
-        const std::string id = entry.path().filename().string();
-        if (id.starts_with(".creating-") || id.starts_with(".updating-")) {
-            const std::string_view prefix = id.starts_with(".creating-") ?
-                std::string_view(".creating-") : std::string_view(".updating-");
-            check(UuidV7::parse(std::string_view(id).substr(prefix.size())).has_value() &&
-                  !entry.is_symlink() && entry.is_regular_file(),
-                  "unsafe staged working-copy record");
-            continue; // unpublished crash remnant, never advertise as a draft
-        }
-        result.push_back(readWorkingCopy(entry.path()));
-    }
-    std::sort(result.begin(), result.end(),
-              [](const WorkingCopyInfo& left, const WorkingCopyInfo& right) {
-                  return left.id < right.id;
-              });
+    for (const std::string& id : publishedDraftIds(directory))
+        result.push_back(readWorkingCopy(directory / id));
     return result;
+}
+
+WorkingCopyPage ProjectService::listWorkingCopies(std::optional<std::string_view> projectId,
+                                                  std::size_t limit,
+                                                  std::optional<std::string_view> after) const {
+    if (limit == 0 || limit > 1000)
+        throw ProjectError(ProjectErrorKind::InvalidInput, "draft page size must be 1..1000");
+    if ((projectId && !validProjectId(*projectId)) || (after && !UuidV7::parse(*after)))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft list project or cursor");
+    checkHealthy();
+    WorkingCopyPage page;
+    const std::filesystem::path directory = workingCopyDirectory(this->root_);
+    for (const std::string& id : publishedDraftIds(directory)) {
+        if (after && id <= *after) continue;
+        if (page.workingCopies.size() == limit) {
+            page.next = page.workingCopies.back().id;
+            break;
+        }
+        WorkingCopyInfo draft = readWorkingCopy(directory / id);
+        if (projectId && draft.projectId != *projectId) continue;
+        page.workingCopies.push_back(std::move(draft));
+    }
+    return page;
+}
+
+void ProjectService::discardWorkingCopy(std::string_view draftId, std::string_view sessionId,
+                                        std::string_view fencingToken,
+                                        std::uint64_t expectedGeneration) {
+    if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
+        !UuidV7::parse(fencingToken).has_value())
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft discard parameters");
+    const std::shared_ptr<std::mutex> lock = draftLock(draftId);
+    std::lock_guard<std::mutex> guard(*lock);
+    requirePrivateRepository("draft requires a private repository");
+    const std::filesystem::path directory = workingCopyDirectory(this->root_);
+    const std::filesystem::path path = directory / std::string(draftId);
+    if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
+        throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
+    const WorkingCopyInfo draft = readWorkingCopy(path);
+    if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
+        !draft.leaseToken || *draft.leaseToken != fencingToken ||
+        draft.leaseExpiresAtMs <= nowEpochMs() || draft.generation != expectedGeneration)
+        throw ProjectError(ProjectErrorKind::Conflict, "draft lease, fencing token or generation changed");
+    try {
+        syscallChecked(::unlink(path.c_str()) == 0, "discard working-copy record");
+        syncDirectory(directory);
+    } catch (...) { markUncertain(); throw; }
 }
 
 WorkingCopyLease ProjectService::acquireWorkingCopyLease(
@@ -1475,7 +1528,7 @@ WorkingCopyInfo ProjectService::saveWorkingCopyChanges(
         merged[change.key] = change.record;
     }
     if (merged.size() > workingCopyMaxChanges)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "draft candidate has too many changes");
+        throw StorageError(StorageErrorKind::LimitExceeded, "draft candidate has too many changes");
     draft.candidateChanges.clear();
     for (const std::pair<const Key, std::optional<ModelRecord>>& entry : merged)
         draft.candidateChanges.push_back(ModelChange{entry.first, entry.second});
@@ -1538,13 +1591,16 @@ WorkingCopyInfo ProjectService::saveWorkingCopyTransactions(
     for (const WorkingCopyEvent& event : events)
         if (applied.contains(event.id))
             throw ProjectError(ProjectErrorKind::Conflict, "edit event already saved");
+    // A local Commit empties the journal; until then a full journal is a
+    // limit (413), not a client error.
     if (draft.journal.size() + events.size() > workingCopyMaxEvents)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "draft event journal is full");
+        throw StorageError(StorageErrorKind::LimitExceeded,
+                           "draft event journal is full; commit or discard the draft");
     std::map<Key, std::optional<ModelRecord>> merged;
     for (const ModelChange& change : draft.candidateChanges) merged.emplace(change.key, change.record);
     for (const ModelChange& change : changes) merged[change.key] = change.record;
     if (merged.size() > workingCopyMaxChanges)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "draft candidate has too many changes");
+        throw StorageError(StorageErrorKind::LimitExceeded, "draft candidate has too many changes");
     draft.candidateChanges.clear();
     for (const std::pair<const Key, std::optional<ModelRecord>>& entry : merged)
         draft.candidateChanges.push_back(ModelChange{entry.first, entry.second});
@@ -1559,6 +1615,35 @@ WorkingCopyInfo ProjectService::saveWorkingCopyTransactions(
 }
 
 namespace {
+// After a successful local Commit the draft continues from the new HEAD:
+// base = committed revision, empty candidate and journal (both are now
+// history), generation + 1, lease unchanged. Only a draft still exactly at
+// the committed state is rebased, so the step is idempotent and also heals
+// a crash between the outcome record and the draft update. Caller holds the
+// draft lock.
+void rebaseCommittedDraft(const std::filesystem::path& root, const PersistedLocalCommit& operation,
+                          const std::function<void()>& markUncertain) {
+    if (operation.info.state != LocalCommitState::Succeeded) return;
+    const std::filesystem::path path = workingCopyDirectory(root) / operation.info.draftId;
+    if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path)) return; // discarded
+    WorkingCopyInfo draft = readWorkingCopy(path);
+    const std::optional<RevisionId> committed = RevisionId::parse(operation.info.reservedRevisionId);
+    if (!committed || draft.projectId != operation.info.projectId ||
+        draft.branchId != operation.info.branchId ||
+        draft.baseRevision != operation.info.expectedHead ||
+        draft.generation != operation.info.expectedGeneration ||
+        draft.generation == std::numeric_limits<std::uint64_t>::max())
+        return;
+    draft.baseRevision = committed;
+    draft.candidateChanges.clear();
+    draft.journal.clear();
+    draft.lastSaveFingerprint.reset();
+    draft.dirty = false;
+    ++draft.generation;
+    try { replaceWorkingCopyRecord(root, draft); }
+    catch (...) { markUncertain(); throw; }
+}
+
 // Decides a pending operation from the branch alone, under the project's
 // operation mutex (no concurrent attempt) and the fact that a HEAD never
 // returns to an older revision:
@@ -1684,6 +1769,7 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
         }
         if (resolvePendingLocalCommit(repository, operation, this->root_,
                                       [this]() { markUncertain(); })) {
+            rebaseCommittedDraft(this->root_, operation, [this]() { markUncertain(); });
             outcome = operation.info;
             return;
         }
@@ -1716,6 +1802,7 @@ LocalCommitInfo ProjectService::commitWorkingCopy(
         }
         try { persistLocalCommit(this->root_, operation, false); }
         catch (...) { markUncertain(); throw; }
+        rebaseCommittedDraft(this->root_, operation, [this]() { markUncertain(); });
         outcome = operation.info;
     });
     return outcome;
@@ -1737,8 +1824,11 @@ LocalCommitInfo ProjectService::localCommitStatus(std::string_view operationId) 
         if (operation.info.repositoryId != this->repository_id_)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "local Commit belongs to another repository");
+        const std::shared_ptr<std::mutex> lock = draftLock(operation.info.draftId);
+        std::lock_guard<std::mutex> guard(*lock);
         (void)resolvePendingLocalCommit(repository, operation, this->root_,
                                         [this]() { markUncertain(); });
+        rebaseCommittedDraft(this->root_, operation, [this]() { markUncertain(); });
         outcome = operation.info;
     });
     return outcome;

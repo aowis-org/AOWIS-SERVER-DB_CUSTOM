@@ -282,7 +282,7 @@ if(BUILD_TESTING)
     add_test(NAME aowis-dvmdb-local-commit-tests
         COMMAND aowis-dvmdb-local-commit-tests)
     set_tests_properties(aowis-dvmdb-local-commit-tests PROPERTIES
-        LABELS "aowis;working-copy;durability;identity" TIMEOUT 30)
+        LABELS "aowis;working-copy;durability;identity" TIMEOUT 120)
     add_executable(aowis-dvmdb-canonical-project-service-tests
         tests/native_canonical_project_service_tests.cpp)
     target_link_libraries(aowis-dvmdb-canonical-project-service-tests PRIVATE aowis-dvmdb-project-service)

@@ -1,12 +1,16 @@
 #include "aowis/dvmdb/project_service.h"
 #include "aowis/dvmdb/object_id.h"
+#include "aowis/dvmdb/storage_error.h"
+#include "model_edit_event_fixture.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <limits>
 #include <thread>
 #include <fstream>
 #include <iostream>
@@ -247,9 +251,16 @@ void testConcurrentFirstCommitIsSerialized() {
             (second.state == LocalCommitState::Succeeded &&
              first.state == LocalCommitState::Rejected),
             "concurrent initial Commit allowed two successful branches");
+    const bool firstWon = first.state == LocalCommitState::Succeeded;
+    const WorkingCopyInfo winner = service.workingCopy(firstWon ? firstDraft : secondDraft);
+    const WorkingCopyInfo loser = service.workingCopy(firstWon ? secondDraft : firstDraft);
+    const std::string committed = firstWon ? first.reservedRevisionId : second.reservedRevisionId;
     require(service.revisionGraph(projectId).revisions.size() == 1 &&
-            service.workingCopy(firstDraft).dirty && service.workingCopy(secondDraft).dirty,
-            "concurrent first Commit wrote duplicate history or lost a draft");
+            !winner.dirty && winner.generation == 2 &&
+            winner.baseRevision == RevisionId::parse(committed) &&
+            loser.dirty && loser.generation == 1 && !loser.baseRevision,
+            "concurrent first Commit wrote duplicate history, lost a draft or did not "
+            "rebase only the committed draft");
 }
 
 void testRejectedOperationIsDurable() {
@@ -502,6 +513,172 @@ void testCommitDoesNotHoldCatalogue() {
     catalogue.get();
     require(available, "a blocked status lookup stalled the catalogue");
 }
+// R6: a successful Commit rebases its draft onto the new HEAD, so the same
+// draft (and lease) keeps working: saves continue, a second Commit from it
+// succeeds with the committed revision as parent, and the journal is empty.
+void testCommitRebasesDraft() {
+    TempRoot root;
+    ProjectService service(root.path);
+    const std::string projectId = service.createUnbornProject("rebased draft").id;
+    service.configureRepositoryRole(RepositoryRole::Private);
+    const std::string session = UuidV7::generate().toString();
+    const std::string draftId = service.createWorkingCopy(projectId, "main", std::nullopt, session).id;
+    const std::string token = service.acquireWorkingCopyLease(draftId, session, 120).token;
+    const UuidV7 entity = UuidV7::generate();
+    const ModelChange first = changeWithValue(41);
+    service.saveWorkingCopyTransactions(draftId, session, token, 0, {first},
+        {aowis::dvmdb::test::editEvent(UuidV7::generate(), entity)});
+    const LocalCommitInfo one = service.commitWorkingCopy(
+        UuidV7::generate().toString(), draftId, session, token, 1, std::nullopt);
+    require(one.state == LocalCommitState::Succeeded, "first Commit failed");
+    const RevisionId firstRevision = *RevisionId::parse(one.reservedRevisionId);
+    const WorkingCopyInfo rebased = service.workingCopy(draftId);
+    require(rebased.baseRevision == firstRevision && rebased.generation == 2 &&
+            !rebased.dirty && rebased.candidateChanges.empty() && rebased.journal.empty() &&
+            rebased.leaseToken == token,
+            "successful Commit did not rebase its draft onto the new HEAD");
+    // Replaying the same Commit request must not rebase a second time.
+    require(service.commitWorkingCopy(one.id, draftId, session, token, 1, std::nullopt).state ==
+                LocalCommitState::Succeeded &&
+            service.workingCopy(draftId).generation == 2,
+            "replayed Commit changed the rebased draft");
+    const ModelChange second = changeWithValue(42);
+    require(service.saveWorkingCopyChanges(draftId, session, token, 2, {second}).generation == 3,
+            "save after Commit failed on the rebased draft");
+    const LocalCommitInfo two = service.commitWorkingCopy(
+        UuidV7::generate().toString(), draftId, session, token, 3, firstRevision);
+    require(two.state == LocalCommitState::Succeeded, "second Commit from the same draft failed");
+    const aowis::dvmdb::RevisionGraphRevision child =
+        service.revision(projectId, *RevisionId::parse(two.reservedRevisionId));
+    require(child.parents.size() == 1 && child.parents[0].id == firstRevision &&
+            service.workingCopy(draftId).baseRevision == RevisionId::parse(two.reservedRevisionId),
+            "second Commit did not continue from the first");
+}
+
+// R6: a full event journal is a limit (413), not a client error, and a
+// Commit empties it so event saves continue.
+void testFullJournalIsALimitAndCommitClearsIt() {
+    TempRoot root;
+    ProjectService service(root.path);
+    const std::string projectId = service.createUnbornProject("journal limit").id;
+    service.configureRepositoryRole(RepositoryRole::Private);
+    const std::string session = UuidV7::generate().toString();
+    const std::string draftId = service.createWorkingCopy(projectId, "main", std::nullopt, session).id;
+    const std::string token = service.acquireWorkingCopyLease(draftId, session, 120).token;
+    const UuidV7 entity = UuidV7::generate();
+    const std::function<std::vector<aowis::dvmdb::Bytes>(std::size_t)> batch = [&](std::size_t count) {
+        std::vector<aowis::dvmdb::Bytes> events;
+        for (std::size_t i = 0; i < count; ++i)
+            events.push_back(aowis::dvmdb::test::editEvent(UuidV7::generate(), entity));
+        return events;
+    };
+    std::uint64_t generation = 0;
+    for (unsigned save = 0; save < 32; ++save)
+        generation = service.saveWorkingCopyTransactions(draftId, session, token, generation,
+                                                         {changeWithValue(1)}, batch(128)).generation;
+    require(service.workingCopy(draftId).journal.size() == 4096, "journal fixture not full");
+    bool limited = false;
+    try {
+        (void)service.saveWorkingCopyTransactions(draftId, session, token, generation,
+                                                  {changeWithValue(2)}, batch(1));
+    } catch (const aowis::dvmdb::StorageError& error) {
+        limited = error.kind() == aowis::dvmdb::StorageErrorKind::LimitExceeded;
+    }
+    require(limited && service.workingCopy(draftId).generation == generation,
+            "a full journal was not reported as LimitExceeded without changing the draft");
+    const LocalCommitInfo committed = service.commitWorkingCopy(
+        UuidV7::generate().toString(), draftId, session, token, generation, std::nullopt);
+    require(committed.state == LocalCommitState::Succeeded, "Commit of a full-journal draft failed");
+    require(service.saveWorkingCopyTransactions(draftId, session, token, generation + 1,
+                                                {changeWithValue(3)}, batch(1)).journal.size() == 1,
+            "event saves did not continue after Commit emptied the journal");
+}
+
+// R6: discarding is fenced like a Save, removes the draft durably, and
+// leaves committed history and local Commit records untouched.
+void testDiscardWorkingCopy() {
+    TempRoot root;
+    const std::string session = UuidV7::generate().toString();
+    std::string projectId;
+    std::string keptDraft;
+    std::string operationId = UuidV7::generate().toString();
+    {
+        ProjectService service(root.path);
+        projectId = service.createUnbornProject("discard").id;
+        service.configureRepositoryRole(RepositoryRole::Private);
+        const std::string draftId = service.createWorkingCopy(
+            projectId, "main", std::nullopt, session).id;
+        keptDraft = service.createWorkingCopy(projectId, "main", std::nullopt, session).id;
+        const std::string token = service.acquireWorkingCopyLease(draftId, session, 120).token;
+        service.saveWorkingCopyChanges(draftId, session, token, 0, {changeWithValue(7)});
+        require(service.commitWorkingCopy(operationId, draftId, session, token, 1,
+                                          std::nullopt).state == LocalCommitState::Succeeded,
+                "fixture Commit failed");
+        expectConflict([&]() {
+            service.discardWorkingCopy(draftId, session, token, 1); // stale generation
+        });
+        expectConflict([&]() {
+            service.discardWorkingCopy(draftId, session, UuidV7::generate().toString(), 2);
+        });
+        service.discardWorkingCopy(draftId, session, token, 2);
+        bool missing = false;
+        try { (void)service.workingCopy(draftId); }
+        catch (const ProjectError& error) { missing = error.kind() == ProjectErrorKind::NotFound; }
+        require(missing, "discarded draft is still readable");
+        bool repeated = false;
+        try { service.discardWorkingCopy(draftId, session, token, 2); }
+        catch (const ProjectError& error) { repeated = error.kind() == ProjectErrorKind::NotFound; }
+        require(repeated, "repeated discard did not answer NotFound");
+        require(service.localCommitStatus(operationId).state == LocalCommitState::Succeeded &&
+                service.optionalHead(projectId, "main").has_value(),
+                "discard affected committed history or its operation record");
+    }
+    ProjectService reopened(root.path);
+    const std::vector<WorkingCopyInfo> remaining = reopened.listWorkingCopies();
+    require(remaining.size() == 1 && remaining.front().id == keptDraft,
+            "discard was not durable or removed another draft");
+}
+
+// R6: draft listing is paged in draft-UUID order and can be filtered by
+// project, so it no longer fails for many drafts.
+void testDraftListPaging() {
+    TempRoot root;
+    ProjectService service(root.path);
+    const std::string a = service.createUnbornProject("paging a").id;
+    const std::string b = service.createUnbornProject("paging b").id;
+    service.configureRepositoryRole(RepositoryRole::Private);
+    const std::string session = UuidV7::generate().toString();
+    std::vector<std::string> all;
+    std::vector<std::string> ofA;
+    for (unsigned i = 0; i < 7; ++i) {
+        const std::string project = i % 3 == 0 ? b : a;
+        const std::string id = service.createWorkingCopy(project, "main", std::nullopt, session).id;
+        all.push_back(id);
+        if (project == a) ofA.push_back(id);
+    }
+    std::sort(all.begin(), all.end());
+    std::sort(ofA.begin(), ofA.end());
+    std::vector<std::string> seen;
+    std::optional<std::string> cursor;
+    for (unsigned page = 0; page < 10; ++page) {
+        const aowis::dvmdb::WorkingCopyPage result = service.listWorkingCopies(
+            std::nullopt, 3, cursor ? std::optional<std::string_view>(*cursor) : std::nullopt);
+        require(result.workingCopies.size() <= 3, "draft page exceeded its limit");
+        for (const WorkingCopyInfo& draft : result.workingCopies) seen.push_back(draft.id);
+        if (!result.next) break;
+        require(*result.next == result.workingCopies.back().id, "draft cursor is not the last ID");
+        cursor = result.next;
+    }
+    require(seen == all, "paged draft listing skipped, repeated or misordered drafts");
+    const aowis::dvmdb::WorkingCopyPage filtered = service.listWorkingCopies(a, 1000, std::nullopt);
+    std::vector<std::string> filteredIds;
+    for (const WorkingCopyInfo& draft : filtered.workingCopies) filteredIds.push_back(draft.id);
+    require(filteredIds == ofA && !filtered.next, "project-filtered draft listing is wrong");
+    bool rejected = false;
+    try { (void)service.listWorkingCopies(std::nullopt, 0, std::nullopt); }
+    catch (const ProjectError& error) { rejected = error.kind() == ProjectErrorKind::InvalidInput; }
+    require(rejected, "draft page size 0 accepted");
+}
 }
 
 int main() {
@@ -512,6 +689,10 @@ int main() {
         testLeaseTakeoverCanCommit();
         testFailedCommitIsRejectedOnceHeadMoves();
         testCommitDoesNotHoldCatalogue();
+        testCommitRebasesDraft();
+        testFullJournalIsALimitAndCommitClearsIt();
+        testDiscardWorkingCopy();
+        testDraftListPaging();
         std::cout << "VC-05 durable local Commit tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << "VC-05 durable local Commit tests failed: " << error.what() << '\n';

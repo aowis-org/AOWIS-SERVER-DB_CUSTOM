@@ -160,6 +160,14 @@ explicitly rather than silently rewritten.
   with the expected generation can Save or local Commit; expiration/takeover
   invalidates stale writes without losing the last durable content. A session
   that took over an expired lease is that writer and may also Commit.
+- After a successful local Commit the draft continues from the new HEAD:
+  its base becomes the committed revision, candidate and event journal are
+  emptied, and its generation increases by one; the lease stays valid. A
+  full event journal (4096 events) or candidate (20000 changes) answers 413
+  until a Commit empties it. `POST /working-copies/{id}/discard` removes a
+  draft for good (fenced like a Save; committed history and local Commit
+  records are unaffected). `GET /working-copies` is paged (`limit`, `after`,
+  optional `projectId`) and returns `nextCursor`.
 - A local Commit that failed with an I/O error before HEAD publication stays
   `pending` only while HEAD is still at its base. Once HEAD has moved without
   the reserved revision, status lookups and retries report it as

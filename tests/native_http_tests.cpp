@@ -2344,6 +2344,79 @@ void exerciseHydraulicDraftMembershipHttp() {
 }
 #endif
 
+
+// R6 over HTTP: the draft list is paged and project-filtered (no root-wide
+// 1000-draft failure), and a draft can be discarded with its fencing token.
+void exerciseWorkingCopyListAndDiscardHttp() {
+    namespace native = aowis::dvmdb;
+    TemporaryRoot root;
+    native::ProjectService service(root.root());
+    const std::string first = service.createUnbornProject("draft paging A").id;
+    const std::string second = service.createUnbornProject("draft paging B").id;
+    service.configureRepositoryRole(native::RepositoryRole::Private);
+    TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL});
+    Client client(server.port());
+    const std::string session = native::UuidV7::generate().toString();
+    std::vector<QString> all;
+    std::vector<QString> ofFirst;
+    for (unsigned i = 0; i < 5; ++i) {
+        const std::string project = i == 2 ? second : first;
+        const QString id = QString::fromStdString(
+            service.createWorkingCopy(project, "main", std::nullopt, session).id);
+        all.push_back(id);
+        if (project == first) ofFirst.push_back(id);
+    }
+    std::sort(all.begin(), all.end());
+    std::sort(ofFirst.begin(), ofFirst.end());
+    const QString listPath = QStringLiteral("/dvmdb/v1/working-copies");
+    std::vector<QString> seen;
+    QString cursor;
+    for (int page = 0; page < 10; ++page) {
+        const Response response = client.call("GET", listPath + "?limit=2" +
+            (cursor.isEmpty() ? QString() : QStringLiteral("&after=") + cursor));
+        check(response.status == 200 && response.json.value("workingCopies").toArray().size() <= 2,
+              "HTTP draft page malformed");
+        for (const QJsonValue& item : response.json.value("workingCopies").toArray())
+            seen.push_back(item.toObject().value("id").toString());
+        if (response.json.value("nextCursor").isNull()) break;
+        cursor = response.json.value("nextCursor").toString();
+    }
+    check(seen == all, "HTTP draft paging skipped, repeated or misordered drafts");
+    const Response filtered = client.call("GET", listPath + "?projectId=" +
+                                          QString::fromStdString(first) + "&limit=1000");
+    std::vector<QString> filteredIds;
+    for (const QJsonValue& item : filtered.json.value("workingCopies").toArray())
+        filteredIds.push_back(item.toObject().value("id").toString());
+    check(filtered.status == 200 && filteredIds == ofFirst &&
+          filtered.json.value("nextCursor").isNull(), "HTTP project-filtered draft list is wrong");
+    check(client.call("GET", listPath + "?limit=0").status == 400 &&
+          client.call("GET", listPath + "?limit=1001").status == 400 &&
+          client.call("GET", listPath + "?after=garbage").status == 400 &&
+          client.call("GET", listPath + "?unknown=1").status == 400,
+          "HTTP draft list accepted invalid paging parameters");
+
+    const QString victim = ofFirst.front();
+    const std::string token = service.acquireWorkingCopyLease(victim.toStdString(), session, 120).token;
+    const QString discardPath = listPath + "/" + victim + "/discard";
+    const QJsonObject stale{{"sessionId", QString::fromStdString(session)},
+                            {"fencingToken", QString::fromStdString(native::UuidV7::generate().toString())},
+                            {"expectedGeneration", "0"}};
+    check(client.call("POST", discardPath, stale).status == 409,
+          "HTTP discard accepted a stale fencing token");
+    const QJsonObject discard{{"sessionId", QString::fromStdString(session)},
+                              {"fencingToken", QString::fromStdString(token)},
+                              {"expectedGeneration", "0"}};
+    const Response discarded = client.call("POST", discardPath, discard);
+    check(discarded.status == 200 && discarded.json.value("discarded") == QJsonValue(true),
+          "HTTP discard failed");
+    check(client.call("GET", listPath + "/" + victim).status == 404 &&
+          client.call("POST", discardPath, discard).status == 404,
+          "HTTP discarded draft is still visible or a repeat did not answer 404");
+    check(client.call("GET", listPath + "?limit=1000").json.value("workingCopies").toArray().size() ==
+              static_cast<qsizetype>(all.size() - 1),
+          "HTTP discard removed the wrong number of drafts");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2360,6 +2433,7 @@ int main(int argc, char** argv) {
         exerciseUnbornProjectHttp();
         exerciseUnbornCheckoutHttp();
         exerciseWorkingCopyHttp();
+        exerciseWorkingCopyListAndDiscardHttp();
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
         exerciseUnbornNetworkInitializationHttp();
         exerciseHydraulicDraftMembershipHttp();
