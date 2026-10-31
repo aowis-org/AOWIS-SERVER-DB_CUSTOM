@@ -61,10 +61,10 @@ ModelChange changeFor(const HydraulicLinkPipe& pipe) {
     return ModelChange{keyFromUuid(pipe.uuid), std::move(record)};
 }
 
-std::optional<HydraulicNodeJunction> readJunction(Repository& store,
-                                                 std::string_view branch, const Key& key,
+std::optional<HydraulicNodeJunction> readJunction(Repository& store, const ProjectId& project,
+                                                 const RevisionId& revision, const Key& key,
                                                  QString* error) {
-    const std::optional<ModelRecord> record = store.getModel(branch, key);
+    const std::optional<ModelRecord> record = store.getModelAtRevision(project, revision, key);
     if (!record) return std::nullopt;
     if (record->kind != junctionKind) {
         if (error) *error = QStringLiteral("Model record kind is not a junction");
@@ -79,10 +79,10 @@ std::optional<HydraulicNodeJunction> readJunction(Repository& store,
     return result;
 }
 
-std::optional<HydraulicLinkPipe> readPipe(Repository& store,
-                                          std::string_view branch, const Key& key,
+std::optional<HydraulicLinkPipe> readPipe(Repository& store, const ProjectId& project,
+                                          const RevisionId& revision, const Key& key,
                                           QString* error) {
-    const std::optional<ModelRecord> record = store.getModel(branch, key);
+    const std::optional<ModelRecord> record = store.getModelAtRevision(project, revision, key);
     if (!record) return std::nullopt;
     if (record->kind != pipeKind) {
         if (error) *error = QStringLiteral("Model record kind is not a pipe");

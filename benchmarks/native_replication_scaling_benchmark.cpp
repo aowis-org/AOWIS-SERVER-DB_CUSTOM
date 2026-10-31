@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "../tests/project_repository.h"
 
 #include <algorithm>
 #include <chrono>
@@ -18,16 +19,16 @@
 
 namespace {
 
-using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::RevisionBundleImport;
 using aowis::dvmdb::BundleImportProfile;
 using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
-using aowis::dvmdb::Hash;
+using aowis::dvmdb::RevisionId;
 using aowis::dvmdb::Key;
 using aowis::dvmdb::ModelChange;
 using aowis::dvmdb::ModelRecord;
-using aowis::dvmdb::Repository;
+using Repository = aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::VerificationReport;
 
 void require(bool valid, std::string_view reason) {
@@ -81,22 +82,25 @@ Bytes payload(std::uint32_t sequence, std::uint32_t size) {
     return result;
 }
 
-void writeHeads(const std::filesystem::path& directory, const Hash& base,
-                const Hash& full) {
+void writeHeads(const std::filesystem::path& directory, const RevisionId& base,
+                const RevisionId& full) {
     std::ofstream out(directory / "heads.txt", std::ios::trunc);
     require(out.good(), "cannot write fixture heads");
-    out << aowis::dvmdb::toHex(base) << '\n' << aowis::dvmdb::toHex(full) << '\n';
+    out << base.toString() << '\n' << full.toString() << '\n';
     out.flush();
     require(out.good(), "failed to write fixture heads");
 }
 
-std::pair<Hash, Hash> readHeads(const std::filesystem::path& directory) {
+std::pair<RevisionId, RevisionId> readHeads(const std::filesystem::path& directory) {
     std::ifstream in(directory / "heads.txt");
     std::string base;
     std::string full;
     require(static_cast<bool>(std::getline(in, base)) &&
             static_cast<bool>(std::getline(in, full)), "fixture heads are missing");
-    return {aowis::dvmdb::fromHex(base), aowis::dvmdb::fromHex(full)};
+    const std::optional<RevisionId> baseId = RevisionId::parse(base);
+    const std::optional<RevisionId> fullId = RevisionId::parse(full);
+    require(baseId.has_value() && fullId.has_value(), "fixture heads are not revision UUIDv7s");
+    return {*baseId, *fullId};
 }
 
 // Linux getrusage(RUSAGE_SELF).ru_maxrss can retain the spawning process's
@@ -140,7 +144,7 @@ void prepare(const std::filesystem::path& directory, std::uint32_t objects,
     requirePackBackend(backendName);
     Repository source(directory / "source");
     source.createBranch("main");
-    Hash base{};
+    RevisionId base = RevisionId::generate();
     const std::uint32_t baseCommits = commits / 2U;
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     for (std::uint32_t revision = 0; revision < commits; ++revision) {
@@ -177,22 +181,22 @@ void prepare(const std::filesystem::path& directory, std::uint32_t objects,
                       << milliseconds(start, checkpoint) / 1000.0 << "s)\n";
         }
         if (revision + 1U == baseCommits) {
-            base = source.head("main").id;
+            base = source.head("main");
             if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
                 std::cerr << "Exporting base bundle\n";
             }
-            source.exportBranchBundle("main", directory / "base.aowbundle");
+            source.exportBundle("main", directory / "base.aowbundle");
         }
     }
-    const Hash full = source.head("main").id;
+    const RevisionId full = source.head("main");
     if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
         std::cerr << "Exporting full bundle\n";
     }
-    source.exportBranchBundle("main", directory / "full.aowbundle");
+    source.exportBundle("main", directory / "full.aowbundle");
     if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
         std::cerr << "Exporting incremental bundle\n";
     }
-    source.exportIncrementalBranchBundle("main", base, directory / "delta.aowbundle");
+    source.exportIncrementalBundle("main", base, directory / "delta.aowbundle");
     writeHeads(directory, base, full);
     if (std::getenv("AOWIS_BENCH_PROGRESS") != nullptr) {
         std::cerr << "Verifying generated source repository\n";
@@ -206,7 +210,7 @@ void prepare(const std::filesystem::path& directory, std::uint32_t objects,
               << "\nfixture_ms=" << milliseconds(start, finish)
               << "\nbundle_full_bytes=" << std::filesystem::file_size(directory / "full.aowbundle")
               << "\nbundle_delta_bytes=" << std::filesystem::file_size(directory / "delta.aowbundle")
-              << "\nsource_head=" << aowis::dvmdb::toHex(full) << '\n';
+              << "\nsource_head=" << full.toString() << '\n';
 }
 
 void import(const std::filesystem::path& fixture, const std::filesystem::path& destination,
@@ -217,18 +221,18 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
     require(delta ? std::filesystem::is_directory(destination) :
             !std::filesystem::exists(destination),
             "destination must exist for delta and must not exist for full/base");
-    const std::pair<Hash, Hash> heads = readHeads(fixture);
+    const std::pair<RevisionId, RevisionId> heads = readHeads(fixture);
     const std::filesystem::path bundle = fixture /
         (delta ? "delta.aowbundle" : (phase == "import-base" ? "base.aowbundle" : "full.aowbundle"));
-    const Hash expected = phase == "import-base" ? heads.first : heads.second;
+    const RevisionId expected = phase == "import-base" ? heads.first : heads.second;
     requirePackBackend(backendName);
     Repository receiver(destination);
-    if (delta) require(receiver.head("main").id == heads.first, "destination is not at base revision");
+    if (delta) require(receiver.head("main") == heads.first, "destination is not at base revision");
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     BundleImportProfile profile{};
-    const BundleImportResult result = receiver.importBranchBundle(bundle, "main", {}, &profile);
+    const RevisionBundleImport result = receiver.importBundle(bundle, "main", {}, &profile);
     const std::chrono::steady_clock::time_point imported = std::chrono::steady_clock::now();
-    require(receiver.head("main").id == expected, "imported branch head differs from source");
+    require(receiver.head("main") == expected, "imported branch head differs from source");
     const std::uint64_t afterImportKiB = peakResidentKiB();
     const VerificationReport report = receiver.verifyRepository();
     const std::chrono::steady_clock::time_point checked = std::chrono::steady_clock::now();
@@ -259,7 +263,7 @@ void import(const std::filesystem::path& fixture, const std::filesystem::path& d
               << "\nverified_reachable_objects=" << report.reachableObjects
               << "\nbundle_bytes=" << std::filesystem::file_size(bundle)
               << "\nstorage_pack_bytes=" << receiver.packSize()
-              << "\nhead=" << aowis::dvmdb::toHex(result.head) << '\n';
+              << "\nhead=" << result.head.toString() << '\n';
 }
 
 } // namespace

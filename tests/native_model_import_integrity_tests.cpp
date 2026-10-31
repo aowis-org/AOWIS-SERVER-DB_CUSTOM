@@ -1,4 +1,6 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
+#include "revision_bundle_builder.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +21,8 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
@@ -63,14 +67,13 @@ struct TemporaryDirectory {
     std::filesystem::path path;
 };
 
-struct BundleBuilder {
-    std::map<Hash, Bytes> objects;
+using aowis::dvmdb::test::BuiltRevision;
 
-    Hash add(const Bytes& bytes) {
-        const Hash hash = aowis::dvmdb::sha256(bytes);
-        this->objects.emplace(hash, bytes);
-        return hash;
-    }
+// Model-aware objects on top of the shared UUIDv7 bundle builder. Every
+// revision built here is model-indexed.
+struct BundleBuilder : aowis::dvmdb::test::RevisionBundleBuilder {
+    explicit BundleBuilder(aowis::dvmdb::ProjectId project = aowis::dvmdb::ProjectId::generate())
+        : RevisionBundleBuilder(project) {}
 
     Hash modelValue(const std::vector<Key>& references, bool noncanonical = false) {
         Bytes envelope = aowis::dvmdb::encodeModelRecord(
@@ -154,41 +157,14 @@ struct BundleBuilder {
         return add(branch);
     }
 
-    Hash revision(const Hash& modelRoot, const Hash& incomingRoot,
-                  const std::optional<Hash>& parent = std::nullopt,
-                  const std::optional<Hash>& mergeParent = std::nullopt) {
-        Bytes encoded{'S'};
-        appendHash(encoded, modelRoot);
-        appendHash(encoded, incomingRoot);
-        encoded.push_back(1);
+    BuiltRevision revision(const Hash& modelRoot, const Hash& incomingRoot,
+                           const std::optional<BuiltRevision>& parent = std::nullopt,
+                           const std::optional<BuiltRevision>& mergeParent = std::nullopt) {
         expect(!mergeParent || parent.has_value(), "merge parent requires first parent");
-        encoded.push_back(mergeParent ? 2U : parent ? 1U : 0U);
-        if (parent) appendHash(encoded, *parent);
-        if (mergeParent) appendHash(encoded, *mergeParent);
-        return add(encoded);
-    }
-
-    void write(const std::filesystem::path& path, const Hash& tip,
-               const std::optional<Hash>& base = std::nullopt,
-               const std::optional<aowis::dvmdb::BranchId>& branchId = std::nullopt) const {
-        Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C',
-                     static_cast<std::uint8_t>(base ? '4' : '3')};
-        appendHash(bundle, tip);
-        appendU64(bundle, this->objects.size());
-        if (base) appendHash(bundle, *base);
-        const aowis::dvmdb::BranchId id = branchId.value_or(aowis::dvmdb::BranchId::generate());
-        const std::array<std::uint8_t, 16>& uuid = id.uuid().bytes;
-        bundle.insert(bundle.end(), uuid.begin(), uuid.end());
-        for (const std::pair<const Hash, Bytes>& object : this->objects) {
-            appendHash(bundle, object.first);
-            appendU64(bundle, object.second.size());
-            bundle.insert(bundle.end(), object.second.begin(), object.second.end());
-        }
-        std::ofstream output(path, std::ios::binary);
-        expect(output.good(), "cannot create model import test bundle");
-        output.write(reinterpret_cast<const char*>(bundle.data()),
-                     static_cast<std::streamsize>(bundle.size()));
-        expect(output.good(), "cannot write model import test bundle");
+        std::vector<BuiltRevision> parents;
+        if (parent) parents.push_back(*parent);
+        if (mergeParent) parents.push_back(*mergeParent);
+        return RevisionBundleBuilder::revision(modelRoot, incomingRoot, true, parents);
     }
 };
 
@@ -202,7 +178,7 @@ enum class Fault {
     InvalidAncestor, InvalidSecondParent, SharedRootDifferentReverseIndex
 };
 
-Hash makeFixture(BundleBuilder& builder, Fault fault) {
+BuiltRevision makeFixture(BundleBuilder& builder, Fault fault) {
     std::map<Key, std::vector<Key>> records{{key(1), {}}, {key(2), {key(1)}}};
     std::map<Key, std::vector<Key>> incoming{{key(1), {key(2)}}};
     switch (fault) {
@@ -266,30 +242,30 @@ Hash makeFixture(BundleBuilder& builder, Fault fault) {
     const Hash modelRoot = builder.tree(models);
     const Hash reverseRoot = builder.tree(index);
     if (fault == Fault::InvalidAncestor) {
-        const Hash badParent = builder.revision(modelRoot, Hash{});
+        const BuiltRevision badParent = builder.revision(modelRoot, Hash{});
         return builder.revision(modelRoot, reverseRoot, badParent);
     }
     if (fault == Fault::InvalidSecondParent) {
-        const Hash goodParent = builder.revision(modelRoot, reverseRoot);
-        const Hash badOtherParent = builder.revision(modelRoot, Hash{});
+        const BuiltRevision goodParent = builder.revision(modelRoot, reverseRoot);
+        const BuiltRevision badOtherParent = builder.revision(modelRoot, Hash{});
         return builder.revision(modelRoot, reverseRoot, goodParent, badOtherParent);
     }
     if (fault == Fault::SharedRootDifferentReverseIndex) {
-        const Hash goodParent = builder.revision(modelRoot, reverseRoot);
+        const BuiltRevision goodParent = builder.revision(modelRoot, reverseRoot);
         return builder.revision(modelRoot, Hash{}, goodParent);
     }
     return builder.revision(modelRoot, reverseRoot);
 }
 
-void expectRejected(Repository& target, const std::filesystem::path& bundle,
+void expectRejected(ProjectRepository& target, const std::filesystem::path& bundle,
                     const std::string& label, std::string_view reason,
                     std::string_view branch = "incoming") {
     const std::uint64_t objectsBefore = target.objectCount();
     const std::uint64_t packBefore = target.packSize();
-    const Hash headBefore = target.head("stable").id;
+    const RevisionId headBefore = target.head("stable");
     bool rejected = false;
     try {
-        (void)target.importBranchBundle(bundle, branch);
+        (void)target.importBundle(bundle, branch);
     } catch (const aowis::dvmdb::StorageError& error) {
         rejected = true;
         expect(std::string(error.what()).find(reason) != std::string::npos,
@@ -300,7 +276,7 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
                aowis::dvmdb::StorageError::kindName(error.kind()) + ")");
     }
     expect(rejected, "forged model history accepted: " + label);
-    expect(target.head("stable").id == headBefore &&
+    expect(target.head("stable") == headBefore &&
            target.objectCount() == objectsBefore && target.packSize() == packBefore,
            "rejected model import wrote pack objects: " + label);
     expect(target.listBranches() == std::vector<std::string>{"stable"},
@@ -309,7 +285,7 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
 
 void testMalformedFull() {
     TemporaryDirectory temporary("forged-full");
-    Repository target(temporary.path / "target");
+    ProjectRepository target(temporary.path / "target");
     target.createBranch("stable");
     target.commit("stable", {{key(42), Bytes{'s', 'a', 'f', 'e'}}});
     struct Case { Fault fault; const char* label; const char* reason; };
@@ -330,8 +306,8 @@ void testMalformedFull() {
          "missing model references"}
     };
     for (const Case& invalid : cases) {
-        BundleBuilder builder;
-        const Hash tip = makeFixture(builder, invalid.fault);
+        BundleBuilder builder(target.project());
+        const BuiltRevision tip = makeFixture(builder, invalid.fault);
         const std::filesystem::path path = temporary.path / "untrusted.bundle";
         builder.write(path, tip);
         expectRejected(target, path, invalid.label, invalid.reason);
@@ -342,25 +318,25 @@ void testMalformedFull() {
 
 void testReproducedUnsafeDeletion() {
     TemporaryDirectory temporary("unsafe-deletion");
-    Repository target(temporary.path / "target");
+    ProjectRepository target(temporary.path / "target");
     target.createBranch("stable");
     target.commit("stable", {{key(42), Bytes{'b', 'a', 's', 'e'}}});
-    BundleBuilder forged;
-    const Hash tip = makeFixture(forged, Fault::MissingIncoming);
+    BundleBuilder forged(target.project());
+    const BuiltRevision tip = makeFixture(forged, Fault::MissingIncoming);
     const std::filesystem::path path = temporary.path / "forged.bundle";
     forged.write(path, tip);
     expectRejected(target, path, "dependent B invisible to index", "missing model references");
     // A valid import of the SAME two model records must preserve the deletion
     // invariant, rather than simply rejecting all model-containing bundles.
-    BundleBuilder valid;
+    BundleBuilder valid(target.project());
     std::map<Key, Hash> models{{key(1), valid.modelValue({})},
                                 {key(2), valid.modelValue({key(1)})}};
     std::map<Key, Hash> inbound{{key(1), valid.incomingValue({key(2)})}};
-    const Hash good = valid.revision(valid.tree(models), valid.tree(inbound));
+    const BuiltRevision good = valid.revision(valid.tree(models), valid.tree(inbound));
     valid.write(temporary.path / "valid.bundle", good);
-    expect(target.importBranchBundle(temporary.path / "valid.bundle", "models").head == good,
+    expect(target.importBundle(temporary.path / "valid.bundle", "models").head == good.id,
            "valid model import rejected");
-    expect(target.referencingModel("models", key(1)) == std::vector<Key>{key(2)},
+    expect(target.referencing("models", key(1)) == std::vector<Key>{key(2)},
            "imported dependency not indexed");
     bool refused = false;
     try {
@@ -368,7 +344,7 @@ void testReproducedUnsafeDeletion() {
     } catch (const std::runtime_error&) {
         refused = true;
     }
-    expect(refused && target.head("models").id == good &&
+    expect(refused && target.head("models") == good.id &&
            target.getModel("models", key(1)).has_value() &&
            target.getModel("models", key(2)).has_value(),
            "valid imported model allowed deletion of referenced UUID");
@@ -376,7 +352,7 @@ void testReproducedUnsafeDeletion() {
 
 void testValidCyclesAndHistory() {
     TemporaryDirectory temporary("valid-graphs");
-    Repository target(temporary.path / "target");
+    ProjectRepository target(temporary.path / "target");
     BundleBuilder builder;
     std::map<Key, Hash> models{{key(1), builder.modelValue({key(2)})},
                                 {key(2), builder.modelValue({key(1)})},
@@ -385,12 +361,12 @@ void testValidCyclesAndHistory() {
                                 {key(2), builder.incomingValue({key(1)})}};
     const Hash root = builder.tree(models);
     const Hash references = builder.tree(inbound);
-    const Hash initial = builder.revision(root, references);
-    const Hash next = builder.revision(root, references, initial);
+    const BuiltRevision initial = builder.revision(root, references);
+    const BuiltRevision next = builder.revision(root, references, initial);
     builder.write(temporary.path / "cycles.bundle", next);
-    expect(target.importBranchBundle(temporary.path / "cycles.bundle", "models").head == next &&
-           target.referencingModelAtRevision(initial, key(1)) == std::vector<Key>{key(2)} &&
-           target.referencingModel("models", key(2)) == std::vector<Key>{key(1)},
+    expect(target.importBundle(temporary.path / "cycles.bundle", "models").head == next.id &&
+           target.referencingAt(initial.id, key(1)) == std::vector<Key>{key(2)} &&
+           target.referencing("models", key(2)) == std::vector<Key>{key(1)},
            "valid model cycles/shared historical roots not preserved");
     target.verifyPack();
 }
@@ -430,12 +406,12 @@ void testLargeReferenceGraph() {
     std::map<Key, Hash> incoming;
     for (const Key& target : targets)
         incoming.emplace(target, builder.incomingValue(sources));
-    const Hash valid = builder.revision(root, builder.tree(incoming));
+    const BuiltRevision valid = builder.revision(root, builder.tree(incoming));
     builder.write(temporary.path / "valid.bundle", valid);
-    Repository receiver(temporary.path / "receiver");
-    expect(receiver.importBranchBundle(temporary.path / "valid.bundle", "models").head == valid,
+    ProjectRepository receiver(temporary.path / "receiver");
+    expect(receiver.importBundle(temporary.path / "valid.bundle", "models").head == valid.id,
            "large reference graph import rejected");
-    expect(receiver.referencingModel("models", targets[17]).size() == sources.size(),
+    expect(receiver.referencing("models", targets[17]).size() == sources.size(),
            "large graph reverse index lost edges");
     (void)receiver.verifyRepository();
     expect(std::filesystem::is_empty(receiver.scratchDirectory()),
@@ -444,13 +420,13 @@ void testLargeReferenceGraph() {
     // If scratch space cannot be created, fail before importing any objects
     // or publishing a branch. This exercises the external-sort failure path
     // rather than allowing a fallback that silently skips verification.
-    Repository inaccessible(temporary.path / "inaccessible");
+    ProjectRepository inaccessible(temporary.path / "inaccessible");
     const std::filesystem::path unusable = inaccessible.scratchDirectory();
     std::filesystem::remove(unusable);
     { std::ofstream blocker(unusable); } // a regular file where the directory belongs
     bool failedWithoutScratch = false;
     try {
-        (void)inaccessible.importBranchBundle(temporary.path / "valid.bundle", "models");
+        (void)inaccessible.importBundle(temporary.path / "valid.bundle", "models");
     } catch (const std::exception&) {
         failedWithoutScratch = true;
     }
@@ -460,7 +436,10 @@ void testLargeReferenceGraph() {
 
     // Change just one stored reverse index value while keeping every object
     // hash and trie path valid. The sorted comparison must find the omission.
-    BundleBuilder forged;
+    ProjectRepository rejected(temporary.path / "rejected");
+    rejected.createBranch("stable");
+    (void)rejected.commit("stable", {{key(230), Bytes{'s'}}});
+    BundleBuilder forged(rejected.project());
     std::map<Key, Hash> badModels;
     for (const Key& target : targets)
         badModels.emplace(target, forged.modelValue({}));
@@ -472,11 +451,8 @@ void testLargeReferenceGraph() {
         if (target == targets[37]) actual.erase(actual.begin() + 87);
         badIncoming.emplace(target, forged.incomingValue(actual));
     }
-    const Hash invalid = forged.revision(forged.tree(badModels), forged.tree(badIncoming));
+    const BuiltRevision invalid = forged.revision(forged.tree(badModels), forged.tree(badIncoming));
     forged.write(temporary.path / "forged.bundle", invalid);
-    Repository rejected(temporary.path / "rejected");
-    rejected.createBranch("stable");
-    (void)rejected.commit("stable", {{key(230), Bytes{'s'}}});
     expectRejected(rejected, temporary.path / "forged.bundle", "large missing incoming edge",
                    "does not match model records");
     expect(std::filesystem::is_empty(rejected.scratchDirectory()),
@@ -491,14 +467,14 @@ void testDeepSharedModelHistory() {
     BundleBuilder builder;
     const Hash value = builder.modelValue({});
     const Hash modelRoot = builder.tree({{key(1), value}});
-    Hash tip = builder.revision(modelRoot, Hash{});
+    BuiltRevision tip = builder.revision(modelRoot, Hash{});
     for (unsigned i = 0; i < 2500; ++i) {
         tip = builder.revision(modelRoot, Hash{}, tip);
     }
     const std::filesystem::path bundle = temporary.path / "long.bundle";
     builder.write(bundle, tip);
-    Repository receiver(temporary.path / "receiver");
-    expect(receiver.importBranchBundle(bundle, "models").head == tip,
+    ProjectRepository receiver(temporary.path / "receiver");
+    expect(receiver.importBundle(bundle, "models").head == tip.id,
            "deep history model import failed");
     expect(receiver.verifyRepository().revisions == 2501,
            "deep history lost revision ancestry");
@@ -519,9 +495,9 @@ void testHistoricalReferenceDeltas() {
     std::map<Key, Hash> baseIndex{{key(1), incomingTwo}};
     const Hash baseModelRoot = builder.tree(baseModels);
     const Hash baseRefRoot = builder.tree(baseIndex);
-    const Hash parent = builder.revision(baseModelRoot, baseRefRoot);
+    const BuiltRevision parent = builder.revision(baseModelRoot, baseRefRoot);
 
-    struct Case { std::string label; Hash tip; bool valid; };
+    struct Case { std::string label; BuiltRevision tip; bool valid; };
     std::vector<Case> cases;
     {
         std::map<Key, Hash> models = baseModels;
@@ -573,7 +549,7 @@ void testHistoricalReferenceDeltas() {
     }
     {
         // A valid merge tip cannot launder a poisoned second-parent revision.
-        const Hash bad = builder.revision(baseModelRoot, Hash{}, parent);
+        const BuiltRevision bad = builder.revision(baseModelRoot, Hash{}, parent);
         cases.push_back({"poisoned second merge parent",
                          builder.revision(baseModelRoot, baseRefRoot, parent, bad), false});
     }
@@ -581,40 +557,40 @@ void testHistoricalReferenceDeltas() {
         const std::filesystem::path bundle = temporary.path / (fixture.label + ".bundle");
         // BundleBuilder accumulates cases; export only the objects reachable
         // from this particular tip, exactly as a real branch export does.
-        BundleBuilder filtered;
+        BundleBuilder filtered(builder.project());
         const std::function<void(const Hash&)> include = [&](const Hash& hash) {
-            if (hash == Hash{} || filtered.objects.contains(hash)) return;
-            const Bytes& object = builder.objects.at(hash);
-            filtered.objects.emplace(hash, object);
+            if (hash == Hash{} || filtered.objects().contains(hash)) return;
+            const Bytes& object = builder.objects().at(hash);
+            filtered.objects().emplace(hash, object);
             const std::function<Hash(std::size_t)> hashAt = [&](std::size_t offset) {
                 Hash child{};
                 std::copy_n(object.begin() + static_cast<std::ptrdiff_t>(offset),
                             32, child.begin());
                 return child;
             };
-            if (object[0] == 'S') {
-                include(hashAt(1));
-                include(hashAt(33));
-                for (unsigned i = 0; i < object[66]; ++i) include(hashAt(67 + 32U * i));
+            if (object[0] == 'T') { // UUIDv7 revision record
+                include(hashAt(34));
+                include(hashAt(66));
+                for (unsigned i = 0; i < object[99]; ++i) include(hashAt(100 + 48U * i + 16U));
             } else if (object[0] == 'B') {
                 for (unsigned i = 0; i < 16; ++i) include(hashAt(18 + 32U * i));
             } else if (object[0] == 'L') {
                 include(hashAt(17));
             }
         };
-        include(fixture.tip);
+        include(fixture.tip.hash);
         filtered.write(bundle, fixture.tip);
-        Repository receiver(temporary.path / fixture.label);
+        ProjectRepository receiver(temporary.path / fixture.label);
         const std::uint64_t initialObjects = receiver.objectCount();
         if (fixture.valid) {
-            expect(receiver.importBranchBundle(bundle, "models").head == fixture.tip,
+            expect(receiver.importBundle(bundle, "models").head == fixture.tip.id,
                    "valid historical model delta was rejected: " + fixture.label);
             expect(receiver.verifyRepository().revisions >= 2,
                    "valid historical history failed independent verification");
         } else {
             bool rejected = false;
             try {
-                (void)receiver.importBranchBundle(bundle, "models");
+                (void)receiver.importBundle(bundle, "models");
             } catch (const std::runtime_error&) {
                 rejected = true;
             }
@@ -627,36 +603,38 @@ void testHistoricalReferenceDeltas() {
 
 void testMalformedIncremental() {
     TemporaryDirectory temporary("incremental");
-    Repository source(temporary.path / "source");
-    Repository destination(temporary.path / "destination");
+    ProjectRepository source(temporary.path / "source");
+    ProjectRepository destination(temporary.path / "destination");
     source.createBranch("models");
-    const Hash base = source.commitModel("models", {
+    const RevisionId base = source.commitModel("models", {
         {key(1), ModelRecord{1, {}, Bytes{'a'}}},
-        {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}}).id;
-    source.exportBranchBundle("models", temporary.path / "base.bundle");
-    destination.importBranchBundle(temporary.path / "base.bundle", "stable");
+        {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}});
+    source.exportBundle("models", temporary.path / "base.bundle");
+    destination.importBundle(temporary.path / "base.bundle", "stable");
 
-    BundleBuilder forged;
+    BundleBuilder forged(destination.project());
     std::map<Key, Hash> models{{key(1), forged.modelValue({})},
                                 {key(2), forged.modelValue({key(1)})},
                                 {key(3), forged.modelValue({key(1)})}};
     const Hash root = forged.tree(models);
     std::map<Key, Hash> badInbound{{key(1), forged.incomingValue({key(2)})}};
-    const Hash malicious = forged.revision(root, forged.tree(badInbound), base);
-    forged.write(temporary.path / "bad-incremental.bundle", malicious, base);
+    const BuiltRevision baseRevision{base, source.revision(base).recordHash};
+    const BuiltRevision malicious = forged.revision(root, forged.tree(badInbound), baseRevision);
+    forged.write(temporary.path / "bad-incremental.bundle", malicious, baseRevision,
+                 source.branchId("models"));
     expectRejected(destination, temporary.path / "bad-incremental.bundle",
                    "forged incremental fast-forward", "does not match model records", "stable");
 
     // A real incremental bundle should still round-trip between two
     // stores, including borrowed tree/value objects from the existing base.
-    const Hash latest = source.commitModel("models", {
-        {key(3), ModelRecord{1, {key(1)}, Bytes{'c'}}}}).id;
-    source.exportIncrementalBranchBundle("models", base,
+    const RevisionId latest = source.commitModel("models", {
+        {key(3), ModelRecord{1, {key(1)}, Bytes{'c'}}}});
+    source.exportIncrementalBundle("models", base,
                                          temporary.path / "valid-incremental.bundle");
-    expect(destination.importBranchBundle(temporary.path / "valid-incremental.bundle",
+    expect(destination.importBundle(temporary.path / "valid-incremental.bundle",
                                           "stable").status == BundleImportStatus::FastForward &&
-           destination.head("stable").id == latest &&
-           destination.referencingModel("stable", key(1)) ==
+           destination.head("stable") == latest &&
+           destination.referencing("stable", key(1)) ==
                (std::vector<Key>{key(2), key(3)}),
            "valid incremental model synchronization failed");
 }

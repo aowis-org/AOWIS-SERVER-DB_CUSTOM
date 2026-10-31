@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 #include "uuid_branch_fixture.h"
 
 #include <algorithm>
@@ -20,6 +21,8 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
 using aowis::dvmdb::Key;
@@ -61,8 +64,17 @@ void appendU64(Bytes& bytes, std::uint64_t value) {
         bytes.push_back(static_cast<std::uint8_t>(value >> (56U - position * 8U)));
     }
 }
+// A forged revision: its UUID and the digest its binding names.
+struct ForgedRevision {
+    RevisionId id;
+    Hash hash{};
+};
+
 struct ForgedObjects {
+    explicit ForgedObjects(aowis::dvmdb::ProjectId owner) : project(owner) {}
+    aowis::dvmdb::ProjectId project;
     std::map<Hash, Bytes> entries;
+    std::vector<ForgedRevision> bindings;
     Hash add(const Bytes& bytes) {
         const Hash hash = aowis::dvmdb::sha256(bytes);
         this->entries.emplace(hash, bytes);
@@ -100,17 +112,23 @@ struct ForgedObjects {
         }
         return add(bytes);
     }
-    Hash revision(const Hash& root, const Hash& reverse, bool model,
-                  const std::optional<Hash>& parent = std::nullopt,
-                  const std::optional<Hash>& secondParent = std::nullopt) {
-        Bytes bytes{'S'};
-        appendHash(bytes, root);
-        appendHash(bytes, reverse);
-        bytes.push_back(model ? 1U : 0U);
-        bytes.push_back(secondParent ? 2U : parent ? 1U : 0U);
-        if (parent) appendHash(bytes, *parent);
-        if (secondParent) appendHash(bytes, *secondParent);
-        return add(bytes);
+    ForgedRevision revision(const Hash& root, const Hash& reverse, bool model,
+                            const std::optional<ForgedRevision>& parent = std::nullopt,
+                            const std::optional<ForgedRevision>& secondParent = std::nullopt,
+                            std::uint8_t modelFlag = 0xff) {
+        std::vector<std::pair<RevisionId, Hash>> parents;
+        if (parent) parents.emplace_back(parent->id, parent->hash);
+        if (secondParent) parents.emplace_back(secondParent->id, secondParent->hash);
+        const RevisionId id = RevisionId::generate();
+        const Hash hash = add(aowis::dvmdb::test::forgedRevisionRecord(
+            id, this->project, root, reverse, modelFlag == 0xff ? (model ? 1 : 0) : modelFlag,
+            parents));
+        return bind(id, hash);
+    }
+    // A published UUID binding to an arbitrary digest (possibly not a record).
+    ForgedRevision bind(const RevisionId& id, const Hash& hash) {
+        this->bindings.push_back(ForgedRevision{id, hash});
+        return this->bindings.back();
     }
 };
 
@@ -119,6 +137,8 @@ struct ForgedObjects {
 // The pack must still pass its independent checksum verification.
 void inject(const std::filesystem::path& directory,
             const ForgedObjects& forged) {
+    for (const ForgedRevision& revision : forged.bindings)
+        aowis::dvmdb::test::forgeBinding(directory, forged.project, revision.id, revision.hash);
     std::ofstream output(directory / "objects.pack", std::ios::binary | std::ios::app);
     expect(output.good(), "cannot append forged pack objects");
     for (const std::pair<const Hash, Bytes>& entry : forged.entries) {
@@ -132,10 +152,9 @@ void inject(const std::filesystem::path& directory,
         expect(output.good(), "cannot write forged pack entry");
     }
 }
-void repoint(const std::filesystem::path& directory, const Hash& tip) {
-    Repository repository(directory);
-    aowis::dvmdb::test::overwriteBranch(repository, directory, "stable",
-                                        aowis::dvmdb::toHex(tip));
+void repoint(const std::filesystem::path& directory, const ForgedRevision& tip) {
+    ProjectRepository repository(directory);
+    aowis::dvmdb::test::repointBranch(repository.native(), directory, "stable", tip.id, tip.hash);
 }
 
 enum class Fault {
@@ -146,13 +165,13 @@ enum class Fault {
     ZeroModelUuid, InvalidModelValue, ZeroIncomingTarget
 };
 
-Hash makeBadHistory(ForgedObjects& objects, Fault fault, const Hash& goodHead) {
+ForgedRevision makeBadHistory(ForgedObjects& objects, Fault fault, const ForgedRevision& goodHead) {
     const Hash value = objects.rawValue();
     const Hash leafOne = objects.leaf(key(1), value);
     const Hash leafTwo = objects.leaf(key(2), value);
     switch (fault) {
     case Fault::InvalidRevision:
-        return value; // valid object, wrong revision type
+        return objects.bind(RevisionId::generate(), value); // valid object, not a revision
     case Fault::InvalidRootTag:
         return objects.revision(objects.add(Bytes{'X'}), Hash{}, false, goodHead);
     case Fault::WrongChildSlot:
@@ -178,25 +197,20 @@ Hash makeBadHistory(ForgedObjects& objects, Fault fault, const Hash& goodHead) {
         return objects.revision(objects.branch(a, b, 2), wrongIncoming, true, goodHead);
     }
     case Fault::InvalidSecondParent: {
-        const Hash badParent = objects.revision(objects.add(Bytes{'X'}), Hash{}, false);
+        const ForgedRevision badParent = objects.revision(objects.add(Bytes{'X'}), Hash{}, false);
         return objects.revision(leafOne, Hash{}, false, goodHead, badParent);
     }
     case Fault::InvalidFirstParent: {
-        const Hash badParent = objects.revision(objects.add(Bytes{'X'}), Hash{}, false);
+        const ForgedRevision badParent = objects.revision(objects.add(Bytes{'X'}), Hash{}, false);
         return objects.revision(leafOne, Hash{}, false, badParent);
     }
     case Fault::MissingRevision:
-        return aowis::dvmdb::sha256(Bytes{'S', 'm', 'i', 's', 's', 'i', 'n', 'g'});
-    case Fault::InvalidRevisionMetadata: {
-        Bytes bytes{'S'};
-        appendHash(bytes, leafOne);
-        appendHash(bytes, Hash{});
-        bytes.push_back(5); // invalid modelIndexed flag
-        bytes.push_back(0);
-        return objects.add(bytes);
-    }
+        return objects.bind(RevisionId::generate(),
+                            aowis::dvmdb::sha256(Bytes{'T', 'm', 'i', 's', 's', 'i', 'n', 'g'}));
+    case Fault::InvalidRevisionMetadata:
+        return objects.revision(leafOne, Hash{}, false, goodHead, std::nullopt, 5); // bad flag
     case Fault::InvalidBranchRef:
-        return Hash{};
+        return ForgedRevision{RevisionId::generate(), Hash{}};
     case Fault::RawIndexPresent:
         return objects.revision(leafOne,
             objects.leaf(key(1), objects.inboundValue(key(2))), false, goodHead);
@@ -217,20 +231,22 @@ Hash makeBadHistory(ForgedObjects& objects, Fault fault, const Hash& goodHead) {
 void testCorruption(Fault fault, const std::string& reason) {
     TemporaryDirectory temp("corrupt");
     const std::filesystem::path directory = temp.path / "repo";
-    Hash original{};
+    std::optional<ForgedObjects> forged;
+    ForgedRevision original{RevisionId::generate(), Hash{}};
     {
-        Repository repository(directory);
+        ProjectRepository repository(directory);
         repository.createBranch("stable");
-        original = repository.commit("stable", {{key(42), Bytes{'g', 'o', 'o', 'd'}}}).id;
-        expect(repository.verifyRepository().revisions == 2,
+        original.id = repository.commit("stable", {{key(42), Bytes{'g', 'o', 'o', 'd'}}});
+        original.hash = repository.revision(original.id).recordHash;
+        expect(repository.verifyRepository().revisions == 1,
                "original repository does not pass full verification");
+        forged.emplace(repository.project());
     }
-    ForgedObjects forged;
-    const Hash tip = makeBadHistory(forged, fault, original);
-    inject(directory, forged);
+    const ForgedRevision tip = makeBadHistory(*forged, fault, original);
+    inject(directory, *forged);
     if (fault == Fault::InvalidBranchRef) {
-        Repository live(directory);
-        aowis::dvmdb::test::overwriteBranch(live, directory, "stable", "invalid-ref");
+        ProjectRepository live(directory);
+        aowis::dvmdb::test::overwriteBranch(live.native(), directory, "stable", "invalid-ref");
     } else {
         repoint(directory, tip);
     }
@@ -238,12 +254,12 @@ void testCorruption(Fault fault, const std::string& reason) {
     // published record is rejected earlier than full graph verification.
     if (fault == Fault::InvalidBranchRef) {
         bool refused = false;
-        try { Repository invalid(directory); }
+        try { ProjectRepository invalid(directory); }
         catch (const std::exception&) { refused = true; }
         expect(refused, "invalid UUID branch record survived repository open");
         return;
     }
-    Repository repository(directory);
+    ProjectRepository repository(directory);
     repository.verifyPack(); // Physically valid even though logically invalid
     const std::uint64_t objects = repository.objectCount();
     const std::uint64_t bytes = repository.packSize();
@@ -262,26 +278,27 @@ void testCorruption(Fault fault, const std::string& reason) {
 
 void testValidHistories() {
     TemporaryDirectory temp("valid");
-    Repository repo(temp.path / "repo");
+    ProjectRepository repo(temp.path / "repo");
     const VerificationReport empty = repo.verifyRepository();
     expect(empty.branches == 0 && empty.revisions == 0 && empty.physicalObjects == 0,
            "empty repository verification counts are wrong");
     repo.createBranch("main");
-    const Hash first = repo.commitModel("main", {
+    const RevisionId first = repo.commitModel("main", {
         {key(1), ModelRecord{1, {}, Bytes{'a'}}},
-        {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}}).id;
+        {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}});
     repo.createBranch("feature", "main");
     (void)repo.commitModel("feature", {{key(3), ModelRecord{1, {key(1)}, Bytes{'c'}}}});
     (void)repo.commitModel("main", {{key(4), ModelRecord{1, {key(2)}, Bytes{'d'}}}});
-    const aowis::dvmdb::MergeResult merge = repo.mergeBranches("main", "feature");
-    expect(merge.status == aowis::dvmdb::MergeStatus::Merged &&
-           merge.revision.parents.size() == 2, "test fixture did not produce merge");
+    const aowis::dvmdb::MergeResult merge = repo.merge("main", "feature");
+    expect(merge.status == aowis::dvmdb::MergeStatus::Merged && merge.resultHead &&
+           repo.revision(*merge.resultHead).parents.size() == 2,
+           "test fixture did not produce merge");
     const VerificationReport result = repo.verifyRepository();
-    expect(result.branches == 2 && result.revisions >= 5 &&
+    expect(result.branches == 2 && result.revisions == 4 &&
            result.modelSnapshots >= 3 && result.treeNodes != 0 &&
            result.reachableObjects >= result.revisions &&
            result.physicalObjects >= result.reachableObjects &&
-           repo.head("main").id == merge.revision.id &&
+           repo.head("main") == *merge.resultHead &&
            repo.revision(first).id == first,
            "valid history verification returned incorrect results");
     repo.verifyPack();
@@ -296,14 +313,14 @@ void testValidHistories() {
 
 void testCrossBackend() {
     TemporaryDirectory temp("transfer");
-    Repository original(temp.path / "pack");
+    ProjectRepository original(temp.path / "pack");
     original.createBranch("models");
     (void)original.commitModel("models", {
         {key(1), ModelRecord{1, {}, Bytes{'a'}}},
         {key(2), ModelRecord{1, {key(1)}, Bytes{'b'}}}});
-    original.exportBranchBundle("models", temp.path / "history.bundle");
-    Repository destination(temp.path / "recipient");
-    destination.importBranchBundle(temp.path / "history.bundle", "models");
+    original.exportBundle("models", temp.path / "history.bundle");
+    ProjectRepository destination(temp.path / "recipient");
+    destination.importBundle(temp.path / "history.bundle", "models");
     expect(destination.verifyRepository().revisions ==
                original.verifyRepository().revisions,
            "full verification differs after independent repository replication");
@@ -315,7 +332,7 @@ void testPhysicalCorruption() {
     TemporaryDirectory temp("physical");
     const std::filesystem::path directory = temp.path / "repo";
     {
-        Repository repo(directory);
+        ProjectRepository repo(directory);
         repo.createBranch("stable");
         (void)repo.commit("stable", {{key(5), Bytes{'x', 'y', 'z'}}});
         (void)repo.verifyRepository();
@@ -335,7 +352,7 @@ void testPhysicalCorruption() {
     stream.close();
     bool refused = false;
     try {
-        Repository invalid(directory);
+        ProjectRepository invalid(directory);
         invalid.verifyPack();
         (void)invalid.verifyRepository();
     } catch (const std::exception&) {
@@ -367,23 +384,25 @@ int runCli(const std::string& executable, const std::filesystem::path& directory
 void testCli(const std::string& executable) {
     TemporaryDirectory temp("cli");
     const std::filesystem::path directory = temp.path / "repo";
-    Hash oldHead{};
+    std::optional<ForgedObjects> forged;
+    ForgedRevision oldHead{RevisionId::generate(), Hash{}};
     {
-        Repository repo(directory);
+        ProjectRepository repo(directory);
         repo.createBranch("main");
-        oldHead = repo.head("main").id;
+        oldHead.id = repo.commit("main", {{key(3), Bytes{'o', 'k'}}});
+        oldHead.hash = repo.revision(oldHead.id).recordHash;
+        forged.emplace(repo.project());
     }
     expect(runCli(executable, directory, "") == 0 &&
            runCli(executable, directory, "--full") == 0 &&
            runCli(executable, directory, "--physical") == 0,
            "valid repository CLI verification failed");
-    ForgedObjects forged;
-    const Hash bad = forged.revision(forged.add(Bytes{'X'}), Hash{}, false, oldHead);
-    inject(directory, forged);
+    const ForgedRevision bad = forged->revision(forged->add(Bytes{'X'}), Hash{}, false, oldHead);
+    inject(directory, *forged);
     // Repoint the actual branch to the forged tip; invalid content remains checksum-correct.
     {
-        Repository live(directory);
-        aowis::dvmdb::test::overwriteBranch(live, directory, "main", aowis::dvmdb::toHex(bad));
+        ProjectRepository live(directory);
+        aowis::dvmdb::test::repointBranch(live.native(), directory, "main", bad.id, bad.hash);
     }
     expect(runCli(executable, directory, "--physical") == 0 &&
            runCli(executable, directory, "--full") == 1 &&
@@ -399,7 +418,7 @@ int main(int argc, char** argv) {
             testValidHistories();
             for (const std::pair<Fault, std::string>& entry :
                  std::vector<std::pair<Fault, std::string>>{
-                    {Fault::InvalidRevision, "invalid bundled revision"},
+                    {Fault::InvalidRevision, "truncated revision record"},
                     {Fault::InvalidRootTag, "invalid bundled tree tag"},
                     {Fault::WrongChildSlot, "wrong slot"},
                     {Fault::MissingRawValue, "missing"},
@@ -409,9 +428,9 @@ int main(int argc, char** argv) {
                     {Fault::InvalidSecondParent, "invalid bundled tree tag"},
                     {Fault::InvalidFirstParent, "invalid bundled tree tag"},
                     {Fault::MissingRevision, "missing"},
-                    {Fault::InvalidRevisionMetadata, "invalid bundled revision metadata"},
+                    {Fault::InvalidRevisionMetadata, "invalid indexing flag"},
                     {Fault::InvalidBranchRef, "invalid branch"},
-                    {Fault::RawIndexPresent, "raw bundled revision has reference index"},
+                    {Fault::RawIndexPresent, "raw revision cannot contain model references"},
                     {Fault::ZeroModelUuid, "model tree contains zero UUID"},
                     {Fault::InvalidModelValue, "invalid native model record"},
                     {Fault::ZeroIncomingTarget, "incoming-reference target is zero"}}) {

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <array>
 #include <fcntl.h>
@@ -18,6 +19,8 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
 using aowis::dvmdb::Hash;
@@ -60,7 +63,7 @@ Bytes value(std::uint8_t number) {
 }
 
 void baseline(const std::filesystem::path& path, bool model) {
-    Repository repository(path);
+    ProjectRepository repository(path);
     repository.createBranch("main");
     if (model) {
         repository.commitModel("main", {
@@ -74,9 +77,9 @@ void baseline(const std::filesystem::path& path, bool model) {
 }
 
 void recover(const std::filesystem::path& path,
-             const Hash& original, bool afterPublish, bool model, bool compaction) {
-    Repository repository(path);
-    const Hash current = repository.head("main").id;
+             const RevisionId& original, bool afterPublish, bool model, bool compaction) {
+    ProjectRepository repository(path);
+    const RevisionId current = repository.head("main");
     if (compaction || !afterPublish) {
         expect(current == original, "unpublished operation changed branch head");
     } else {
@@ -87,7 +90,7 @@ void recover(const std::filesystem::path& path,
                "model disappeared after recovery");
         expect(repository.getModel("main", key(2)).has_value(),
                "dependent model disappeared after recovery");
-        expect(repository.referencingModel("main", key(1)) == std::vector<Key>{key(2)},
+        expect(repository.referencing("main", key(1)) == std::vector<Key>{key(2)},
                "reverse-reference index inconsistent after recovery");
     } else {
         const std::optional<Bytes> data = repository.get("main", key(1));
@@ -95,7 +98,10 @@ void recover(const std::filesystem::path& path,
                "baseline record corrupted during recovery");
     }
     const aowis::dvmdb::VerificationReport report = repository.verifyRepository();
-    expect(report.branches == 1 && report.revisions >= 2,
+    // An interrupted commit may leave its immutable revision published but
+    // unreferenced (the UUID binding precedes the ref); it is still verified.
+    expect(report.branches == 1 &&
+           report.revisions >= ((afterPublish && !compaction) ? 2U : 1U),
            "full verification failed to inspect recovered history");
     // A recovered repository must remain writable (not merely readable).
     if (model) {
@@ -113,10 +119,10 @@ void runFault(std::string_view point, bool crash,
               bool model, bool compaction, bool afterPublish) {
     TestDirectory directory(point);
     baseline(directory.path / "repo", model);
-    Hash original{};
+    RevisionId original = RevisionId::generate();
     {
-        Repository repository(directory.path / "repo");
-        original = repository.head("main").id;
+        ProjectRepository repository(directory.path / "repo");
+        original = repository.head("main");
     }
     const pid_t child = ::fork();
     expect(child >= 0, "fork failed");
@@ -125,7 +131,7 @@ void runFault(std::string_view point, bool crash,
         ::setenv("AOWIS_DVMDB_TEST_FAULT", selected.c_str(), 1);
         ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
-            Repository repository(directory.path / "repo");
+            ProjectRepository repository(directory.path / "repo");
             if (compaction) {
                 (void)repository.compact();
             } else if (model) {
@@ -160,21 +166,21 @@ void runImportFault(std::string_view point, bool crash,
     const std::filesystem::path to = directory.path / "to";
     const std::filesystem::path initial = directory.path / "initial.bundle";
     const std::filesystem::path incremental = directory.path / "incremental.bundle";
-    Hash initialHead{};
+    RevisionId initialHead = RevisionId::generate();
     {
-        Repository origin(from);
+        ProjectRepository origin(from);
         origin.createBranch("main");
         origin.commitModel("main", {ModelChange{key(1), ModelRecord{1, {}, value(11)}}});
-        initialHead = origin.head("main").id;
-        origin.exportBranchBundle("main", initial);
+        initialHead = origin.head("main");
+        origin.exportBundle("main", initial);
         origin.commitModel("main", {
             ModelChange{key(2), ModelRecord{1, {key(1)}, value(22)}}});
-        origin.exportIncrementalBranchBundle("main", initialHead, incremental);
+        origin.exportIncrementalBundle("main", initialHead, incremental);
     }
     {
-        Repository destination(to);
-        const aowis::dvmdb::BundleImportResult imported =
-            destination.importBranchBundle(initial, "main");
+        ProjectRepository destination(to);
+        const aowis::dvmdb::RevisionBundleImport imported =
+            destination.importBundle(initial, "main");
         expect(imported.head == initialHead, "incorrect initial import");
     }
     const pid_t child = ::fork();
@@ -184,8 +190,8 @@ void runImportFault(std::string_view point, bool crash,
         ::setenv("AOWIS_DVMDB_TEST_FAULT", selected.c_str(), 1);
         ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
-            Repository destination(to);
-            (void)destination.importBranchBundle(incremental, "main");
+            ProjectRepository destination(to);
+            (void)destination.importBundle(incremental, "main");
         } catch (const std::exception&) { ::_exit(crash ? 95 : 94); }
         ::_exit(96);
     }
@@ -193,13 +199,13 @@ void runImportFault(std::string_view point, bool crash,
     expect(::waitpid(child, &status, 0) == child, "import waitpid failed");
     expect(WIFEXITED(status) && WEXITSTATUS(status) == (crash ? 93 : 94),
            "import did not reach fault point: " + std::string(point));
-    Repository recovered(to);
-    const Hash current = recovered.head("main").id;
+    ProjectRepository recovered(to);
+    const RevisionId current = recovered.head("main");
     if (afterPublish) {
         expect(current != initialHead, "published import did not advance head");
         expect(recovered.getModel("main", key(2)).has_value(),
                "published import lost dependent model");
-        expect(recovered.referencingModel("main", key(1)) == std::vector<Key>{key(2)},
+        expect(recovered.referencing("main", key(1)) == std::vector<Key>{key(2)},
                "published import lost reverse reference");
     } else {
         expect(current == initialHead, "failed import published branch head");
@@ -208,8 +214,8 @@ void runImportFault(std::string_view point, bool crash,
     }
     recovered.verifyRepository();
     if (!afterPublish) {
-        const aowis::dvmdb::BundleImportResult retried =
-            recovered.importBranchBundle(incremental, "main");
+        const aowis::dvmdb::RevisionBundleImport retried =
+            recovered.importBundle(incremental, "main");
         expect(retried.head != initialHead, "retry did not complete import");
     }
     recovered.verifyRepository();
@@ -224,7 +230,7 @@ void testBackupAndSidecars() {
     // engine is live is NOT promised to yield a consistent filesystem snapshot.
     std::filesystem::copy(origin, backup, std::filesystem::copy_options::recursive);
     {
-        Repository restored(backup);
+        ProjectRepository restored(backup);
         restored.verifyRepository();
     }
     // Index sidecars are reconstructible. Simulate a crash that leaves only an
@@ -234,7 +240,7 @@ void testBackupAndSidecars() {
     expect(oldSize > 16, "fixture lacks an index");
     std::filesystem::resize_file(index, oldSize - 7);
     {
-        Repository restored(origin);
+        ProjectRepository restored(origin);
         restored.verifyRepository();
         restored.commitModel("main", {
             ModelChange{key(3), ModelRecord{1, {}, value(33)}}});
@@ -254,7 +260,7 @@ void verifyLocking() {
         ::close(ready[0]);
         ::close(finish[1]);
         try {
-            Repository repository(directory.path / "repo");
+            ProjectRepository repository(directory.path / "repo");
             const char yes = 'Y';
             if (::write(ready[1], &yes, 1) != 1) ::_exit(20);
             char signal = 0;
@@ -269,7 +275,7 @@ void verifyLocking() {
            "child could not open independent repository handle");
     bool refused = false;
     {
-        Repository repository(directory.path / "repo");
+        ProjectRepository repository(directory.path / "repo");
         try { (void)repository.compact(); }
         catch (const std::exception&) { refused = true; }
     }
@@ -281,7 +287,7 @@ void verifyLocking() {
     ::close(ready[0]);
     ::close(finish[1]);
     expect(refused, "compaction permitted a concurrent repository handle");
-    Repository repository(directory.path / "repo");
+    ProjectRepository repository(directory.path / "repo");
     repository.verifyRepository();
 }
 
@@ -290,7 +296,7 @@ void testInterruptedCompactionHandle(bool afterSwitch) {
     const std::filesystem::path path = directory.path / "repo";
     baseline(path, false);
     {
-        Repository repository(path);
+        ProjectRepository repository(path);
         const char* point = (afterSwitch ? "compact.pack.after.pointer" : "compact.pack.before.pointer");
         ::setenv("AOWIS_DVMDB_TEST_FAULT", point, 1);
         ::setenv("AOWIS_DVMDB_TEST_ACTION", "error", 1);
@@ -306,7 +312,7 @@ void testInterruptedCompactionHandle(bool afterSwitch) {
         expect(writable != afterSwitch,
                "stale repository handle was writable after generation switch");
     }
-    Repository reopened(path);
+    ProjectRepository reopened(path);
     reopened.verifyRepository();
     reopened.commit("main", {Change{key(6), value(66)}});
     reopened.verifyRepository();
@@ -367,22 +373,22 @@ void testTornPackTail(std::string_view label, const Bytes& tail) {
     TestDirectory directory(label);
     const std::filesystem::path repo = directory.path / "repo";
     baseline(repo, true);
-    Hash head{};
+    RevisionId head = RevisionId::generate();
     {
-        Repository repository(repo);
-        head = repository.head("main").id;
+        ProjectRepository repository(repo);
+        head = repository.head("main");
     }
     const std::uintmax_t packBefore = std::filesystem::file_size(repo / "objects.pack");
     appendToPack(repo, tail);
     try {
         {
-            Repository repository(repo);
+            ProjectRepository repository(repo);
             expect(repository.recoveredPackTailBytes() == tail.size(),
                    "recovered byte count differs from torn tail size");
             expect(std::filesystem::file_size(repo / "objects.pack") == packBefore,
                    "torn tail was not truncated to the last valid record");
-            expect(repository.head("main").id == head, "torn tail recovery changed head");
-            expect(repository.referencingModel("main", key(1)) == std::vector<Key>{key(2)},
+            expect(repository.head("main") == head, "torn tail recovery changed head");
+            expect(repository.referencing("main", key(1)) == std::vector<Key>{key(2)},
                    "torn tail recovery damaged reverse references");
             repository.verifyRepository();
             repository.commitModel("main", {ModelChange{key(3), ModelRecord{1, {}, value(33)}}});
@@ -391,7 +397,7 @@ void testTornPackTail(std::string_view label, const Bytes& tail) {
         const std::vector<std::filesystem::path> copies = recoveredCopies(repo);
         expect(copies.size() == 1, "expected exactly one preserved torn tail copy");
         expect(readFile(copies.front()) == tail, "preserved torn tail differs from discarded bytes");
-        Repository reopened(repo);
+        ProjectRepository reopened(repo);
         expect(reopened.recoveredPackTailBytes() == 0, "clean reopen reported tail recovery");
         expect(reopened.getModel("main", key(3)).has_value(), "post-recovery commit lost");
         reopened.verifyRepository();
@@ -441,7 +447,7 @@ void testCorruptionBeforeValidRecord(std::string_view label, std::size_t gap) {
     appendToPack(repo, damage);
     const std::uintmax_t size = std::filesystem::file_size(repo / "objects.pack");
     bool refused = false;
-    try { Repository repository(repo); }
+    try { ProjectRepository repository(repo); }
     catch (const std::exception& error) {
         refused = std::string_view(error.what()).find("followed by a valid record") !=
                   std::string_view::npos;
@@ -472,7 +478,7 @@ void testDamagedPublishedHeadIsNotTruncated() {
         expect(stream.good(), "cannot corrupt head revision record");
     }
     bool refused = false;
-    try { Repository repository(repo); }
+    try { ProjectRepository repository(repo); }
     catch (const std::exception& error) {
         refused = !std::string_view(error.what()).empty();
     }
@@ -501,7 +507,7 @@ void crashCompaction(const std::filesystem::path& repo, const char* point) {
         ::setenv("AOWIS_DVMDB_TEST_FAULT", point, 1);
         ::setenv("AOWIS_DVMDB_TEST_ACTION", "crash", 1);
         try {
-            Repository repository(repo);
+            ProjectRepository repository(repo);
             (void)repository.compact();
         } catch (...) { ::_exit(95); }
         ::_exit(96);
@@ -523,7 +529,7 @@ void testStaleGenerationCleanup() {
     { std::ofstream(repo / pointerTemp) << "PACK1 0123456789abcdef0123456789abcdef\n"; }
     { std::ofstream(repo / "objects.notes") << "unrelated administrator file\n"; }
     {
-        Repository repository(repo);
+        ProjectRepository repository(repo);
         const aowis::dvmdb::CompactionStats stats = repository.compact();
         expect(stats.staleFilesRemoved == 3,
                "expected orphan pack, orphan index and pointer temp to be removed, got " +
@@ -539,7 +545,7 @@ void testStaleGenerationCleanup() {
     crashCompaction(repo, "compact.pack.after.pointer");
     expect(countFiles(repo, "objects.", ".pack") == 2, "fixture lacks a retired generation");
     {
-        Repository repository(repo);
+        ProjectRepository repository(repo);
         repository.verifyRepository();
         const aowis::dvmdb::CompactionStats stats = repository.compact();
         expect(stats.staleFilesRemoved == 2, "retired generation was not removed");
@@ -547,7 +553,7 @@ void testStaleGenerationCleanup() {
         repository.verifyRepository();
     }
     expect(countFiles(repo, "objects.", ".pack") == 1, "more than one generation remains");
-    Repository reopened(repo);
+    ProjectRepository reopened(repo);
     reopened.verifyRepository();
 }
 
@@ -560,19 +566,19 @@ void testExportFailureBeforePublish() {
     const std::filesystem::path repo = directory.path / "repo";
     const std::filesystem::path bundle = directory.path / "main.aowbundle";
     baseline(repo, true);
-    Repository repository(repo);
+    ProjectRepository repository(repo);
     ::setenv("AOWIS_DVMDB_TEST_FAULT", "export.before.publish", 1);
     ::setenv("AOWIS_DVMDB_TEST_ACTION", "error", 1);
     bool failed = false;
-    try { repository.exportBranchBundle("main", bundle); }
+    try { repository.exportBundle("main", bundle); }
     catch (const std::exception&) { failed = true; }
     ::unsetenv("AOWIS_DVMDB_TEST_FAULT");
     ::unsetenv("AOWIS_DVMDB_TEST_ACTION");
     expect(failed, "export did not observe injected failure before publication");
     expect(!std::filesystem::exists(bundle), "failed export left a bundle behind");
-    repository.exportBranchBundle("main", bundle);
-    Repository copy(directory.path / "copy");
-    expect(copy.importBranchBundle(bundle, "main").head == repository.head("main").id,
+    repository.exportBundle("main", bundle);
+    ProjectRepository copy(directory.path / "copy");
+    expect(copy.importBundle(bundle, "main").head == repository.head("main"),
            "export after a failed attempt is not importable");
 }
 
@@ -584,10 +590,10 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
     const std::filesystem::path repo = directory.path / "repo";
     const std::filesystem::path bundle = directory.path / "partial.bundle";
     baseline(repo, false);
-    Hash original{};
+    RevisionId original = RevisionId::generate();
     {
-        Repository repository(repo);
-        original = repository.head("main").id;
+        ProjectRepository repository(repo);
+        original = repository.head("main");
     }
     const pid_t child = ::fork();
     expect(child >= 0, "partial export fork failed");
@@ -595,11 +601,11 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
         ::setenv("AOWIS_DVMDB_TEST_FAULT", "export.partial.object", 1);
         ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
         try {
-            Repository repository(repo);
+            ProjectRepository repository(repo);
             if (descriptor) {
                 const int fd = ::open(bundle.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
                 if (fd < 0) ::_exit(97);
-                try { repository.exportBranchBundle("main", fd); }
+                try { repository.exportBundle("main", fd); }
                 catch (...) {
                     if (::lseek(fd, 0, SEEK_END) != 0) ::_exit(98);
                     ::close(fd);
@@ -607,7 +613,7 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
                 }
                 ::close(fd);
             } else {
-                repository.exportBranchBundle("main", bundle);
+                repository.exportBundle("main", bundle);
             }
         } catch (const StorageError& error) {
             ::_exit(!crash && error.kind() == StorageErrorKind::ResourceExhausted ? 94 : 95);
@@ -628,9 +634,9 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
         expect((std::filesystem::file_size(bundle) == 0) == !crash,
                "partial descriptor output cleanup mismatch");
         if (crash) {
-            Repository destination(directory.path / "destination");
+            ProjectRepository destination(directory.path / "destination");
             bool rejected = false;
-            try { (void)destination.importBranchBundle(bundle, "main"); }
+            try { (void)destination.importBundle(bundle, "main"); }
             catch (const StorageError&) { rejected = true; }
             expect(rejected, "interrupted descriptor bundle was accepted as valid");
             expect(destination.listBranches().empty(),
@@ -638,14 +644,14 @@ void testPartialBundleOutput(bool crash, bool descriptor) {
             destination.verifyRepository();
         }
     }
-    Repository reopened(repo);
-    expect(reopened.head("main").id == original,
+    ProjectRepository reopened(repo);
+    expect(reopened.head("main") == original,
            "failed export changed source branch head");
     reopened.verifyRepository();
     const std::filesystem::path retry = directory.path / "retry.bundle";
-    reopened.exportBranchBundle("main", retry);
-    Repository restored(directory.path / "restored");
-    expect(restored.importBranchBundle(retry, "main").head == original,
+    reopened.exportBundle("main", retry);
+    ProjectRepository restored(directory.path / "restored");
+    expect(restored.importBundle(retry, "main").head == original,
            "export retry failed after interruption");
     restored.verifyRepository();
 }
@@ -663,10 +669,10 @@ void testAtomicNamedBundlePublication() {
                 const std::filesystem::path repo = directory.path / "repo";
                 const std::filesystem::path bundle = directory.path / "main.bundle";
                 baseline(repo, false);
-                Hash expected{};
+                RevisionId expected = RevisionId::generate();
                 {
-                    Repository source(repo);
-                    expected = source.head("main").id;
+                    ProjectRepository source(repo);
+                    expected = source.head("main");
                 }
                 const pid_t child = ::fork();
                 expect(child >= 0, "atomic export fork failed");
@@ -676,8 +682,8 @@ void testAtomicNamedBundlePublication() {
                     ::setenv("AOWIS_DVMDB_TEST_ACTION", crash ? "crash" : "error", 1);
                     if (namedFallback) ::setenv("AOWIS_DVMDB_TEST_NAMED_SCRATCH", "1", 1);
                     try {
-                        Repository source(repo);
-                        source.exportBranchBundle("main", bundle);
+                        ProjectRepository source(repo);
+                        source.exportBundle("main", bundle);
                     } catch (const StorageError& error) {
                         ::_exit(!crash && error.kind() == StorageErrorKind::ResourceExhausted ? 94 : 95);
                     } catch (...) { ::_exit(96); }
@@ -692,24 +698,24 @@ void testAtomicNamedBundlePublication() {
                 expect(std::filesystem::exists(bundle) == published,
                        "atomic named export visibility differs from publication point");
                 if (published) {
-                    Repository receiver(directory.path / "receiver");
-                    expect(receiver.importBranchBundle(bundle, "main").head == expected,
+                    ProjectRepository receiver(directory.path / "receiver");
+                    expect(receiver.importBundle(bundle, "main").head == expected,
                            "atomically published bundle cannot be imported");
                     receiver.verifyRepository();
                     // Re-export must never overwrite an already published file.
                     const std::uint64_t previousBytes = std::filesystem::file_size(bundle);
-                    Repository source(repo);
+                    ProjectRepository source(repo);
                     bool rejected = false;
-                    try { source.exportBranchBundle("main", bundle); }
+                    try { source.exportBundle("main", bundle); }
                     catch (const StorageError&) { rejected = true; }
                     expect(rejected && std::filesystem::file_size(bundle) == previousBytes,
                            "export unexpectedly replaced existing bundle");
                 } else {
-                    Repository source(repo);
+                    ProjectRepository source(repo);
                     const std::filesystem::path retry = directory.path / "retry.bundle";
-                    source.exportBranchBundle("main", retry);
-                    Repository receiver(directory.path / "receiver");
-                    expect(receiver.importBranchBundle(retry, "main").head == expected,
+                    source.exportBundle("main", retry);
+                    ProjectRepository receiver(directory.path / "receiver");
+                    expect(receiver.importBundle(retry, "main").head == expected,
                            "export cannot be retried after aborted publication");
                 }
                 // A normal failure cleans up private fallback files. A crash
@@ -729,9 +735,9 @@ void testAtomicNamedBundlePublication() {
     baseline(repo, false);
     { std::ofstream output(target); output << "unchanged\n"; }
     std::filesystem::create_symlink(target, bundle);
-    Repository source(repo);
+    ProjectRepository source(repo);
     bool rejected = false;
-    try { source.exportBranchBundle("main", bundle); }
+    try { source.exportBundle("main", bundle); }
     catch (const StorageError&) { rejected = true; }
     expect(rejected && std::filesystem::is_symlink(bundle),
            "export unexpectedly replaced existing symlink");

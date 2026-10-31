@@ -80,7 +80,7 @@ void compare(const std::filesystem::path& root, const std::vector<Snapshot>& exp
             "backup/restore changed the durable repository UUIDv7");
     const std::vector<ProjectInfo> projects = service.listProjects();
     require(projects.size() == expected.size(), "restored project count mismatch");
-    const std::vector<aowis::dvmdb::WorkingCopyInfoV1> drafts = service.listWorkingCopiesV1();
+    const std::vector<aowis::dvmdb::WorkingCopyInfo> drafts = service.listWorkingCopies();
     require(drafts.size() == 1 && drafts.front().projectId == expected.front().id &&
             drafts.front().branchId == expected.front().mainBranchId &&
             drafts.front().baseRevision == expected.front().main &&
@@ -125,17 +125,17 @@ void tests(const std::string& python, const std::string& script, const std::stri
         // Tracking metadata is part of a verified offline snapshot, but it
         // must never change a local branch's mutable HEAD.
         remoteRepositoryId = aowis::dvmdb::UuidV7::generate().toString();
-        service.configureRepositoryRoleV1(aowis::dvmdb::RepositoryRoleV1::Private);
-        service.registerRemoteRepositoryV1(remoteRepositoryId,
+        service.configureRepositoryRole(aowis::dvmdb::RepositoryRole::Private);
+        service.registerRemoteRepository(remoteRepositoryId,
                                             "https://remote.example.test/dvmdb/v1");
-        service.recordRemoteTrackingRefV1({remoteRepositoryId,
+        service.recordRemoteTrackingRef({remoteRepositoryId,
               ProjectId::generate().toString(), aowis::dvmdb::BranchId::generate().toString(),
               std::nullopt}, std::nullopt);
         for (int index = 0; index < 3; ++index) {
             const ProjectInfo info = service.createProject("Hydraulic project " + std::to_string(index));
             const RevisionId before = service.head(info.id, "main");
             const std::string secondary = index == 1 ? "Scénario Süd 2026" : "design";
-            service.createBranch(info.id, secondary, "main", before);
+            service.createBranchAtRevision(info.id, secondary, "main", before);
             Key key{};
             key[0] = static_cast<std::uint8_t>(index + 1);
             ModelRecord value;
@@ -144,18 +144,18 @@ void tests(const std::string& python, const std::string& script, const std::stri
             std::optional<RevisionId> after;
             service.withRepository(info.id, [&](Repository& repository) {
                 const ProjectId project = *ProjectId::parse(info.id);
-                after = repository.commitModelV2(project, "main", {{key, value}}, before);
+                after = repository.commitModel(project, "main", {{key, value}}, before);
             });
             expected.push_back({info.id, info.name, secondary, *after, before,
                                 service.branchId(info.id, "main")->toString(),
                                 service.branchId(info.id, secondary)->toString()});
             if (index == 0) {
                 const std::string session = aowis::dvmdb::UuidV7::generate().toString();
-                const aowis::dvmdb::WorkingCopyInfoV1 draft =
-                    service.createWorkingCopyV1(info.id, "main", after, session);
+                const aowis::dvmdb::WorkingCopyInfo draft =
+                    service.createWorkingCopy(info.id, "main", after, session);
                 require(draft.baseRevision == after, "could not create backup draft fixture");
-                const aowis::dvmdb::WorkingCopyLeaseV1 lease =
-                    service.acquireWorkingCopyLeaseV1(draft.id, session, 120);
+                const aowis::dvmdb::WorkingCopyLease lease =
+                    service.acquireWorkingCopyLease(draft.id, session, 120);
                 Key candidateKey{};
                 candidateKey[15] = 9;
                 ModelRecord candidate;
@@ -163,12 +163,12 @@ void tests(const std::string& python, const std::string& script, const std::stri
                 candidate.payload = {42, 43};
                 const aowis::dvmdb::Bytes event = aowis::dvmdb::test::editEvent(
                     aowis::dvmdb::UuidV7::generate(), aowis::dvmdb::UuidV7::generate());
-                const aowis::dvmdb::WorkingCopyInfoV1 saved =
-                    service.saveWorkingCopyTransactionsV1(draft.id, session, lease.token,
+                const aowis::dvmdb::WorkingCopyInfo saved =
+                    service.saveWorkingCopyTransactions(draft.id, session, lease.token,
                                          lease.generation, {{candidateKey, candidate}}, {event});
                 require(saved.generation == 1 && saved.dirty,
                         "failed to save private draft before backup");
-                service.releaseWorkingCopyLeaseV1(draft.id, session, lease.token);
+                service.releaseWorkingCopyLease(draft.id, session, lease.token);
             }
         }
         // The catalogue is open; an offline snapshot must refuse it promptly.
@@ -187,11 +187,11 @@ void tests(const std::string& python, const std::string& script, const std::stri
     compare(backup, expected, originalRepositoryId);
     {
         ProjectService snapshot(backup);
-        require(snapshot.repositoryRoleV1() == aowis::dvmdb::RepositoryRoleV1::Private &&
-                snapshot.remoteRepositoriesV1().size() == 1 &&
-                snapshot.remoteRepositoriesV1().front().repositoryId == remoteRepositoryId &&
-                snapshot.remoteTrackingRefsV1().size() == 1 &&
-                !snapshot.remoteTrackingRefsV1().front().observedHead.has_value(),
+        require(snapshot.repositoryRole() == aowis::dvmdb::RepositoryRole::Private &&
+                snapshot.remoteRepositories().size() == 1 &&
+                snapshot.remoteRepositories().front().repositoryId == remoteRepositoryId &&
+                snapshot.remoteTrackingRefs().size() == 1 &&
+                !snapshot.remoteTrackingRefs().front().observedHead.has_value(),
                 "offline backup lost qualified remote tracking or unborn observation");
     }
     require(run(python, script, verify, "verify", backup) == 0,
@@ -201,10 +201,10 @@ void tests(const std::string& python, const std::string& script, const std::stri
     compare(restored, expected, originalRepositoryId);
     {
         ProjectService snapshot(restored);
-        require(snapshot.repositoryRoleV1() == aowis::dvmdb::RepositoryRoleV1::Private &&
-                snapshot.remoteRepositoriesV1().size() == 1 &&
-                snapshot.remoteTrackingRefsV1().size() == 1 &&
-                !snapshot.remoteTrackingRefsV1().front().observedHead.has_value(),
+        require(snapshot.repositoryRole() == aowis::dvmdb::RepositoryRole::Private &&
+                snapshot.remoteRepositories().size() == 1 &&
+                snapshot.remoteTrackingRefs().size() == 1 &&
+                !snapshot.remoteTrackingRefs().front().observedHead.has_value(),
                 "offline restore lost remote tracking metadata");
     }
     const std::filesystem::path backupTracking = backup / "repository.tracking";
@@ -225,9 +225,9 @@ void tests(const std::string& python, const std::string& script, const std::stri
         reset << originalTracking;
     }
     // A malformed draft must never be backed up or restored as usable private data.
-    const aowis::dvmdb::WorkingCopyInfoV1 draftInfo = [&]() {
+    const aowis::dvmdb::WorkingCopyInfo draftInfo = [&]() {
         ProjectService store(backup);
-        return store.listWorkingCopiesV1().front();
+        return store.listWorkingCopies().front();
     }();
     const std::filesystem::path draftPath = backup / "working-copies" / draftInfo.id;
     const std::string originalDraft = [&]() {

@@ -1,5 +1,6 @@
 // Review findings F9 (bounded diffs) and F10a (branch-scoped revisions).
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <chrono>
 #include <cstdint>
@@ -19,6 +20,8 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
 using aowis::dvmdb::Difference;
@@ -26,7 +29,7 @@ using aowis::dvmdb::Hash;
 using aowis::dvmdb::Key;
 using aowis::dvmdb::MergeStatus;
 using aowis::dvmdb::Repository;
-using aowis::dvmdb::Revision;
+using aowis::dvmdb::test::CommittedRevision;
 using aowis::dvmdb::StorageError;
 using aowis::dvmdb::StorageErrorKind;
 
@@ -119,11 +122,15 @@ Key randomKey(std::mt19937_64& random) {
 
 void testRandomizedDiffMatchesReference() {
     TestDirectory directory("random");
-    Repository repository(directory.path / "repo");
+    ProjectRepository repository(directory.path / "repo");
     repository.createBranch("main");
     std::mt19937_64 random(20261023);
-    Model model;
-    std::vector<std::pair<Hash, Model>> history{{repository.head("main").id, model}};
+    // A branch starts unborn; the first commit is the first diffable state.
+    Key seed{};
+    seed[15] = 0x5e;
+    Model model{{seed, Bytes{0}}};
+    std::vector<std::pair<RevisionId, Model>> history{
+        {repository.commit("main", {Change{seed, Bytes{0}}}), model}};
     for (unsigned round = 0; round < 120; ++round) {
         std::vector<Change> changes;
         const unsigned count = 1U + static_cast<unsigned>(random() % (round % 10U == 0U ? 200U : 12U));
@@ -153,24 +160,24 @@ void testRandomizedDiffMatchesReference() {
             else expectedModel.erase(change.key);
         }
         model = expectedModel;
-        const Revision revision = repository.commit("main", changes);
+        const CommittedRevision revision = repository.revision(repository.commit("main", changes));
         history.emplace_back(revision.id, model);
         // Adjacent, distant and reversed pairs.
         const std::size_t other = static_cast<std::size_t>(random() % history.size());
-        const std::pair<Hash, Model>& previous = history[history.size() - 2];
-        expectSameDiff(repository.diffRevisions(previous.first, revision.id),
+        const std::pair<RevisionId, Model>& previous = history[history.size() - 2];
+        expectSameDiff(repository.diff(previous.first, revision.id),
                        naiveDiff(previous.second, model), "adjacent round " + std::to_string(round));
-        expectSameDiff(repository.diffRevisions(history[other].first, revision.id),
+        expectSameDiff(repository.diff(history[other].first, revision.id),
                        naiveDiff(history[other].second, model), "distant round " + std::to_string(round));
-        expectSameDiff(repository.diffRevisions(revision.id, history[other].first),
+        expectSameDiff(repository.diff(revision.id, history[other].first),
                        naiveDiff(model, history[other].second), "reverse round " + std::to_string(round));
         // The bounded overload returns the identical result when it fits.
         const std::vector<Difference> exact = naiveDiff(previous.second, model);
-        expectSameDiff(repository.diffRevisions(previous.first, revision.id, exact.size()), exact,
+        expectSameDiff(repository.diff(previous.first, revision.id, exact.size()), exact,
                        "bounded exact round " + std::to_string(round));
         if (!exact.empty()) {
             expectKind(StorageErrorKind::LimitExceeded, "bounded too small round " + std::to_string(round),
-                       [&] { (void)repository.diffRevisions(previous.first, revision.id, exact.size() - 1); });
+                       [&] { (void)repository.diff(previous.first, revision.id, exact.size() - 1); });
         }
     }
     expect(model.size() > 300, "randomized fixture stayed too small: " + std::to_string(model.size()));
@@ -199,7 +206,7 @@ void corruptPackObject(const std::filesystem::path& pack, const Hash& hash) {
 
 void testPrefixSplitAboveLargeSubtree() {
     TestDirectory directory("split");
-    Repository repository(directory.path / "repo");
+    ProjectRepository repository(directory.path / "repo");
     repository.createBranch("main");
     std::vector<Change> changes;
     for (unsigned i = 0; i < 20000; ++i) {
@@ -210,7 +217,7 @@ void testPrefixSplitAboveLargeSubtree() {
         key[13] = static_cast<std::uint8_t>(i % 7U);
         changes.push_back(Change{key, Bytes{static_cast<std::uint8_t>(i)}});
     }
-    const Revision large = repository.commit("main", changes);
+    const CommittedRevision large = repository.revision(repository.commit("main", changes));
     // Damage one leaf deep inside the subtree that the next commit leaves
     // unchanged. A structural diff compares subtree hashes and never reads it;
     // a diff that lists unaligned subtrees would hit the checksum error.
@@ -226,24 +233,29 @@ void testPrefixSplitAboveLargeSubtree() {
                [&] { (void)repository.get("main", probeKey); });
     Key outsider{};
     outsider[0] = 0x01; // diverges at the first nibble: new root above the subtree
-    const Revision split = repository.commit("main", {Change{outsider, Bytes{9}}});
-    const std::vector<Difference> one = repository.diffRevisions(large.id, split.id, 1);
+    const CommittedRevision split = repository.revision(
+        repository.commit("main", {Change{outsider, Bytes{9}}}));
+    const std::vector<Difference> one = repository.diff(large.id, split.id, 1);
     expect(one.size() == 1 && one.front().key == outsider && !one.front().before,
            "prefix split diff incorrect");
-    const std::vector<Difference> back = repository.diffRevisions(split.id, large.id, 1);
+    const std::vector<Difference> back = repository.diff(split.id, large.id, 1);
     expect(back.size() == 1 && back.front().key == outsider && !back.front().after,
            "prefix merge (removal) diff incorrect");
     // Deleting the outsider collapses the root again: same single difference.
-    const Revision collapsed = repository.commit("main", {Change{outsider, std::nullopt}});
+    const CommittedRevision collapsed = repository.revision(
+        repository.commit("main", {Change{outsider, std::nullopt}}));
     expect(collapsed.root == large.root, "canonical trie did not collapse to the original root");
-    expect(repository.diffRevisions(large.id, collapsed.id, 0).empty(), "identical roots differ");
+    expect(repository.diff(large.id, collapsed.id, 0).empty(), "identical roots differ");
 }
 
 void testLimitBoundaries() {
     TestDirectory directory("limits");
-    Repository repository(directory.path / "repo");
+    ProjectRepository repository(directory.path / "repo");
     repository.createBranch("main");
-    const Hash empty = repository.head("main").id;
+    // The baseline holds one sentinel key that both sides of every diff share.
+    Key sentinel{};
+    sentinel[0] = 0xfe;
+    const RevisionId empty = repository.commit("main", {Change{sentinel, Bytes{0}}});
     std::vector<Change> changes;
     for (unsigned i = 0; i < 1001; ++i) {
         Key key{};
@@ -252,46 +264,75 @@ void testLimitBoundaries() {
         key[14] = static_cast<std::uint8_t>(i >> 8U);
         changes.push_back(Change{key, Bytes{1}});
     }
-    const Hash full = repository.commit("main", changes).id;
-    expect(repository.diffRevisions(empty, full, 1001).size() == 1001, "limit equal to size rejected");
+    const RevisionId full = repository.commit("main", changes);
+    expect(repository.diff(empty, full, 1001).size() == 1001, "limit equal to size rejected");
     expectKind(StorageErrorKind::LimitExceeded, "1001 additions over limit 1000",
-               [&] { (void)repository.diffRevisions(empty, full, 1000); });
+               [&] { (void)repository.diff(empty, full, 1000); });
     expectKind(StorageErrorKind::LimitExceeded, "1001 removals over limit 1000",
-               [&] { (void)repository.diffRevisions(full, empty, 1000); });
-    expect(repository.diffRevisions(full, full, 0).empty(), "self diff not empty");
+               [&] { (void)repository.diff(full, empty, 1000); });
+    expect(repository.diff(full, full, 0).empty(), "self diff not empty");
     expectKind(StorageErrorKind::NotFound, "bounded diff with unknown revision", [&] {
-        (void)repository.diffRevisions(aowis::dvmdb::sha256(Bytes{4}), full, 10);
+        (void)repository.diff(RevisionId::generate(), full, 10);
     });
+}
+
+// Branch scoping as the HTTP read routes use it: a revision belongs to a
+// branch when it is the HEAD or an ancestor through either merge parent.
+bool onBranch(ProjectRepository& repository, std::string_view branch, const RevisionId& revision) {
+    return repository.reachable(repository.head(branch), revision);
 }
 
 void testRevisionOnBranch() {
     TestDirectory directory("scope");
-    Repository repository(directory.path / "repo");
+    ProjectRepository repository(directory.path / "repo");
     repository.createBranch("main");
     Key a{}; a[15] = 1;
     Key b{}; b[15] = 2;
     Key c{}; c[15] = 3;
-    const Revision first = repository.commit("main", {Change{a, Bytes{1}}});
+    const RevisionId first = repository.commit("main", {Change{a, Bytes{1}}});
     repository.createBranch("side", "main");
-    const Revision sideOnly = repository.commit("side", {Change{b, Bytes{2}}});
-    const Revision mainOnly = repository.commit("main", {Change{c, Bytes{3}}});
-    expect(repository.revisionOnBranch("main", mainOnly.id), "head not on its branch");
-    expect(repository.revisionOnBranch("main", first.id), "ancestor not on branch");
-    expect(repository.revisionOnBranch("side", first.id), "shared ancestor not on forked branch");
-    expect(!repository.revisionOnBranch("main", sideOnly.id), "other branch revision accepted");
-    expect(!repository.revisionOnBranch("side", mainOnly.id), "other branch revision accepted (side)");
+    const RevisionId sideOnly = repository.commit("side", {Change{b, Bytes{2}}});
+    const RevisionId mainOnly = repository.commit("main", {Change{c, Bytes{3}}});
+    expect(onBranch(repository, "main", mainOnly), "head not on its branch");
+    expect(onBranch(repository, "main", first), "ancestor not on branch");
+    expect(onBranch(repository, "side", first), "shared ancestor not on forked branch");
+    expect(!onBranch(repository, "main", sideOnly), "other branch revision accepted");
+    expect(!onBranch(repository, "side", mainOnly), "other branch revision accepted (side)");
     // A merge makes the source history (second parent) part of the target.
-    expect(repository.mergeBranches("main", "side").status == MergeStatus::Merged, "merge failed");
-    expect(repository.revisionOnBranch("main", sideOnly.id), "merged second-parent history not on branch");
-    expect(!repository.revisionOnBranch("side", mainOnly.id), "merge leaked target history into source");
-    expectKind(StorageErrorKind::NotFound, "unknown revision",
-               [&] { (void)repository.revisionOnBranch("main", aowis::dvmdb::sha256(Bytes{7})); });
-    expectKind(StorageErrorKind::NotFound, "tree hash is not a revision",
-               [&] { (void)repository.revisionOnBranch("main", first.root); });
+    expect(repository.merge("main", "side").status == MergeStatus::Merged, "merge failed");
+    expect(onBranch(repository, "main", sideOnly), "merged second-parent history not on branch");
+    expect(!onBranch(repository, "side", mainOnly), "merge leaked target history into source");
+    // An unpublished UUID (e.g. an arbitrary ?revision= value) is never on a
+    // branch, and answering that must not depend on the history length.
+    expect(!onBranch(repository, "main", RevisionId::generate()), "unknown revision accepted");
+    const RevisionId branchUuid(repository.branchId("main")->uuid());
+    expect(!onBranch(repository, "main", branchUuid), "branch UUID accepted as revision");
     expectKind(StorageErrorKind::NotFound, "unknown branch",
-               [&] { (void)repository.revisionOnBranch("missing", first.id); });
+               [&] { (void)onBranch(repository, "missing", first); });
     expectKind(StorageErrorKind::InvalidInput, "invalid branch name",
-               [&] { (void)repository.revisionOnBranch("../x", first.id); });
+               [&] { (void)onBranch(repository, "../x", first); });
+}
+
+// Reachability walks each revision once: on a long linear history, the walk
+// for an ancestor deep in history must not re-read the ancestry per node.
+void testReachabilityIsLinear() {
+    TestDirectory directory("reachability");
+    ProjectRepository repository(directory.path / "repo");
+    repository.createBranch("main");
+    Key key{}; key[15] = 4;
+    const RevisionId first = repository.commit("main", {Change{key, Bytes{0}}});
+    const std::function<double(unsigned)> timeWalk = [&](unsigned commits) {
+        for (unsigned i = 0; i < commits; ++i)
+            (void)repository.commit("main", {Change{key, Bytes{static_cast<std::uint8_t>(i)}}});
+        const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        expect(onBranch(repository, "main", first), "root not reachable");
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    const double shorter = timeWalk(100);  // history 101
+    const double longer = timeWalk(300);   // history 401: 4x the revisions
+    // A quadratic walk takes ~16x as long; allow generous noise for linear.
+    expect(longer < shorter * 9.0 + 0.05,
+           "reachability walk grows faster than linearly with history");
 }
 
 } // namespace
@@ -302,6 +343,7 @@ int main() {
         testPrefixSplitAboveLargeSubtree();
         testLimitBoundaries();
         testRevisionOnBranch();
+        testReachabilityIsLinear();
         std::cout << "Bounded diff and branch scoping tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "../tests/project_repository.h"
 
 #include <algorithm>
 #include <chrono>
@@ -20,7 +21,7 @@ namespace {
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
 using aowis::dvmdb::Key;
-using aowis::dvmdb::Repository;
+using Repository = aowis::dvmdb::test::ProjectRepository;
 using Clock = std::chrono::steady_clock;
 namespace fs = std::filesystem;
 
@@ -135,7 +136,7 @@ void repoMetrics(Repository& repo, const fs::path& path) {
     metric("physical_objects", repo.objectCount());
     metric("pack_bytes", repo.packSize());
     metric("index_bytes", indexBytes(path));
-    std::cout << "head=" << aowis::dvmdb::toHex(repo.head("main").id) << '\n';
+    std::cout << "head=" << repo.head("main").toString() << '\n';
 }
 
 void prepare(const fs::path& path, std::uint64_t minimum, std::uint64_t keys,
@@ -217,7 +218,7 @@ void writeProbe(const fs::path& path, std::uint64_t keys, std::uint64_t batch,
     std::vector<double> timings;
     timings.reserve(static_cast<std::size_t>(rounds));
     const std::uint64_t initialCount = repo.objectCount();
-    const aowis::dvmdb::Hash oldHead = repo.head("main").id;
+    const aowis::dvmdb::Hash oldHead = repo.headRevision("main").recordHash;
     // Use a unique revision-version marker per run, preventing dedup across repeated probes.
     std::uint64_t nonce = 0;
     for (unsigned i = 0; i < 8; ++i) nonce = (nonce << 8U) | oldHead[i];

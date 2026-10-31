@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/model_codec_adapter.h"
+#include "../tests/project_repository.h"
 
 #include <QCoreApplication>
 
@@ -23,7 +24,7 @@ using aowis::dvmdb::Key;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::ModelRecord;
 using aowis::dvmdb::ModelChange;
-using aowis::dvmdb::Repository;
+using Repository = aowis::dvmdb::test::ProjectRepository;
 namespace hydraulic = aowis::dvmdb::hydraulic;
 
 QUuid uuidFor(std::uint8_t kind, std::uint64_t ordinal) {
@@ -111,7 +112,7 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point checkingReferences =
             std::chrono::steady_clock::now();
         const Key indexedNode = hydraulic::keyFromUuid(junctionFor(0).uuid);
-        const std::size_t incomingReferences = store->referencingModel("main", indexedNode).size();
+        const std::size_t incomingReferences = store->referencing("main", indexedNode).size();
         const double referenceLookupMs = elapsed(checkingReferences);
         const std::chrono::steady_clock::time_point checkingDeletion =
             std::chrono::steady_clock::now();
@@ -136,7 +137,7 @@ int main(int argc, char** argv) {
         }
         const double revisionMs = elapsed(revising);
         const std::chrono::steady_clock::time_point comparing = std::chrono::steady_clock::now();
-        const std::size_t differenceCount = store->diff("baseline", "main").size();
+        const std::size_t differenceCount = store->diffBranches("baseline", "main").size();
         const double diffMs = elapsed(comparing);
         const std::chrono::steady_clock::time_point scanning = std::chrono::steady_clock::now();
         std::uint64_t count = 0;
@@ -168,13 +169,13 @@ int main(int argc, char** argv) {
         }
         if (count != 2 * pipes + 1) throw std::runtime_error("incorrect record count");
         const double scanMs = elapsed(scanning);
-        const aowis::dvmdb::Revision final = store->head("main");
+        const aowis::dvmdb::test::CommittedRevision final = store->headRevision("main");
         const std::uint64_t packBytes = store->packSize();
         const std::uint64_t packedObjects = store->objectCount();
         store.reset(); // Close the repository before reopening for verification.
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
         Repository reopened(directory);
-        if (reopened.head("main").root != final.root) throw std::runtime_error("reopen root mismatch");
+        if (reopened.headRevision("main").root != final.root) throw std::runtime_error("reopen root mismatch");
         const double reopenMs = elapsed(reopening);
         const std::chrono::steady_clock::time_point verifying = std::chrono::steady_clock::now();
         reopened.verifyPack();

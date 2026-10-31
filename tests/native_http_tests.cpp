@@ -17,6 +17,7 @@
 #include <QUuid>
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <atomic>
 #include <condition_variable>
@@ -167,7 +168,7 @@ public:
     }
     BinaryResponse callRaw(const QByteArray& verb, const QString& path,
                            const QByteArray& bytes = QByteArray(),
-                           const QByteArray& mime = "application/vnd.aowis.bundle") {
+                           const QByteArray& mime = "application/vnd.aowis.revision-bundle-v2") {
         const std::string target = path.toStdString();
         httplib::Result result = verb == "GET"
             ? this->client_.Get(target)
@@ -231,133 +232,160 @@ private:
 };
 
 
-// Real TCP bundle transfer: full/incremental between independent repositories, corrupt/truncated,
-// stale/divergent branches, transfer limits, and idempotent retry.
+// Fixtures write through the canonical UUIDv7 repository API.
+aowis::dvmdb::RevisionId commitRaw(aowis::dvmdb::ProjectService& service, const QString& projectId,
+                                   std::string_view branch,
+                                   const std::vector<aowis::dvmdb::Change>& changes) {
+    const std::string id = projectId.toStdString();
+    const std::optional<aowis::dvmdb::ProjectId> project = aowis::dvmdb::ProjectId::parse(id);
+    check(project.has_value(), "fixture project is not UUIDv7");
+    std::optional<aowis::dvmdb::RevisionId> committed;
+    service.withRepository(id, [&](aowis::dvmdb::Repository& repository) {
+        committed = repository.commit(*project, branch, changes);
+    });
+    return *committed;
+}
+
+QString branchIdOf(aowis::dvmdb::ProjectService& service, const QString& projectId,
+                   std::string_view branch) {
+    const std::optional<aowis::dvmdb::BranchId> id = service.branchId(projectId.toStdString(), branch);
+    check(id.has_value(), "fixture branch has no UUIDv7");
+    return QString::fromStdString(id->toString());
+}
+
+QString revisionText(const aowis::dvmdb::RevisionId& id) {
+    return QString::fromStdString(id.toString());
+}
+
+// Full AOWREV21 export of a branch, written by the engine to a scratch file.
+QByteArray exportFull(aowis::dvmdb::ProjectService& service, const std::string& projectId,
+                      std::string_view branch) {
+    const std::optional<aowis::dvmdb::ProjectId> project = aowis::dvmdb::ProjectId::parse(projectId);
+    check(project.has_value(), "fixture project is not UUIDv7");
+    QByteArray bytes;
+    service.withRepository(projectId, [&](aowis::dvmdb::Repository& repository) {
+        aowis::dvmdb::ScratchFile file = repository.createScratchFile();
+        repository.exportRevisionBundle(*project, branch, file.fd(), {});
+        std::array<char, 64 * 1024> buffer{};
+        off_t offset = 0;
+        for (;;) {
+            const ssize_t count = ::pread(file.fd(), buffer.data(), buffer.size(), offset);
+            check(count >= 0, "reading the exported bundle failed");
+            if (count == 0) break;
+            bytes.append(buffer.data(), static_cast<qsizetype>(count));
+            offset += static_cast<off_t>(count);
+        }
+    });
+    return bytes;
+}
+
+// Real TCP bundle transfer of a project into its clone in an independent
+// catalogue: byte-stable export, corrupt/truncated/partial uploads,
+// idempotent replay, incremental fast-forward, and divergent recipients.
 void exerciseBundleApi(Client& client, aowis::dvmdb::ProjectService& service,
                        const QString& sourceId) {
     namespace native = aowis::dvmdb;
-    const Response destination = client.call("POST", "/dvmdb/v1/projects",
-        QJsonObject{{"name", "Replication recipient"}});
-    check(destination.status == 201, "destination creation failed");
-    const QString destinationId = destination.json.value("id").toString();
-    const QString from = QStringLiteral("/dvmdb/v1/projects/") + sourceId + "/branches/sync_demo";
-    const QString to = QStringLiteral("/dvmdb/v1/projects/") + destinationId + "/branches/tracking";
+    const std::string source = sourceId.toStdString();
+    TemporaryRoot recipientRoot;
+    native::ProjectService recipient(recipientRoot.root());
+    recipient.provisionCloneTarget(source, service.project(source).name);
+    TestServer recipientServer(recipient,
+                               native::BundleLimits{1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL});
+    Client receiver(recipientServer.port());
+    const QString from = QStringLiteral("/dvmdb/v1/projects/") + sourceId + "/branches/main";
+    const QString to = QStringLiteral("/dvmdb/v1/projects/") + sourceId + "/branches/tracking";
     native::Key item{};
     item[15] = 37;
     native::Key largeItem{};
     largeItem[15] = 38;
-    native::Bytes largePayload(512 * 1024, static_cast<std::uint8_t>(0x5c));
-    service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
-        repository.createBranch("sync_demo");
-        (void)repository.commit("sync_demo", {{item, native::Bytes{'o', 'n', 'e'}},
-                                               {largeItem, largePayload}});
-    });
+    const native::Bytes largePayload(512 * 1024, static_cast<std::uint8_t>(0x5c));
+    (void)commitRaw(service, sourceId, "main", {{item, native::Bytes{'o', 'n', 'e'}},
+                                                {largeItem, largePayload}});
     const QString firstHead = client.call("GET", from + "/head").json.value("id").toString();
+    check(native::RevisionId::parse(firstHead.toStdString()).has_value(),
+          "branch HEAD is not a revision UUIDv7");
     const BinaryResponse bundle = client.callRaw("GET", from + "/bundle");
     check(bundle.status == 200 && bundle.body.size() > 512 * 1024 &&
-          bundle.contentType.startsWith("application/vnd.aowis.bundle"),
-          "large file-backed bundle download failed");
+          bundle.body.startsWith("AOWREV21") &&
+          bundle.contentType.startsWith("application/vnd.aowis.revision-bundle-v2"),
+          "large file-backed revision bundle download failed");
     check(client.callRaw("GET", from + "/bundle").body == bundle.body,
           "repeated file-backed bundle export changed bytes");
-    const BinaryResponse identifiedFull = client.callRaw("GET", from + "/bundle?identity=1");
-    check(identifiedFull.status == 200 && identifiedFull.body.startsWith("AOWSYNC3"),
-          "identified HTTP export did not use UUIDv7 bundle format");
-    check(client.callRaw("GET", from + "/bundle?identity=0").status == 400,
-          "invalid identified bundle option accepted");
-    const QString identifiedTo = QStringLiteral("/dvmdb/v1/projects/") +
-                                 destinationId + "/branches/with_identity";
-    const BinaryResponse identifiedImport = client.callRaw(
-        "POST", identifiedTo + "/bundle", identifiedFull.body);
-    check(identifiedImport.status == 201, "identified HTTP bundle import failed");
-    service.withRepository(sourceId.toStdString(), [&](native::Repository& source) {
-        service.withRepository(destinationId.toStdString(), [&](native::Repository& dest) {
-            check(source.branchId("sync_demo") == dest.branchId("with_identity"),
-                  "identified HTTP transfer did not preserve branch UUIDv7");
-        });
-    });
     client.abortDownload(from + "/bundle");
     check(client.callRaw("GET", from + "/bundle").body == bundle.body,
           "download after client cancellation changed bytes");
     check(client.callRaw("GET", from + "/bundle?base=invalid").status == 400,
-          "malformed base hash accepted");
-    check(client.callRaw("GET", from + "/bundle?base=" + QString(64, QChar('f'))).status == 409,
+          "malformed base revision accepted");
+    check(client.callRaw("GET", from + "/bundle?base=" +
+                         revisionText(native::RevisionId::generate())).status == 404,
           "unknown export base accepted");
     check(client.callRaw("GET", from + "/bundle?unexpected=1").status == 400,
           "unknown bundle query argument accepted");
-    check(client.callRaw("GET", "/dvmdb/v1/projects/invalid/branches/sync_demo/bundle").status == 400,
+    check(client.callRaw("GET", "/dvmdb/v1/projects/invalid/branches/main/bundle").status == 400,
           "invalid project bundle URL accepted");
-    check(client.callRaw("POST", to + "/bundle", QByteArray()).status == 400,
+    check(receiver.callRaw("POST", to + "/bundle", QByteArray()).status == 400,
           "empty bundle import accepted");
-    check(client.callRaw("POST", to + "/bundle", QByteArray(1024 * 1024 + 1, 'x')).status == 413,
+    check(receiver.callRaw("POST", to + "/bundle", QByteArray(1024 * 1024 + 1, 'x')).status == 413,
           "oversized bundle upload accepted");
     // Partial request body followed by disconnect must never invoke bundle publication.
     {
-        RawConnection interrupted(client.port());
+        RawConnection interrupted(receiver.port());
         check(interrupted.connected(), "unable to connect interrupted upload");
         const QByteArray head = "POST " + to.toUtf8() +
-            "/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/vnd.aowis.bundle\r\n" +
+            "/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Content-Type: application/vnd.aowis.revision-bundle-v2\r\n"
             "Content-Length: " + QByteArray::number(bundle.body.size()) + "\r\n\r\n";
         interrupted.send(head + bundle.body.left(bundle.body.size() / 2));
         interrupted.close();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    check(client.call("GET", to + "/head").status == 404,
+    check(receiver.call("GET", to + "/head").status == 404,
           "disconnected partial request published a branch");
-    check(client.callRaw("POST", to + "/bundle", bundle.body.left(bundle.body.size() - 1)).status == 400,
+    check(receiver.callRaw("POST", to + "/bundle", bundle.body.left(bundle.body.size() - 1)).status == 400,
           "truncated bundle accepted");
     QByteArray corrupted = bundle.body;
     corrupted[corrupted.size() - 1] = static_cast<char>(corrupted.back() ^ 1);
-    check(client.callRaw("POST", to + "/bundle", corrupted).status == 400,
+    check(receiver.callRaw("POST", to + "/bundle", corrupted).status == 400,
           "corrupted bundle accepted");
-    check(client.call("GET", to + "/head").status == 404,
+    check(receiver.call("GET", to + "/head").status == 404,
           "invalid bundle published a branch");
-    const Response firstImport = client.call("POST", to + "/bundle", QJsonObject{});
-    check(firstImport.status == 400, "JSON is not a valid binary bundle");
-    const BinaryResponse imported = client.callRaw("POST", to + "/bundle", bundle.body);
+    check(receiver.call("POST", to + "/bundle", QJsonObject{}).status == 400,
+          "JSON was accepted as a binary bundle");
+    const BinaryResponse imported = receiver.callRaw("POST", to + "/bundle", bundle.body);
     const QJsonObject first = QJsonDocument::fromJson(imported.body).object();
     check(imported.status == 201 && first.value("status").toString() == QStringLiteral("created") &&
           first.value("head").toString() == firstHead &&
           first.value("objectsImported").toInteger() > 0,
           "initial bundle import failed");
-    const BinaryResponse repeated = client.callRaw("POST", to + "/bundle", bundle.body);
+    check(service.branchId(source, "main") == recipient.branchId(source, "tracking"),
+          "bundle transfer did not preserve the branch UUIDv7");
+    const BinaryResponse repeated = receiver.callRaw("POST", to + "/bundle", bundle.body);
     const QJsonObject repeatJson = QJsonDocument::fromJson(repeated.body).object();
     check(repeated.status == 200 && repeatJson.value("status").toString() == QStringLiteral("up_to_date") &&
           repeatJson.value("objectsImported").toInteger() == 0,
           "repeated bundle import was not idempotent");
-    service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
-        (void)repository.commit("sync_demo", {{item, native::Bytes{'t', 'w', 'o'}}});
-    });
+    (void)commitRaw(service, sourceId, "main", {{item, native::Bytes{'t', 'w', 'o'}}});
     const QString nextHead = client.call("GET", from + "/head").json.value("id").toString();
     const BinaryResponse delta = client.callRaw("GET", from + "/bundle?base=" + firstHead);
-    check(delta.status == 200 && delta.body.startsWith("AOWSYNC2"),
+    check(delta.status == 200 && delta.body.startsWith("AOWREV22"),
           "incremental binary bundle export failed");
-    const BinaryResponse identifiedDelta = client.callRaw(
-        "GET", from + "/bundle?base=" + firstHead + "&identity=1");
-    check(identifiedDelta.status == 200 && identifiedDelta.body.startsWith("AOWSYNC4"),
-          "identified HTTP incremental export did not use AOWSYNC4");
-    check(client.callRaw("POST", identifiedTo + "/bundle", identifiedDelta.body).status == 200,
-          "identified HTTP incremental import failed");
-    const BinaryResponse advanced = client.callRaw("POST", to + "/bundle", delta.body);
+    const BinaryResponse advanced = receiver.callRaw("POST", to + "/bundle", delta.body);
     const QJsonObject advancedJson = QJsonDocument::fromJson(advanced.body).object();
     check(advanced.status == 200 && advancedJson.value("status").toString() == QStringLiteral("fast_forward") &&
           advancedJson.value("head").toString() == nextHead,
           "incremental import failed");
-    check(client.call("GET", to + "/head").json.value("id").toString() == nextHead,
+    check(receiver.call("GET", to + "/head").json.value("id").toString() == nextHead,
           "destination branch did not fast-forward");
-    service.withRepository(destinationId.toStdString(), [&](native::Repository& repository) {
-        (void)repository.commit("tracking", {{item, native::Bytes{'d', 'e', 's', 't'}}});
-    });
-    const QString divergentHead = client.call("GET", to + "/head").json.value("id").toString();
-    service.withRepository(sourceId.toStdString(), [&](native::Repository& repository) {
-        (void)repository.commit("sync_demo", {{item, native::Bytes{'n', 'e', 'x', 't'}}});
-    });
+    (void)commitRaw(recipient, sourceId, "tracking", {{item, native::Bytes{'d', 'e', 's', 't'}}});
+    const QString divergentHead = receiver.call("GET", to + "/head").json.value("id").toString();
+    (void)commitRaw(service, sourceId, "main", {{item, native::Bytes{'n', 'e', 'x', 't'}}});
     const BinaryResponse more = client.callRaw("GET", from + "/bundle?base=" + nextHead);
     check(more.status == 200, "follow-up incremental export failed");
-    check(client.callRaw("POST", to + "/bundle", more.body).status == 409,
+    check(receiver.callRaw("POST", to + "/bundle", more.body).status == 409,
           "divergent tracking history was overwritten");
-    check(client.call("GET", to + "/head").json.value("id").toString() == divergentHead,
+    check(receiver.call("GET", to + "/head").json.value("id").toString() == divergentHead,
           "rejected bundle mutated divergent branch");
-    service.withRepository(destinationId.toStdString(), [&](native::Repository& repository) {
+    recipient.withRepository(source, [](native::Repository& repository) {
         (void)repository.verifyRepository();
     });
 }
@@ -370,25 +398,24 @@ void exerciseErrorClassification(Client& client, aowis::dvmdb::ProjectService& s
     check(created.status == 201, "error-classification project creation failed");
     const QString id = created.json.value("id").toString();
     const QString prefix = "/dvmdb/v1/projects/" + id;
-    native::Revision committed;
-    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
-        native::Key key{};
-        key[15] = 7;
-        committed = repository.commit("main", {native::Change{key, native::Bytes{1, 2, 3}}});
-    });
-    // A tree hash is an existing object, but not a revision: 404, not 500.
-    const Response tree = client.call("GET", prefix + "/revisions/" +
-                                      QString::fromStdString(native::toHex(committed.root)));
-    check(tree.status == 404 &&
-          tree.json.value("error").toObject().value("code").toString() == "not_found",
-          "non-revision object hash was not reported as 404 not_found");
-    const QString to = QString::fromStdString(native::toHex(committed.id));
-    check(client.call("GET", prefix + "/diff?from=" +
-                      QString::fromStdString(native::toHex(committed.root)) + "&to=" + to).status == 404,
-          "diff accepted a non-revision object hash");
+    const native::RevisionId initial = service.head(id.toStdString(), "main");
+    native::Key key{};
+    key[15] = 7;
+    const native::RevisionId committed =
+        commitRaw(service, id, "main", {native::Change{key, native::Bytes{1, 2, 3}}});
+    // A well-formed UUIDv7 that names no revision of this project: 404, not 500.
+    const QString unknown = revisionText(native::RevisionId::generate());
+    const Response missing = client.call("GET", prefix + "/revisions/" + unknown);
+    check(missing.status == 404 &&
+          missing.json.value("error").toObject().value("code").toString() == "not_found",
+          "unknown revision UUIDv7 was not reported as 404 not_found");
+    check(client.call("GET", prefix + "/diff?from=" + unknown + "&to=" +
+                      revisionText(committed)).status == 404,
+          "diff accepted an unknown revision UUIDv7");
 
     // Damaged local storage is a server failure: 500 with a generic message
     // and no internal details (checksums, paths, errno text) in the response.
+    // Byte 50 of the pack lies in the project's root revision record.
     const std::filesystem::path pack = root / "projects" / id.toStdString() / "repository" / "objects.pack";
     {
         std::fstream stream(pack, std::ios::in | std::ios::out | std::ios::binary);
@@ -401,8 +428,7 @@ void exerciseErrorClassification(Client& client, aowis::dvmdb::ProjectService& s
         stream.write(&byte, 1);
         check(stream.good(), "cannot corrupt project pack");
     }
-    const QString initial = QString::fromStdString(native::toHex(committed.parents.front()));
-    const BinaryResponse damaged = client.callRaw("GET", prefix + "/revisions/" + initial);
+    const BinaryResponse damaged = client.callRaw("GET", prefix + "/revisions/" + revisionText(initial));
     const QJsonObject error = QJsonDocument::fromJson(damaged.body).object().value("error").toObject();
     check(damaged.status == 500 && error.value("code").toString() == "internal_error" &&
           error.value("message").toString() == "database operation failed",
@@ -411,54 +437,38 @@ void exerciseErrorClassification(Client& client, aowis::dvmdb::ProjectService& s
           "storage corruption details leaked to the HTTP client");
 }
 
-// Review F9/F10a: list-like responses are bounded before materialization, and
-// branch-scoped routes only serve revisions of that branch.
+// Review F9/F10a: list-like responses are bounded before materialization.
 void exerciseBoundsAndScoping(Client& client, aowis::dvmdb::ProjectService& service) {
     namespace native = aowis::dvmdb;
     const Response created = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Bounds"}});
     check(created.status == 201, "bounds project creation failed");
     const QString id = created.json.value("id").toString();
     const QString prefix = "/dvmdb/v1/projects/" + id;
-    native::Hash empty{};
-    native::Hash exactly1000{};
-    native::Hash over1000{};
-    native::Hash mainOnly{};
-    native::Hash sideOnly{};
-    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
-        empty = repository.head("main").id;
-        std::vector<native::Change> changes;
-        for (unsigned i = 0; i < 1000; ++i) {
-            native::Key key{};
-            key[0] = static_cast<std::uint8_t>(i * 37U);
-            key[14] = static_cast<std::uint8_t>(i >> 8U);
-            key[15] = static_cast<std::uint8_t>(i);
-            changes.push_back(native::Change{key, native::Bytes{1}});
-        }
-        repository.createBranch("bulk", "main");
-        exactly1000 = repository.commit("bulk", changes).id;
-        native::Key extra{};
-        extra[0] = 0xfe;
-        extra[15] = 0xfe;
-        over1000 = repository.commit("bulk", {native::Change{extra, native::Bytes{2}}}).id;
-        native::Key a{};
-        a[15] = 1;
-        mainOnly = repository.commit("main", {native::Change{a, native::Bytes{3}}}).id;
-        repository.createBranch("side", "main");
-        native::Key b{};
-        b[15] = 2;
-        sideOnly = repository.commit("side", {native::Change{b, native::Bytes{4}}}).id;
-    });
-    const QString hex0 = QString::fromStdString(native::toHex(empty));
-    const Response fits = client.call("GET", prefix + "/diff?from=" + hex0 + "&to=" +
-                                      QString::fromStdString(native::toHex(exactly1000)));
+    const native::RevisionId empty = service.head(id.toStdString(), "main");
+    std::vector<native::Change> changes;
+    for (unsigned i = 0; i < 1000; ++i) {
+        native::Key key{};
+        key[0] = static_cast<std::uint8_t>(i * 37U);
+        key[14] = static_cast<std::uint8_t>(i >> 8U);
+        key[15] = static_cast<std::uint8_t>(i);
+        changes.push_back(native::Change{key, native::Bytes{1}});
+    }
+    (void)service.createBranch(id.toStdString(), "bulk", "main");
+    const native::RevisionId exactly1000 = commitRaw(service, id, "bulk", changes);
+    native::Key extra{};
+    extra[0] = 0xfe;
+    extra[15] = 0xfe;
+    const native::RevisionId over1000 =
+        commitRaw(service, id, "bulk", {native::Change{extra, native::Bytes{2}}});
+    const Response fits = client.call("GET", prefix + "/diff?from=" + revisionText(empty) +
+                                      "&to=" + revisionText(exactly1000));
     check(fits.status == 200 && fits.json.value("changes").toArray().size() == 1000,
           "diff with exactly 1000 records was not returned");
-    const Response tooLarge = client.call("GET", prefix + "/diff?from=" + hex0 + "&to=" +
-                                          QString::fromStdString(native::toHex(over1000)));
+    const Response tooLarge = client.call("GET", prefix + "/diff?from=" + revisionText(empty) +
+                                          "&to=" + revisionText(over1000));
     check(tooLarge.status == 413 &&
           tooLarge.json.value("error").toObject().value("code").toString() == "limit_exceeded",
           "diff with 1001 records was not rejected with 413 limit_exceeded");
-
 }
 
 // Phase 5 (cpp-httplib): limits are enforced before bodies are read, uploads
@@ -467,12 +477,13 @@ void exerciseTransport(Client& client, aowis::dvmdb::ProjectService& service,
                        const std::filesystem::path& root, std::uint64_t transferLimit) {
     namespace native = aowis::dvmdb;
     const quint16 port = client.port();
-    const Response sourceProject = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Transport source"}});
-    const Response targetProject = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Transport target"}});
-    check(sourceProject.status == 201 && targetProject.status == 201, "transport projects not created");
-    const QString sourceId = sourceProject.json.value("id").toString();
-    const QString targetId = targetProject.json.value("id").toString();
-    service.withRepository(sourceId.toStdString(), [](native::Repository& repository) {
+    // The served target is a clone target of an independent source
+    // catalogue, so it accepts that project's revision bundle.
+    TemporaryRoot originRoot;
+    native::ProjectService origin(originRoot.root());
+    const native::ProjectInfo sourceProject = origin.createProject("Transport source");
+    const QString targetId = QString::fromStdString(sourceProject.id);
+    {
         std::vector<native::Change> changes;
         for (unsigned i = 0; i < 200; ++i) {
             native::Key key{};
@@ -480,11 +491,12 @@ void exerciseTransport(Client& client, aowis::dvmdb::ProjectService& service,
             key[15] = 1;
             changes.push_back(native::Change{key, native::Bytes(1024, static_cast<std::uint8_t>(i))});
         }
-        repository.commit("main", changes);
-    });
-    const BinaryResponse bundle = client.callRaw("GET", "/dvmdb/v1/projects/" + sourceId + "/branches/main/bundle");
-    check(bundle.status == 200 && bundle.body.size() > 100 * 1024 &&
-          bundle.contentType == "application/vnd.aowis.bundle", "transport bundle export failed");
+        (void)commitRaw(origin, targetId, "main", changes);
+    }
+    const BinaryResponse bundle{200, exportFull(origin, sourceProject.id, "main"), {}, {}};
+    check(bundle.body.size() > 100 * 1024 && bundle.body.startsWith("AOWREV21"),
+          "transport bundle export failed");
+    (void)service.provisionCloneTarget(sourceProject.id, "Transport target");
     const QByteArray uploadPath = "/dvmdb/v1/projects/" + targetId.toUtf8() + "/branches/incoming/bundle";
 
     // 1. A declared length above the transfer limit is refused before any body
@@ -579,7 +591,7 @@ void exerciseTransport(Client& client, aowis::dvmdb::ProjectService& service,
                     for (int request = 0; request < 20; ++request) {
                         const QString path = request % 2 == 0
                             ? "/dvmdb/v1/projects/" + targetId + "/branches/incoming/head"
-                            : "/dvmdb/v1/projects/" + sourceId + "/branches/main/history?limit=1";
+                            : "/dvmdb/v1/projects/" + targetId + "/branches/incoming/history?limit=1";
                         if (parallel.call("GET", path).status != 200) failures.fetch_add(1);
                     }
                 } catch (...) {
@@ -691,12 +703,15 @@ void exerciseConcurrency() {
     const QString b = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "B"}}).json.value("id").toString();
     const QString aPrefix = "/dvmdb/v1/projects/" + a;
     const QString bPrefix = "/dvmdb/v1/projects/" + b;
+    const QString aMain = branchIdOf(service, a, "main");
+    const QString bMain = branchIdOf(service, b, "main");
 
-    // A bundle of ~4 MiB for project B, built in an independent repository.
-    QByteArray bundle;
+    // A bundle of ~4 MiB of an independent project, imported into that
+    // project's clone target on this server while A is busy.
+    TemporaryRoot originRoot;
+    native::ProjectService origin(originRoot.root());
+    const native::ProjectInfo imported = origin.createProject("Imported");
     {
-        native::Repository source(root.root() / "source");
-        source.createBranch("main");
         std::vector<native::Change> changes;
         for (unsigned i = 0; i < 2000; ++i) {
             native::Key item{};
@@ -705,12 +720,12 @@ void exerciseConcurrency() {
             item[15] = 7;
             changes.push_back(native::Change{item, native::Bytes(2048, static_cast<std::uint8_t>(i))});
         }
-        source.commit("main", changes);
-        source.exportBranchBundle("main", root.root() / "source.bundle");
-        std::ifstream input(root.root() / "source.bundle", std::ios::binary);
-        const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        bundle = QByteArray(bytes.data(), static_cast<qsizetype>(bytes.size()));
+        (void)commitRaw(origin, QString::fromStdString(imported.id), "main", changes);
     }
+    const QByteArray bundle = exportFull(origin, imported.id, "main");
+    (void)service.provisionCloneTarget(imported.id, "Imported");
+    const QString importPath = "/dvmdb/v1/projects/" + QString::fromStdString(imported.id) +
+                               "/branches/main/bundle";
 
     std::thread importer;
     std::thread first;
@@ -728,14 +743,15 @@ void exerciseConcurrency() {
         check(timed([&] { check(client.call("GET", "/dvmdb/v1/ready").status == 200, "ready failed"); }) <
               std::chrono::milliseconds(200), "/ready waited for a project operation");
         check(client.call("GET", aPrefix + "/branches/main/head").status == 200, "read of held project failed");
-        check(client.call("POST", bPrefix + "/branches", QJsonObject{{"name", "side"}}).status == 201,
+        check(client.call("POST", bPrefix + "/branches",
+                          QJsonObject{{"name", "side"}, {"fromBranchId", bMain}}).status == 201,
               "other project's write waited");
-        // A real import into B, with /health probed throughout.
+        // A real import into another project, with /health probed throughout.
         std::atomic<bool> importing{true};
         int importStatus = 0;
         importer = std::thread([&] {
             Client own(server.port());
-            importStatus = own.callRaw("POST", bPrefix + "/branches/imported/bundle", bundle).status;
+            importStatus = own.callRaw("POST", importPath, bundle).status;
             importing = false;
         });
         std::chrono::milliseconds slowest{0};
@@ -753,15 +769,18 @@ void exerciseConcurrency() {
         // Two racing creations of one branch on A queue behind the hold.
         first = std::thread([&] {
             Client own(server.port());
-            firstStatus = own.call("POST", aPrefix + "/branches", QJsonObject{{"name", "race"}}).status;
+            firstStatus = own.call("POST", aPrefix + "/branches",
+                                   QJsonObject{{"name", "race"}, {"fromBranchId", aMain}}).status;
         });
         second = std::thread([&] {
             Client own(server.port());
-            secondStatus = own.call("POST", aPrefix + "/branches", QJsonObject{{"name", "race"}}).status;
+            secondStatus = own.call("POST", aPrefix + "/branches",
+                                    QJsonObject{{"name", "race"}, {"fromBranchId", aMain}}).status;
         });
         waitForPending(service, a, 3);
         // The queue of A is full: 503 + Retry-After, also before an upload body.
-        const Response busy = client.call("POST", aPrefix + "/branches", QJsonObject{{"name", "late"}});
+        const Response busy = client.call("POST", aPrefix + "/branches",
+                                          QJsonObject{{"name", "late"}, {"fromBranchId", aMain}});
         check(busy.status == 503 && busy.retryAfter == "1" &&
               busy.json.value("error").toObject().value("code").toString() == "busy",
               "full project queue not answered with 503 busy and Retry-After");
@@ -771,12 +790,13 @@ void exerciseConcurrency() {
             // Headers only: the 503 must come without waiting for the body.
             RawConnection raw(server.port());
             raw.send("POST " + aPrefix.toUtf8() + "/branches/up/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                     "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 1000000\r\n\r\n");
+                     "Content-Type: application/vnd.aowis.revision-bundle-v2\r\nContent-Length: 1000000\r\n\r\n");
             const QByteArray reply = raw.receive(2000);
             check(statusOf(reply) == 503 && reply.contains("Retry-After: 1") && raw.closedByPeer(),
                   "full project queue did not refuse the upload before its body");
         }
-        check(client.call("POST", bPrefix + "/branches", QJsonObject{{"name", "still"}}).status == 201,
+        check(client.call("POST", bPrefix + "/branches",
+                          QJsonObject{{"name", "still"}, {"fromBranchId", bMain}}).status == 201,
               "other project affected by A's full queue");
         hold.release();
         first.join();
@@ -785,7 +805,8 @@ void exerciseConcurrency() {
               "racing branch creations not exactly one 201 and one 409");
     }
     check(service.pendingOperations(a.toStdString()) == 0, "project queue not drained");
-    check(client.call("POST", aPrefix + "/branches", QJsonObject{{"name", "late"}}).status == 201,
+    check(client.call("POST", aPrefix + "/branches",
+                      QJsonObject{{"name", "late"}, {"fromBranchId", aMain}}).status == 201,
           "project still busy after its queue drained");
 
 
@@ -793,6 +814,7 @@ void exerciseConcurrency() {
     // answer is a success or a 503 for a full queue; nothing else.
     const QString c = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "C"}}).json.value("id").toString();
     const std::vector<QString> projects{a, b, c};
+    const std::vector<QString> mainIds{aMain, bMain, branchIdOf(service, c, "main")};
     std::atomic<unsigned> created{0};
     std::atomic<unsigned> busyAnswers{0};
     std::atomic<unsigned> unexpected{0};
@@ -801,12 +823,14 @@ void exerciseConcurrency() {
         clients.emplace_back([&, worker] {
             Client own(server.port());
             for (unsigned step = 0; step < 30; ++step) {
-                const QString prefix = "/dvmdb/v1/projects/" + projects[(worker + step) % projects.size()];
+                const std::size_t index = (worker + step) % projects.size();
+                const QString prefix = "/dvmdb/v1/projects/" + projects[index];
                 int status = 0;
                 switch (step % 4) {
                 case 0:
                     status = own.call("POST", prefix + "/branches", QJsonObject{
-                        {"name", QStringLiteral("s%1_%2").arg(worker).arg(step)}}).status;
+                        {"name", QStringLiteral("s%1_%2").arg(worker).arg(step)},
+                        {"fromBranchId", mainIds[index]}}).status;
                     if (status == 201) ++created;
                     break;
                 case 1: status = own.call("GET", prefix + "/branches/main/head").status; break;
@@ -828,12 +852,14 @@ void exerciseConcurrency() {
             (void)repository.verifyRepository();
         });
     }
-    // Before the stress: A main/race/late, B main/side/imported/still, C main.
-    check(branches == 8U + created.load(), "branch count does not match successful creations");
+    // Before the stress: A main/race/late, B main/side/still, C main.
+    check(branches == 7U + created.load(), "branch count does not match successful creations");
     std::cout << "  concurrent load: " << created.load() << " branches created, "
               << busyAnswers.load() << " busy answers\n";
 }
 
+// Project catalogue and branch routes, then bundle transfer, error
+// classification, response bounds and transport limits on one server.
 void exercise() {
     TemporaryRoot root;
     QString firstId;
@@ -856,6 +882,8 @@ void exercise() {
         const Response first = client.call("POST", "/dvmdb/v1/projects", QJsonObject{{"name", "Hydraulik Ü"}});
         check(first.status == 201, "create project failed");
         firstId = first.json.value("id").toString();
+        check(aowis::dvmdb::ProjectId::parse(firstId.toStdString()).has_value(),
+              "created project id is not UUIDv7");
         check(first.json.value("name").toString() == "Hydraulik Ü", "project name wrong");
         check(first.json.keys() == QStringList({"id", "name"}), "project JSON has unexpected fields");
         check(client.call("POST", "/dvmdb/v1/projects",
@@ -868,17 +896,22 @@ void exercise() {
               "project listing incorrect");
         check(client.call("GET", "/dvmdb/v1/projects/invalid-id").status == 400,
               "invalid project UUID was accepted");
-        check(client.call("GET", "/dvmdb/v1/projects/00000000-0000-4000-8000-000000000000").status == 404,
+        check(client.call("GET", "/dvmdb/v1/projects/00000000-0000-4000-8000-000000000000").status == 400,
+              "non-UUIDv7 project id was accepted");
+        check(client.call("GET", "/dvmdb/v1/projects/" +
+                          QString::fromStdString(aowis::dvmdb::ProjectId::generate().toString())).status == 404,
               "unknown project accepted");
         check(client.call("GET", "/dvmdb/v1/projects/" + firstId).status == 200,
               "project details failed");
         const QString prefix = "/dvmdb/v1/projects/" + firstId;
         check(client.call("GET", prefix + "/branches").json.value("branches").toArray().size() == 1,
               "initial branch missing");
+        const QString mainId = branchIdOf(service, firstId, "main");
         const Response head = client.call("GET", prefix + "/branches/main/head");
         check(head.status == 200, "head request failed");
         firstRevision = head.json.value("id").toString();
-        check(firstRevision.size() == 64, "head hash malformed");
+        check(aowis::dvmdb::RevisionId::parse(firstRevision.toStdString()).has_value(),
+              "head is not a revision UUIDv7");
         check(client.call("GET", prefix + "/branches/main/history?limit=0").status == 400,
               "invalid history limit accepted");
         check(client.call("GET", prefix + "/branches/main/history?limit=1").json.value("revisions").toArray().size() == 1,
@@ -888,25 +921,33 @@ void exercise() {
         check(client.call("GET", prefix + "/revisions/" + firstRevision).status == 200,
               "immutable revision read failed");
         check(client.call("GET", prefix + "/revisions/garbage").status == 400,
-              "invalid revision hash accepted");
-        check(client.call("GET", prefix + "/revisions/" + QString(64, QChar('f'))).status == 404,
+              "invalid revision UUID accepted");
+        check(client.call("GET", prefix + "/revisions/" +
+                          revisionText(aowis::dvmdb::RevisionId::generate())).status == 404,
               "unknown revision should be 404");
         check(client.call("GET", prefix + "/branches/unknown/head").status == 404,
               "unknown branch accepted");
         const Response fork = client.call("POST", prefix + "/branches",
-            QJsonObject{{"name", "design"}, {"fromBranch", "main"}, {"revision", firstRevision}});
-        check(fork.status == 201 && fork.json.value("id").toString() == firstRevision,
+            QJsonObject{{"name", "design"}, {"fromBranchId", mainId}, {"revision", firstRevision}});
+        check(fork.status == 201 && fork.json.value("id").toString() == firstRevision &&
+              fork.json.value("originBranchId").toString() == mainId,
               "pinned fork failed");
-        check(client.call("POST", prefix + "/branches", QJsonObject{{"name", "design"}}).status == 409,
+        check(client.call("POST", prefix + "/branches",
+                          QJsonObject{{"name", "design"}, {"fromBranchId", mainId}}).status == 409,
               "duplicate branch accepted");
-        check(client.call("POST", prefix + "/branches", QJsonObject{{"name", "../bad"}}).status == 400,
+        check(client.call("POST", prefix + "/branches",
+                          QJsonObject{{"name", "../bad"}, {"fromBranchId", mainId}}).status == 400,
               "malformed branch name accepted");
-        check(client.call("POST", prefix + "/branches", QJsonObject{{"name", "missing-source"}, {"fromBranch", "missing"}}).status == 404,
+        check(client.call("POST", prefix + "/branches", QJsonObject{
+                  {"name", "missing-source"},
+                  {"fromBranchId", QString::fromStdString(aowis::dvmdb::BranchId::generate().toString())}}).status == 404,
               "missing source branch should be 404");
-        check(client.call("POST", prefix + "/branches", QJsonObject{{"name", "bad"}, {"revision", firstRevision}}).status == 400,
+        check(client.call("POST", prefix + "/branches",
+                          QJsonObject{{"name", "bad"}, {"revision", firstRevision}}).status == 400,
               "fork without source accepted");
-        check(client.call("POST", prefix + "/branches", QJsonObject{{"name", "scratch"}}).status == 201,
-              "empty branch creation failed");
+        check(client.call("POST", prefix + "/branches",
+                          QJsonObject{{"name", "scratch"}, {"fromBranchId", mainId}}).status == 201,
+              "branch creation failed");
         check(client.call("GET", prefix + "/branches").json.value("branches").toArray().size() == 3,
               "branch listing wrong");
         check(client.call("GET", "/dvmdb/v1/projects/" + second.json.value("id").toString() + "/branches")
@@ -937,8 +978,8 @@ void exercise() {
     {
         aowis::dvmdb::ProjectService reopened(root.root());
         check(reopened.project(firstId.toStdString()).name == "Hydraulik Ü", "restart lost project name");
-        check(aowis::dvmdb::toHex(reopened.headShaFixture(firstId.toStdString(), "design").id) ==
-              firstRevision.toStdString(), "restart lost fork revision");
+        check(revisionText(reopened.head(firstId.toStdString(), "design")) == firstRevision,
+              "restart lost fork revision");
     }
 }
 
@@ -999,28 +1040,28 @@ void exerciseTransferStagingBudget() {
 }
 
 // A separate full-DAG protocol test keeps the ordinary CRUD fixture intact.
+// Paged revision graph over HTTP: bounded pages, signed project-bound
+// cursors, a pinned HEAD snapshot across pages, and complete ancestry.
 void exerciseRevisionGraphHttp() {
     TemporaryRoot root;
     aowis::dvmdb::ProjectService service(root.root());
-    const std::string id = service.createProjectShaFixture("Graph API").id;
-    const std::string other = service.createProjectShaFixture("Other graph").id;
-    aowis::dvmdb::Hash initial{};
-    aowis::dvmdb::Hash merged{};
-    service.withRepository(id, [&](aowis::dvmdb::Repository& repository) {
-        initial = repository.head("main").id;
-        repository.commit("main", {{aowis::dvmdb::Key{1}, aowis::dvmdb::Bytes{1}}});
-        repository.createBranch("feature", "main");
-        repository.createBranch("alias", "feature");
-        repository.commit("main", {{aowis::dvmdb::Key{2}, aowis::dvmdb::Bytes{2}}});
-        repository.commit("feature", {{aowis::dvmdb::Key{3}, aowis::dvmdb::Bytes{3}}});
-        const aowis::dvmdb::MergeResult result = repository.mergeBranches("main", "feature");
-        check(result.status == aowis::dvmdb::MergeStatus::Merged &&
-              result.revision.parents.size() == 2, "HTTP graph test merge fixture failed");
-        merged = result.revision.id;
-    });
+    const std::string id = service.createProject("Graph API").id;
+    const std::string other = service.createProject("Other graph").id;
+    const QString project = QString::fromStdString(id);
+    const aowis::dvmdb::RevisionId initial = service.head(id, "main");
+    (void)commitRaw(service, project, "main", {{aowis::dvmdb::Key{1}, aowis::dvmdb::Bytes{1}}});
+    (void)service.createBranch(id, "feature", "main");
+    (void)service.createBranch(id, "alias", "feature");
+    (void)commitRaw(service, project, "main", {{aowis::dvmdb::Key{2}, aowis::dvmdb::Bytes{2}}});
+    (void)commitRaw(service, project, "feature", {{aowis::dvmdb::Key{3}, aowis::dvmdb::Bytes{3}}});
+    const aowis::dvmdb::MergeResult result = service.mergeBranches(id, "main", "feature");
+    check(result.status == aowis::dvmdb::MergeStatus::Merged && result.resultHead.has_value() &&
+          service.revision(id, *result.resultHead).parents.size() == 2,
+          "HTTP graph test merge fixture failed");
+    const aowis::dvmdb::RevisionId merged = *result.resultHead;
     TestServer server(service, aowis::dvmdb::BundleLimits{1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL});
     Client client(server.port());
-    const QString path = "/dvmdb/v1/projects/" + QString::fromStdString(id) + "/revision-graph";
+    const QString path = "/dvmdb/v1/projects/" + project + "/revision-graph";
     check(client.call("GET", path + "?limit=0").status == 400,
           "graph route accepted zero limit");
     check(client.call("GET", path + "?limit=1001").status == 400,
@@ -1042,22 +1083,20 @@ void exerciseRevisionGraphHttp() {
           "tampered graph cursor accepted");
     // Commit after the snapshot was pinned; old pages must still describe
     // the original graph, while a new request shows the advanced main head.
-    aowis::dvmdb::Hash later{};
-    service.withRepository(id, [&](aowis::dvmdb::Repository& repository) {
-        later = repository.commit("main", {{aowis::dvmdb::Key{4}, aowis::dvmdb::Bytes{4}}}).id;
-    });
+    const aowis::dvmdb::RevisionId later =
+        commitRaw(service, project, "main", {{aowis::dvmdb::Key{4}, aowis::dvmdb::Bytes{4}}});
     std::set<QString> seen;
-    auto record = [&](const Response& response) {
+    const std::function<void(const Response&)> record = [&](const Response& response) {
         check(response.status == 200 && response.json.value("heads").toArray().size() == 3,
               "graph paging response malformed");
+        // Heads are ordered by branch name: alias, feature, main.
         const QJsonArray heads = response.json.value("heads").toArray();
-        check(heads.at(2).toObject().value("revision").toString() ==
-              QString::fromStdString(aowis::dvmdb::toHex(merged)),
+        check(heads.at(2).toObject().value("revision").toString() == revisionText(merged),
               "graph HEAD snapshot changed after concurrent commit");
         const QJsonArray revisions = response.json.value("revisions").toArray();
         check(revisions.size() == 1, "graph page size incorrect");
-        const QString hash = revisions.at(0).toObject().value("id").toString();
-        check(seen.insert(hash).second, "duplicate graph revision across HTTP pages");
+        const QString revision = revisions.at(0).toObject().value("id").toString();
+        check(seen.insert(revision).second, "duplicate graph revision across HTTP pages");
     };
     record(first);
     QString cursor = initialCursor;
@@ -1069,14 +1108,14 @@ void exerciseRevisionGraphHttp() {
         check(response.json.value("complete").toBool() == cursor.isEmpty(),
               "graph completeness flag disagrees with cursor");
     }
-    check(seen.size() == 5 && seen.contains(QString::fromStdString(aowis::dvmdb::toHex(initial))) &&
-          !seen.contains(QString::fromStdString(aowis::dvmdb::toHex(later))),
+    check(seen.size() == 5 && seen.contains(revisionText(initial)) &&
+          !seen.contains(revisionText(later)),
           "HTTP graph omitted ancestry or leaked a later revision");
     const Response updated = client.call("GET", path);
     check(updated.status == 200 && updated.json.value("complete").toBool() &&
           updated.json.value("revisions").toArray().size() == 6 &&
           updated.json.value("heads").toArray().at(2).toObject().value("revision").toString() ==
-              QString::fromStdString(aowis::dvmdb::toHex(later)),
+              revisionText(later),
           "fresh HTTP graph missing advanced branch tip");
 }
 
@@ -1193,15 +1232,15 @@ void exerciseExecutable(const QString& executable) {
                                                       QString::fromStdString(ini.string())});
     check(validIni.listened && validIni.exitCode == 0, "valid INI max_pending_per_project refused");
 }
-void exerciseRevisionBundleV2Http() {
+void exerciseRevisionBundleHttp() {
     namespace native = aowis::dvmdb;
     TemporaryRoot temp;
     const std::filesystem::path sourcePath = temp.root() / "v2-source";
     const std::filesystem::path replicaPath = temp.root() / "v2-replica";
     native::ProjectService source(sourcePath);
-    const native::ProjectInfo project = source.createProjectV2("Revision transfer");
+    const native::ProjectInfo project = source.createProject("Revision transfer");
     const std::optional<native::ProjectId> projectId = native::ProjectId::parse(project.id);
-    check(projectId.has_value(), "created v2 project is not UUIDv7");
+    check(projectId.has_value(), "created project is not UUIDv7");
     // Clone the initial, fully published project before either side commits.
     // The source and recipient therefore agree on the project and branch IDs,
     // and only the source later advances its HEAD.
@@ -1212,12 +1251,12 @@ void exerciseRevisionBundleV2Http() {
     native::ProjectService replica(replicaPath);
     const std::optional<native::BranchId> identity = source.branchId(project.id, "main");
     check(identity.has_value() && replica.branchId(project.id, "main") == identity,
-          "cloned v2 project lost branch identity");
-    native::RevisionId tip = source.headV2(project.id, "main");
+          "cloned project lost branch identity");
+    native::RevisionId tip = source.head(project.id, "main");
     native::Key key{};
     key[15] = 41;
     source.withRepository(project.id, [&](native::Repository& repository) {
-        tip = repository.commitV2(*projectId, "main", {{key, native::Bytes{1, 2, 3}}}, tip);
+        tip = repository.commit(*projectId, "main", {{key, native::Bytes{1, 2, 3}}}, tip);
     });
     const native::BundleLimits limits{4ULL * 1024ULL * 1024ULL, 10000ULL, 1024ULL * 1024ULL};
     TestServer sourceServer(source, limits);
@@ -1250,15 +1289,15 @@ void exerciseRevisionBundleV2Http() {
           "clone target silently renamed a provisioned project");
     const BinaryResponse firstImport = freshClient.callRaw(
         "POST", prefix, full.body, "application/vnd.aowis.revision-bundle-v2");
-    check(firstImport.status == 201 && fresh.headV2(project.id, "main") == tip &&
+    check(firstImport.status == 201 && fresh.head(project.id, "main") == tip &&
           fresh.branchId(project.id, "main") == identity &&
           fresh.repositoryId() != source.repositoryId(),
           "first HTTP clone failed to preserve logical UUIDs and independent repository root");
     check(sender.callRaw("GET", prefix + "?base=not-a-uuid").status == 400,
-          "invalid v2 incremental base accepted");
+          "invalid incremental base accepted");
     check(sender.callRaw("GET", prefix + "?unused=1").status == 400,
-          "unknown v2 export query argument accepted");
-    const native::ProjectInfo unrelated = replica.createProjectV2("Unrelated project");
+          "unknown export query argument accepted");
+    const native::ProjectInfo unrelated = replica.createProject("Unrelated project");
     const QString unrelatedPath = QStringLiteral("/dvmdb/v1/projects/") +
         QString::fromStdString(unrelated.id) + "/branches/main/bundle";
     check(receiver.callRaw("POST", unrelatedPath, full.body,
@@ -1267,7 +1306,7 @@ void exerciseRevisionBundleV2Http() {
     sender.abortDownload(prefix);
     const BinaryResponse advanced = receiver.callRaw(
         "POST", prefix, full.body, "application/vnd.aowis.revision-bundle-v2");
-    check(advanced.status == 200 && replica.headV2(project.id, "main") == tip &&
+    check(advanced.status == 200 && replica.head(project.id, "main") == tip &&
           replica.branchId(project.id, "main") == identity,
           "HTTP UUIDv7 full import did not preserve HEAD/branch identity");
     check(receiver.callRaw("POST", prefix, full.body,
@@ -1275,7 +1314,7 @@ void exerciseRevisionBundleV2Http() {
           "HTTP full revision replay failed");
     const native::RevisionId base = tip;
     source.withRepository(project.id, [&](native::Repository& repository) {
-        tip = repository.commitV2(*projectId, "main", {{key, native::Bytes{4, 5, 6}}}, base);
+        tip = repository.commit(*projectId, "main", {{key, native::Bytes{4, 5, 6}}}, base);
     });
     const BinaryResponse delta = sender.callRaw("GET", prefix + "?base=" +
                                               QString::fromStdString(base.toString()));
@@ -1287,11 +1326,11 @@ void exerciseRevisionBundleV2Http() {
     const BinaryResponse invalid = receiver.callRaw(
         "POST", prefix, damaged, "application/vnd.aowis.revision-bundle-v2");
     check(invalid.status >= 400 && invalid.status < 500 &&
-          replica.headV2(project.id, "main") == base,
+          replica.head(project.id, "main") == base,
           "corrupt HTTP revision delta advanced recipient HEAD");
     const BinaryResponse imported = receiver.callRaw(
         "POST", prefix, delta.body, "application/vnd.aowis.revision-bundle-v2");
-    check(imported.status == 200 && replica.headV2(project.id, "main") == tip &&
+    check(imported.status == 200 && replica.head(project.id, "main") == tip &&
           replica.branchId(project.id, "main") == identity,
           "HTTP UUIDv7 incremental import lost identity");
     check(receiver.callRaw("POST", prefix, delta.body,
@@ -1340,21 +1379,21 @@ void exerciseUnbornProjectHttp() {
     check(configuredRole.status == 200 &&
           configuredRole.json.value("repositoryId").toString() == localRepositoryId &&
           configuredRole.json.value("role").toString() == QStringLiteral("private") &&
-          service.repositoryRoleV1() == native::RepositoryRoleV1::Private,
+          service.repositoryRole() == native::RepositoryRole::Private,
           "HTTP could not configure discovered repository as private");
     check(client.call("POST", roleRoute, privateRole).status == 200,
           "HTTP private role configuration is not idempotent");
     check(client.call("POST", roleRoute,
                       QJsonObject{{"expectedRepositoryId", localRepositoryId},
                                   {"role", "shared"}}).status == 409 &&
-          service.repositoryRoleV1() == native::RepositoryRoleV1::Private,
+          service.repositoryRole() == native::RepositoryRole::Private,
           "HTTP role configuration allowed an irreversible role change");
     const std::string remoteId = native::UuidV7::generate().toString();
     const std::string trackedProject = native::ProjectId::generate().toString();
     const std::string trackedBranch = native::BranchId::generate().toString();
-    service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
-    service.registerRemoteRepositoryV1(remoteId, "https://shared.example.test/dvmdb/v1");
-    service.recordRemoteTrackingRefV1({remoteId, trackedProject, trackedBranch, std::nullopt},
+    service.configureRepositoryRole(native::RepositoryRole::Private);
+    service.registerRemoteRepository(remoteId, "https://shared.example.test/dvmdb/v1");
+    service.recordRemoteTrackingRef({remoteId, trackedProject, trackedBranch, std::nullopt},
                                       std::nullopt);
     const Response tracking = client.call("GET", "/dvmdb/v1/repository/tracking");
     const QJsonArray refs = tracking.json.value("tracking").toArray();
@@ -1437,7 +1476,7 @@ void exerciseUnbornProjectHttp() {
     key[15] = 9;
     std::optional<native::RevisionId> first;
     service.withRepository(project, [&](native::Repository& repository) {
-        first = repository.commitV2(*id, "main", {{key, native::Bytes{1, 2, 3}}}, std::nullopt);
+        first = repository.commit(*id, "main", {{key, native::Bytes{1, 2, 3}}}, std::nullopt);
     });
     check(first.has_value(), "HTTP first unborn commit returned no revision");
     const QString firstId = QString::fromStdString(first->toString());
@@ -1459,12 +1498,12 @@ void exerciseUnbornCheckoutHttp() {
     TemporaryRoot sourceRoot;
     TemporaryRoot targetRoot;
     native::ProjectService source(sourceRoot.root());
-    const native::ProjectInfo project = source.createUnbornProjectV2("Unborn network");
+    const native::ProjectInfo project = source.createUnbornProject("Unborn network");
     const std::optional<native::BranchId> sourceBranch = source.branchId(project.id, "main");
-    check(sourceBranch.has_value() && !source.optionalHeadV2(project.id, "main"),
+    check(sourceBranch.has_value() && !source.optionalHead(project.id, "main"),
           "unborn source has no stable branch ID or has a revision");
     native::ProjectService target(targetRoot.root());
-    target.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+    target.configureRepositoryRole(native::RepositoryRole::Private);
     TestServer targetServer(target, native::BundleLimits{4ULL * 1024ULL * 1024ULL, 10000, 1024ULL * 1024ULL});
     Client client(targetServer.port());
     const QString prefix = QStringLiteral("/dvmdb/v1/projects/") + QString::fromStdString(project.id);
@@ -1482,7 +1521,7 @@ void exerciseUnbornCheckoutHttp() {
     check(first.status == 200 && retry.status == 200 && first.json == retry.json &&
           first.json.value("branchId") == identity && first.json.value("revision").isNull() &&
           target.branchId(project.id, "main") == sourceBranch &&
-          !target.optionalHeadV2(project.id, "main"),
+          !target.optionalHead(project.id, "main"),
           "unborn checkout lost source branch UUID, null HEAD, or retry safety");
     check(client.call("POST", path,
           QJsonObject{{"branchId", identity}, {"name", "renamed"}}).status == 409,
@@ -1502,8 +1541,8 @@ void exerciseUnbornCheckoutHttp() {
                       {"sessionId", session}, {"id", draftId}});
     check(draft.status == 201 && draft.json.value("id") == draftId &&
           draft.json.value("baseRevision").isNull() &&
-          target.workingCopyV1(draftId.toStdString()).baseRevision == std::nullopt &&
-          !target.optionalHeadV2(project.id, "main"),
+          target.workingCopy(draftId.toStdString()).baseRevision == std::nullopt &&
+          !target.optionalHead(project.id, "main"),
           "unborn checkout could not create a durable null-base working copy");
     targetServer.stop();
 }
@@ -1521,7 +1560,7 @@ void exerciseUuidv7HistoryHttp() {
                       QJsonObject{{"name", "format override"}, {"revisionFormat", "uuidv7"}}).status == 400,
           "canonical UUIDv7 project creation accepted obsolete revisionFormat selector");
     const Response created = client.call("POST", "/dvmdb/v1/projects",
-        QJsonObject{{"name", "V2 API"}});
+        QJsonObject{{"name", "API"}});
     const std::string project = created.json.value("id").toString().toStdString();
     check(created.status == 201 && native::ProjectId::parse(project).has_value(),
           "HTTP did not create UUIDv7 project");
@@ -1531,18 +1570,18 @@ void exerciseUuidv7HistoryHttp() {
     const QString mainHeadPath = basePath + "/branches/main/head";
     const Response head = client.call("GET", mainHeadPath);
     check(head.status == 200 && native::RevisionId::parse(head.json.value("id").toString().toStdString()),
-          "HTTP V2 branch HEAD is not UUIDv7");
+          "HTTP branch HEAD is not UUIDv7");
     const QString rootId = head.json.value("id").toString();
     check(client.call("GET", basePath + "/branches/main/head-v2").status == 404,
-          "obsolete V2 HEAD alias still registered");
+          "obsolete HEAD alias still registered");
     check(client.call("GET", basePath + "/revisions/" + QString(64, '0')).status == 400,
           "canonical revision lookup accepted a SHA-256 revision identity");
     check(client.call("GET", basePath + "/revisions/garbage").status == 400,
-          "HTTP v2 revision lookup accepted non-UUID identity");
+          "HTTP revision lookup accepted non-UUID identity");
     const Response initial = client.call("GET", basePath + "/revisions/" + rootId);
     check(initial.status == 200 && initial.json.value("recordHash").toString().size() == 64 &&
           initial.json.value("parents").toArray().isEmpty(),
-          "HTTP V2 root detail is invalid");
+          "HTTP root detail is invalid");
     // Branches are addressed by UUIDv7 (DG-01): read main's identity first.
     const std::function<QString(const QString&)> mainBranchIdOf = [&client](const QString& path) {
         for (const QJsonValue& value : client.call("GET", path + "/revision-graph?limit=1")
@@ -1555,7 +1594,7 @@ void exerciseUuidv7HistoryHttp() {
     };
     const QString mainBranchId = mainBranchIdOf(basePath);
     check(native::BranchId::parse(mainBranchId.toStdString()).has_value(),
-          "HTTP V2 initial graph did not expose the main branch identity");
+          "HTTP initial graph did not expose the main branch identity");
     check(client.call("POST", basePath + "/branches",
         QJsonObject{{"name", "by-name"}, {"fromBranch", "main"}}).status == 400,
           "branch creation still accepted a source branch name");
@@ -1591,10 +1630,10 @@ void exerciseUuidv7HistoryHttp() {
           native::BranchId::parse(feature.json.value("branchId").toString().toStdString()) &&
           feature.json.value("originBranchId").toString() == mainBranchId &&
           feature.json.value("forkRevisionId").toString() == rootId,
-          "HTTP V2 branch creation did not return persisted fork provenance");
+          "HTTP branch creation did not return persisted fork provenance");
     check(client.call("POST", basePath + "/branches",
         QJsonObject{{"name", "orphan"}}).status == 400,
-          "source-less V2 fork allowed for nonempty project");
+          "source-less fork allowed for nonempty project");
     check(client.call("POST", basePath + "/branches",
         QJsonObject{{"name", "bad"}, {"fromBranchId", mainBranchId}, {"revision", "1234"}}).status == 400,
           "invalid historical UUID was accepted");
@@ -1603,7 +1642,7 @@ void exerciseUuidv7HistoryHttp() {
     native::Key first{};
     first[15] = 7;
     service.withRepository(project, [&](native::Repository& repository) {
-        mainTip = repository.commitV2(*id, "main", {{first, native::Bytes{1, 2}}}, mainTip);
+        mainTip = repository.commit(*id, "main", {{first, native::Bytes{1, 2}}}, mainTip);
     });
     const QString newer = QString::fromStdString(mainTip.toString());
     const Response graphFirst = client.call("GET", graphPath + "?limit=1");
@@ -1612,7 +1651,7 @@ void exerciseUuidv7HistoryHttp() {
           !graphFirst.json.value("complete").toBool(), "UUIDv7 graph first page malformed");
     const QString cursor = graphFirst.json.value("nextCursor").toString();
     check(!cursor.isEmpty(), "UUIDv7 graph did not return pagination cursor");
-    const QString differentProject = QString::fromStdString(service.createProjectV2("Other").id);
+    const QString differentProject = QString::fromStdString(service.createProject("Other").id);
     check(client.call("GET", "/dvmdb/v1/projects/" + differentProject +
                       "/revision-graph?cursor=" + cursor).status == 400,
           "UUIDv7 graph cursor was accepted across projects");
@@ -1623,7 +1662,7 @@ void exerciseUuidv7HistoryHttp() {
           "forged UUIDv7 graph cursor was accepted");
     // Advance main during paging; the pinned first page must not be rewritten.
     service.withRepository(project, [&](native::Repository& repository) {
-        mainTip = repository.commitV2(*id, "main", {{first, native::Bytes{3, 4}}}, mainTip);
+        mainTip = repository.commit(*id, "main", {{first, native::Bytes{3, 4}}}, mainTip);
     });
     const Response graphSecond = client.call("GET", graphPath + "?limit=1&cursor=" + cursor);
     check(graphSecond.status == 200 && graphSecond.json.value("heads") == graphFirst.json.value("heads") &&
@@ -1637,7 +1676,7 @@ void exerciseUuidv7HistoryHttp() {
     const Response history = client.call("GET", basePath + "/branches/main/history?limit=1");
     check(history.status == 200 && history.json.value("revisions").toArray().size() == 1 &&
           history.json.value("revisions").toArray().at(0).toObject().value("id").toString() ==
-          QString::fromStdString(mainTip.toString()), "V2 history did not begin at current HEAD");
+          QString::fromStdString(mainTip.toString()), "history did not begin at current HEAD");
     const QJsonObject historicRequest{{"name", "historic"}, {"fromBranchId", mainBranchId},
         {"revision", rootId}, {"id", QString::fromStdString(native::BranchId::generate().toString())}};
     const Response historic = client.call("POST", basePath + "/branches", historicRequest);
@@ -1647,25 +1686,25 @@ void exerciseUuidv7HistoryHttp() {
           native::BranchId::parse(historic.json.value("branchId").toString().toStdString()) &&
           historic.json.value("originBranchId").toString() == mainBranchId &&
           historic.json.value("forkRevisionId").toString() == rootId,
-          "V2 historical branching did not return exact persisted fork provenance");
+          "historical branching did not return exact persisted fork provenance");
     const Response renamed = client.call("PATCH", basePath + "/branches/historic",
         QJsonObject{{"name", "archived"}, {"expectedHead", rootId}});
     check(renamed.status == 200 &&
           client.call("GET", basePath + "/branches/archived/head").json.value("id").toString() == rootId,
-          "V2 rename moved HEAD or lost branch");
+          "rename moved HEAD or lost branch");
     const QString historicId = historic.json.value("branchId").toString();
     check(client.call("GET", basePath + "/branch-ids/" + historicId).json.value("branch") == "archived",
           "branch lookup by UUIDv7 did not follow the rename");
     check(client.call("PATCH", basePath + "/branches/archived",
         QJsonObject{{"name", "bad-again"}, {"expectedHead", newer}}).status == 409,
-          "V2 stale rename did not conflict");
+          "stale rename did not conflict");
 
-    // A separate v2 project starts with an empty root, so the HTTP model
+    // A separate project starts with an empty root, so the HTTP model
     // operations are exercised against actual UUIDv7 HEADs rather than
     // the SHA-only model API or a fixture-created raw revision.
     const Response modelProject = client.call("POST", "/dvmdb/v1/projects",
-        QJsonObject{{"name", "V2 REST commits"}});
-    check(modelProject.status == 201, "V2 model test project creation failed");
+        QJsonObject{{"name", "REST commits"}});
+    check(modelProject.status == 201, "model test project creation failed");
     const QString modelPath = QStringLiteral("/dvmdb/v1/projects/") +
                               modelProject.json.value("id").toString();
     const QString modelRoot = client.call("GET", modelPath + "/branches/main/head")
@@ -1674,7 +1713,7 @@ void exerciseUuidv7HistoryHttp() {
     const Response modelFeature = client.call("POST", modelPath + "/branches",
         QJsonObject{{"name", "feature"}, {"fromBranchId", modelMainId}});
     check(modelFeature.status == 201 && modelFeature.json.value("id").toString() == modelRoot,
-          "V2 model feature branch creation failed");
+          "model feature branch creation failed");
     const QString keyA = QStringLiteral("00000000-0000-0000-0000-000000000007");
     const QString keyB = QStringLiteral("00000000-0000-0000-0000-000000000008");
     const QString mainCommitPath = modelPath + "/branches/main/model-commits";
@@ -1687,57 +1726,57 @@ void exerciseUuidv7HistoryHttp() {
                                   {"changes", QJsonArray{addA}}};
     check(client.call("POST", mainCommitPath,
         QJsonObject{{"expectedHead", modelRoot}, {"changes", QJsonArray{}}}).status == 400,
-        "V2 REST accepted empty model change batch");
+        "REST accepted empty model change batch");
     check(client.call("POST", mainCommitPath,
         QJsonObject{{"expectedHead", modelRoot}, {"changes", QJsonArray{
             QJsonObject{{"uuid", keyA}, {"kind", 31}, {"references", QJsonArray{}},
                         {"payloadBase64", "invalid***"}}}}}).status == 400,
-        "V2 REST accepted invalid model base64");
+        "REST accepted invalid model base64");
     const Response modelFirst = client.call("POST", mainCommitPath, firstCommit);
     const QString modelFirstId = modelFirst.json.value("id").toString();
     check(modelFirst.status == 201 && native::RevisionId::parse(modelFirstId.toStdString()),
-          "V2 REST model commit did not create revision UUIDv7");
+          "REST model commit did not create revision UUIDv7");
     check(client.call("POST", mainCommitPath, firstCommit).status == 409,
-          "V2 REST accepted stale model expectedHead");
+          "REST accepted stale model expectedHead");
     const Response modelDiff = client.call("GET", modelPath + "/diff?from=" + modelRoot +
                                             "&to=" + modelFirstId);
     check(modelDiff.status == 200 && modelDiff.json.value("changes").toArray().size() == 1 &&
           modelDiff.json.value("changes").toArray().at(0).toObject().value("uuid").toString() == keyA,
-          "V2 REST immutable diff did not include added model");
+          "REST immutable diff did not include added model");
     check(client.call("GET", modelPath + "/diff?from=garbage&to=" + modelFirstId).status == 400,
-          "V2 REST immutable diff accepted non-UUID identity");
+          "REST immutable diff accepted non-UUID identity");
     const Response modelSecond = client.call("POST", featureCommitPath,
         QJsonObject{{"expectedHead", modelRoot}, {"changes", QJsonArray{addB}}});
     const QString featureCommitId = modelSecond.json.value("id").toString();
     check(modelSecond.status == 201 && native::RevisionId::parse(featureCommitId.toStdString()),
-          "V2 REST model branch commit failed");
+          "REST model branch commit failed");
     const QString mergePath = modelPath + "/merges";
     const QJsonObject mergeRequest{{"target", "main"}, {"source", "feature"},
         {"expectedTargetHead", modelFirstId}, {"expectedSourceHead", featureCommitId}};
     check(client.call("POST", mergePath,
         QJsonObject{{"target", "main"}, {"source", "feature"},
                     {"expectedTargetHead", modelRoot}, {"expectedSourceHead", featureCommitId}}).status == 409,
-          "V2 REST merge accepted stale target HEAD");
+          "REST merge accepted stale target HEAD");
     const Response merged = client.call("POST", mergePath, mergeRequest);
     const QString mergedId = merged.json.value("head").toString();
     check(merged.status == 200 && merged.json.value("status").toString() == "merged" &&
           native::RevisionId::parse(mergedId.toStdString()),
-          "V2 REST disjoint model merge did not publish UUIDv7 merge revision");
+          "REST disjoint model merge did not publish UUIDv7 merge revision");
     const Response mergeRecord = client.call("GET", modelPath + "/revisions/" + mergedId);
     check(mergeRecord.status == 200 && mergeRecord.json.value("parents").toArray().size() == 2,
-          "V2 REST merge revision did not retain both parents");
+          "REST merge revision did not retain both parents");
     check(client.call("GET", modelPath + "/branches/feature/head")
            .json.value("id").toString() == featureCommitId,
-          "V2 REST merge unexpectedly advanced source branch HEAD");
+          "REST merge unexpectedly advanced source branch HEAD");
     const Response mergedDiff = client.call("GET", modelPath + "/diff?from=" +
                                               modelFirstId + "&to=" + mergedId);
     check(mergedDiff.status == 200 && mergedDiff.json.value("changes").toArray().size() == 1 &&
           mergedDiff.json.value("changes").toArray().at(0).toObject().value("uuid").toString() == keyB,
-          "V2 REST merged revision diff omitted source change");
+          "REST merged revision diff omitted source change");
     const Response otherBranch = client.call("POST", modelPath + "/branches",
         QJsonObject{{"name", "competing"}, {"fromBranchId", modelMainId}});
     check(otherBranch.status == 201 && otherBranch.json.value("id").toString() == mergedId,
-          "V2 REST conflict test branch creation failed");
+          "REST conflict test branch creation failed");
     const QJsonObject overwriteA{{"uuid", keyA}, {"kind", 31},
         {"references", QJsonArray{}}, {"payloadBase64", "Mw=="}};
     const QJsonObject overwriteOther{{"uuid", keyA}, {"kind", 31},
@@ -1750,19 +1789,19 @@ void exerciseUuidv7HistoryHttp() {
     const QString mainAdvancedId = mainAdvanced.json.value("id").toString();
     const QString otherAdvancedId = otherAdvanced.json.value("id").toString();
     check(mainAdvanced.status == 201 && otherAdvanced.status == 201,
-          "V2 REST conflict fixture model commits failed");
+          "REST conflict fixture model commits failed");
     const Response conflict = client.call("POST", mergePath,
         QJsonObject{{"target", "main"}, {"source", "competing"},
                     {"expectedTargetHead", mainAdvancedId},
                     {"expectedSourceHead", otherAdvancedId}});
     check(conflict.status == 409 && conflict.json.value("status").toString() == "conflicts" &&
           conflict.json.value("conflicts").toArray().size() == 1,
-          "V2 REST concurrent model conflict not reported");
+          "REST concurrent model conflict not reported");
     check(client.call("GET", modelPath + "/branches/main/head")
                 .json.value("id").toString() == mainAdvancedId &&
           client.call("GET", modelPath + "/branches/competing/head")
                 .json.value("id").toString() == otherAdvancedId,
-          "V2 REST conflict changed a branch HEAD");
+          "REST conflict changed a branch HEAD");
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
     // The hydraulic merge endpoint must apply its domain validator, not
     // silently accept generic, non-hydraulic indexed models as networks.
@@ -1800,7 +1839,7 @@ void exerciseUuidv7HistoryHttp() {
               .json.value("id").toString() == mainAdvancedId &&
           client.call("GET", modelPath + "/branches/competing/head")
               .json.value("id").toString() == otherAdvancedId,
-          "rejected hydraulic V2 REST merge advanced a branch HEAD");
+          "rejected hydraulic REST merge advanced a branch HEAD");
 #endif
 
 
@@ -1818,7 +1857,7 @@ void exerciseWorkingCopyHttp() {
     const QString modelUuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     {
         native::ProjectService service(root.root());
-        const native::ProjectInfo project = service.createUnbornProjectV2("private working-copy HTTP");
+        const native::ProjectInfo project = service.createUnbornProject("private working-copy HTTP");
         projectId = project.id;
         TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
                                                          10000ULL, 1024ULL * 1024ULL});
@@ -1832,7 +1871,7 @@ void exerciseWorkingCopyHttp() {
                                  {"sessionId", firstSession}, {"id", chosenDraft}};
         check(client.call("POST", listPath, create).status == 409,
               "non-private repository accepted draft creation");
-        service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+        service.configureRepositoryRole(native::RepositoryRole::Private);
         check(client.call("POST", listPath,
               QJsonObject{{"projectId", QString::fromStdString(projectId)},
                           {"branchId", mainId}, {"sessionId", firstSession}}).status == 400,
@@ -1903,8 +1942,8 @@ void exerciseWorkingCopyHttp() {
         check(client.call("GET", detailPath).json.value("generation") == QStringLiteral("1") &&
               client.call("GET", detailPath).json.value("changes").toArray().size() == 1 &&
               !client.call("GET", detailPath).json.contains("token") &&
-              !service.optionalHeadV2(projectId, "main").has_value() &&
-              service.revisionGraphV2(projectId).revisions.empty(),
+              !service.optionalHead(projectId, "main").has_value() &&
+              service.revisionGraph(projectId).revisions.empty(),
               "HTTP draft save changed committed HEAD or lost candidate");
         const Response released = client.call("POST", detailPath + "/release",
             QJsonObject{{"sessionId", firstSession}, {"fencingToken", token}});
@@ -1964,12 +2003,12 @@ void exerciseWorkingCopyHttp() {
     }
     {
         native::ProjectService reopened(root.root());
-        const native::WorkingCopyInfoV1 draft = reopened.workingCopyV1(draftId);
+        const native::WorkingCopyInfo draft = reopened.workingCopy(draftId);
         check(draft.generation == 2 && draft.dirty && draft.journal.size() == 1 &&
               draft.candidateChanges.size() == 1 &&
               draft.candidateChanges.front().record.has_value() &&
               draft.candidateChanges.front().record->payload == native::Bytes{1, 2, 3} &&
-              !reopened.optionalHeadV2(projectId, "main").has_value(),
+              !reopened.optionalHead(projectId, "main").has_value(),
               "HTTP draft candidate did not survive repository restart");
         TestServer server(reopened, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
                                                          10000ULL, 1024ULL * 1024ULL});
@@ -1997,9 +2036,9 @@ void exerciseUnbornNetworkInitializationHttp() {
     const QString junctionId = junctionUuid.toString(QUuid::WithoutBraces);
     {
         native::ProjectService service(root.root());
-        const native::ProjectInfo project = service.createUnbornProjectV2("first hydraulic network");
+        const native::ProjectInfo project = service.createUnbornProject("first hydraulic network");
         projectId = project.id;
-        service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+        service.configureRepositoryRole(native::RepositoryRole::Private);
         TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
                                                        10000ULL, 1024ULL * 1024ULL});
         Client client(server.port());
@@ -2044,7 +2083,7 @@ void exerciseUnbornNetworkInitializationHttp() {
               initialized.json.value("changes").toArray().first().toObject()
                   .value("kind").toInt() == 100 &&
               initialized.json.value("events").toArray().isEmpty() &&
-              !service.optionalHeadV2(project.id, "main").has_value(),
+              !service.optionalHead(project.id, "main").has_value(),
               "first network changed committed HEAD or did not save root in unborn draft");
         const Response firstView = client.call("GET", path + "/networks/" + networkId);
         const QByteArray firstPayload = QByteArray::fromBase64(
@@ -2090,7 +2129,7 @@ void exerciseUnbornNetworkInitializationHttp() {
             {"events", QJsonArray{QString::fromLatin1(frame.toBase64())}}};
         const Response saved = client.call("POST", path + "/save-events", save);
         check(saved.status == 200 && saved.json.value("generation") == QStringLiteral("2") &&
-              !service.optionalHeadV2(project.id, "main").has_value(),
+              !service.optionalHead(project.id, "main").has_value(),
               "first hydraulic member could not be saved into unborn draft");
         const Response populatedView = client.call("GET", path + "/networks/" + networkId);
         const QByteArray populatedPayload = QByteArray::fromBase64(
@@ -2101,7 +2140,7 @@ void exerciseUnbornNetworkInitializationHttp() {
               populatedNetwork && populatedNetwork->nodes_junctions.size() == 1 &&
               populatedNetwork->nodes_junctions.first().uuid == junctionUuid &&
               populatedNetwork->nodes_junctions.first().elevation_m == 12 &&
-              !service.optionalHeadV2(project.id, "main").has_value(),
+              !service.optionalHead(project.id, "main").has_value(),
               "saved membership did not hydrate canonical draft network");
         const Response after = client.call("POST", path + "/initialize-network", request);
         check(after.status == 409, "initialization replay was accepted after later edit");
@@ -2109,10 +2148,10 @@ void exerciseUnbornNetworkInitializationHttp() {
     }
     {
         native::ProjectService reopened(root.root());
-        const native::WorkingCopyInfoV1 draft = reopened.workingCopyV1(draftId);
+        const native::WorkingCopyInfo draft = reopened.workingCopy(draftId);
         check(!draft.baseRevision && draft.generation == 2 && draft.journal.size() == 1 &&
               draft.candidateChanges.size() >= 3 &&
-              !reopened.optionalHeadV2(projectId, "main").has_value(),
+              !reopened.optionalHead(projectId, "main").has_value(),
               "first hydraulic network and member did not survive service restart");
         TestServer server(reopened, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
                                                         10000ULL, 1024ULL * 1024ULL});
@@ -2133,7 +2172,7 @@ void exerciseHydraulicDraftMembershipHttp() {
     namespace native = aowis::dvmdb;
     TemporaryRoot root;
     native::ProjectService service(root.root());
-    const native::ProjectInfo project = service.createUnbornProjectV2("draft-membership-test");
+    const native::ProjectInfo project = service.createUnbornProject("draft-membership-test");
     const native::ProjectId projectUuid = *native::ProjectId::parse(project.id);
     const QUuid networkUuid(QString::fromStdString(native::UuidV7::generate().toString()));
     const QUuid oldUuid(QString::fromStdString(native::UuidV7::generate().toString()));
@@ -2151,17 +2190,17 @@ void exerciseHydraulicDraftMembershipHttp() {
     network.nodes_junctions.append(initial);
     // New projects have an unborn HEAD: establish a real empty model revision
     // before exercising the committed-network fixture.
-    check(!service.optionalHeadV2(project.id, "main").has_value(),
+    check(!service.optionalHead(project.id, "main").has_value(),
           "new hydraulic fixture project should have an unborn HEAD");
-    const native::RevisionId head = service.commitModelV2(project.id, "main", {});
-    check(service.optionalHeadV2(project.id, "main") == head,
+    const native::RevisionId head = service.commitModel(project.id, "main", {});
+    check(service.optionalHead(project.id, "main") == head,
           "first hydraulic fixture commit did not establish the HEAD");
     native::RevisionId base = head;
     service.withRepository(project.id, [&](native::Repository& repository) {
         base = native::hydraulic::saveHydraulicNetwork(repository, projectUuid,
                                                          "main", network, head);
     });
-    service.configureRepositoryRoleV1(native::RepositoryRoleV1::Private);
+    service.configureRepositoryRole(native::RepositoryRole::Private);
     TestServer server(service, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
                                                      10000ULL, 1024ULL * 1024ULL});
     Client client(server.port());
@@ -2287,7 +2326,7 @@ void exerciseHydraulicDraftMembershipHttp() {
     check(client.call("POST", path + "/save-events", second).status == 200 &&
           client.call("POST", path + "/save-events", second).status == 200 &&
           client.call("GET", path).json.value("generation") == QStringLiteral("2") &&
-          service.optionalHeadV2(project.id, "main") == base,
+          service.optionalHead(project.id, "main") == base,
           "hydraulic deletion or replay modified committed HEAD");
     const Response finalView = client.call("GET", path + "/networks/" + networkId);
     const std::optional<NetworkHydraulic> finalNetwork = native::ModelCodec<NetworkHydraulic>::decode(
@@ -2297,7 +2336,7 @@ void exerciseHydraulicDraftMembershipHttp() {
           finalNetwork->nodes_junctions.first().uuid == newUuid,
           "deleted pinned-base member was resurrected during draft hydration");
     server.stop();
-    const native::WorkingCopyInfoV1 persisted = service.workingCopyV1(
+    const native::WorkingCopyInfo persisted = service.workingCopy(
         created.json.value("id").toString().toStdString());
     check(persisted.generation == 2 && persisted.journal.size() == 2 &&
           persisted.candidateChanges.size() >= 3,
@@ -2311,11 +2350,13 @@ int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     try {
         check(argc == 2, "expected path to aowis-server-dvmdb executable");
-        // Exercise the canonical UUIDv7 HTTP routes. SHA-era hydraulic HTTP
-        // fixtures for removed endpoints have been deleted rather than kept
-        // behind an inactive preprocessor flag.
+        // Exercise the canonical UUIDv7 HTTP routes; every revision identity
+        // on these routes is a UUIDv7.
         exerciseTransferStagingBudget();
-        exerciseRevisionBundleV2Http();
+        exercise();
+        exerciseConcurrency();
+        exerciseRevisionGraphHttp();
+        exerciseRevisionBundleHttp();
         exerciseUnbornProjectHttp();
         exerciseUnbornCheckoutHttp();
         exerciseWorkingCopyHttp();

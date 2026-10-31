@@ -1,8 +1,9 @@
 #include "aowis/dvmdb/native_store.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -41,45 +42,45 @@ void testUnbornNativeRefFoundation() {
     BranchId branch = BranchId::generate();
     {
         Repository repo(temp.path);
-        repo.createUnbornBranchV2(project, "main");
+        repo.createUnbornBranch(project, "main");
         branch = *repo.branchId("main");
-        check(!repo.optionalHeadV2(project, "main"), "unborn HEAD is not null");
-        check(repo.historyV2(project, "main", 10).empty(),
+        check(!repo.optionalHead(project, "main"), "unborn HEAD is not null");
+        check(repo.history(project, "main", 10).empty(),
               "unborn branch must have empty history");
-        rejects([&] { (void)repo.historyV2(project, "main", 10, RevisionId::generate()); },
+        rejects([&] { (void)repo.history(project, "main", 10, RevisionId::generate()); },
                 StorageErrorKind::InvalidInput, "unborn history accepted a cursor");
-        rejects([&] { repo.createUnbornBranchV2(project, "second"); },
+        rejects([&] { repo.createUnbornBranch(project, "second"); },
                 StorageErrorKind::Conflict, "second unborn branch accepted");
-        rejects([&] { (void)repo.headV2(project, "main"); },
-                StorageErrorKind::Unavailable, "legacy nonnullable HEAD accepted unborn");
+        rejects([&] { (void)repo.head(project, "main"); },
+                StorageErrorKind::Unavailable, "required HEAD accepted an unborn branch");
     }
     {
         Repository reopened(temp.path);
         check(reopened.branchId("main") == branch &&
-              !reopened.optionalHeadV2(project, "main"),
+              !reopened.optionalHead(project, "main"),
               "unborn branch not durable across reopen");
-        rejects([&] { (void)reopened.commitV2(project, "main", {}, RevisionId::generate()); },
+        rejects([&] { (void)reopened.commit(project, "main", {}, RevisionId::generate()); },
                 StorageErrorKind::Conflict, "unborn commit accepted a non-null expected HEAD");
-        const RevisionId first = reopened.commitV2(project, "main", {{key(1), value("first")}});
-        check(reopened.optionalHeadV2(project, "main") == first,
+        const RevisionId first = reopened.commit(project, "main", {{key(1), value("first")}});
+        check(reopened.optionalHead(project, "main") == first,
               "first raw commit did not publish unborn HEAD");
-        const auto bytes = reopened.readRevisionV2(project, first);
-        check(bytes && decodeRevisionRecordV2(*bytes).parents.empty(),
+        const auto bytes = reopened.readRevision(project, first);
+        check(bytes && decodeRevisionRecord(*bytes).parents.empty(),
               "first raw revision has a parent");
         check(reopened.branchId("main") == branch, "first commit changed branch identity");
-        rejects([&] { (void)reopened.commitV2(project, "main", {}, RevisionId::generate()); },
+        rejects([&] { (void)reopened.commit(project, "main", {}, RevisionId::generate()); },
                 StorageErrorKind::Conflict, "committed branch accepted stale expected HEAD");
     }
     {
         Repository modelRepo(temp.path / "model");
-        modelRepo.createUnbornBranchV2(project, "main");
-        const RevisionId first = modelRepo.commitModelV2(project, "main", {});
-        const auto bytes = modelRepo.readRevisionV2(project, first);
+        modelRepo.createUnbornBranch(project, "main");
+        const RevisionId first = modelRepo.commitModel(project, "main", {});
+        const auto bytes = modelRepo.readRevision(project, first);
         check(bytes.has_value(), "first model revision missing");
-        const RevisionRecordV2 record = decodeRevisionRecordV2(*bytes);
+        const RevisionRecord record = decodeRevisionRecord(*bytes);
         check(record.parents.empty() && record.modelIndexed,
               "first model revision must be parentless and model-indexed");
-        check(modelRepo.optionalHeadV2(project, "main") == first,
+        check(modelRepo.optionalHead(project, "main") == first,
               "first model commit did not publish unborn HEAD");
     }
 }
@@ -89,26 +90,26 @@ void testIdentityPreservingUnbornCheckout() {
     const BranchId source = BranchId::generate();
     {
         Repository target(temp.path);
-        target.provisionUnbornBranchV2(project, "main", source);
-        target.provisionUnbornBranchV2(project, "main", source);
+        target.provisionUnbornBranch(project, "main", source);
+        target.provisionUnbornBranch(project, "main", source);
         check(target.branchId("main") == source &&
-              !target.optionalHeadV2(project, "main") &&
-              target.historyV2(project, "main").empty(),
+              !target.optionalHead(project, "main") &&
+              target.history(project, "main").empty(),
               "unborn checkout fabricated a revision or lost source branch UUID");
-        rejects([&] { target.provisionUnbornBranchV2(project, "different", source); },
+        rejects([&] { target.provisionUnbornBranch(project, "different", source); },
                 StorageErrorKind::Conflict, "unborn checkout renamed existing source branch");
-        rejects([&] { target.provisionUnbornBranchV2(project, "main", BranchId::generate()); },
+        rejects([&] { target.provisionUnbornBranch(project, "main", BranchId::generate()); },
                 StorageErrorKind::Conflict, "unborn checkout overwrote a branch identity");
     }
     {
         Repository reopened(temp.path);
         check(reopened.branchId("main") == source &&
-              !reopened.optionalHeadV2(project, "main"),
+              !reopened.optionalHead(project, "main"),
               "identity-preserving unborn checkout was not durable");
     }
 }
 
-void testV2Publication() {
+void testPublication() {
     Temporary temp;
     const ProjectId project = ProjectId::generate();
     const ProjectId foreign = ProjectId::generate();
@@ -119,11 +120,11 @@ void testV2Publication() {
     BranchId featureBranch = BranchId::generate();
     {
         Repository repo(temp.path);
-        root = repo.createBranchV2(project, "main");
-        check(root == repo.headV2(project, "main"), "new main HEAD not published");
-        const std::optional<Bytes> rootBytes = repo.readRevisionV2(project, root);
+        root = repo.createBranch(project, "main");
+        check(root == repo.head(project, "main"), "new main HEAD not published");
+        const std::optional<Bytes> rootBytes = repo.readRevision(project, root);
         check(rootBytes.has_value(), "initial UUIDv7 revision missing from real pack");
-        check(decodeRevisionRecordV2(*rootBytes).parents.empty(), "initial revision has parents");
+        check(decodeRevisionRecord(*rootBytes).parents.empty(), "initial revision has parents");
         mainBranch = *repo.branchId("main");
         const fs::path recordPath = temp.path / "refs" / "heads" / mainBranch.toString();
         check(fs::exists(recordPath), "UUIDv7 branch filename is missing");
@@ -136,74 +137,72 @@ void testV2Publication() {
         check(magic == "AOWIS-BRANCH-2" && name == "main" && uuid == root.toString() &&
               digest == toHex(sha256(*rootBytes)), "branch HEAD is not UUID and checked SHA");
         check(!fs::exists(temp.path / "refs" / "heads" / "main"), "name-keyed ref created");
-        rejects([&] { (void)repo.head("main"); }, StorageErrorKind::Unavailable,
-                "SHA API accidentally interpreted UUID HEAD");
-        rejects([&] { repo.createBranch("old"); }, StorageErrorKind::Unavailable,
-                "mixed SHA and UUID branches accepted");
-        rejects([&] { (void)repo.headV2(foreign, "main"); }, StorageErrorKind::Conflict,
+        rejects([&] { (void)repo.createBranch(project, "second-root"); },
+                StorageErrorKind::InvalidInput, "second independent root branch accepted");
+        rejects([&] { (void)repo.head(foreign, "main"); }, StorageErrorKind::Conflict,
                 "foreign project accessed branch HEAD");
-        check(repo.createBranchV2(project, "feature", "main") == root,
+        check(repo.createBranch(project, "feature", "main") == root,
               "fork did not share source revision UUID");
         featureBranch = *repo.branchId("feature");
         check(featureBranch != mainBranch, "two branch references have identical UUID");
-        rejects([&] { (void)repo.createBranchV2(project, "../evil", "main"); },
+        rejects([&] { (void)repo.createBranch(project, "../evil", "main"); },
                 StorageErrorKind::InvalidInput, "malicious branch name accepted");
-        rejects([&] { (void)repo.createBranchV2(project, "orphan"); },
+        rejects([&] { (void)repo.createBranch(project, "orphan"); },
                 StorageErrorKind::InvalidInput, "second unsourced root allowed");
-        main = repo.commitV2(project, "main", {{key(1), value("one")}}, root);
-        feature = repo.commitV2(project, "feature", {{key(2), value("two")}}, root);
+        main = repo.commit(project, "main", {{key(1), value("one")}}, root);
+        feature = repo.commit(project, "feature", {{key(2), value("two")}}, root);
         check(main != feature && main != root && feature != root, "revision UUID not unique");
-        const RevisionRecordV2 mainRecord = decodeRevisionRecordV2(*repo.readRevisionV2(project, main));
-        const RevisionRecordV2 featureRecord = decodeRevisionRecordV2(*repo.readRevisionV2(project, feature));
+        const RevisionRecord mainRecord = decodeRevisionRecord(*repo.readRevision(project, main));
+        const RevisionRecord featureRecord = decodeRevisionRecord(*repo.readRevision(project, feature));
         check(mainRecord.parents.size() == 1 && mainRecord.parents[0].id == root &&
               featureRecord.parents.size() == 1 && featureRecord.parents[0].id == root,
               "fork parent UUID not preserved");
         check(mainRecord.root != featureRecord.root, "independent branch snapshots collapsed");
-        rejects([&] { (void)repo.commitV2(project, "main", {}, root); },
+        rejects([&] { (void)repo.commit(project, "main", {}, root); },
                 StorageErrorKind::Conflict, "stale expected HEAD accepted");
-        rejects([&] { (void)repo.commitV2(foreign, "main", {}); },
+        rejects([&] { (void)repo.commit(foreign, "main", {}); },
                 StorageErrorKind::Conflict, "foreign commit accepted");
-        check(repo.headV2(project, "main") == main && repo.headV2(project, "feature") == feature,
+        check(repo.head(project, "main") == main && repo.head(project, "feature") == feature,
               "commit moved wrong HEAD");
         const VerificationReport verified = repo.verifyRepository();
         check(verified.branches == 2 && verified.revisions == 3 &&
               verified.reachableObjects >= 3,
-              "v2 repository verification did not follow both branch histories");
+              "repository verification did not follow both branch histories");
         const CompactionStats compacted = repo.compact();
         check(compacted.objectsAfter >= 3,
-              "v2 compaction discarded published branch revisions");
-        check(repo.headV2(project, "main") == main && repo.headV2(project, "feature") == feature,
-              "compaction changed v2 branch HEADs");
+              "compaction discarded published branch revisions");
+        check(repo.head(project, "main") == main && repo.head(project, "feature") == feature,
+              "compaction changed branch HEADs");
         check(repo.verifyRepository().revisions == 3,
-              "v2 DAG failed verification after compaction");
-        repo.renameBranchV2(project, "feature", "experiment", feature);
+              "DAG failed verification after compaction");
+        repo.renameBranch(project, "feature", "experiment", feature);
         check(!repo.hasBranch("feature") && repo.hasBranch("experiment") &&
-              repo.headV2(project, "experiment") == feature &&
+              repo.head(project, "experiment") == feature &&
               *repo.branchId("experiment") == featureBranch,
-              "v2 rename changed branch UUID or HEAD");
-        rejects([&] { repo.renameBranchV2(project, "experiment", "invalid", root); },
-                StorageErrorKind::Conflict, "stale v2 rename accepted");
+              "rename changed branch UUID or HEAD");
+        rejects([&] { repo.renameBranch(project, "experiment", "invalid", root); },
+                StorageErrorKind::Conflict, "stale rename accepted");
     }
     {
         Repository repo(temp.path);
-        check(repo.headV2(project, "main") == main && repo.headV2(project, "experiment") == feature,
+        check(repo.head(project, "main") == main && repo.head(project, "experiment") == feature,
               "reopen changed UUIDv7 branch HEADs");
         check(*repo.branchId("main") == mainBranch &&
               *repo.branchId("experiment") == featureBranch,
               "reopen changed branch IDs");
-        const std::optional<Bytes> bytes = repo.readRevisionV2(project, feature);
-        check(bytes.has_value(), "reopen lost packed v2 revision");
-        rejects([&] { (void)repo.commit("experiment", {}); }, StorageErrorKind::Unavailable,
-                "SHA commit mutated UUID HEAD");
+        const std::optional<Bytes> bytes = repo.readRevision(project, feature);
+        check(bytes.has_value(), "reopen lost packed revision");
+        rejects([&] { (void)repo.commit(project, "experiment", {}, main); },
+                StorageErrorKind::Conflict, "stale expected HEAD accepted by raw commit");
     }
 }
-void testCorruptV2HeadRejected() {
+void testCorruptHeadRejected() {
     Temporary temp;
     const ProjectId project = ProjectId::generate();
     BranchId branch = BranchId::generate();
     {
         Repository repo(temp.path);
-        (void)repo.createBranchV2(project, "main");
+        (void)repo.createBranch(project, "main");
         branch = *repo.branchId("main");
     }
     const fs::path path = temp.path / "refs" / "heads" / branch.toString();
@@ -219,9 +218,9 @@ void testCorruptV2HeadRejected() {
     }
     {
         Repository repo(temp.path);
-        rejects([&] { (void)repo.headV2(project, "main"); },
+        rejects([&] { (void)repo.head(project, "main"); },
                 StorageErrorKind::Corruption, "altered HEAD SHA was not rejected");
-        rejects([&] { (void)repo.commitV2(project, "main", {}); },
+        rejects([&] { (void)repo.commit(project, "main", {}); },
                 StorageErrorKind::Corruption, "commit accepted altered HEAD SHA");
     }
 }
@@ -232,14 +231,14 @@ void testCorruptPublishedMappingRejected() {
     RevisionId head = RevisionId::generate();
     {
         Repository repo(tmp.path);
-        head = repo.createBranchV2(project, "main");
+        head = repo.createBranch(project, "main");
         check(repo.verifyRepository().revisions == 1,
-              "initial v2 binding was not verified");
+              "initial binding was not verified");
     }
     const fs::path mapping = tmp.path / "revision-v2" / "ids" / head.toString();
     {
         std::fstream file(mapping, std::ios::in | std::ios::out | std::ios::binary);
-        check(file.good(), "cannot open published v2 mapping");
+        check(file.good(), "cannot open published mapping");
         file.seekg(36);
         char original = 0;
         file.read(&original, 1);
@@ -261,12 +260,70 @@ void testCorruptPublishedMappingRejected() {
     }
 }
 
-void testMixingRejected() {
+// AOWIS-BRANCH-1 stored a SHA-256 revision HEAD. That pre-release format is
+// rejected on open, never interpreted or converted.
+void testObsoleteShaBranchRecordRejected() {
     Temporary temp;
+    {
+        Repository repo(temp.path);
+        repo.createUnbornBranch(ProjectId::generate(), "main");
+    }
+    const fs::path record = temp.path / "refs" / "heads" / BranchId::generate().toString();
+    {
+        std::ofstream obsolete(record, std::ios::binary);
+        obsolete << "AOWIS-BRANCH-1\nold\n" << std::string(64, 'a') << "\n";
+    }
+    rejects([&] { Repository reopened(temp.path); }, StorageErrorKind::Corruption,
+            "obsolete SHA-headed branch record was opened");
+}
+
+// Lookups at a revision read that revision only. Damage deep in the history
+// must not affect reads at the HEAD; full verification still finds it.
+void testLookupsDoNotWalkHistory() {
+    Temporary temp;
+    const ProjectId project = ProjectId::generate();
+    Key key{};
+    key[15] = 9;
+    RevisionId first = RevisionId::generate();
+    Bytes firstRecord;
+    {
+        Repository repo(temp.path);
+        repo.createUnbornBranch(project, "main");
+        for (std::uint8_t value = 0; value != 40; ++value) {
+            const RevisionId id = repo.commit(project, "main", {Change{key, Bytes{value}}});
+            if (value == 0) first = id;
+        }
+        firstRecord = *repo.readRevision(project, first);
+    }
+    // Damage the first revision's record inside the pack.
+    fs::path pack;
+    for (const fs::directory_entry& entry : fs::directory_iterator(temp.path))
+        if (entry.path().extension() == ".pack") pack = entry.path();
+    std::string bytes;
+    {
+        std::ifstream in(pack, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::size_t at = bytes.find(std::string(firstRecord.begin(), firstRecord.end()));
+    check(at != std::string::npos, "first revision record not found in pack");
+    {
+        std::fstream out(pack, std::ios::binary | std::ios::in | std::ios::out);
+        out.seekp(static_cast<std::streamoff>(at + 40));
+        out.put(static_cast<char>(bytes[at + 40] ^ 0x01));
+    }
     Repository repo(temp.path);
-    repo.createBranch("main");
-    rejects([&] { (void)repo.createBranchV2(ProjectId::generate(), "new"); },
-            StorageErrorKind::Unavailable, "existing SHA branch allowed a v2 insertion");
+    const RevisionId head = repo.head(project, "main");
+    try {
+        check(repo.getAtRevision(project, head, key) == std::optional<Bytes>(Bytes{39}),
+              "HEAD read returned the wrong value");
+    } catch (const StorageError& error) {
+        throw std::runtime_error(std::string("HEAD read failed because an old revision is damaged: ") +
+                                 error.what());
+    }
+    (void)repo.commit(project, "main", {Change{key, Bytes{40}}});
+    check(repo.history(project, "main", 5).size() == 5, "recent history unreadable");
+    rejects([&] { (void)repo.verifyRepository(); }, StorageErrorKind::Corruption,
+            "full verification missed a damaged historical revision");
 }
 } // namespace
 
@@ -274,9 +331,10 @@ int main() {
     try {
         testUnbornNativeRefFoundation();
         testIdentityPreservingUnbornCheckout();
-        testV2Publication();
-        testMixingRejected();
-        testCorruptV2HeadRejected();
+        testPublication();
+        testObsoleteShaBranchRecordRejected();
+        testLookupsDoNotWalkHistory();
+        testCorruptHeadRejected();
         testCorruptPublishedMappingRejected();
         std::cout << "UUIDv7 HEAD publication, fork, raw commit, rename and recovery passed\n";
     } catch (const std::exception& error) {

@@ -41,7 +41,23 @@ void expectError(const std::function<void()>& action, ProjectErrorKind kind) {
     require(rejected, "operation was not rejected");
 }
 
-void exerciseLegacyUuidV4() {
+aowis::dvmdb::ModelRecord record(std::uint8_t value) {
+    aowis::dvmdb::ModelRecord result;
+    result.kind = 31;
+    result.payload = {value};
+    return result;
+}
+
+aowis::dvmdb::Key modelKey(std::uint8_t value) {
+    aowis::dvmdb::Key result{};
+    result[0] = 0x91;
+    result[15] = value;
+    return result;
+}
+
+// Project identities are UUIDv7. A directory named with another UUID
+// version is not a project; the catalogue refuses to start, never ignores it.
+void exerciseNonV7ProjectRejected() {
     TemporaryRoot root;
     const std::string legacyId = "12345678-1234-4123-8123-1234567890ab";
     const std::filesystem::path directory = root.directory / "projects" / legacyId;
@@ -49,41 +65,27 @@ void exerciseLegacyUuidV4() {
     {
         std::ofstream manifest(directory / "project.meta", std::ios::binary);
         manifest << "AOWIS-PROJECT-1\n" << legacyId << "\npack\n4c6567616379\n";
-        require(manifest.good(), "cannot create legacy project manifest");
+        require(manifest.good(), "cannot create UUIDv4 project manifest");
     }
-    {
-        aowis::dvmdb::Repository repository(directory / "repository");
-        repository.createBranch("main");
-    }
-    {
-        ProjectService service(root.directory);
-        require(service.project(legacyId).name == "Legacy", "legacy UUIDv4 project failed to open");
-        require(service.headShaFixture(legacyId, "main").parents.empty(),
-                "legacy project's initial revision was not preserved");
-        require(!aowis::dvmdb::ProjectId::parse(legacyId),
-                "legacy UUIDv4 unexpectedly validates as UUIDv7");
-        const aowis::dvmdb::ProjectInfo fresh = service.createProjectShaFixture("Fresh");
-        require(aowis::dvmdb::ProjectId::parse(fresh.id).has_value(),
-                "new projects must have UUIDv7 even in a legacy catalogue");
-    }
-    {
-        ProjectService reopened(root.directory);
-        require(reopened.project(legacyId).name == "Legacy",
-                "legacy UUIDv4 project cannot reopen beside UUIDv7 project");
-        require(reopened.listProjects().size() == 2, "mixed-ID catalogue lost a project");
-    }
+    require(!ProjectService::validProjectId(legacyId), "UUIDv4 accepted as project identity");
+    require(!ProjectService::validProjectId("01234567-89AB-7DEF-8123-456789ABCDEF"),
+            "noncanonical uppercase UUIDv7 accepted as project identity");
+    bool refused = false;
+    try { ProjectService service(root.directory); }
+    catch (const std::exception&) { refused = true; }
+    require(refused, "catalogue opened with a non-UUIDv7 project directory");
 }
 
 void exerciseBackend() {
     TemporaryRoot root;
     std::string firstId;
     std::string secondId;
-    aowis::dvmdb::Hash firstHead{};
+    aowis::dvmdb::RevisionId firstHead = aowis::dvmdb::RevisionId::generate();
     {
         ProjectService service(root.directory);
         require(service.listProjects().empty(), "new catalogue is not empty");
-        const aowis::dvmdb::ProjectInfo first = service.createProjectShaFixture("Engineering Å");
-        const aowis::dvmdb::ProjectInfo second = service.createProjectShaFixture("Second project");
+        const aowis::dvmdb::ProjectInfo first = service.createUnbornProject("Engineering Å");
+        const aowis::dvmdb::ProjectInfo second = service.createUnbornProject("Second project");
         firstId = first.id;
         secondId = second.id;
         require(ProjectService::validProjectId(firstId), "invalid generated UUID");
@@ -96,33 +98,31 @@ void exerciseBackend() {
         require(service.project(firstId).name == first.name, "catalogue read differs");
         require(service.listProjects().size() == 2, "missing published project");
         require(service.listBranches(firstId) == std::vector<std::string>{"main"}, "missing initial main branch");
-        firstHead = service.headShaFixture(firstId, "main").id;
-        require(service.historyShaFixture(firstId, "main", 10).size() == 1, "missing initial revision");
-        require(service.revisionShaFixture(firstId, firstHead).id == firstHead, "revision lookup failed");
-        require(service.historyShaFixture(firstId, "main", 10, firstHead).empty(), "history cursor should be exclusive");
-        require(service.headShaFixture(secondId, "main").id == firstHead,
-                "initial object identities should be deterministic");
-        const aowis::dvmdb::Revision fork = service.createBranchShaFixture(firstId, "design", "main", firstHead);
-        require(fork.id == firstHead, "pinned fork changed revision");
-        service.createBranchShaFixture(firstId, "independent");
+        require(!service.optionalHead(firstId, "main") && service.history(firstId, "main", 10).empty(),
+                "new project main is not unborn");
+        firstHead = service.commitModel(firstId, "main", {{modelKey(1), record(1)}});
+        require(service.history(firstId, "main", 10).size() == 1, "missing first revision");
+        require(service.revision(firstId, firstHead).id == firstHead, "revision lookup failed");
+        require(service.history(firstId, "main", 10, firstHead).empty(), "history cursor should be exclusive");
+        require(!service.optionalHead(secondId, "main"), "commit leaked across projects");
+        const aowis::dvmdb::RevisionId fork = service.createBranchAtRevision(firstId, "design", "main", firstHead);
+        require(fork == firstHead, "pinned fork changed revision");
+        (void)service.createBranch(firstId, "independent", "main");
         require(service.listBranches(firstId).size() == 3, "missing new branch");
         require(service.listBranches(secondId).size() == 1, "projects are not isolated");
         // The model HTTP adapter's scoped native callback shares the exact
         // project handle and serializes access without exposing its lifetime.
-        aowis::dvmdb::Key modelKey{};
-        modelKey[0] = 0x91;
-        aowis::dvmdb::Hash modelRevision{};
+        const aowis::dvmdb::ProjectId project = *aowis::dvmdb::ProjectId::parse(firstId);
+        aowis::dvmdb::RevisionId modelRevision = aowis::dvmdb::RevisionId::generate();
         service.withRepository(firstId, [&](aowis::dvmdb::Repository& repository) {
-            aowis::dvmdb::ModelRecord record;
-            record.kind = 31;
-            record.payload = {1, 3, 5};
-            modelRevision = repository.commitModel("main", {{modelKey, record}}, firstHead).id;
-            require(repository.getModel("main", modelKey).has_value(),
+            modelRevision = repository.commitModel(project, "main", {{modelKey(2), record(2)}},
+                                                     firstHead);
+            require(repository.getModelAtRevision(project, modelRevision, modelKey(2)).has_value(),
                     "scoped repository callback did not persist model record");
         });
-        require(modelRevision != firstHead && service.headShaFixture(firstId, "main").id == modelRevision,
+        require(modelRevision != firstHead && service.head(firstId, "main") == modelRevision,
                 "scoped repository callback lost the model commit");
-        require(service.headShaFixture(secondId, "main").id == firstHead,
+        require(!service.optionalHead(secondId, "main"),
                 "scoped model commit leaked across project boundaries");
         expectError([&] {
             service.withRepository("../../wrong", [](aowis::dvmdb::Repository&) {});
@@ -133,24 +133,25 @@ void exerciseBackend() {
                 throw std::runtime_error("intentional callback failure");
             });
         } catch (const std::runtime_error&) { callbackFailure = true; }
-        require(callbackFailure && service.headShaFixture(firstId, "main").id == modelRevision,
+        require(callbackFailure && service.head(firstId, "main") == modelRevision,
                 "failing scoped callback left catalogue locked or corrupted");
-        expectError([&]{ service.createBranchShaFixture(firstId, "design"); }, ProjectErrorKind::Conflict);
+        expectError([&]{ service.createBranch(firstId, "design", "main"); }, ProjectErrorKind::Conflict);
         expectError([&]{ service.project("../../etc/passwd"); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.project("00000000-0000-4000-8000-000000000000"); }, ProjectErrorKind::NotFound);
-        expectError([&]{ service.headShaFixture(firstId, "missing"); }, ProjectErrorKind::NotFound);
-        expectError([&]{ service.createBranchShaFixture(firstId, "fork", "missing"); }, ProjectErrorKind::NotFound);
-        expectError([&]{ service.revisionShaFixture(firstId, aowis::dvmdb::sha256(aowis::dvmdb::Bytes{1,2,3,4})); }, ProjectErrorKind::NotFound);
-        expectError([&]{ service.createProjectShaFixture(""); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createProjectShaFixture("bad\nname"); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createProjectShaFixture(std::string("\xc0\xaf", 2)); },
+        expectError([&]{ service.project(aowis::dvmdb::ProjectId::generate().toString()); },
+                    ProjectErrorKind::NotFound);
+        expectError([&]{ service.head(firstId, "missing"); }, ProjectErrorKind::NotFound);
+        expectError([&]{ service.createBranch(firstId, "fork", "missing"); }, ProjectErrorKind::NotFound);
+        expectError([&]{ service.revision(firstId, aowis::dvmdb::RevisionId::generate()); },
+                    ProjectErrorKind::NotFound);
+        expectError([&]{ service.createUnbornProject(""); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.createUnbornProject("bad\nname"); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.createUnbornProject(std::string("\xc0\xaf", 2)); },
                     ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createProjectShaFixture(std::string("\xed\xa0\x80", 3)); },
+        expectError([&]{ service.createUnbornProject(std::string("\xed\xa0\x80", 3)); },
                     ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createBranchShaFixture(firstId, "../invalid"); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.createBranchShaFixture(firstId, "fork", std::nullopt, firstHead); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.historyShaFixture(firstId, "main", 1001); }, ProjectErrorKind::InvalidInput);
-        expectError([&]{ service.historyShaFixture(firstId, "main", 0); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.createBranch(firstId, "../invalid", "main"); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.history(firstId, "main", 1001); }, ProjectErrorKind::InvalidInput);
+        expectError([&]{ service.history(firstId, "main", 0); }, ProjectErrorKind::InvalidInput);
         // No second service instance (and no separate process) can own the same root.
         expectError([&]{ ProjectService another(root.directory); }, ProjectErrorKind::Conflict);
         const pid_t pid = ::fork();
@@ -169,7 +170,8 @@ void exerciseBackend() {
         std::vector<std::thread> workers;
         for (int worker = 0; worker < 6; ++worker) {
             workers.emplace_back([&, worker] {
-                const aowis::dvmdb::ProjectInfo item = service.createProjectShaFixture("thread-" + std::to_string(worker));
+                const aowis::dvmdb::ProjectInfo item =
+                    service.createUnbornProject("thread-" + std::to_string(worker));
                 require(!item.id.empty(), "concurrent create failed");
                 ++completed;
             });
@@ -182,7 +184,7 @@ void exerciseBackend() {
         ProjectService reopened(root.directory);
         require(reopened.listProjects().size() == 8, "restart lost catalogue entries");
         require(reopened.project(firstId).name == "Engineering Å", "restart changed project metadata");
-        require(reopened.headShaFixture(firstId, "design").id == firstHead, "restart lost branch");
+        require(reopened.head(firstId, "design") == firstHead, "restart lost branch");
         require(reopened.listBranches(secondId).size() == 1, "restart crossed project boundaries");
     }
 
@@ -209,8 +211,10 @@ void exerciseBackend() {
 void exerciseLargeBranchCatalogue() {
     TemporaryRoot root;
     ProjectService service(root.directory);
-    const aowis::dvmdb::ProjectInfo project = service.createProjectShaFixture("Branch scaling");
-    const aowis::dvmdb::Hash mainHead = service.headShaFixture(project.id, "main").id;
+    const aowis::dvmdb::ProjectInfo project = service.createUnbornProject("Branch scaling");
+    const aowis::dvmdb::RevisionId mainHead =
+        service.commitModel(project.id, "main", {{modelKey(1), record(1)}});
+    const aowis::dvmdb::Hash mainDigest = service.revision(project.id, mainHead).recordHash;
     const std::filesystem::path heads = root.directory / "projects" / project.id /
                                         "repository" / "refs" / "heads";
     constexpr unsigned branchCount = 4096;
@@ -219,27 +223,27 @@ void exerciseLargeBranchCatalogue() {
         const aowis::dvmdb::BranchId id = aowis::dvmdb::BranchId::generate();
         std::ofstream record(heads / id.toString(), std::ios::binary);
         require(record.good(), "cannot create UUID-named bulk branch");
-        record << "AOWIS-BRANCH-1\n" << branch << "\n"
-               << aowis::dvmdb::toHex(mainHead) << "\n";
+        record << "AOWIS-BRANCH-2\n" << branch << "\n" << mainHead.toString() << "\n"
+               << aowis::dvmdb::toHex(mainDigest) << "\n";
         require(record.good(), "cannot write UUID-named bulk branch");
     }
     require(service.listBranches(project.id).size() == branchCount + 1U,
             "large branch catalogue is missing entries");
     for (const unsigned number : {0U, 1024U, 2048U, 4095U}) {
         const std::string branch = "bulk_" + std::to_string(number);
-        require(service.headShaFixture(project.id, branch).id == mainHead,
+        require(service.head(project.id, branch) == mainHead,
                 "targeted branch read changed revision");
-        require(service.historyShaFixture(project.id, branch, 1).at(0).id == mainHead,
+        require(service.history(project.id, branch, 1).at(0).id == mainHead,
                 "targeted branch history changed revision");
     }
-    service.createBranchShaFixture(project.id, "new_from_bulk", "bulk_2048");
-    require(service.headShaFixture(project.id, "new_from_bulk").id == mainHead,
+    (void)service.createBranch(project.id, "new_from_bulk", "bulk_2048");
+    require(service.head(project.id, "new_from_bulk") == mainHead,
             "fork from large branch catalogue lost head");
-    expectError([&] { service.headShaFixture(project.id, "absent"); }, ProjectErrorKind::NotFound);
-    expectError([&] { service.historyShaFixture(project.id, "absent", 1); }, ProjectErrorKind::NotFound);
-    expectError([&] { service.createBranchShaFixture(project.id, "missing_parent", "absent"); },
+    expectError([&] { service.head(project.id, "absent"); }, ProjectErrorKind::NotFound);
+    expectError([&] { service.history(project.id, "absent", 1); }, ProjectErrorKind::NotFound);
+    expectError([&] { service.createBranch(project.id, "missing_parent", "absent"); },
                 ProjectErrorKind::NotFound);
-    expectError([&] { service.createBranchShaFixture(project.id, "bulk_2048"); },
+    expectError([&] { service.createBranch(project.id, "bulk_2048", "main"); },
                 ProjectErrorKind::Conflict);
 
     // UUID-only storage rejects unknown filenames rather than treating
@@ -268,7 +272,8 @@ void exerciseUnsafeCatalogue() {
     TemporaryRoot root;
     const std::filesystem::path directory = root.directory / "projects";
     std::filesystem::create_directory(directory);
-    std::filesystem::create_symlink("/tmp", directory / "00000000-0000-4000-8000-000000000000");
+    // A valid UUIDv7 name, so the refusal is about the symlink itself.
+    std::filesystem::create_symlink("/tmp", directory / aowis::dvmdb::ProjectId::generate().toString());
     bool rejected = false;
     try { ProjectService service(root.directory); }
     catch (const std::exception&) { rejected = true; }
@@ -279,7 +284,7 @@ void exerciseUnsafeCatalogue() {
 int main() {
     try {
         exerciseBackend();
-        exerciseLegacyUuidV4();
+        exerciseNonV7ProjectRejected();
         exerciseUnsafeCatalogue();
         exerciseLargeBranchCatalogue();
         std::cout << "Project catalogue and lifecycle tests passed\n";

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/access_policy.h"
+#include "project_repository.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -15,6 +16,7 @@
 
 namespace {
 using namespace aowis::dvmdb;
+using aowis::dvmdb::test::ProjectRepository;
 
 void expect(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
@@ -68,9 +70,12 @@ void exercise() {
     const std::string owner = account->pw_name;
     const std::filesystem::path repoPath = temp.path / "repo";
     {
-        Repository repository(repoPath);
+        ProjectRepository repository(repoPath);
         repository.createBranch("main");
-        repository.createBranch("restricted");
+        Key key{};
+        key[15] = 1;
+        (void)repository.commit("main", {aowis::dvmdb::Change{key, aowis::dvmdb::Bytes{1}}});
+        repository.createBranch("restricted", "main");
     }
     AccessPolicyStore store(repoPath);
     expect(!store.initialized(), "policy should initially be absent");
@@ -135,7 +140,7 @@ void exerciseCli(const std::filesystem::path& accessCli) {
     TemporaryDirectory temp;
     const std::filesystem::path directory = temp.path / "repository";
     {
-        Repository repository(directory);
+        ProjectRepository repository(directory);
         repository.createBranch("main");
     }
     const struct passwd* account = ::getpwuid(::geteuid());

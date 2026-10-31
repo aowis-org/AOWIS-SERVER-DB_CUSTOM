@@ -1,4 +1,4 @@
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 
 #include <algorithm>
 #include <array>
@@ -42,30 +42,30 @@ bool isUuidV7(const UuidV7& value) {
            (value.bytes[8] & 0xc0U) == 0x80U;
 }
 
-void validateRecord(const RevisionRecordV2& record, StorageErrorKind kind) {
+void validateRecord(const RevisionRecord& record, StorageErrorKind kind) {
     check(isUuidV7(record.id.uuid()) && isUuidV7(record.project.uuid()), kind,
-          "invalid v2 revision or project UUIDv7");
-    check(record.parents.size() <= 2, kind, "v2 revision has too many parents");
+          "invalid revision or project UUIDv7");
+    check(record.parents.size() <= 2, kind, "revision has too many parents");
     check(record.modelIndexed || record.referencesRoot == Hash{}, kind,
-          "raw v2 revision cannot contain model references");
+          "raw revision cannot contain model references");
     std::set<UuidV7> seen;
-    for (const RevisionParentV2& parent : record.parents) {
-        check(isUuidV7(parent.id.uuid()), kind, "invalid v2 parent UUIDv7");
-        check(parent.id != record.id, kind, "v2 revision is its own parent");
-        check(seen.insert(parent.id.uuid()).second, kind, "duplicate v2 revision parent");
+    for (const RevisionParent& parent : record.parents) {
+        check(isUuidV7(parent.id.uuid()), kind, "invalid parent UUIDv7");
+        check(parent.id != record.id, kind, "revision is its own parent");
+        check(seen.insert(parent.id.uuid()).second, kind, "duplicate revision parent");
         check(parent.expectedRecordHash != Hash{}, kind, "zero parent revision digest");
     }
 }
 
 struct Frame {
-    RevisionRecordV2 record;
+    RevisionRecord record;
     Hash digest;
     std::size_t nextParent = 0;
 };
 
 } // namespace
 
-Bytes encodeRevisionRecordV2(const RevisionRecordV2& record) {
+Bytes encodeRevisionRecord(const RevisionRecord& record) {
     validateRecord(record, StorageErrorKind::InvalidInput);
     // The canonical format has a fixed size. Filling its offsets directly
     // avoids both reallocations and any intermediate noncanonical shape.
@@ -86,16 +86,16 @@ Bytes encodeRevisionRecordV2(const RevisionRecordV2& record) {
     return bytes;
 }
 
-RevisionRecordV2 decodeRevisionRecordV2(const Bytes& bytes) {
-    check(bytes.size() >= 100, StorageErrorKind::Corruption, "truncated v2 revision record");
+RevisionRecord decodeRevisionRecord(const Bytes& bytes) {
+    check(bytes.size() >= 100, StorageErrorKind::Corruption, "truncated revision record");
     check(bytes[0] == static_cast<std::uint8_t>('T') && bytes[1] == 2,
-          StorageErrorKind::Corruption, "unsupported v2 revision record header");
+          StorageErrorKind::Corruption, "unsupported revision record header");
     const std::size_t parentCount = bytes[99];
     check(parentCount <= 2 && bytes.size() == 100 + 48 * parentCount,
-          StorageErrorKind::Corruption, "invalid v2 revision length or parent count");
-    check(bytes[98] <= 1, StorageErrorKind::Corruption, "invalid v2 indexing flag");
+          StorageErrorKind::Corruption, "invalid revision length or parent count");
+    check(bytes[98] <= 1, StorageErrorKind::Corruption, "invalid indexing flag");
 
-    RevisionRecordV2 record{
+    RevisionRecord record{
         RevisionId(readUuid(bytes, 2)),
         ProjectId(readUuid(bytes, 18)),
         readHash(bytes, 34),
@@ -112,18 +112,19 @@ RevisionRecordV2 decodeRevisionRecordV2(const Bytes& bytes) {
     return record;
 }
 
-Hash hashRevisionRecordV2(const RevisionRecordV2& record) {
-    return sha256(encodeRevisionRecordV2(record));
+Hash hashRevisionRecord(const RevisionRecord& record) {
+    return sha256(encodeRevisionRecord(record));
 }
 
-Hash verifyRevisionAncestryV2(const Bytes& tipRecord,
-                              const RevisionRecordLookupV2& getRecord,
-                              std::size_t maxRevisions) {
+Hash verifyRevisionAncestry(const Bytes& tipRecord,
+                              const RevisionRecordLookup& getRecord,
+                              std::size_t maxRevisions,
+                              const TrustedRevision& trusted) {
     check(static_cast<bool>(getRecord), StorageErrorKind::InvalidInput,
-          "missing v2 revision resolver");
+          "missing revision resolver");
     check(maxRevisions > 0, StorageErrorKind::InvalidInput,
-          "zero v2 revision traversal budget");
-    const RevisionRecordV2 tip = decodeRevisionRecordV2(tipRecord);
+          "zero revision traversal budget");
+    const RevisionRecord tip = decodeRevisionRecord(tipRecord);
     const Hash tipHash = sha256(tipRecord);
     std::vector<Frame> stack;
     stack.push_back({tip, tipHash, 0});
@@ -139,27 +140,31 @@ Hash verifyRevisionAncestryV2(const Bytes& tipRecord,
             stack.pop_back();
             continue;
         }
-        const RevisionParentV2 parent = frame.record.parents[frame.nextParent++];
+        const RevisionParent parent = frame.record.parents[frame.nextParent++];
         check(!active.contains(parent.id.uuid()), StorageErrorKind::Corruption,
-              "cycle in v2 revision ancestry");
+              "cycle in revision ancestry");
         const std::map<UuidV7, Hash>::const_iterator known = verified.find(parent.id.uuid());
         if (known != verified.end()) {
             check(known->second == parent.expectedRecordHash,
-                  StorageErrorKind::Corruption, "conflicting v2 revision identity binding");
+                  StorageErrorKind::Corruption, "conflicting revision identity binding");
+            continue;
+        }
+        if (trusted && trusted(parent)) {
+            verified.emplace(parent.id.uuid(), parent.expectedRecordHash);
             continue;
         }
         check(traversed < maxRevisions, StorageErrorKind::LimitExceeded,
-              "v2 revision ancestry budget exceeded");
+              "revision ancestry budget exceeded");
         const std::optional<Bytes> encoded = getRecord(parent.id);
-        check(encoded.has_value(), StorageErrorKind::Corruption, "missing v2 parent revision");
+        check(encoded.has_value(), StorageErrorKind::Corruption, "missing parent revision");
         const Hash parentHash = sha256(*encoded);
         check(parentHash == parent.expectedRecordHash, StorageErrorKind::Corruption,
-              "v2 parent revision SHA-256 mismatch");
-        const RevisionRecordV2 parentRecord = decodeRevisionRecordV2(*encoded);
+              "parent revision SHA-256 mismatch");
+        const RevisionRecord parentRecord = decodeRevisionRecord(*encoded);
         check(parentRecord.id == parent.id, StorageErrorKind::Corruption,
-              "v2 resolver returned wrong revision UUID");
+              "resolver returned wrong revision UUID");
         check(parentRecord.project == tip.project, StorageErrorKind::Corruption,
-              "cross-project v2 revision parent");
+              "cross-project revision parent");
         active.insert(parent.id.uuid());
         stack.push_back({parentRecord, parentHash, 0});
         ++traversed;

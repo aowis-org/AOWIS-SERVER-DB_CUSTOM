@@ -76,7 +76,7 @@ def projects_in(root):
 
 
 def repository_identity(root):
-    # Legacy catalogues have no ID until a ProjectService first opens them.
+    # A catalogue has no ID until a ProjectService first opens it.
     # A present identity must be valid; never replace malformed metadata.
     path = root / "repository.id"
     if not path.exists() and not path.is_symlink():

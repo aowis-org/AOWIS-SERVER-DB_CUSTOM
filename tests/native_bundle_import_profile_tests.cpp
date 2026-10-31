@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <cmath>
 #include <cstdio>
@@ -11,9 +12,11 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 
 using aowis::dvmdb::BundleImportProfile;
-using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::RevisionBundleImport;
 using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
@@ -74,34 +77,34 @@ void checkProfile(const BundleImportProfile& profile, bool expectsLocalReads) {
 }
 
 void testPair(const std::filesystem::path& root) {
-    Repository source(root / "source");
+    ProjectRepository source(root / "source");
     source.createBranch("main");
     ModelRecord one;
     one.kind = 1;
     one.payload = Bytes{1, 2, 3};
     source.commitModel("main", {ModelChange{id(1), one}});
-    const Hash baseHead = source.head("main").id;
-    source.exportBranchBundle("main", root / "base.aowbundle");
+    const RevisionId baseHead = source.head("main");
+    source.exportBundle("main", root / "base.aowbundle");
 
     ModelRecord two;
     two.kind = 1;
     two.payload = Bytes{4, 5, 6};
     two.references = {id(1)};
     source.commitModel("main", {ModelChange{id(2), two}});
-    const Hash finalHead = source.head("main").id;
-    source.exportBranchBundle("main", root / "full.aowbundle");
-    source.exportIncrementalBranchBundle("main", baseHead, root / "delta.aowbundle");
+    const RevisionId finalHead = source.head("main");
+    source.exportBundle("main", root / "full.aowbundle");
+    source.exportIncrementalBundle("main", baseHead, root / "delta.aowbundle");
 
-    Repository fresh(root / "full");
+    ProjectRepository fresh(root / "full");
     BundleImportProfile fullProfile{};
-    const BundleImportResult full = fresh.importBranchBundle(root / "full.aowbundle",
+    const RevisionBundleImport full = fresh.importBundle(root / "full.aowbundle",
                                                               "main", {}, &fullProfile);
     check(full.status == BundleImportStatus::Created && full.head == finalHead,
           "full import has incorrect result");
     checkProfile(fullProfile, false);
 
     BundleImportProfile repeatedProfile{};
-    const BundleImportResult repeated = fresh.importBranchBundle(root / "full.aowbundle",
+    const RevisionBundleImport repeated = fresh.importBundle(root / "full.aowbundle",
                                                                   "main", {}, &repeatedProfile);
     check(repeated.status == BundleImportStatus::UpToDate && repeated.objectsImported == 0,
           "repeated import should be up to date");
@@ -109,10 +112,10 @@ void testPair(const std::filesystem::path& root) {
           repeatedProfile.publicationMs == 0,
           "up-to-date import profile counted nonexistent publication");
 
-    Repository incremental(root / "incremental");
-    incremental.importBranchBundle(root / "base.aowbundle", "main");
+    ProjectRepository incremental(root / "incremental");
+    incremental.importBundle(root / "base.aowbundle", "main");
     BundleImportProfile deltaProfile{};
-    const BundleImportResult delta = incremental.importBranchBundle(root / "delta.aowbundle",
+    const RevisionBundleImport delta = incremental.importBundle(root / "delta.aowbundle",
                                                                      "main", {}, &deltaProfile);
     check(delta.status == BundleImportStatus::FastForward && delta.head == finalHead,
           "incremental import did not fast-forward");
@@ -137,12 +140,12 @@ void testPair(const std::filesystem::path& root) {
     bool rejected = false;
     try {
         BundleImportProfile rejectedProfile{};
-        (void)incremental.importBranchBundle(root / "corrupt.aowbundle", "main", {},
+        (void)incremental.importBundle(root / "corrupt.aowbundle", "main", {},
                                              &rejectedProfile);
     } catch (const std::exception&) {
         rejected = true;
     }
-    check(rejected && incremental.head("main").id == finalHead,
+    check(rejected && incremental.head("main") == finalHead,
           "profiling weakened rejection of corrupted transfers");
 }
 

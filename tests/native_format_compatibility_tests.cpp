@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <filesystem>
 #include <fstream>
@@ -11,6 +12,8 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
@@ -47,29 +50,30 @@ void rejectOldRepository(const std::filesystem::path& fixture,
     std::filesystem::copy(fixture / "repository", destination,
                           std::filesystem::copy_options::recursive);
     bool refused = false;
-    try { Repository obsolete(destination); }
+    try { ProjectRepository obsolete(destination); }
     catch (const std::exception&) { refused = true; }
     expect(refused, "obsolete name-keyed branch refs opened without explicit rejection");
 }
 
 void rejectOldBundle(const std::filesystem::path& fixture,
                      const std::filesystem::path& destination) {
-    Repository receiver(destination);
+    ProjectRepository receiver(destination);
     const std::uint64_t before = receiver.objectCount();
     bool refused = false;
-    try { (void)receiver.importBranchBundle(fixture / "base.aowbundle", "old"); }
+    try { (void)receiver.importBundle(fixture / "base.aowbundle", "old"); }
     catch (const std::exception&) { refused = true; }
     expect(refused && receiver.listBranches().empty() && receiver.objectCount() == before,
-           "legacy SHA-only transfer was accepted or modified the repository");
+           "obsolete SHA-revision (AOWSYNC) transfer was accepted or modified the repository");
 }
 
+// AOWREV21/22: full/delta without fork provenance; AOWREV23/24 with it.
 void checkBundle(const std::filesystem::path& path, char version) {
     std::ifstream input(path, std::ios::binary);
     expect(input.good(), "bundle missing");
     char marker[8]{};
     input.read(marker, sizeof(marker));
-    expect(input.good() && std::string_view(marker, 7) == "AOWSYNC" && marker[7] == version,
-           "export did not use required identity-bearing wire format");
+    expect(input.good() && std::string_view(marker, 7) == "AOWREV2" && marker[7] == version,
+           "export did not use the required UUIDv7 revision bundle format");
 }
 
 void testCurrentFormat(const std::filesystem::path& root) {
@@ -78,67 +82,67 @@ void testCurrentFormat(const std::filesystem::path& root) {
     const std::filesystem::path mainBundle = root / "main.bundle";
     const std::filesystem::path featureBundle = root / "feature.bundle";
     const std::filesystem::path deltaBundle = root / "delta.bundle";
-    Hash base{};
-    Hash mainHead{};
-    Hash featureHead{};
+    RevisionId base = RevisionId::generate();
+    RevisionId mainHead = RevisionId::generate();
+    RevisionId featureHead = RevisionId::generate();
     aowis::dvmdb::BranchId mainId = aowis::dvmdb::BranchId::generate();
     aowis::dvmdb::BranchId featureId = aowis::dvmdb::BranchId::generate();
     {
-        Repository source(sourcePath);
+        ProjectRepository source(sourcePath);
         source.createBranch("main");
-        base = source.commit("main", {{key(0x10), Bytes{'a'}}}).id;
+        base = source.commit("main", {{key(0x10), Bytes{'a'}}});
         source.createBranch("feature", "main");
         mainId = *source.branchId("main");
         featureId = *source.branchId("feature");
         expect(mainId != featureId, "new branches reused UUIDv7 identity");
-        featureHead = source.commit("feature", {{key(0x20), Bytes{'f'}}}).id;
-        mainHead = source.commit("main", {{key(0x30), Bytes{'m'}}}).id;
-        source.exportBranchBundle("main", mainBundle);
-        source.exportBranchBundle("feature", featureBundle);
+        featureHead = source.commit("feature", {{key(0x20), Bytes{'f'}}});
+        mainHead = source.commit("main", {{key(0x30), Bytes{'m'}}});
+        source.exportBundle("main", mainBundle);
+        source.exportBundle("feature", featureBundle);
         source.verifyRepository();
     }
-    checkBundle(mainBundle, '3');
-    checkBundle(featureBundle, '3');
+    checkBundle(mainBundle, '1');    // main has no fork provenance
+    checkBundle(featureBundle, '3'); // feature records its origin and fork revision
     {
-        Repository destination(destinationPath);
-        expect(destination.importBranchBundle(mainBundle, "main").status == BundleImportStatus::Created,
+        ProjectRepository destination(destinationPath);
+        expect(destination.importBundle(mainBundle, "main").status == BundleImportStatus::Created,
                "initial identity-bearing transfer failed");
-        expect(destination.importBranchBundle(featureBundle, "feature").status == BundleImportStatus::Created,
+        expect(destination.importBundle(featureBundle, "feature").status == BundleImportStatus::Created,
                "divergent identity-bearing transfer failed");
         expect(destination.branchId("main") == mainId && destination.branchId("feature") == featureId,
                "transfer changed branch UUIDv7 identity");
-        expect(destination.head("main").id == mainHead && destination.head("feature").id == featureHead,
+        expect(destination.head("main") == mainHead && destination.head("feature") == featureHead,
                "transfer changed immutable revision heads");
         expect(destination.revision(mainHead).parents.front() == base &&
                destination.revision(featureHead).parents.front() == base,
                "transfer changed shared revision ancestry");
         destination.verifyRepository();
-        expect(destination.importBranchBundle(mainBundle, "main").status == BundleImportStatus::UpToDate,
+        expect(destination.importBundle(mainBundle, "main").status == BundleImportStatus::UpToDate,
                "identical current-format bundle was not idempotent");
         const std::uint64_t before = destination.objectCount();
         bool aliasRejected = false;
-        try { (void)destination.importBranchBundle(mainBundle, "alias"); }
+        try { (void)destination.importBundle(mainBundle, "alias"); }
         catch (const std::exception&) { aliasRejected = true; }
         expect(aliasRejected && destination.objectCount() == before &&
                destination.listBranches().size() == 2,
                "one UUIDv7 was incorrectly published as two branches");
     }
     {
-        Repository source(sourcePath);
+        ProjectRepository source(sourcePath);
         (void)source.commit("main", {{key(0x40), Bytes{'n'}}});
-        source.exportIncrementalBranchBundle("main", mainHead, deltaBundle);
+        source.exportIncrementalBundle("main", mainHead, deltaBundle);
     }
-    checkBundle(deltaBundle, '4');
+    checkBundle(deltaBundle, '2');
     {
-        Repository destination(destinationPath);
-        expect(destination.importBranchBundle(deltaBundle, "main").status == BundleImportStatus::FastForward &&
+        ProjectRepository destination(destinationPath);
+        expect(destination.importBundle(deltaBundle, "main").status == BundleImportStatus::FastForward &&
                destination.branchId("main") == mainId &&
                destination.get("main", key(0x40)) == Bytes{'n'},
                "identity-bearing incremental transfer lost branch identity or contents");
         destination.verifyRepository();
     }
     {
-        Repository reopened(destinationPath);
+        ProjectRepository reopened(destinationPath);
         expect(reopened.branchId("main") == mainId && reopened.branchId("feature") == featureId,
                "current-format branch identities did not survive restart");
         reopened.verifyRepository();

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <algorithm>
 #include <array>
@@ -17,8 +18,10 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::BundleImportStatus;
-using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::RevisionBundleImport;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
 using aowis::dvmdb::Hash;
@@ -93,11 +96,11 @@ void appendUnreachableObject(const std::filesystem::path& source,
     check(input.good(), "open valid bundle for orphan injection");
     const Bytes original((std::istreambuf_iterator<char>(input)),
                          std::istreambuf_iterator<char>());
-    check(original.size() >= 64 && original[0] == 'A' && original[7] == '3',
-          "expected full bundle fixture");
-    const std::uint64_t count = readU64(original, 40);
+    const aowis::dvmdb::test::BundleLayout layout = aowis::dvmdb::test::bundleLayout(source);
+    check(!layout.incremental, "expected full bundle fixture");
+    const std::uint64_t count = layout.objects;
     std::map<Hash, Bytes> objects;
-    std::size_t offset = 64;
+    std::size_t offset = static_cast<std::size_t>(layout.headerBytes);
     for (std::uint64_t index = 0; index < count; ++index) {
         check(offset <= original.size() && original.size() - offset >= 40,
               "truncated valid bundle fixture");
@@ -115,10 +118,11 @@ void appendUnreachableObject(const std::filesystem::path& source,
     const Bytes orphan{'V', 'o', 'r', 'p', 'h', 'a', 'n', 0x7d};
     check(objects.emplace(aowis::dvmdb::sha256(orphan), orphan).second,
           "unexpected orphan hash collision");
-    Bytes output(original.begin(), original.begin() + 40);
+    // Keep the header (identities, tip, provenance); only the count changes.
+    Bytes output(original.begin(), original.begin() + 88);
     appendU64(output, static_cast<std::uint64_t>(objects.size()));
-    // Preserve the immutable UUIDv7 branch identity after the object count.
-    output.insert(output.end(), original.begin() + 48, original.begin() + 64);
+    output.insert(output.end(), original.begin() + 96,
+                  original.begin() + static_cast<std::ptrdiff_t>(layout.headerBytes));
     for (const std::pair<const Hash, Bytes>& entry : objects) {
         output.insert(output.end(), entry.first.begin(), entry.first.end());
         appendU64(output, entry.second.size());
@@ -147,12 +151,12 @@ void corruptTail(const std::filesystem::path& source,
     check(stream.good(), "write corrupted bundle fixture");
 }
 
-void rejectWithoutPublication(Repository& receiver, const std::filesystem::path& bundle,
+void rejectWithoutPublication(ProjectRepository& receiver, const std::filesystem::path& bundle,
                               std::string_view branch,
                               std::string_view expectedReason = {}) {
     const std::uint64_t objectsBefore = receiver.objectCount();
     try {
-        (void)receiver.importBranchBundle(bundle, branch);
+        (void)receiver.importBundle(bundle, branch);
     } catch (const std::runtime_error& error) {
         check(expectedReason.empty() ||
               std::string_view(error.what()).find(expectedReason) != std::string_view::npos,
@@ -173,8 +177,8 @@ void rejectWithoutPublication(Repository& receiver, const std::filesystem::path&
 void exerciseSharedTreesAcrossKinds() {
     TemporaryRoot temporary;
     ScopedTemporaryIndexDirectory temporaryIndex(temporary.path() / "scratch");
-    Repository source(temporary.path() / "source");
-    Repository destination(temporary.path() / "destination");
+    ProjectRepository source(temporary.path() / "source");
+    ProjectRepository destination(temporary.path() / "destination");
     source.createBranch("main");
     Key first{};
     Key second{};
@@ -182,29 +186,29 @@ void exerciseSharedTreesAcrossKinds() {
     second.back() = 0x34;
     const ModelRecord one{1, {}, Bytes{'a', 'b', 'c'}};
     const ModelRecord two{2, {}, Bytes{'d', 'e', 'f'}};
-    const aowis::dvmdb::Revision raw = source.commit("main", {
+    const aowis::dvmdb::test::CommittedRevision raw = source.revision(source.commit("main", {
         Change{first, aowis::dvmdb::encodeModelRecord(one)},
-        Change{second, aowis::dvmdb::encodeModelRecord(two)}});
+        Change{second, aowis::dvmdb::encodeModelRecord(two)}}));
     (void)source.commit("main", {Change{first, std::nullopt},
                                   Change{second, std::nullopt}});
-    const aowis::dvmdb::Revision model = source.commitModel("main", {
-        ModelChange{first, one}, ModelChange{second, two}});
+    const aowis::dvmdb::test::CommittedRevision model = source.revision(source.commitModel("main", {
+        ModelChange{first, one}, ModelChange{second, two}}));
     check(raw.root == model.root && raw.root != Hash{},
           "shared-tree fixture did not reuse identical immutable trie objects");
     check(!raw.modelIndexed && model.modelIndexed,
           "shared-tree fixture must cross raw/model revision kinds");
     const std::filesystem::path bundle = temporary.path() / "shared-kinds.aowbundle";
-    source.exportBranchBundle("main", bundle);
-    const BundleImportResult imported = destination.importBranchBundle(bundle, "main");
+    source.exportBundle("main", bundle);
+    const RevisionBundleImport imported = destination.importBundle(bundle, "main");
     check(imported.status == BundleImportStatus::Created && imported.head == model.id,
           "shared raw/model tree transfer failed");
-    check(destination.revision(raw.id).root == destination.head("main").root,
+    check(destination.revision(raw.id).root == destination.headRevision("main").root,
           "imported shared trie roots differ");
-    check(destination.getAtRevision(raw.id, first) ==
+    check(destination.getAt(raw.id, first) ==
           std::optional<Bytes>(aowis::dvmdb::encodeModelRecord(one)),
           "raw historical record differs after shared-tree import");
     const std::optional<ModelRecord> restored =
-        destination.getModelAtRevision(model.id, second);
+        destination.getModelAt(model.id, second);
     check(restored.has_value() && restored->kind == two.kind &&
           restored->references == two.references && restored->payload == two.payload,
           "model historical record differs after shared-tree import");
@@ -220,9 +224,9 @@ void exerciseSharedTreesAcrossKinds() {
 void exercise() {
     TemporaryRoot temporary;
     ScopedTemporaryIndexDirectory temporaryIndex(temporary.path() / "scratch");
-    Repository source(temporary.path() / "source");
-    Repository destination(temporary.path() / "destination");
-    Repository rejected(temporary.path() / "rejected");
+    ProjectRepository source(temporary.path() / "source");
+    ProjectRepository destination(temporary.path() / "destination");
+    ProjectRepository rejected(temporary.path() / "rejected");
     source.createBranch("main");
 
     // Many small changes generate many revision, trie and immutable payload
@@ -249,14 +253,14 @@ void exercise() {
     Key largeKey{};
     largeKey[0] = 0xf1;
     (void)source.commit("main", {{largeKey, Bytes(2U * 1024U * 1024U, 0x4d)}});
-    const Hash firstTip = source.head("main").id;
+    const RevisionId firstTip = source.head("main");
     const std::filesystem::path full = temporary.path() / "full.aowbundle";
-    source.exportBranchBundle("main", full);
+    source.exportBundle("main", full);
     check(std::filesystem::file_size(full) > 2U * 1024U * 1024U,
           "full bundle fixture should include large object");
     check(source.objectCount() > 3000, "insufficient objects for mapped visitation exercise");
 
-    const BundleImportResult created = destination.importBranchBundle(full, "remote");
+    const RevisionBundleImport created = destination.importBundle(full, "remote");
     check(created.status == BundleImportStatus::Created && created.head == firstTip &&
           created.objectsImported > 600, "full file-backed import was incomplete");
     temporaryIndex.checkEmpty();
@@ -269,7 +273,7 @@ void exercise() {
 
     const std::filesystem::path orphan = temporary.path() / "orphan.aowbundle";
     appendUnreachableObject(full, orphan);
-    rejectWithoutPublication(rejected, orphan, "remote", "unreachable objects");
+    rejectWithoutPublication(rejected, orphan, "remote", "unreachable");
     temporaryIndex.checkEmpty();
 
     const std::filesystem::path corrupted = temporary.path() / "corrupt.aowbundle";
@@ -283,13 +287,13 @@ void exercise() {
         key[15] = static_cast<std::uint8_t>(index);
         (void)source.commit("main", {{key, Bytes(90 + index, static_cast<std::uint8_t>(index))}});
     }
-    const Hash secondTip = source.head("main").id;
+    const RevisionId secondTip = source.head("main");
     const std::filesystem::path incremental = temporary.path() / "incremental.aowbundle";
-    source.exportIncrementalBranchBundle("main", firstTip, incremental);
-    const BundleImportResult updated = destination.importBranchBundle(incremental, "remote");
+    source.exportIncrementalBundle("main", firstTip, incremental);
+    const RevisionBundleImport updated = destination.importBundle(incremental, "remote");
     check(updated.status == BundleImportStatus::FastForward && updated.head == secondTip,
           "incremental file-backed index import failed");
-    check(destination.importBranchBundle(incremental, "remote").status ==
+    check(destination.importBundle(incremental, "remote").status ==
           BundleImportStatus::UpToDate, "incremental retry lost idempotence");
     temporaryIndex.checkEmpty();
     (void)destination.verifyRepository();
@@ -297,8 +301,8 @@ void exercise() {
     // A delta from a tip to itself has zero entries. The index must be able
     // to represent it without creating or mapping a zero-length file.
     const std::filesystem::path noOp = temporary.path() / "noop.aowbundle";
-    source.exportIncrementalBranchBundle("main", secondTip, noOp);
-    check(destination.importBranchBundle(noOp, "remote").status ==
+    source.exportIncrementalBundle("main", secondTip, noOp);
+    check(destination.importBundle(noOp, "remote").status ==
           BundleImportStatus::UpToDate, "empty incremental transfer was rejected");
     temporaryIndex.checkEmpty();
 
@@ -306,16 +310,28 @@ void exercise() {
     // the finalized temporary index must be released on this failure path.
     Key localKey{};
     localKey[0] = 0xed;
-    const Hash localTip = destination.commit("remote", {{localKey, Bytes{0x91}}}).id;
+    const RevisionId localTip = destination.commit("remote", {{localKey, Bytes{0x91}}});
     const std::uint64_t beforeDivergence = destination.objectCount();
+    // A delta is valid for exactly one recipient HEAD: refused up front.
     try {
-        (void)destination.importBranchBundle(incremental, "remote");
+        (void)destination.importBundle(incremental, "remote");
         throw std::runtime_error("divergent imported branch was incorrectly accepted");
+    } catch (const aowis::dvmdb::StorageError& error) {
+        check(error.kind() == aowis::dvmdb::StorageErrorKind::Conflict,
+              "stale incremental base was not a conflict");
+    }
+    // A full bundle is indexed and verified first; divergence is detected
+    // afterwards, so the finalized index must be released on this path.
+    const std::filesystem::path diverging = temporary.path() / "diverging-full.aowbundle";
+    source.exportBundle("main", diverging);
+    try {
+        (void)destination.importBundle(diverging, "remote");
+        throw std::runtime_error("divergent full bundle was incorrectly accepted");
     } catch (const std::runtime_error& error) {
         check(std::string_view(error.what()).find("divergent") != std::string_view::npos,
               "divergence test rejected for the wrong reason");
     }
-    check(destination.head("remote").id == localTip &&
+    check(destination.head("remote") == localTip &&
           destination.objectCount() == beforeDivergence,
           "rejected divergent transfer changed the destination");
     temporaryIndex.checkEmpty();

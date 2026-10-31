@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +14,7 @@ namespace {
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
 using aowis::dvmdb::Key;
-using aowis::dvmdb::Repository;
+using aowis::dvmdb::test::ProjectRepository;
 
 Key counterKey() {
     Key result{};
@@ -31,7 +32,7 @@ Bytes counterData(std::uint64_t sequence) {
     return result;
 }
 
-std::uint64_t readCounter(Repository& repository) {
+std::uint64_t readCounter(ProjectRepository& repository) {
     const std::optional<Bytes> value = repository.get("main", counterKey());
     if (!value.has_value() || value->size() != 131072U)
         throw std::runtime_error("missing or incorrectly sized counter");
@@ -43,11 +44,11 @@ std::uint64_t readCounter(Repository& repository) {
     return sequence;
 }
 
-void check(Repository& repository) {
+void check(ProjectRepository& repository) {
     repository.verifyRepository();
     const std::uint64_t sequence = readCounter(repository);
     std::cout << "STATE " << sequence << " "
-              << aowis::dvmdb::toHex(repository.head("main").id) << std::endl;
+              << aowis::dvmdb::toHex(repository.headRevision("main").recordHash) << std::endl;
 }
 } // namespace
 
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
             !std::filesystem::exists(repositoryPath / "objects.pack") &&
             !std::filesystem::exists(repositoryPath / "objects.current"))
             throw std::runtime_error("repository missing; is the test disk mounted?");
-        Repository repository(repositoryPath);
+        ProjectRepository repository(repositoryPath);
         if (mode == "init") {
             repository.createBranch("main");
             (void)repository.commit("main", {Change{counterKey(), counterData(0)}});
@@ -80,9 +81,11 @@ int main(int argc, char** argv) {
             // bounds crash-publication ambiguity to at most one revision.
             for (;;) {
                 ++next;
-                const aowis::dvmdb::Revision revision = repository.commit(
+                const aowis::dvmdb::RevisionId revision = repository.commit(
                     "main", {Change{counterKey(), counterData(next)}});
-                std::cout << "ACK " << next << " " << aowis::dvmdb::toHex(revision.id)
+                // The immutable record digest identifies the acknowledged state.
+                std::cout << "ACK " << next << " "
+                          << aowis::dvmdb::toHex(repository.revision(revision).recordHash)
                           << std::endl;
                 std::string proceed;
                 if (!std::getline(std::cin, proceed) || proceed != "GO") break;

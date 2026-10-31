@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "../tests/project_repository.h"
 
 #include <chrono>
 #include <cstdint>
@@ -14,7 +15,7 @@ namespace {
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
 using aowis::dvmdb::Key;
-using aowis::dvmdb::Repository;
+using Repository = aowis::dvmdb::test::ProjectRepository;
 
 Key keyFor(std::uint64_t number) {
     // Deterministic scattered UUID-like keys; not chronological UUIDs.
@@ -117,7 +118,7 @@ int main(int argc, char** argv) {
         }
         const double revisionMs = elapsedMs(revising);
         const std::chrono::steady_clock::time_point comparing = std::chrono::steady_clock::now();
-        const std::vector<aowis::dvmdb::Difference> diff = repo.diff("baseline", "main");
+        const std::vector<aowis::dvmdb::Difference> diff = repo.diffBranches("baseline", "main");
         const double diffMs = elapsedMs(comparing);
         const std::chrono::steady_clock::time_point scanning = std::chrono::steady_clock::now();
         const std::size_t scanned = repo.scan("main").size();
@@ -125,10 +126,10 @@ int main(int argc, char** argv) {
         if (scanned != objects) throw std::runtime_error("scan has incorrect object count");
         const std::uint64_t packBytes = repo.packSize();
         const std::uint64_t storedObjects = repo.objectCount();
-        const aowis::dvmdb::Revision finalRevision = repo.head("main");
+        const aowis::dvmdb::test::CommittedRevision finalRevision = repo.headRevision("main");
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
         Repository reopened(path);
-        if (reopened.head("main").root != finalRevision.root) {
+        if (reopened.headRevision("main").root != finalRevision.root) {
             throw std::runtime_error("reopened repository has a different final root");
         }
         const double reopenMs = elapsedMs(reopening);

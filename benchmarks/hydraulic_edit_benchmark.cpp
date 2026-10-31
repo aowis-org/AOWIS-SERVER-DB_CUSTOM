@@ -1,5 +1,5 @@
 #include <aowis/dvmdb/hydraulic_network_persistence.h>
-#include <aowis/dvmdb/revision_record_v2.h>
+#include <aowis/dvmdb/revision_record.h>
 
 #include <QCoreApplication>
 
@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
         network.links_valves.append(physicalValve);
         native::Repository repository(directory);
         const native::ProjectId project = native::ProjectId::generate();
-        const native::RevisionId genesis = repository.createBranchV2(project, "main");
+        const native::RevisionId genesis = repository.createBranch(project, "main");
         const std::chrono::steady_clock::time_point importStart = std::chrono::steady_clock::now();
         native::RevisionId mainHead = hydraulic::saveHydraulicNetwork(
             repository, project, "main", network, genesis);
@@ -359,8 +359,8 @@ int main(int argc, char** argv) {
         // Validate the real hydraulic three-way merger, not the generic
         // object-level conflict resolver. The immutable baseline must survive.
         const native::RevisionId baselineId = mainHead;
-        if (repository.createBranchV2(project, "baseline", "main") != baselineId ||
-            repository.createBranchV2(project, "feature", "main") != baselineId)
+        if (repository.createBranch(project, "baseline", "main") != baselineId ||
+            repository.createBranch(project, "feature", "main") != baselineId)
             throw std::runtime_error("UUIDv7 benchmark branch fork changed base revision");
         native::RevisionId featureHead = baselineId;
         HydraulicLinkPipe targetPipe = edited;
@@ -374,24 +374,24 @@ int main(int argc, char** argv) {
         const std::chrono::steady_clock::time_point diffStart =
             std::chrono::steady_clock::now();
         const std::vector<native::Difference> differences =
-            repository.diffRevisionsV2(project, mainHead, featureHead, 1000000);
+            repository.diffRevisions(project, mainHead, featureHead, 1000000);
         const double diffMs = elapsedMs(diffStart);
         if (differences.empty())
             throw std::runtime_error("divergent hydraulic branches unexpectedly have no diff");
         const std::chrono::steady_clock::time_point mergeStart =
             std::chrono::steady_clock::now();
-        const native::MergeResultV2 merged = hydraulic::mergeHydraulicBranches(
+        const native::MergeResult merged = hydraulic::mergeHydraulicBranches(
             repository, project, "main", "feature",
             hydraulic::HydraulicMergeSelections{mainHead, featureHead, {}, {}});
         const double mergeMs = elapsedMs(mergeStart);
         if (merged.status != native::MergeStatus::Merged || !merged.resultHead ||
-            repository.headV2(project, "feature") != featureHead)
+            repository.head(project, "feature") != featureHead)
             throw std::runtime_error("expected an immutable UUIDv7 hydraulic merge");
         mainHead = *merged.resultHead;
-        const std::optional<native::Bytes> mergeBytes = repository.readRevisionV2(project, mainHead);
+        const std::optional<native::Bytes> mergeBytes = repository.readRevision(project, mainHead);
         if (!mergeBytes)
             throw std::runtime_error("missing committed UUIDv7 merge revision");
-        const native::RevisionRecordV2 mergeRecord = native::decodeRevisionRecordV2(*mergeBytes);
+        const native::RevisionRecord mergeRecord = native::decodeRevisionRecord(*mergeBytes);
         if (mergeRecord.parents.size() != 2 || !merged.targetBefore || !merged.sourceHead ||
             mergeRecord.parents[0].id != *merged.targetBefore ||
             mergeRecord.parents[1].id != *merged.sourceHead)
@@ -420,7 +420,7 @@ int main(int argc, char** argv) {
         if (finalPackBytes < importPackBytes || finalIndexBytes < importIndexBytes)
             throw std::runtime_error("append-only pack or index unexpectedly shrank");
         repository.verifyPack();
-        const std::optional<native::ModelRecord> networkRoot = repository.getModelAtRevisionV2(
+        const std::optional<native::ModelRecord> networkRoot = repository.getModelAtRevision(
             project, mainHead, hydraulic::keyFromUuid(network.uuid));
         if (!networkRoot || networkRoot->kind != hydraulic::hydraulicNetworkKind)
             throw std::runtime_error("missing indexed network root");

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <chrono>
 #include <cstdint>
@@ -11,14 +12,15 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::BundleImportStatus;
-using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::RevisionBundleImport;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
 using aowis::dvmdb::Key;
 using aowis::dvmdb::ModelRecord;
 using aowis::dvmdb::Repository;
-using aowis::dvmdb::Revision;
 
 void expect(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -63,88 +65,100 @@ void testPortableBundles() {
     const std::filesystem::path secondBundle = temporary.path / "second.aowbundle";
     const std::filesystem::path modelBundle = temporary.path / "model.aowbundle";
     const std::filesystem::path alternateBundle = temporary.path / "alternate.aowbundle";
-    Hash base{};
-    Hash mergeTip{};
-    Hash modelTip{};
+    RevisionId base = RevisionId::generate();
+    RevisionId mergeTip = RevisionId::generate();
+    RevisionId modelTip = RevisionId::generate();
+    // One repository holds one project with one root history, and a branch
+    // is either raw or model-indexed: the model history is its own project.
     {
-        Repository source(sourcePath);
+        ProjectRepository models(temporary.path / "model-source");
+        models.createBranch("models");
+        const ModelRecord node{10, {}, bytes("junction")};
+        const ModelRecord pipe{11, {key(10)}, bytes("pipe")};
+        modelTip = models.commitModel("models", {{key(10), node}, {key(11), pipe}});
+        models.exportBundle("models", modelBundle);
+        ProjectRepository target(temporary.path / "model-destination");
+        const RevisionBundleImport modelImport = target.importBundle(modelBundle, "remote_models");
+        expect(modelImport.head == modelTip &&
+               target.getModel("remote_models", key(11))->payload == bytes("pipe") &&
+               target.referencing("remote_models", key(10)) == std::vector<Key>{key(11)},
+               "model reverse-reference snapshot did not survive replication");
+        target.compact();
+        ProjectRepository reopened(temporary.path / "model-destination");
+        expect(reopened.revision(modelTip).id == modelTip &&
+               reopened.referencing("remote_models", key(10)) == std::vector<Key>{key(11)},
+               "imported model objects lost after compaction and reopening");
+    }
+    {
+        ProjectRepository source(sourcePath);
         source.createBranch("main");
-        base = source.commit("main", {{key(1), bytes("original")}}).id;
+        base = source.commit("main", {{key(1), bytes("original")}});
         source.createBranch("feature", "main");
         source.commit("main", {{key(2), bytes("on-main")}});
         source.commit("feature", {{key(3), bytes("on-feature")}});
-        const aowis::dvmdb::MergeResult merged = source.mergeBranches("main", "feature");
-        expect(merged.status == aowis::dvmdb::MergeStatus::Merged &&
-               merged.revision.parents.size() == 2,
+        const aowis::dvmdb::MergeResult merged = source.merge("main", "feature");
+        expect(merged.status == aowis::dvmdb::MergeStatus::Merged && merged.resultHead &&
+               source.revision(*merged.resultHead).parents.size() == 2,
                "merge fixture did not preserve two-parent ancestry");
-        mergeTip = merged.revision.id;
-        source.createBranch("models");
-        const ModelRecord node{10, {}, bytes("junction")};
-        const ModelRecord pipe{11, {key(10)}, bytes("pipe")};
-        modelTip = source.commitModel("models", {{key(10), node}, {key(11), pipe}}).id;
-        source.exportBranchBundle("main", firstBundle);
-        source.exportBranchBundle("models", modelBundle);
-        expectFailure([&] { source.exportBranchBundle("main", firstBundle); },
+        mergeTip = *merged.resultHead;
+        source.exportBundle("main", firstBundle);
+        expectFailure([&] { source.exportBundle("main", firstBundle); },
                       "bundle export overwrote existing destination");
     }
     {
-        Repository target(destinationPath);
-        const BundleImportResult first = target.importBranchBundle(firstBundle, "remote_main");
+        ProjectRepository target(destinationPath);
+        const RevisionBundleImport first = target.importBundle(firstBundle, "remote_main");
         expect(first.status == BundleImportStatus::Created && first.head == mergeTip &&
                first.objectsImported > 0,
                "initial import did not create branch");
         expect(target.get("remote_main", key(1)) == bytes("original") &&
                target.get("remote_main", key(2)) == bytes("on-main") &&
                target.get("remote_main", key(3)) == bytes("on-feature") &&
-               target.getAtRevision(base, key(1)) == bytes("original") &&
-               !target.getAtRevision(base, key(2)),
+               target.getAt(base, key(1)) == bytes("original") &&
+               !target.getAt(base, key(2)),
                "independent repository replication changed historical contents");
         expect(target.revision(mergeTip).parents.size() == 2 &&
                target.revision(mergeTip).id == mergeTip,
                "replication did not preserve two-parent merge history");
-        const BundleImportResult modelImport = target.importBranchBundle(modelBundle, "remote_models");
-        expect(modelImport.head == modelTip &&
-               target.getModel("remote_models", key(11))->payload == bytes("pipe") &&
-               target.referencingModel("remote_models", key(10)) == std::vector<Key>{key(11)},
-               "model reverse-reference snapshot did not survive replication");
-        expect(target.importBranchBundle(firstBundle, "remote_main").status ==
+        expect(target.importBundle(firstBundle, "remote_main").status ==
                BundleImportStatus::UpToDate,
                "repeated bundle import is not idempotent");
         target.verifyPack();
     }
     {
-        Repository source(sourcePath);
+        ProjectRepository source(sourcePath);
         source.commit("main", {{key(4), bytes("after-first-bundle")}});
-        source.exportBranchBundle("main", secondBundle);
-        source.createBranchAtRevision("alternate", "main", mergeTip);
+        source.exportBundle("main", secondBundle);
+        source.createBranchAt("alternate", "main", mergeTip);
         source.commit("alternate", {{key(99), bytes("alternative-history")}});
-        source.exportBranchBundle("alternate", alternateBundle);
+        source.exportBundle("alternate", alternateBundle);
     }
     {
-        Repository target(destinationPath);
-        const BundleImportResult updated = target.importBranchBundle(secondBundle, "remote_main");
+        ProjectRepository target(destinationPath);
+        const RevisionBundleImport updated = target.importBundle(secondBundle, "remote_main");
         expect(updated.status == BundleImportStatus::FastForward &&
                target.get("remote_main", key(4)) == bytes("after-first-bundle"),
                "subsequent bundle did not fast-forward branch");
-        const Hash tip = updated.head;
-        expect(target.importBranchBundle(firstBundle, "remote_main").status ==
-               BundleImportStatus::UpToDate && target.head("remote_main").id == tip,
+        const RevisionId tip = updated.head;
+        expect(target.importBundle(firstBundle, "remote_main").status ==
+               BundleImportStatus::UpToDate && target.head("remote_main") == tip,
                "older bundle rewound branch");
         target.createBranch("local", "remote_main");
-        const Hash diverged = target.commit("local", {{key(5), bytes("local-only")}}).id;
+        const RevisionId diverged = target.commit("local", {{key(5), bytes("local-only")}});
         const std::uint64_t before = target.packSize();
-        expectFailure([&] { target.importBranchBundle(alternateBundle, "local"); },
+        expectFailure([&] { target.importBundle(alternateBundle, "local"); },
                       "divergent bundle was accepted");
-        expect(target.head("local").id == diverged && target.packSize() == before,
+        expect(target.head("local") == diverged && target.packSize() == before,
                "divergent bundle changed existing ref or pack");
 
         // Corruption, truncation, and trailing bytes are rejected without
         // publishing a ref or writing objects.
         const std::filesystem::path tampered = temporary.path / "tampered.aowbundle";
-        std::filesystem::copy_file(modelBundle, tampered);
+        std::filesystem::copy_file(secondBundle, tampered);
         {
             std::fstream file(tampered, std::ios::in | std::ios::out | std::ios::binary);
-            file.seekp(64 + 40);
+            file.seekp(static_cast<std::streamoff>(
+                aowis::dvmdb::test::bundleLayout(secondBundle).headerBytes + 40));
             const char corrupt = static_cast<char>(0x7f);
             file.write(&corrupt, 1);
         }
@@ -164,16 +178,11 @@ void testPortableBundles() {
             std::ifstream original(secondBundle, std::ios::binary);
             const Bytes content((std::istreambuf_iterator<char>(original)),
                                 std::istreambuf_iterator<char>());
-            expect(content.size() >= 104, "source bundle unexpectedly small");
-            const std::uint64_t count = [&content]() {
-                std::uint64_t number = 0;
-                for (unsigned index = 40; index < 48; ++index) {
-                    number = (number << 8U) | content[index];
-                }
-                return number;
-            }();
+            const aowis::dvmdb::test::BundleLayout layout =
+                aowis::dvmdb::test::bundleLayout(secondBundle);
+            const std::uint64_t count = layout.objects;
             expect(count > 1, "bundle fixture requires multiple objects");
-            std::uint64_t end = 64;
+            std::uint64_t end = layout.headerBytes;
             std::uint64_t last = end;
             for (std::uint64_t index = 0; index < count; ++index) {
                 last = end;
@@ -189,7 +198,7 @@ void testPortableBundles() {
             Bytes missing(content.begin(), content.begin() + static_cast<std::ptrdiff_t>(last));
             std::uint64_t newCount = count - 1;
             for (unsigned index = 0; index < 8; ++index) {
-                missing[47 - index] = static_cast<std::uint8_t>(newCount & 0xffU);
+                missing[95 - index] = static_cast<std::uint8_t>(newCount & 0xffU);
                 newCount >>= 8U;
             }
             std::ofstream output(incomplete, std::ios::binary);
@@ -197,9 +206,9 @@ void testPortableBundles() {
                          static_cast<std::streamsize>(missing.size()));
         }
         for (const std::filesystem::path& bundle : {tampered, truncated, trailing, incomplete}) {
-            expectFailure([&] { target.importBranchBundle(bundle, "invalid_branch"); },
+            expectFailure([&] { target.importBundle(bundle, "invalid_branch"); },
                           "malformed bundle was accepted");
-            expect(target.packSize() == before && target.head("local").id == diverged,
+            expect(target.packSize() == before && target.head("local") == diverged,
                    "malformed import changed repository");
             expectFailure([&] { (void)target.head("invalid_branch"); },
                           "malformed bundle published a branch");
@@ -208,44 +217,45 @@ void testPortableBundles() {
         target.verifyPack();
     }
     {
-        Repository reopened(destinationPath);
+        ProjectRepository reopened(destinationPath);
         expect(reopened.get("remote_main", key(4)) == bytes("after-first-bundle") &&
                reopened.get("local", key(5)) == bytes("local-only") &&
-               reopened.revision(modelTip).id == modelTip &&
-               reopened.referencingModel("remote_models", key(10)) == std::vector<Key>{key(11)},
+               reopened.revision(mergeTip).parents.size() == 2,
                "imported objects lost after compaction and reopening");
     }
 }
 void testMergeParentIncremental() {
     TemporaryDirectory temporary("merge-parent-delta");
-    Repository source(temporary.path / "source");
-    Repository destination(temporary.path / "destination");
+    ProjectRepository source(temporary.path / "source");
+    ProjectRepository destination(temporary.path / "destination");
     source.createBranch("main");
     source.commit("main", {{key(1), bytes("common")}});
     source.createBranch("feature", "main");
-    source.commit("main", {{key(2), bytes("main")}});
-    const Hash featureHead = source.commit("feature", {{key(3), bytes("feature")}}).id;
+    const RevisionId mainBeforeMerge = source.commit("main", {{key(2), bytes("main")}});
+    const RevisionId featureHead = source.commit("feature", {{key(3), bytes("feature")}});
     const std::filesystem::path initial = temporary.path / "feature.aowbundle";
     const std::filesystem::path delta = temporary.path / "merged.aowbundle";
     // Pin the recipient to the target branch identity. A source branch with a
     // different UUID must not be allowed to silently replace that identity.
-    source.exportBranchBundle("main", initial);
-    destination.importBranchBundle(initial, "remote_merge");
+    source.exportBundle("main", initial);
+    destination.importBundle(initial, "remote_merge");
     const std::filesystem::path featureBundle = temporary.path / "feature-base.aowbundle";
-    source.exportBranchBundle("feature", featureBundle);
-    destination.importBranchBundle(featureBundle, "remote_feature");
-    const aowis::dvmdb::MergeResult merged = source.mergeBranches("main", "feature");
-    expect(merged.status == aowis::dvmdb::MergeStatus::Merged &&
-               merged.revision.parents.size() == 2 &&
-               merged.revision.parents[1] == featureHead,
+    source.exportBundle("feature", featureBundle);
+    destination.importBundle(featureBundle, "remote_feature");
+    const aowis::dvmdb::MergeResult merged = source.merge("main", "feature");
+    expect(merged.status == aowis::dvmdb::MergeStatus::Merged && merged.resultHead &&
+               source.revision(*merged.resultHead).parents.size() == 2 &&
+               source.revision(*merged.resultHead).parents[1] == featureHead,
            "two-parent incremental fixture is invalid");
-    source.exportIncrementalBranchBundle("main", featureHead, delta);
-    const BundleImportResult imported = destination.importBranchBundle(delta, "remote_merge");
+    // A delta is cut against the recipient's exact HEAD. It must carry the
+    // second-parent (feature) history that the base does not reach.
+    source.exportIncrementalBundle("main", mainBeforeMerge, delta);
+    const RevisionBundleImport imported = destination.importBundle(delta, "remote_merge");
     expect(imported.status == BundleImportStatus::FastForward &&
-               destination.head("remote_merge").id == merged.revision.id &&
+               destination.head("remote_merge") == *merged.resultHead &&
                destination.get("remote_merge", key(2)) == bytes("main") &&
                destination.get("remote_merge", key(3)) == bytes("feature") &&
-               destination.revision(merged.revision.id).parents.size() == 2,
+               destination.revision(*merged.resultHead).parents.size() == 2,
            "incremental bundle did not preserve second-parent ancestry");
 }
 
@@ -253,24 +263,24 @@ void testIncrementalModelReferences() {
     TemporaryDirectory temporary("model-delta");
     const std::filesystem::path full = temporary.path / "models-full.aowbundle";
     const std::filesystem::path delta = temporary.path / "models-delta.aowbundle";
-    Repository source(temporary.path / "source");
-    Repository destination(temporary.path / "destination");
+    ProjectRepository source(temporary.path / "source");
+    ProjectRepository destination(temporary.path / "destination");
     source.createBranch("models");
     const ModelRecord node{10, {}, bytes("junction")};
     const ModelRecord pipe{11, {key(10)}, bytes("pipe")};
-    const Hash base = source.commitModel("models", {{key(10), node}, {key(11), pipe}}).id;
-    source.exportBranchBundle("models", full);
-    destination.importBranchBundle(full, "remote_models");
+    const RevisionId base = source.commitModel("models", {{key(10), node}, {key(11), pipe}});
+    source.exportBundle("models", full);
+    destination.importBundle(full, "remote_models");
     const ModelRecord secondPipe{11, {key(10)}, bytes("new pipe")};
-    const Hash latest = source.commitModel("models", {{key(12), secondPipe}}).id;
-    source.exportIncrementalBranchBundle("models", base, delta);
-    expect(destination.importBranchBundle(delta, "remote_models").status ==
+    const RevisionId latest = source.commitModel("models", {{key(12), secondPipe}});
+    source.exportIncrementalBundle("models", base, delta);
+    expect(destination.importBundle(delta, "remote_models").status ==
                BundleImportStatus::FastForward &&
-           destination.head("remote_models").id == latest &&
+           destination.head("remote_models") == latest &&
            destination.getModel("remote_models", key(12))->payload == bytes("new pipe") &&
-           destination.referencingModel("remote_models", key(10)) ==
+           destination.referencing("remote_models", key(10)) ==
                (std::vector<Key>{key(11), key(12)}) &&
-           destination.referencingModelAtRevision(base, key(10)) ==
+           destination.referencingAt(base, key(10)) ==
                (std::vector<Key>{key(11)}),
            "incremental transfer damaged typed model references/history");
 }
@@ -285,66 +295,68 @@ void testIncrementalBundles() {
     const std::filesystem::path incremental = temporary.path / "incremental.aowbundle";
     const std::filesystem::path noChanges = temporary.path / "no-changes.aowbundle";
     const std::filesystem::path damaged = temporary.path / "damaged.aowbundle";
-    Hash base{};
-    Hash tip{};
+    RevisionId base = RevisionId::generate();
+    RevisionId tip = RevisionId::generate();
     {
-        Repository source(sourcePath);
-        Repository destination(destinationPath);
+        ProjectRepository source(sourcePath);
+        ProjectRepository destination(destinationPath);
         source.createBranch("main");
         std::vector<aowis::dvmdb::Change> initial;
         for (std::uint64_t index = 1; index <= 250; ++index) {
             initial.push_back({key(index), Bytes(240, static_cast<std::uint8_t>(index))});
         }
-        base = source.commit("main", initial).id;
-        source.exportBranchBundle("main", full);
-        expect(destination.importBranchBundle(full, "remote_main").status ==
+        base = source.commit("main", initial);
+        source.exportBundle("main", full);
+        expect(destination.importBundle(full, "remote_main").status ==
                    BundleImportStatus::Created,
                "full baseline import failed");
-        expect(destination.head("remote_main").id == base, "baseline head mismatch");
+        expect(destination.head("remote_main") == base, "baseline head mismatch");
         destination.createBranch("diverged", "remote_main");
-        const Hash divergentHead = destination.commit("diverged", {{key(501), bytes("local")}}).id;
+        const RevisionId divergentHead = destination.commit("diverged", {{key(501), bytes("local")}});
 
         source.commit("main", {{key(100), bytes("updated")}});
-        tip = source.commit("main", {{key(502), bytes("new-object")}}).id;
-        source.exportBranchBundle("main", completeUpdate);
-        source.exportIncrementalBranchBundle("main", base, incremental);
+        tip = source.commit("main", {{key(502), bytes("new-object")}});
+        source.exportBundle("main", completeUpdate);
+        source.exportIncrementalBundle("main", base, incremental);
         expect(std::filesystem::file_size(incremental) <
                    std::filesystem::file_size(completeUpdate) / 3,
                "incremental transfer retained almost the entire baseline");
         expectFailure([&] {
-            source.exportIncrementalBranchBundle("main", Hash{}, temporary.path / "zero.aowbundle");
-        }, "zero incremental base accepted");
-        source.createBranch("unrelated");
-        const Hash unrelated = source.commit("unrelated", {{key(777), bytes("other")}}).id;
+            source.exportIncrementalBundle("main", RevisionId::generate(),
+                                           temporary.path / "unknown.aowbundle");
+        }, "unknown incremental base accepted");
+        source.createBranchAt("unrelated", "main", base);
+        const RevisionId unrelated = source.commit("unrelated", {{key(777), bytes("other")}});
         expectFailure([&] {
-            source.exportIncrementalBranchBundle(
+            source.exportIncrementalBundle(
                 "main", unrelated, temporary.path / "nonancestor.aowbundle");
         }, "non-ancestor base accepted");
 
         {
-            Repository empty(missingBasePath);
-            expectFailure([&] { empty.importBranchBundle(incremental, "remote_main"); },
+            ProjectRepository empty(missingBasePath);
+            expectFailure([&] { empty.importBundle(incremental, "remote_main"); },
                           "incremental bundle imported without recipient baseline");
             expect(empty.objectCount() == 0, "missing baseline import wrote content");
         }
         const std::uint64_t beforeDivergence = destination.packSize();
-        expectFailure([&] { destination.importBranchBundle(incremental, "diverged"); },
+        expectFailure([&] { destination.importBundle(incremental, "diverged"); },
                       "incremental transfer overwrote divergent head");
-        expect(destination.head("diverged").id == divergentHead &&
+        expect(destination.head("diverged") == divergentHead &&
                    destination.packSize() == beforeDivergence,
                "divergent incremental import touched the store");
 
         std::filesystem::copy_file(incremental, damaged);
         {
             std::fstream file(damaged, std::ios::binary | std::ios::in | std::ios::out);
-            file.seekp(96 + 40);
+            file.seekp(static_cast<std::streamoff>(
+                aowis::dvmdb::test::bundleLayout(incremental).headerBytes + 40));
             file.put(static_cast<char>(0x7f));
         }
         const std::uint64_t beforeCorruption = destination.packSize();
-        expectFailure([&] { destination.importBranchBundle(damaged, "remote_main"); },
+        expectFailure([&] { destination.importBundle(damaged, "remote_main"); },
                       "corrupted incremental object was accepted");
         expect(destination.packSize() == beforeCorruption &&
-                   destination.head("remote_main").id == base,
+                   destination.head("remote_main") == base,
                "corrupt incremental import changed content or branch");
 
         // A malicious delta could omit an object without tampering with any
@@ -354,14 +366,12 @@ void testIncrementalBundles() {
             std::ifstream sourceFile(incremental, std::ios::binary);
             const Bytes content((std::istreambuf_iterator<char>(sourceFile)),
                                 std::istreambuf_iterator<char>());
-            expect(content.size() > 136 && content[7] == '4',
-                   "incremental fixture was unexpectedly empty");
-            std::uint64_t count = 0;
-            for (unsigned index = 40; index < 48; ++index) {
-                count = (count << 8U) | content[index];
-            }
+            const aowis::dvmdb::test::BundleLayout layout =
+                aowis::dvmdb::test::bundleLayout(incremental);
+            expect(layout.incremental, "incremental fixture is not a delta");
+            const std::uint64_t count = layout.objects;
             expect(count > 1, "incremental fixture needs multiple objects");
-            std::size_t end = 96;
+            std::size_t end = static_cast<std::size_t>(layout.headerBytes);
             std::size_t last = end;
             for (std::uint64_t index = 0; index < count; ++index) {
                 last = end;
@@ -377,41 +387,43 @@ void testIncrementalBundles() {
                             static_cast<std::ptrdiff_t>(last));
             std::uint64_t reduced = count - 1;
             for (unsigned index = 0; index < 8; ++index) {
-                shortened[47 - index] = static_cast<std::uint8_t>(reduced & 0xffU);
+                shortened[95 - index] = static_cast<std::uint8_t>(reduced & 0xffU);
                 reduced >>= 8U;
             }
             std::ofstream output(incomplete, std::ios::binary);
             output.write(reinterpret_cast<const char*>(shortened.data()),
                          static_cast<std::streamsize>(shortened.size()));
         }
-        expectFailure([&] { destination.importBranchBundle(incomplete, "remote_main"); },
+        expectFailure([&] { destination.importBundle(incomplete, "remote_main"); },
                       "incomplete incremental object graph was accepted");
         expect(destination.packSize() == beforeCorruption &&
-                   destination.head("remote_main").id == base,
+                   destination.head("remote_main") == base,
                "incomplete incremental graph changed repository");
 
-        const BundleImportResult updated = destination.importBranchBundle(incremental,
+        const RevisionBundleImport updated = destination.importBundle(incremental,
                                                                            "remote_main");
         expect(updated.status == BundleImportStatus::FastForward && updated.head == tip &&
                    updated.objectsImported != 0 &&
                    destination.get("remote_main", key(100)) == bytes("updated") &&
                    destination.get("remote_main", key(502)) == bytes("new-object") &&
-                   destination.getAtRevision(base, key(100)) == Bytes(240, 100),
+                   destination.getAt(base, key(100)) == Bytes(240, 100),
                "incremental transfer lost old/new object contents");
-        expect(destination.importBranchBundle(incremental, "remote_main").status ==
+        expect(destination.importBundle(incremental, "remote_main").status ==
                    BundleImportStatus::UpToDate,
                "incremental reimport should be idempotent");
-        source.exportIncrementalBranchBundle("main", tip, noChanges);
-        expect(std::filesystem::file_size(noChanges) == 96,
+        source.exportIncrementalBundle("main", tip, noChanges);
+        expect(std::filesystem::file_size(noChanges) ==
+                   aowis::dvmdb::test::bundleLayout(noChanges).headerBytes &&
+               aowis::dvmdb::test::bundleLayout(noChanges).objects == 0,
                "matching branch tip should generate header-only incremental bundle");
-        expect(destination.importBranchBundle(noChanges, "remote_main").status ==
+        expect(destination.importBundle(noChanges, "remote_main").status ==
                    BundleImportStatus::UpToDate,
                "header-only incremental bundle should be up to date");
         destination.verifyPack();
     }
     {
-        Repository reopened(destinationPath);
-        expect(reopened.head("remote_main").id == tip &&
+        ProjectRepository reopened(destinationPath);
+        expect(reopened.head("remote_main") == tip &&
                    reopened.get("remote_main", key(502)) == bytes("new-object"),
                "incremental objects did not survive reopening");
         reopened.compact();

@@ -171,8 +171,8 @@ unbounded scale of projects.
 - Scratch files are repository-local and normally unlinked. Space held by an
   open descriptor is freed when that operation/process exits. A restart
   removes the named scratch fallback leftovers on repository open.
-- **Interrupted filesystem-path bundle exports:** `exportBranchBundle(path)`
-  and its incremental variant write and fsync a private file in the final
+- **Interrupted filesystem-path bundle exports:** `exportRevisionBundleV2(path)`
+  and `exportIncrementalRevisionBundleV2(path)` write and fsync a private file in the final
   destination directory, then atomically link the completed file at the
   requested name **without replacing existing files or symlinks**. The
   directory is fsynced before a successful return. A crash before publication

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -15,6 +16,8 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 namespace fs = std::filesystem;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
@@ -100,43 +103,43 @@ void run(const fs::path& root) {
     const fs::path failedBundle = root / "failed.bundle";
     const fs::path completedBundle = root / "completed.bundle";
     const Bytes payload(4U * 1024U * 1024U, 0x6b);
-    Hash original{};
-    Hash originalWrite{};
-    Hash latest{};
+    RevisionId original = RevisionId::generate();
+    RevisionId originalWrite = RevisionId::generate();
+    RevisionId latest = RevisionId::generate();
     {
-        Repository source(originPath);
+        ProjectRepository source(originPath);
         source.createBranch("main");
         (void)source.commit("main", {Change{key(1), Bytes(1024, 0x11)}});
-        original = source.head("main").id;
-        source.exportBranchBundle("main", initialBundle);
+        original = source.head("main");
+        source.exportBundle("main", initialBundle);
         (void)source.commit("main", {Change{key(2), payload}});
-        latest = source.head("main").id;
-        source.exportIncrementalBranchBundle("main", original, deltaBundle);
+        latest = source.head("main");
+        source.exportIncrementalBundle("main", original, deltaBundle);
     }
     {
-        Repository destination(destinationPath);
-        check(destination.importBranchBundle(initialBundle, "main").head == original,
+        ProjectRepository destination(destinationPath);
+        check(destination.importBundle(initialBundle, "main").head == original,
               "initial bundle did not publish expected base");
         destination.verifyRepository();
     }
     {
-        Repository writable(writePath);
+        ProjectRepository writable(writePath);
         writable.createBranch("main");
         (void)writable.commit("main", {Change{key(1), Bytes(512, 0x12)}});
-        originalWrite = writable.head("main").id;
+        originalWrite = writable.head("main");
     }
     check(fs::file_size(deltaBundle) > 4U * 1024U * 1024U,
           "incremental bundle too small for physical ENOSPC case");
 
     exhaust(root);
     expectsDiskFull("commit", [&] {
-        Repository writable(writePath);
+        ProjectRepository writable(writePath);
         (void)writable.commit("main", {Change{key(3), payload}});
     });
     release(root);
     {
-        Repository writable(writePath);
-        check(writable.head("main").id == originalWrite, "disk-full commit published a branch");
+        ProjectRepository writable(writePath);
+        check(writable.head("main") == originalWrite, "disk-full commit published a branch");
         check(!writable.get("main", key(3)).has_value(), "uncommitted value was exposed");
         writable.verifyRepository();
         (void)writable.commit("main", {Change{key(3), payload}});
@@ -147,16 +150,16 @@ void run(const fs::path& root) {
 
     exhaust(root);
     expectsDiskFull("named export", [&] {
-        Repository origin(originPath);
-        origin.exportBranchBundle("main", failedBundle);
+        ProjectRepository origin(originPath);
+        origin.exportBundle("main", failedBundle);
     });
     check(!fs::exists(failedBundle), "failed export exposed a partial bundle filename");
     release(root);
     {
-        Repository origin(originPath);
-        check(origin.head("main").id == latest, "failed export changed source head");
+        ProjectRepository origin(originPath);
+        check(origin.head("main") == latest, "failed export changed source head");
         origin.verifyRepository();
-        origin.exportBranchBundle("main", completedBundle);
+        origin.exportBundle("main", completedBundle);
     }
     check(fs::file_size(completedBundle) > 4U * 1024U * 1024U,
           "retry did not export complete bundle");
@@ -164,18 +167,18 @@ void run(const fs::path& root) {
 
     exhaust(root);
     expectsDiskFull("incremental import", [&] {
-        Repository destination(destinationPath);
-        (void)destination.importBranchBundle(deltaBundle, "main");
+        ProjectRepository destination(destinationPath);
+        (void)destination.importBundle(deltaBundle, "main");
     });
     release(root);
     {
-        Repository destination(destinationPath);
-        check(destination.head("main").id == original,
+        ProjectRepository destination(destinationPath);
+        check(destination.head("main") == original,
               "disk-full import advanced destination branch");
         check(!destination.get("main", key(2)).has_value(),
               "disk-full import exposed uncommitted data");
         destination.verifyRepository();
-        check(destination.importBranchBundle(deltaBundle, "main").head == latest,
+        check(destination.importBundle(deltaBundle, "main").head == latest,
               "incremental import retry published wrong revision");
         check(destination.get("main", key(2)).value() == payload,
               "incremental import retry lost payload");

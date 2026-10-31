@@ -28,7 +28,7 @@ struct File {
     int fd;
     File(const fs::path& path, int flags)
         : fd(::open(path.c_str(), flags | O_CLOEXEC | O_NOFOLLOW, 0600)) {
-        if (this->fd < 0) throw std::runtime_error("cannot open v2 staging file");
+        if (this->fd < 0) throw std::runtime_error("cannot open staging file");
     }
     ~File() { (void)::close(this->fd); }
     File(const File&) = delete;
@@ -39,7 +39,7 @@ void run() {
     WorkingDirectory work;
     const ProjectId project = ProjectId::generate();
     Repository source(work.root / "source");
-    const RevisionId initial = source.createBranchV2(project, "main");
+    const RevisionId initial = source.createBranch(project, "main");
     // Distinct incompressible-looking raw model values. The old fixed 64 MiB
     // *bundle* ceiling must not reject a bounded, disk-backed transfer.
     std::vector<Change> changes;
@@ -51,23 +51,23 @@ void run() {
             value[position] = static_cast<std::uint8_t>((position * 131U + index * 17U) & 255U);
         changes.push_back(Change{key, std::move(value)});
     }
-    const RevisionId head = source.commitV2(project, "main", changes, initial);
+    const RevisionId head = source.commit(project, "main", changes, initial);
     changes.clear();
     const fs::path fullPath = work.root / "full.bundle";
     {
         File output(fullPath, O_RDWR | O_CREAT | O_EXCL);
-        source.exportRevisionBundleV2(project, "main", output.fd);
+        source.exportRevisionBundle(project, "main", output.fd);
     }
     check(fs::file_size(fullPath) > 64ULL * 1024ULL * 1024ULL,
-          "v2 regression fixture did not exceed the old 64 MiB ceiling");
+          "regression fixture did not exceed the old 64 MiB ceiling");
     Repository target(work.root / "target");
     {
         File input(fullPath, O_RDONLY);
-        const RevisionBundleImportV2 result = target.importRevisionBundleV2(project, input.fd, "main");
+        const RevisionBundleImport result = target.importRevisionBundle(project, input.fd, "main");
         check(result.status == BundleImportStatus::Created && result.head == head,
-              "disk-backed v2 full import failed");
+              "disk-backed full import failed");
     }
-    check(target.headV2(project, "main") == head &&
+    check(target.head(project, "main") == head &&
           target.branchId("main") == source.branchId("main"),
           "large bundle changed revision/branch UUIDv7 identities");
     check(target.verifyRepository().revisions >= 2,
@@ -77,7 +77,7 @@ void run() {
     {
         File input(fullPath, O_RDONLY);
         try {
-            (void)limited.importRevisionBundleV2(project, input.fd, "main",
+            (void)limited.importRevisionBundle(project, input.fd, "main",
                   BundleLimits{32ULL * 1024ULL * 1024ULL, 0, 0});
             throw std::runtime_error("configured import byte ceiling ignored");
         } catch (const StorageError& error) {

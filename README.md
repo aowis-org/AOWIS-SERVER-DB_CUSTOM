@@ -221,9 +221,10 @@ project_uuid="<project-uuidv7>"
 
 An incremental bundle supplies an authenticated UUIDv7 base revision:
 `aowis-dvmdb-sync export-incremental REPOSITORY PROJECT_UUID BRANCH BASE_UUID BUNDLE`.
-Full bundles use `AOWREV21`, incremental bundles use `AOWREV22`; neither accepts
-SHA-256 revision IDs or SHA-era `AOWSYNC3/4` on this canonical CLI. SHA-256
-still authenticates immutable records and content. See
+Full bundles use `AOWREV21`, incremental bundles use `AOWREV22` (`AOWREV23/24`
+when they carry fork provenance). Revisions are addressed only by UUIDv7; the
+SHA-256 revision engine and its `AOWSYNC` bundles were removed, and old bundles
+are rejected. SHA-256 still authenticates immutable records and content. See
 [portable synchronization](docs/offline-repository-synchronization.md) and
 [UUIDv7 transfer contract](docs/uuidv7-revision-replication-v2.md).
 

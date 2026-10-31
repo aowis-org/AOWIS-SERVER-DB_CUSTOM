@@ -44,8 +44,8 @@ private:
 };
 
 // Distinct domain tags make it impossible to accidentally pass a branch ID
-// where a revision ID is expected in future typed native APIs. The existing
-// string-based ProjectService surface is kept for legacy compatibility.
+// where a revision ID is expected. ProjectService takes project IDs as
+// strings because they arrive as HTTP path parameters.
 struct ProjectIdTag {};
 struct BranchIdTag {};
 struct RevisionIdTag {};

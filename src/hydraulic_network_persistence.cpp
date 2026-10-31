@@ -1,5 +1,5 @@
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 #include "aowis/dvmdb/storage_error.h"
 
 #include <aowis/dvmdb/model_validation.h>
@@ -60,7 +60,7 @@ constexpr std::uint16_t chunkKind = 101;
 
 struct Manifest {
     NetworkHydraulic metadata;
-    // Populated only by manifestFor()/loadMembersAtRevisionV2(), never serialized inline.
+    // Populated only by manifestFor()/loadMembersAtRevision(), never serialized inline.
     std::array<QList<QUuid>, collectionCount> members;
     std::array<QList<QUuid>, collectionCount> chunks;
     std::array<quint32, collectionCount> nextChunk{};
@@ -102,7 +102,7 @@ Manifest decodeManifest(const QByteArray& bytes) {
     QByteArray metadata;
     stream >> magic >> version >> metadata;
     if (stream.status() != QDataStream::Ok || magic != manifestMagic || version != manifestVersion)
-        throw StorageError(StorageErrorKind::Corruption, "unsupported hydraulic network manifest (requires fresh v2 repository)");
+        throw StorageError(StorageErrorKind::Corruption, "unsupported hydraulic network manifest");
     QString error;
     std::optional<NetworkHydraulic> decoded = aowis::dvmdb::ModelCodec<NetworkHydraulic>::decode(metadata, &error);
     if (!decoded) throw StorageError(StorageErrorKind::Corruption, "invalid hydraulic network metadata: " + error.toStdString());
@@ -217,12 +217,12 @@ void loadMembersUsing(ReadModel readModel, Manifest& manifest,
     }
 }
 
-void loadMembersAtRevisionV2(Repository& repository, const ProjectId& project,
+void loadMembersAtRevision(Repository& repository, const ProjectId& project,
                              const RevisionId& revisionId, Manifest& manifest,
                              std::optional<std::size_t> onlyCollection = std::nullopt,
                              std::size_t maxMembers = std::numeric_limits<std::size_t>::max()) {
     loadMembersUsing([&repository, &project, &revisionId](const Key& key) {
-        return repository.getModelAtRevisionV2(project, revisionId, key);
+        return repository.getModelAtRevision(project, revisionId, key);
     }, manifest, onlyCollection, maxMembers);
 }
 
@@ -268,13 +268,13 @@ std::optional<Key> ownerChunkUsing(ReadModel readModel, ReadReferrers readReferr
     return found;
 }
 
-std::optional<Key> ownerChunkAtRevisionV2(Repository& repository, const ProjectId& project,
+std::optional<Key> ownerChunkAtRevision(Repository& repository, const ProjectId& project,
                                           const RevisionId& revisionId,
                                           const QUuid& network, const Key& member) {
     return ownerChunkUsing([&repository, &project, &revisionId](const Key& key) {
-        return repository.getModelAtRevisionV2(project, revisionId, key);
+        return repository.getModelAtRevision(project, revisionId, key);
     }, [&repository, &project, &revisionId](const Key& key) {
-        return repository.referencingModelAtRevisionV2(project, revisionId, key);
+        return repository.referencingModelAtRevision(project, revisionId, key);
     }, network, member);
 }
 
@@ -346,13 +346,13 @@ void addEntities(const QList<T>& entities, std::uint16_t kind,
 }
 
 template<typename T>
-void restoreEntitiesV2(Repository& repository, const ProjectId& project,
+void restoreEntities(Repository& repository, const ProjectId& project,
                        const RevisionId& revisionId, const QList<QUuid>& ids,
                        std::uint16_t kind, QList<T>& output,
                        std::vector<std::pair<Key, Key>>& storedReferences) {
     for (const QUuid& uuid : ids) {
         const std::optional<ModelRecord> record =
-            repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(uuid));
+            repository.getModelAtRevision(project, revisionId, keyFromUuid(uuid));
         if (!record || record->kind != kind)
             throw StorageError(StorageErrorKind::Corruption, "missing or wrong-type hydraulic entity");
         QString error;
@@ -417,35 +417,6 @@ void applyEntityChange(NetworkHydraulic& network, const HydraulicEntityChange& c
     AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(APPLY_EDIT)
 #undef APPLY_EDIT
     throw StorageError(StorageErrorKind::Internal, "unknown hydraulic entity collection");
-}
-
-// The same canonical codec and model reference extraction as full saves.
-ModelChange encodeChangedEntity(const HydraulicEntityChange& change,
-                                const DependencyIndex& references) {
-    ModelChange result;
-    result.key = keyFromUuid(change.uuid);
-    if (!change.value) return result;
-    ModelRecord record;
-    static_assert(std::variant_size_v<HydraulicEntity> == collectionCount);
-    const std::array<std::uint16_t, collectionCount> kinds = {
-#define MEMBER_KIND(name, type, kind) static_cast<std::uint16_t>(kind),
-        AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(MEMBER_KIND)
-#undef MEMBER_KIND
-    };
-    record.kind = kinds[change.value->index()];
-    std::visit([&record](const auto& entity) {
-        using T = std::decay_t<decltype(entity)>;
-        record.payload = bytesFromQByteArray(aowis::dvmdb::ModelCodec<T>::encode(entity));
-    }, *change.value);
-    if (record.payload.empty()) throw StorageError(StorageErrorKind::Internal, "cannot encode changed hydraulic entity");
-    record.references = entityReferences(references, result.key);
-    // The persisted ModelRecord's reference list is canonicalized by
-    // commitModel(). Match that ordering before testing for no-op changes.
-    std::sort(record.references.begin(), record.references.end());
-    record.references.erase(std::unique(record.references.begin(), record.references.end()),
-                            record.references.end());
-    result.record = std::move(record);
-    return result;
 }
 
 // The canonical validator currently checks UUID identity, cross-object
@@ -1074,7 +1045,7 @@ std::optional<RevisionType> tryIndexedMembershipEditsUsing(
 }
 
 // All reads and reverse-reference lookups belong to the same immutable UUIDv7
-// revision. commitModelV2 atomically verifies the expected HEAD and publishes
+// revision. commitModel atomically verifies the expected HEAD and publishes
 // root, chunks and entity records as a single revision or publishes nothing.
 std::optional<RevisionId> tryIndexedUuidMembershipEdits(
     Repository& repository, const ProjectId& project, std::string_view branch,
@@ -1082,16 +1053,16 @@ std::optional<RevisionId> tryIndexedUuidMembershipEdits(
     const RevisionId& expectedHead, HydraulicEditDiagnostics* diagnostics) {
     return tryIndexedMembershipEditsUsing<RevisionId>(
         [&repository, &project, &expectedHead](const Key& key) {
-            return repository.getModelAtRevisionV2(project, expectedHead, key);
+            return repository.getModelAtRevision(project, expectedHead, key);
         },
         [&repository, &project, &expectedHead](const Key& key) {
-            return repository.referencingModelAtRevisionV2(project, expectedHead, key);
+            return repository.referencingModelAtRevision(project, expectedHead, key);
         },
         [&repository, &project, &expectedHead, &networkUuid](const Key& key) {
-            return ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key);
+            return ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key);
         },
         [&repository, &project, branch, &expectedHead](std::vector<ModelChange> pending) {
-            return repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+            return repository.commitModel(project, branch, std::move(pending), expectedHead);
         }, networkUuid, changes, diagnostics);
 }
 
@@ -1135,10 +1106,10 @@ std::optional<RevisionId> tryIndexedUuidPhysicalEdits(
             return std::nullopt;
         const Key key = keyFromUuid(change.uuid);
         if (!seen.insert(key).second ||
-            !ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            !ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key))
             return std::nullopt;
         const std::optional<ModelRecord> old =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!old || !physicalOnlyChange(*change.value, *old, change.uuid) ||
             old->references != physicalReferences(*change.value))
             return std::nullopt;
@@ -1155,11 +1126,11 @@ std::optional<RevisionId> tryIndexedUuidPhysicalEdits(
     }
     RevisionId result = expectedHead;
     if (pending.empty()) {
-        if (repository.headV2(project, branch) != expectedHead)
+        if (repository.head(project, branch) != expectedHead)
             throw StorageError(StorageErrorKind::Conflict,
                                "branch head changed during UUIDv7 hydraulic physical edit");
     } else {
-        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+        result = repository.commitModel(project, branch, std::move(pending), expectedHead);
     }
     if (diagnostics) {
         diagnostics->indexedPhysicalFastPath = true;
@@ -1185,10 +1156,10 @@ std::optional<RevisionId> tryIndexedUuidCatalogueEdits(
             return std::nullopt;
         const Key key = keyFromUuid(change.uuid);
         if (!seen.insert(key).second ||
-            !ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            !ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key))
             return std::nullopt;
         const std::optional<ModelRecord> old =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!old || old->kind != 8 + change.value->index() ||
             !validCatalogueRecord(*old, change.uuid))
             return std::nullopt;
@@ -1205,11 +1176,11 @@ std::optional<RevisionId> tryIndexedUuidCatalogueEdits(
     }
     RevisionId result = expectedHead;
     if (pending.empty()) {
-        if (repository.headV2(project, branch) != expectedHead)
+        if (repository.head(project, branch) != expectedHead)
             throw StorageError(StorageErrorKind::Conflict,
                                "branch head changed during UUIDv7 hydraulic catalogue edit");
     } else {
-        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+        result = repository.commitModel(project, branch, std::move(pending), expectedHead);
     }
     if (diagnostics) {
         diagnostics->indexedCatalogueFastPath = true;
@@ -1233,14 +1204,14 @@ std::optional<RevisionId> tryIndexedUuidPipeRewires(
         if (target.isNull()) return true;
         const Key key = keyFromUuid(target);
         const std::optional<ModelRecord> record =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!record) return false;
         if (material) {
             if (record->kind != 8) return false;
         } else if (record->kind != junctionKind && record->kind != 2 && record->kind != 3) {
             return false;
         }
-        return ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key).has_value();
+        return ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key).has_value();
     };
     for (const HydraulicEntityChange& change : changes) {
         if (change.uuid.isNull() || change.uuid == networkUuid || !change.value ||
@@ -1250,13 +1221,13 @@ std::optional<RevisionId> tryIndexedUuidPipeRewires(
         const Key key = keyFromUuid(change.uuid);
         if (!seen.insert(key).second) return std::nullopt;
         const std::optional<Key> owning =
-            ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key);
+            ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key);
         if (!owning) return std::nullopt;
         const std::vector<Key> incoming =
-            repository.referencingModelAtRevisionV2(project, expectedHead, key);
+            repository.referencingModelAtRevision(project, expectedHead, key);
         if (incoming.size() != 1 || incoming.front() != *owning) return std::nullopt;
         const std::optional<ModelRecord> old =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!old || old->kind != pipeKind) return std::nullopt;
         const std::optional<HydraulicLinkPipe> prior =
             ModelCodec<HydraulicLinkPipe>::decode(qByteArrayFromBytes(old->payload));
@@ -1280,11 +1251,11 @@ std::optional<RevisionId> tryIndexedUuidPipeRewires(
     }
     RevisionId result = expectedHead;
     if (pending.empty()) {
-        if (repository.headV2(project, branch) != expectedHead)
+        if (repository.head(project, branch) != expectedHead)
             throw StorageError(StorageErrorKind::Conflict,
                                "branch head changed during UUIDv7 hydraulic topology edit");
     } else {
-        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+        result = repository.commitModel(project, branch, std::move(pending), expectedHead);
     }
     if (diagnostics) {
         diagnostics->indexedTopologyFastPath = true;
@@ -1309,10 +1280,10 @@ std::optional<RevisionId> tryIndexedUuidDependentUpdates(
         if (id.isNull()) return true;
         const Key key = keyFromUuid(id);
         const std::optional<ModelRecord> target =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!target || std::find(accepted.begin(), accepted.end(), target->kind) == accepted.end())
             return false;
-        return ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key).has_value();
+        return ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key).has_value();
     };
     const std::function<bool(const QUuid&)> nodeTarget = [&](const QUuid& id) -> bool {
         return validTarget(id, {junctionKind, 2, 3});
@@ -1327,10 +1298,10 @@ std::optional<RevisionId> tryIndexedUuidDependentUpdates(
             return std::nullopt;
         const Key key = keyFromUuid(change.uuid);
         if (!seen.insert(key).second ||
-            !ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+            !ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key))
             return std::nullopt;
         const std::optional<ModelRecord> old =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!old) return std::nullopt;
         std::optional<HydraulicEntity> previous;
         const QByteArray oldBytes = qByteArrayFromBytes(old->payload);
@@ -1359,7 +1330,7 @@ std::optional<RevisionId> tryIndexedUuidDependentUpdates(
                     const QUuid junctionUuid = point->attachment.pipe_assigned_junction_uuid;
                     if (!validTarget(junctionUuid, {junctionKind})) return std::nullopt;
                     if (!pipeUuid.isNull() && !junctionUuid.isNull()) {
-                        const std::optional<ModelRecord> pipeRecord = repository.getModelAtRevisionV2(
+                        const std::optional<ModelRecord> pipeRecord = repository.getModelAtRevision(
                             project, expectedHead, keyFromUuid(pipeUuid));
                         if (!pipeRecord || pipeRecord->kind != pipeKind) return std::nullopt;
                         const std::optional<HydraulicLinkPipe> pipe = ModelCodec<HydraulicLinkPipe>::decode(
@@ -1406,11 +1377,11 @@ std::optional<RevisionId> tryIndexedUuidDependentUpdates(
     }
     RevisionId result = expectedHead;
     if (pending.empty()) {
-        if (repository.headV2(project, branch) != expectedHead)
+        if (repository.head(project, branch) != expectedHead)
             throw StorageError(StorageErrorKind::Conflict,
                                "branch head changed during UUIDv7 hydraulic dependent edit");
     } else {
-        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+        result = repository.commitModel(project, branch, std::move(pending), expectedHead);
     }
     if (diagnostics) {
         diagnostics->indexedDependentUpdateFastPath = true;
@@ -1420,7 +1391,7 @@ std::optional<RevisionId> tryIndexedUuidDependentUpdates(
 }
 
 // UUIDv7 indexed scalar-edit counterpart. All ownership and payload reads are
-// pinned to one immutable project revision; commitModelV2() atomically checks
+// pinned to one immutable project revision; commitModel() atomically checks
 // the same expected HEAD before publishing. An ineligible batch returns
 // nullopt WITHOUT applying any of its changes, so the caller can use the
 // complete-network validator instead.
@@ -1445,10 +1416,10 @@ std::optional<RevisionId> tryIndexedUuidScalarEdits(
         if ((!pipe || pipe->uuid != change.uuid) &&
             (!junction || junction->uuid != change.uuid) &&
             (!label || label->uuid != change.uuid)) return std::nullopt;
-        if (!ownerChunkAtRevisionV2(repository, project, expectedHead, networkUuid, key))
+        if (!ownerChunkAtRevision(repository, project, expectedHead, networkUuid, key))
             return std::nullopt;
         const std::optional<ModelRecord> old =
-            repository.getModelAtRevisionV2(project, expectedHead, key);
+            repository.getModelAtRevision(project, expectedHead, key);
         if (!old || !scalarOnlyChange(*change.value, *old, change.uuid))
             return std::nullopt;
         if (old->references != scalarReferences(*change.value)) return std::nullopt;
@@ -1473,11 +1444,11 @@ std::optional<RevisionId> tryIndexedUuidScalarEdits(
     }
     RevisionId result = expectedHead;
     if (pending.empty()) {
-        if (repository.headV2(project, branch) != expectedHead)
+        if (repository.head(project, branch) != expectedHead)
             throw StorageError(StorageErrorKind::Conflict,
                                "branch head changed during UUIDv7 hydraulic scalar edit");
     } else {
-        result = repository.commitModelV2(project, branch, std::move(pending), expectedHead);
+        result = repository.commitModel(project, branch, std::move(pending), expectedHead);
     }
     if (diagnostics) {
         diagnostics->indexedScalarFastPath = true;
@@ -2190,12 +2161,12 @@ std::invoke_result_t<Callback, const MergeOptions&> mergeHydraulicWithChoices(
 }
 
 
-MergeResultV2 mergeHydraulicBranches(Repository& repository, const ProjectId& project,
+MergeResult mergeHydraulicBranches(Repository& repository, const ProjectId& project,
                                        std::string_view target, std::string_view source,
                                        const HydraulicMergeSelections& selections) {
     return mergeHydraulicWithChoices(selections.fields, selections.objects,
         [&](const MergeOptions& options) {
-            return repository.mergeBranchesV2(project, target, source,
+            return repository.mergeBranches(project, target, source,
                 selections.expectedTargetHead, selections.expectedSourceHead, options);
         });
 }
@@ -2207,13 +2178,13 @@ std::optional<QList<QUuid>> listHydraulicEntityIdsAtRevisionLimited(
     if (index >= collectionCount)
         throw StorageError(StorageErrorKind::InvalidInput, "unknown hydraulic entity collection");
     const std::optional<ModelRecord> root =
-        repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(networkUuid));
+        repository.getModelAtRevision(project, revisionId, keyFromUuid(networkUuid));
     if (!root || root->kind != hydraulicNetworkKind) return std::nullopt;
     Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
     if (manifest.metadata.uuid != networkUuid)
         throw StorageError(StorageErrorKind::Corruption, "hydraulic network root UUID mismatch");
     checkRoot(manifest, *root);
-    loadMembersAtRevisionV2(repository, project, revisionId, manifest, index, maxCount);
+    loadMembersAtRevision(repository, project, revisionId, manifest, index, maxCount);
     return manifest.members[index];
 }
 
@@ -2222,14 +2193,14 @@ std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
     const QUuid& networkUuid, const QUuid& entityUuid) {
     if (networkUuid.isNull() || entityUuid.isNull() || networkUuid == entityUuid)
         return std::nullopt;
-    if (!ownerChunkAtRevisionV2(repository, project, revisionId, networkUuid, keyFromUuid(entityUuid)))
+    if (!ownerChunkAtRevision(repository, project, revisionId, networkUuid, keyFromUuid(entityUuid)))
         return std::nullopt;
     const std::optional<ModelRecord> record =
-        repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(entityUuid));
+        repository.getModelAtRevision(project, revisionId, keyFromUuid(entityUuid));
     if (!record) throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity payload is missing");
     std::optional<HydraulicEntity> decoded;
     switch (record->kind) {
-#define LOAD_ONE_V2(name, type, kind) \
+#define LOAD_ONE_COLLECTION(name, type, kind) \
     case static_cast<std::uint16_t>(kind): { \
         QString error; \
         std::optional<type> item = ModelCodec<type>::decode(qByteArrayFromBytes(record->payload), &error); \
@@ -2238,8 +2209,8 @@ std::optional<HydraulicEntity> loadHydraulicEntityAtRevision(
         decoded.emplace(std::move(*item)); \
         break; \
     }
-    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(LOAD_ONE_V2)
-#undef LOAD_ONE_V2
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(LOAD_ONE_COLLECTION)
+#undef LOAD_ONE_COLLECTION
     default:
         throw StorageError(StorageErrorKind::Corruption, "owned hydraulic entity has unknown storage kind");
     }
@@ -2250,23 +2221,23 @@ std::optional<NetworkHydraulic> loadHydraulicNetworkAtRevision(
     Repository& repository, const ProjectId& project, const RevisionId& revisionId,
     const QUuid& networkUuid) {
     const std::optional<ModelRecord> root =
-        repository.getModelAtRevisionV2(project, revisionId, keyFromUuid(networkUuid));
+        repository.getModelAtRevision(project, revisionId, keyFromUuid(networkUuid));
     if (!root || root->kind != hydraulicNetworkKind) return std::nullopt;
     Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
     if (manifest.metadata.uuid != networkUuid)
         throw StorageError(StorageErrorKind::Corruption, "hydraulic network root UUID mismatch");
     checkRoot(manifest, *root);
-    loadMembersAtRevisionV2(repository, project, revisionId, manifest);
+    loadMembersAtRevision(repository, project, revisionId, manifest);
     const std::set<Key> members = memberKeys(manifest);
     NetworkHydraulic network = std::move(manifest.metadata);
     DependencyIndex storedReferences;
     std::size_t ordinal = 0;
-#define RESTORE_V2(name, type, kind) \
-    restoreEntitiesV2(repository, project, revisionId, manifest.members[ordinal], \
+#define RESTORE_COLLECTION(name, type, kind) \
+    restoreEntities(repository, project, revisionId, manifest.members[ordinal], \
                       static_cast<std::uint16_t>(kind), network.name, storedReferences); \
     ++ordinal;
-    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE_V2)
-#undef RESTORE_V2
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE_COLLECTION)
+#undef RESTORE_COLLECTION
     const aowis::dvmdb::HydraulicDependencyValidation validated =
         aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
     if (!validated.report.valid())
@@ -2287,13 +2258,13 @@ RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project
                                   const RevisionId& expectedHead) {
     if (network.uuid.isNull())
         throw StorageError(StorageErrorKind::InvalidInput, "hydraulic network UUID is null");
-    // Pin one immutable starting point. Native commitModelV2() rechecks the
+    // Pin one immutable starting point. Native commitModel() rechecks the
     // expected HEAD under the writer lock before publishing any new revision.
-    if (repository.headV2(project, branch) != expectedHead)
+    if (repository.head(project, branch) != expectedHead)
         throw StorageError(StorageErrorKind::Conflict, "branch head changed since hydraulic save was prepared");
-    const std::optional<Bytes> startingBytes = repository.readRevisionV2(project, expectedHead);
+    const std::optional<Bytes> startingBytes = repository.readRevision(project, expectedHead);
     if (!startingBytes) throw StorageError(StorageErrorKind::NotFound, "revision UUID not found");
-    const RevisionRecordV2 starting = decodeRevisionRecordV2(*startingBytes);
+    const RevisionRecord starting = decodeRevisionRecord(*startingBytes);
     if (!starting.modelIndexed && starting.root != Hash{})
         throw StorageError(StorageErrorKind::InvalidInput, "cannot save a hydraulic network to a populated raw branch");
     Manifest next = manifestFor(network);
@@ -2307,7 +2278,7 @@ RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project
     const Key networkKey = keyFromUuid(network.uuid);
     std::optional<ModelRecord> currentRoot;
     if (starting.modelIndexed)
-        currentRoot = repository.getModelAtRevisionV2(project, expectedHead, networkKey);
+        currentRoot = repository.getModelAtRevision(project, expectedHead, networkKey);
     std::set<Key> oldMembers;
     if (currentRoot) {
         if (currentRoot->kind != hydraulicNetworkKind)
@@ -2316,20 +2287,20 @@ RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project
         if (previous.metadata.uuid != network.uuid)
             throw StorageError(StorageErrorKind::Corruption, "network root identity mismatch");
         checkRoot(previous, *currentRoot);
-        loadMembersAtRevisionV2(repository, project, expectedHead, previous);
+        loadMembersAtRevision(repository, project, expectedHead, previous);
         oldMembers = memberKeys(previous);
     }
     for (const Key& key : newMembers) {
         if (starting.modelIndexed && !oldMembers.contains(key) &&
-            repository.getModelAtRevisionV2(project, expectedHead, key))
+            repository.getModelAtRevision(project, expectedHead, key))
             throw StorageError(StorageErrorKind::Conflict, "hydraulic entity UUID already exists outside network");
     }
     std::vector<ModelChange> changes;
     changes.reserve(newMembers.size() + oldMembers.size() + 1);
-#define APPEND_V2(name, type, kind) \
+#define APPEND_COLLECTION(name, type, kind) \
     addEntities(network.name, static_cast<std::uint16_t>(kind), references, changes);
-    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(APPEND_V2)
-#undef APPEND_V2
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(APPEND_COLLECTION)
+#undef APPEND_COLLECTION
     for (const Key& key : oldMembers)
         if (!newMembers.contains(key)) changes.push_back(ModelChange{key, std::nullopt});
     buildChunks(next, changes);
@@ -2345,7 +2316,7 @@ RevisionId saveHydraulicNetwork(Repository& repository, const ProjectId& project
     root.payload = bytesFromQByteArray(encodeManifest(next));
     root.references = chunkKeys(next);
     changes.push_back(ModelChange{networkKey, std::move(root)});
-    return repository.commitModelV2(project, branch, std::move(changes), expectedHead);
+    return repository.commitModel(project, branch, std::move(changes), expectedHead);
 }
 
 RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project,
@@ -2358,7 +2329,7 @@ RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project
         throw StorageError(StorageErrorKind::InvalidInput, "hydraulic network UUID is null");
     if (changes.size() > 128)
         throw StorageError(StorageErrorKind::LimitExceeded, "hydraulic edit exceeds 128 changes");
-    if (repository.headV2(project, branch) != expectedHead)
+    if (repository.head(project, branch) != expectedHead)
         throw StorageError(StorageErrorKind::Conflict, "branch head changed since edit was prepared");
     // Every fast path validates its entire batch before an indexed commit.
     // Mixed or reference-changing batches fall through to full validation.
@@ -2405,7 +2376,7 @@ RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project
             if (existing != owners.end() && existing->second != collection)
                 throw StorageError(StorageErrorKind::InvalidInput, "cannot change hydraulic entity type");
             if (existing == owners.end() &&
-                repository.getModelAtRevisionV2(project, expectedHead, key))
+                repository.getModelAtRevision(project, expectedHead, key))
                 throw StorageError(StorageErrorKind::Conflict, "entity UUID owned outside network");
         } else {
             if (existing == owners.end())
@@ -2417,7 +2388,7 @@ RevisionId editHydraulicNetwork(Repository& repository, const ProjectId& project
     // The save below checks every hydraulic reference and physical rule.
     // No-op edits still verify the pinned HEAD, without creating a revision.
     if (ModelCodec<NetworkHydraulic>::encode(*network) == before) {
-        if (repository.headV2(project, branch) != expectedHead)
+        if (repository.head(project, branch) != expectedHead)
             throw StorageError(StorageErrorKind::Conflict, "branch head changed during hydraulic edit");
         return expectedHead;
     }

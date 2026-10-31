@@ -26,11 +26,12 @@ Bytes bytesFromQByteArray(const QByteArray& data);
 QByteArray qByteArrayFromBytes(const Bytes& data);
 ModelChange changeFor(const HydraulicNodeJunction& junction);
 ModelChange changeFor(const HydraulicLinkPipe& pipe);
-std::optional<HydraulicNodeJunction> readJunction(Repository& store,
-                                                 std::string_view branch, const Key& key,
+// Typed reads of one model record at an immutable revision of `project`.
+std::optional<HydraulicNodeJunction> readJunction(Repository& store, const ProjectId& project,
+                                                 const RevisionId& revision, const Key& key,
                                                  QString* error = nullptr);
-std::optional<HydraulicLinkPipe> readPipe(Repository& store,
-                                          std::string_view branch, const Key& key,
+std::optional<HydraulicLinkPipe> readPipe(Repository& store, const ProjectId& project,
+                                          const RevisionId& revision, const Key& key,
                                           QString* error = nullptr);
 
 }  // namespace aowis::dvmdb::hydraulic

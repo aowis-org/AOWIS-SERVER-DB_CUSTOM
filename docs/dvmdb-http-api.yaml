@@ -354,7 +354,7 @@ paths:
         '409': {$ref: '#/components/responses/Conflict'}
   /projects/clone-target:
     post:
-      operationId: provisionCloneTargetV2
+      operationId: provisionCloneTarget
       description: |
         Idempotently provision an empty destination project with the exact
         logical UUIDv7 and display name supplied by the remote source. No
@@ -406,7 +406,7 @@ paths:
       - {$ref: '#/components/parameters/ProjectId'}
       - {$ref: '#/components/parameters/Branch'}
     get:
-      operationId: exportRevisionBundleV2
+      operationId: exportRevisionBundle
       description: |
         UUIDv7 revision-graph transfer, separate from SHA revision bundles.
         AOWREV21 full bundle or AOWREV22 incremental when the source branch
@@ -434,7 +434,7 @@ paths:
         '503': {description: Staging quota or repository queue exhausted}
         '507': {description: Scratch storage exhausted}
     post:
-      operationId: importRevisionBundleV2
+      operationId: importRevisionBundle
       description: |
         Bounded disk-backed UUIDv7 revision import. The project ID in the URL
         must equal the imported bundle's project UUID. Preserves both branch
@@ -685,7 +685,7 @@ paths:
     parameters:
       - {$ref: '#/components/parameters/ProjectId'}
     post:
-      operationId: mergeBranchesV2
+      operationId: mergeBranches
       description: >-
         Generic UUIDv7 three-way merge. Always requires both exact expected
         HEAD UUIDs. Domain-specific hydraulic field and object resolution is

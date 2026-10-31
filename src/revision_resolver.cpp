@@ -1,4 +1,4 @@
-#include "aowis/dvmdb/revision_resolver_v2.h"
+#include "aowis/dvmdb/revision_resolver.h"
 
 #include "aowis/dvmdb/storage_error.h"
 
@@ -36,7 +36,7 @@ private:
 class FileLock final {
 public:
     explicit FileLock(int fd) : fd_(fd) {
-        if (::flock(this->fd_, LOCK_EX) != 0) throwSystemError("lock v2 revision resolver");
+        if (::flock(this->fd_, LOCK_EX) != 0) throwSystemError("lock revision resolver");
     }
     ~FileLock() { (void)::flock(this->fd_, LOCK_UN); }
     FileLock(const FileLock&) = delete;
@@ -87,8 +87,9 @@ std::optional<Bytes> readFixed(int dirFd, const std::string& name, std::size_t e
 
 // Names in this module are *only* fixed internal tokens or canonical UUIDv7
 // values. No user-facing project/branch/revision label is ever a path segment.
-int openDirectory(int parent, const char* name) {
-    if (::mkdirat(parent, name, 0700) != 0 && errno != EEXIST)
+int openDirectory(int parent, const char* name, bool& created) {
+    created = ::mkdirat(parent, name, 0700) == 0;
+    if (!created && errno != EEXIST)
         throwSystemError("create revision resolver directory");
     const int fd = ::openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && (errno == ELOOP || errno == ENOTDIR))
@@ -140,20 +141,22 @@ Bytes bindingBytes(const RevisionId& id, const ProjectId& project, const Hash& h
 
 } // namespace
 
-RevisionResolverV2::RevisionResolverV2(const std::filesystem::path& repository, ProjectId project)
+RevisionResolver::RevisionResolver(const std::filesystem::path& repository, ProjectId project)
     : project_(std::move(project)) {
     // The repository directory must already exist and may not itself be a
     // symbolic link. The caller owns its higher-level repository path.
     if (std::filesystem::is_symlink(repository))
         throw StorageError(Err::Corruption, "symlinked revision repository");
     ensure(ProjectId::parse(this->project_.toString()).has_value(), Err::InvalidInput,
-           "invalid v2 project UUIDv7");
+           "invalid project UUIDv7");
     Fd root(::open(repository.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     if (root.get() < 0) throwSystemError("open revision repository");
-    Fd namespaceDir(openDirectory(root.get(), "revision-v2"));
+    bool createdNamespace = false;
+    Fd namespaceDir(openDirectory(root.get(), "revision-v2", createdNamespace));
     // Durable directory ancestry: a successful publication must survive loss
-    // of the containing directory entries after a sudden power cut.
-    syncDir(root.get());
+    // of the containing directory entries after a sudden power cut. Only a
+    // newly created entry needs the parent sync; lookups never fsync.
+    if (createdNamespace) syncDir(root.get());
     Fd lock(::openat(namespaceDir.get(), "lock", O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600));
     if (lock.get() < 0) throwSystemError("open revision resolver lock");
     struct stat lockStat{};
@@ -162,6 +165,7 @@ RevisionResolverV2::RevisionResolverV2(const std::filesystem::path& repository, 
     FileLock exclusive(lock.get());
     const Bytes expected = manifestBytes(this->project_);
     const std::optional<Bytes> recorded = readFixed(namespaceDir.get(), "project", expected.size());
+    bool publishedManifest = false;
     if (recorded) {
         ensure(*recorded == expected, Err::Conflict, "revision repository project UUID mismatch");
     } else {
@@ -172,23 +176,25 @@ RevisionResolverV2::RevisionResolverV2(const std::filesystem::path& repository, 
             throw StorageError(Err::Corruption, "revision project manifest missing from existing index");
         if (errno != ENOENT) throwSystemError("check revision identity namespace");
         publishOnce(namespaceDir.get(), "project", expected);
+        publishedManifest = true;
     }
-    Fd identities(openDirectory(namespaceDir.get(), "ids"));
-    syncDir(namespaceDir.get());
+    bool createdIdentities = false;
+    Fd identities(openDirectory(namespaceDir.get(), "ids", createdIdentities));
+    if (createdIdentities || publishedManifest) syncDir(namespaceDir.get());
     this->identitiesFd_ = identities.release();
     this->dirFd_ = namespaceDir.release();
     this->lockFd_ = lock.release();
 }
 
-RevisionResolverV2::~RevisionResolverV2() {
+RevisionResolver::~RevisionResolver() {
     if (this->identitiesFd_ >= 0) (void)::close(this->identitiesFd_);
     if (this->dirFd_ >= 0) (void)::close(this->dirFd_);
     if (this->lockFd_ >= 0) (void)::close(this->lockFd_);
 }
 
-const ProjectId& RevisionResolverV2::project() const noexcept { return this->project_; }
+const ProjectId& RevisionResolver::project() const noexcept { return this->project_; }
 
-std::optional<Hash> RevisionResolverV2::readBindingLocked(const RevisionId& id) const {
+std::optional<Hash> RevisionResolver::readBindingLocked(const RevisionId& id) const {
     const std::string name = id.toString();
     ensure(RevisionId::parse(name).has_value(), Err::InvalidInput,
            "invalid revision UUIDv7 lookup");
@@ -205,49 +211,52 @@ std::optional<Hash> RevisionResolverV2::readBindingLocked(const RevisionId& id) 
     return hash;
 }
 
-void RevisionResolverV2::verifyStoredLocked(const RevisionRecordV2& record,
-                                            const Hash& digest,
-                                            const RevisionObjectReaderV2& readObject,
-                                            std::size_t maxRevisions) const {
-    ensure(static_cast<bool>(readObject), Err::InvalidInput, "missing immutable revision object reader");
+// The stored record must be the exact SHA-addressed immutable object, and
+// every parent must already be published with the parent digest recorded in
+// this record. Parents were checked the same way when they were published,
+// so the whole DAG is valid by induction without walking the ancestry.
+void RevisionResolver::verifyRecordLocked(const RevisionRecord& record, const Hash& digest,
+                                            const RevisionObjectReader& readObject) const {
     const std::optional<Bytes> stored = readObject(digest);
-    ensure(stored.has_value(), Err::Corruption, "revision record is missing from immutable storage");
-    ensure(sha256(*stored) == digest, Err::Corruption, "revision stored SHA-256 mismatch");
-    const RevisionRecordV2 decoded = decodeRevisionRecordV2(*stored);
+    ensure(stored.has_value() && sha256(*stored) == digest,
+           Err::Corruption, "missing or altered immutable revision record");
+    const RevisionRecord decoded = decodeRevisionRecord(*stored);
     ensure(decoded.id == record.id && decoded.project == this->project_,
            Err::Corruption, "revision record UUID or project mismatch");
-    const RevisionRecordLookupV2 byIdentity = [this, &readObject](const RevisionId& id) -> std::optional<Bytes> {
-        const std::optional<Hash> parentDigest = readBindingLocked(id);
-        if (!parentDigest) return std::nullopt;
-        const std::optional<Bytes> parent = readObject(*parentDigest);
-        if (!parent || sha256(*parent) != *parentDigest)
-            throw StorageError(Err::Corruption, "revision parent SHA-256 mismatch or missing object");
-        return parent;
-    };
-    const Hash verified = verifyRevisionAncestryV2(*stored, byIdentity, maxRevisions);
-    ensure(verified == digest, Err::Corruption, "verified revision SHA-256 mismatch");
+    for (const RevisionParent& parent : decoded.parents) {
+        const std::optional<Hash> binding = readBindingLocked(parent.id);
+        ensure(binding.has_value() && *binding == parent.expectedRecordHash,
+               Err::Corruption, "parent UUID/SHA binding mismatch");
+    }
 }
 
-Hash RevisionResolverV2::publish(const Bytes& canonicalRecord,
-                                  const RevisionObjectReaderV2& readObject) {
-    const RevisionRecordV2 record = decodeRevisionRecordV2(canonicalRecord);
+Hash RevisionResolver::publish(const Bytes& canonicalRecord,
+                                  const RevisionObjectReader& readObject) {
+    ensure(static_cast<bool>(readObject), Err::InvalidInput,
+           "missing immutable revision object reader");
+    const RevisionRecord record = decodeRevisionRecord(canonicalRecord);
     ensure(record.project == this->project_, Err::InvalidInput, "cross-project revision publication");
     const Hash digest = sha256(canonicalRecord);
     FileLock exclusive(this->lockFd_);
     const std::optional<Hash> existing = readBindingLocked(record.id);
     if (existing) {
         ensure(*existing == digest, Err::Conflict, "attempt to rebind immutable revision UUID");
-        verifyStoredLocked(record, digest, readObject, 250000);
+        verifyRecordLocked(record, digest, readObject);
         return digest;
     }
-    verifyStoredLocked(record, digest, readObject, 250000);
+    verifyRecordLocked(record, digest, readObject);
     publishOnce(this->identitiesFd_, record.id.toString(),
                 bindingBytes(record.id, this->project_, digest));
     return digest;
 }
 
-std::optional<ResolvedRevisionV2> RevisionResolverV2::resolveDirect(
-    const RevisionId& id, const RevisionObjectReaderV2& readObject) const {
+bool RevisionResolver::contains(const RevisionId& id) const {
+    FileLock exclusive(this->lockFd_);
+    return readBindingLocked(id).has_value();
+}
+
+std::optional<ResolvedRevision> RevisionResolver::resolve(
+    const RevisionId& id, const RevisionObjectReader& readObject) const {
     ensure(static_cast<bool>(readObject), Err::InvalidInput,
            "missing immutable revision object reader");
     FileLock exclusive(this->lockFd_);
@@ -256,35 +265,15 @@ std::optional<ResolvedRevisionV2> RevisionResolverV2::resolveDirect(
     const std::optional<Bytes> stored = readObject(*digest);
     ensure(stored.has_value() && sha256(*stored) == *digest,
            Err::Corruption, "missing or altered immutable revision record");
-    const RevisionRecordV2 record = decodeRevisionRecordV2(*stored);
+    const RevisionRecord record = decodeRevisionRecord(*stored);
     ensure(record.id == id && record.project == this->project_, Err::Corruption,
            "resolved revision UUID or project mismatch");
-    for (const RevisionParentV2& parent : record.parents) {
+    for (const RevisionParent& parent : record.parents) {
         const std::optional<Hash> binding = readBindingLocked(parent.id);
         ensure(binding.has_value() && *binding == parent.expectedRecordHash,
-               Err::Corruption, "v2 parent UUID/SHA binding mismatch");
+               Err::Corruption, "parent UUID/SHA binding mismatch");
     }
-    return ResolvedRevisionV2{record, *digest};
-}
-
-std::optional<ResolvedRevisionV2> RevisionResolverV2::resolve(
-    const RevisionId& id, const RevisionObjectReaderV2& readObject,
-    std::size_t maxRevisions) const {
-    ensure(static_cast<bool>(readObject), Err::InvalidInput,
-           "missing immutable revision object reader");
-    ensure(maxRevisions > 0, Err::InvalidInput,
-           "zero revision ancestry budget");
-    FileLock exclusive(this->lockFd_);
-    const std::optional<Hash> hash = readBindingLocked(id);
-    if (!hash) return std::nullopt;
-    const std::optional<Bytes> stored = readObject(*hash);
-    ensure(stored.has_value() && sha256(*stored) == *hash,
-           Err::Corruption, "missing or altered immutable revision record");
-    const RevisionRecordV2 decoded = decodeRevisionRecordV2(*stored);
-    ensure(decoded.id == id && decoded.project == this->project_,
-           Err::Corruption, "resolved revision identity or project mismatch");
-    verifyStoredLocked(decoded, *hash, readObject, maxRevisions);
-    return ResolvedRevisionV2{decoded, *hash};
+    return ResolvedRevision{record, *digest};
 }
 
 } // namespace aowis::dvmdb

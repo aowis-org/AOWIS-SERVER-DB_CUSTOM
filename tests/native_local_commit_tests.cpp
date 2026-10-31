@@ -16,18 +16,18 @@
 
 namespace {
 using aowis::dvmdb::Key;
-using aowis::dvmdb::LocalCommitInfoV1;
-using aowis::dvmdb::LocalCommitStateV1;
+using aowis::dvmdb::LocalCommitInfo;
+using aowis::dvmdb::LocalCommitState;
 using aowis::dvmdb::ModelChange;
 using aowis::dvmdb::ModelRecord;
 using aowis::dvmdb::ProjectError;
 using aowis::dvmdb::ProjectErrorKind;
 using aowis::dvmdb::ProjectService;
-using aowis::dvmdb::RepositoryRoleV1;
+using aowis::dvmdb::RepositoryRole;
 using aowis::dvmdb::RevisionId;
 using aowis::dvmdb::UuidV7;
-using aowis::dvmdb::WorkingCopyInfoV1;
-using aowis::dvmdb::WorkingCopyLeaseV1;
+using aowis::dvmdb::WorkingCopyInfo;
+using aowis::dvmdb::WorkingCopyLease;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -85,62 +85,62 @@ void testLocalCommitRecovery() {
     {
         ProjectService service(root.path);
         const aowis::dvmdb::ProjectInfo project =
-            service.createUnbornProjectV2("private local commits");
+            service.createUnbornProject("private local commits");
         projectId = project.id;
         branchId = service.branchId(projectId, "main")->toString();
-        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        const WorkingCopyInfoV1 first = service.createWorkingCopyForBranchV1(
+        service.configureRepositoryRole(RepositoryRole::Private);
+        const WorkingCopyInfo first = service.createWorkingCopyForBranch(
             projectId, branchId, std::nullopt, session);
-        const WorkingCopyInfoV1 second = service.createWorkingCopyForBranchV1(
+        const WorkingCopyInfo second = service.createWorkingCopyForBranch(
             projectId, branchId, std::nullopt, secondSession);
         firstDraft = first.id;
         staleDraft = second.id;
-        firstToken = service.acquireWorkingCopyLeaseV1(firstDraft, session, 120).token;
-        staleToken = service.acquireWorkingCopyLeaseV1(staleDraft, secondSession, 120).token;
-        require(service.saveWorkingCopyChangesV1(firstDraft, session, firstToken, 0,
+        firstToken = service.acquireWorkingCopyLease(firstDraft, session, 120).token;
+        staleToken = service.acquireWorkingCopyLease(staleDraft, secondSession, 120).token;
+        require(service.saveWorkingCopyChanges(firstDraft, session, firstToken, 0,
                         {changeWithValue(15)}).generation == 1,
                 "first candidate was not durably saved");
-        require(service.saveWorkingCopyChangesV1(staleDraft, secondSession, staleToken, 0,
+        require(service.saveWorkingCopyChanges(staleDraft, secondSession, staleToken, 0,
                         {changeWithValue(22)}).generation == 1,
                 "concurrent candidate was not durably saved");
-        require(service.revisionGraphV2(projectId).revisions.empty(),
+        require(service.revisionGraph(projectId).revisions.empty(),
                 "draft autosaves unexpectedly committed a revision");
-        const LocalCommitInfoV1 committed = service.commitWorkingCopyV1(
+        const LocalCommitInfo committed = service.commitWorkingCopy(
             operationId, firstDraft, session, firstToken, 1, std::nullopt);
-        require(committed.state == LocalCommitStateV1::Succeeded &&
+        require(committed.state == LocalCommitState::Succeeded &&
                 committed.expectedHead == std::nullopt &&
                 committed.repositoryId == service.repositoryId() &&
                 RevisionId::parse(committed.reservedRevisionId).has_value() &&
                 committed.payloadDigest.size() == 64,
                 "first Commit did not return durable UUIDv7 outcome");
         firstRevision = committed.reservedRevisionId;
-        const std::optional<RevisionId> saved = service.optionalHeadV2(projectId, "main");
+        const std::optional<RevisionId> saved = service.optionalHead(projectId, "main");
         require(saved && saved->toString() == firstRevision,
                 "first Commit did not advance only the local HEAD");
-        const std::optional<ModelRecord> loaded = service.getModelAtRevisionV2(
+        const std::optional<ModelRecord> loaded = service.getModelAtRevision(
             projectId, *saved, changeWithValue(15).key);
         require(loaded && loaded->payload == std::vector<std::uint8_t>{15},
                 "first immutable revision did not contain saved draft candidate");
-        const aowis::dvmdb::RevisionGraphRevisionV2 revision = service.revision(projectId, *saved);
+        const aowis::dvmdb::RevisionGraphRevision revision = service.revision(projectId, *saved);
         require(revision.parents.empty(), "first Commit must have zero parents");
-        const LocalCommitInfoV1 replay = service.commitWorkingCopyV1(
+        const LocalCommitInfo replay = service.commitWorkingCopy(
             operationId, firstDraft, session, firstToken, 1, std::nullopt);
-        require(replay.state == LocalCommitStateV1::Succeeded &&
+        require(replay.state == LocalCommitState::Succeeded &&
                 replay.reservedRevisionId == firstRevision &&
-                service.revisionGraphV2(projectId).revisions.size() == 1,
+                service.revisionGraph(projectId).revisions.size() == 1,
                 "operation replay duplicated the first Commit");
         expectConflict([&]() {
-            (void)service.commitWorkingCopyV1(operationId, staleDraft, secondSession,
+            (void)service.commitWorkingCopy(operationId, staleDraft, secondSession,
                                                staleToken, 1, std::nullopt);
         });
-        const LocalCommitInfoV1 stale = service.commitWorkingCopyV1(
+        const LocalCommitInfo stale = service.commitWorkingCopy(
             staleOperationId, staleDraft, secondSession, staleToken, 1, std::nullopt);
-        require(stale.state == LocalCommitStateV1::Rejected &&
+        require(stale.state == LocalCommitState::Rejected &&
                 stale.rejection == "conflict" &&
-                service.localCommitStatusV1(staleOperationId).state == LocalCommitStateV1::Rejected,
+                service.localCommitStatus(staleOperationId).state == LocalCommitState::Rejected,
                 "stale HEAD outcome was not durably rejected");
-        require(service.workingCopyV1(staleDraft).dirty &&
-                service.workingCopyV1(staleDraft).generation == 1,
+        require(service.workingCopy(staleDraft).dirty &&
+                service.workingCopy(staleDraft).generation == 1,
                 "stale first-commit conflict destroyed the competing draft");
     }
     {
@@ -161,35 +161,35 @@ void testLocalCommitRecovery() {
     }
     {
         ProjectService reopened(root.path);
-        const LocalCommitInfoV1 recovered = reopened.localCommitStatusV1(operationId);
-        require(recovered.state == LocalCommitStateV1::Succeeded &&
+        const LocalCommitInfo recovered = reopened.localCommitStatus(operationId);
+        require(recovered.state == LocalCommitState::Succeeded &&
                 recovered.reservedRevisionId == firstRevision,
                 "restart failed to recover committed operation from branch ancestry");
-        const LocalCommitInfoV1 retry = reopened.commitWorkingCopyV1(
+        const LocalCommitInfo retry = reopened.commitWorkingCopy(
             operationId, firstDraft, session, firstToken, 1, std::nullopt);
-        require(retry.state == LocalCommitStateV1::Succeeded &&
-                reopened.revisionGraphV2(projectId).revisions.size() == 1,
+        require(retry.state == LocalCommitState::Succeeded &&
+                reopened.revisionGraph(projectId).revisions.size() == 1,
                 "recovery retry created a duplicate revision");
 
         const RevisionId parent = *RevisionId::parse(firstRevision);
-        const std::string draftId = reopened.createWorkingCopyForBranchV1(
+        const std::string draftId = reopened.createWorkingCopyForBranch(
             projectId, branchId, parent, session).id;
-        const WorkingCopyLeaseV1 lease = reopened.acquireWorkingCopyLeaseV1(draftId, session, 120);
+        const WorkingCopyLease lease = reopened.acquireWorkingCopyLease(draftId, session, 120);
         const ModelChange changed = changeWithValue(27);
-        reopened.saveWorkingCopyChangesV1(draftId, session, lease.token, 0, {changed});
+        reopened.saveWorkingCopyChanges(draftId, session, lease.token, 0, {changed});
         const std::string secondOperationId = UuidV7::generate().toString();
-        const LocalCommitInfoV1 result = reopened.commitWorkingCopyV1(
+        const LocalCommitInfo result = reopened.commitWorkingCopy(
             secondOperationId, draftId, session, lease.token, 1, parent);
-        require(result.state == LocalCommitStateV1::Succeeded &&
+        require(result.state == LocalCommitState::Succeeded &&
                 result.reservedRevisionId != firstRevision,
                 "subsequent Commit did not allocate a new revision UUID");
         const RevisionId child = *RevisionId::parse(result.reservedRevisionId);
-        const aowis::dvmdb::RevisionGraphRevisionV2 revision = reopened.revision(projectId, child);
+        const aowis::dvmdb::RevisionGraphRevision revision = reopened.revision(projectId, child);
         require(revision.parents.size() == 1 && revision.parents[0].id == parent,
                 "second local Commit did not preserve immutable parent");
-        require(reopened.getModelAtRevisionV2(projectId, parent, changed.key)->payload ==
+        require(reopened.getModelAtRevision(projectId, parent, changed.key)->payload ==
                     std::vector<std::uint8_t>{15} &&
-                reopened.getModelAtRevisionV2(projectId, child, changed.key)->payload ==
+                reopened.getModelAtRevision(projectId, child, changed.key)->payload ==
                     std::vector<std::uint8_t>{27},
                 "local Commit modified historical model content");
     }
@@ -199,35 +199,35 @@ void testLocalCommitRecovery() {
 void testConcurrentFirstCommitIsSerialized() {
     TempRoot root;
     ProjectService service(root.path);
-    const std::string projectId = service.createUnbornProjectV2("concurrent local Commit").id;
-    service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
+    const std::string projectId = service.createUnbornProject("concurrent local Commit").id;
+    service.configureRepositoryRole(RepositoryRole::Private);
     const std::string firstSession = UuidV7::generate().toString();
     const std::string secondSession = UuidV7::generate().toString();
-    const std::string firstDraft = service.createWorkingCopyV1(
+    const std::string firstDraft = service.createWorkingCopy(
         projectId, "main", std::nullopt, firstSession).id;
-    const std::string secondDraft = service.createWorkingCopyV1(
+    const std::string secondDraft = service.createWorkingCopy(
         projectId, "main", std::nullopt, secondSession).id;
-    const std::string firstToken = service.acquireWorkingCopyLeaseV1(
+    const std::string firstToken = service.acquireWorkingCopyLease(
         firstDraft, firstSession, 120).token;
-    const std::string secondToken = service.acquireWorkingCopyLeaseV1(
+    const std::string secondToken = service.acquireWorkingCopyLease(
         secondDraft, secondSession, 120).token;
-    service.saveWorkingCopyChangesV1(firstDraft, firstSession, firstToken, 0,
+    service.saveWorkingCopyChanges(firstDraft, firstSession, firstToken, 0,
                                      {changeWithValue(31)});
-    service.saveWorkingCopyChangesV1(secondDraft, secondSession, secondToken, 0,
+    service.saveWorkingCopyChanges(secondDraft, secondSession, secondToken, 0,
                                      {changeWithValue(32)});
     const std::string firstOperation = UuidV7::generate().toString();
     const std::string secondOperation = UuidV7::generate().toString();
-    LocalCommitInfoV1 first;
-    LocalCommitInfoV1 second;
+    LocalCommitInfo first;
+    LocalCommitInfo second;
     std::exception_ptr firstError;
     std::exception_ptr secondError;
     std::thread left([&]() {
-        try { first = service.commitWorkingCopyV1(firstOperation, firstDraft,
+        try { first = service.commitWorkingCopy(firstOperation, firstDraft,
                                                    firstSession, firstToken, 1, std::nullopt); }
         catch (...) { firstError = std::current_exception(); }
     });
     std::thread right([&]() {
-        try { second = service.commitWorkingCopyV1(secondOperation, secondDraft,
+        try { second = service.commitWorkingCopy(secondOperation, secondDraft,
                                                     secondSession, secondToken, 1, std::nullopt); }
         catch (...) { secondError = std::current_exception(); }
     });
@@ -235,13 +235,13 @@ void testConcurrentFirstCommitIsSerialized() {
     right.join();
     if (firstError) std::rethrow_exception(firstError);
     if (secondError) std::rethrow_exception(secondError);
-    require((first.state == LocalCommitStateV1::Succeeded &&
-             second.state == LocalCommitStateV1::Rejected) ||
-            (second.state == LocalCommitStateV1::Succeeded &&
-             first.state == LocalCommitStateV1::Rejected),
+    require((first.state == LocalCommitState::Succeeded &&
+             second.state == LocalCommitState::Rejected) ||
+            (second.state == LocalCommitState::Succeeded &&
+             first.state == LocalCommitState::Rejected),
             "concurrent initial Commit allowed two successful branches");
-    require(service.revisionGraphV2(projectId).revisions.size() == 1 &&
-            service.workingCopyV1(firstDraft).dirty && service.workingCopyV1(secondDraft).dirty,
+    require(service.revisionGraph(projectId).revisions.size() == 1 &&
+            service.workingCopy(firstDraft).dirty && service.workingCopy(secondDraft).dirty,
             "concurrent first Commit wrote duplicate history or lost a draft");
 }
 
@@ -253,32 +253,32 @@ void testRejectedOperationIsDurable() {
     std::string token;
     {
         ProjectService service(root.path);
-        const std::string projectId = service.createUnbornProjectV2("rejected Commit").id;
-        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        draftId = service.createWorkingCopyV1(projectId, "main", std::nullopt, session).id;
-        token = service.acquireWorkingCopyLeaseV1(draftId, session, 120).token;
+        const std::string projectId = service.createUnbornProject("rejected Commit").id;
+        service.configureRepositoryRole(RepositoryRole::Private);
+        draftId = service.createWorkingCopy(projectId, "main", std::nullopt, session).id;
+        token = service.acquireWorkingCopyLease(draftId, session, 120).token;
         ModelChange invalid = changeWithValue(5);
         Key absent{};
         absent[15] = 9;
         invalid.record->references.push_back(absent);
-        service.saveWorkingCopyChangesV1(draftId, session, token, 0, {invalid});
-        const LocalCommitInfoV1 rejected = service.commitWorkingCopyV1(
+        service.saveWorkingCopyChanges(draftId, session, token, 0, {invalid});
+        const LocalCommitInfo rejected = service.commitWorkingCopy(
             operationId, draftId, session, token, 1, std::nullopt);
-        require(rejected.state == LocalCommitStateV1::Rejected &&
+        require(rejected.state == LocalCommitState::Rejected &&
                 rejected.rejection == "invalid-input" &&
-                !service.optionalHeadV2(projectId, "main"),
+                !service.optionalHead(projectId, "main"),
                 "invalid model commit was not rejected without changing HEAD");
-        const LocalCommitInfoV1 retry = service.commitWorkingCopyV1(
+        const LocalCommitInfo retry = service.commitWorkingCopy(
             operationId, draftId, session, token, 1, std::nullopt);
-        require(retry.state == LocalCommitStateV1::Rejected &&
+        require(retry.state == LocalCommitState::Rejected &&
                 retry.reservedRevisionId == rejected.reservedRevisionId,
                 "rejected operation was retried instead of returning outcome");
     }
     {
         ProjectService reopened(root.path);
-        require(reopened.localCommitStatusV1(operationId).state == LocalCommitStateV1::Rejected,
+        require(reopened.localCommitStatus(operationId).state == LocalCommitState::Rejected,
                 "rejected operation status disappeared after restart");
-        require(reopened.workingCopyV1(draftId).dirty,
+        require(reopened.workingCopy(draftId).dirty,
                 "rejected Commit unexpectedly deleted saved draft");
     }
 }

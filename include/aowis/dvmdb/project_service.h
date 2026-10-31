@@ -45,14 +45,14 @@ private:
 
 // VC-03 metadata. "Private" and "Shared" describe deployment intent;
 // neither is authentication or an authorization capability.
-enum class RepositoryRoleV1 { Unconfigured, Private, Shared };
+enum class RepositoryRole { Unconfigured, Private, Shared };
 
-struct RemoteRepositoryV1 {
+struct RemoteRepository {
     std::string repositoryId;      // Actual remote root UUIDv7, not a GUI profile name.
     std::string endpoint;          // Connection hint, NOT an authenticated identity.
 };
 
-struct RemoteTrackingRefV1 {
+struct RemoteTrackingRef {
     std::string remoteRepositoryId;
     std::string projectId;         // Logical project UUIDv7 remains stable on clone.
     std::string branchId;          // Logical branch UUIDv7 remains stable on clone.
@@ -63,12 +63,12 @@ struct RemoteTrackingRefV1 {
 // private repository state, never a committed revision or mutable branch HEAD.
 // Saves persist an overlay of typed model changes without advancing HEAD.
 // The UUIDv7 fencing token is rotated on every lease acquisition or takeover.
-struct WorkingCopyEventV1 {
+struct WorkingCopyEvent {
     std::string id;  // UUIDv7 of a MODEL edit transaction.
     Bytes encoded;    // Exact ModelEditTransactionCodec binary frame.
 };
 
-struct WorkingCopyInfoV1 {
+struct WorkingCopyInfo {
     std::string id;
     std::string projectId;
     std::string branchId;
@@ -77,7 +77,7 @@ struct WorkingCopyInfoV1 {
     std::uint64_t generation = 0;
     bool dirty = false;
     std::vector<ModelChange> candidateChanges;
-    std::vector<WorkingCopyEventV1> journal;
+    std::vector<WorkingCopyEvent> journal;
     std::optional<std::string> lastSaveFingerprint; // Last journalled batch for idempotency.
     std::optional<std::string> leaseSessionId;
     std::optional<std::string> leaseToken;
@@ -87,8 +87,8 @@ struct WorkingCopyInfoV1 {
 // VC-05 local Commit operation. The reserved revision UUID is durable before
 // HEAD publication. Pending means the caller must query/retry with the SAME ID;
 // it does not mean that the commit definitely failed.
-enum class LocalCommitStateV1 { Pending, Succeeded, Rejected };
-struct LocalCommitInfoV1 {
+enum class LocalCommitState { Pending, Succeeded, Rejected };
+struct LocalCommitInfo {
     std::string id;
     std::string repositoryId;
     std::string projectId;
@@ -98,11 +98,11 @@ struct LocalCommitInfoV1 {
     std::string reservedRevisionId;
     std::uint64_t expectedGeneration = 0;
     std::string payloadDigest;
-    LocalCommitStateV1 state = LocalCommitStateV1::Pending;
+    LocalCommitState state = LocalCommitState::Pending;
     std::string rejection;
 };
 
-struct WorkingCopyLeaseV1 {
+struct WorkingCopyLease {
     std::string token;                // UUIDv7, changes on every acquisition
     std::uint64_t expiresAtMs = 0;   // UTC epoch milliseconds
     std::uint64_t generation = 0;    // caller must pin for Save
@@ -135,140 +135,119 @@ public:
     ProjectService(const ProjectService&) = delete;
     ProjectService& operator=(const ProjectService&) = delete;
 
-    // Canonical native service API: revision IDs are UUIDv7, never SHA-256.
+    // Revision IDs are UUIDv7; SHA-256 only authenticates stored records.
     ProjectInfo createProject(std::string_view name);
     // Explicit opt-in until all clients support nullable initial HEADs.
     // With a caller-chosen projectId (UUIDv7) the creation is idempotent: a
     // repeated request returns the existing project of that ID and name, so
     // a client may safely retry after a lost response; the same ID with a
     // different name is a Conflict.
-    ProjectInfo createUnbornProjectV2(std::string_view name,
+    ProjectInfo createUnbornProject(std::string_view name,
                                       std::optional<std::string_view> projectId = std::nullopt);
     // Provision an empty catalogue project with an existing logical UUIDv7.
     // Only a full verified branch bundle may populate it. Safe to retry.
-    ProjectInfo provisionCloneTargetV2(std::string_view projectId, std::string_view name);
+    ProjectInfo provisionCloneTarget(std::string_view projectId, std::string_view name);
     // Import the exact identity of a root unborn branch into an empty private
     // clone target. Does not make an initial revision. Safe to retry.
-    void provisionUnbornBranchV2(std::string_view projectId, std::string_view name,
+    void provisionUnbornBranch(std::string_view projectId, std::string_view name,
                                  std::string_view branchId);
-    RevisionId createBranch(std::string_view projectId, std::string_view name,
-                            std::optional<std::string_view> source = std::nullopt,
-                            std::optional<RevisionId> fromRevision = std::nullopt);
-    RevisionId head(std::string_view projectId, std::string_view branch);
-    std::vector<RevisionGraphRevisionV2> history(
-        std::string_view projectId, std::string_view branch, std::size_t maxCount = 100,
-        std::optional<RevisionId> after = std::nullopt);
-    RevisionGraphPageV2 revisionGraph(
-        std::string_view projectId, std::size_t maxCount = 100,
-        std::optional<RevisionGraphCursorV2> cursor = std::nullopt);
-    RevisionGraphRevisionV2 revision(std::string_view projectId, const RevisionId& id);
+    RevisionGraphRevision revision(std::string_view projectId, const RevisionId& id);
     void renameBranch(std::string_view projectId, std::string_view previous,
                       std::string_view renamed, const RevisionId& expectedHead);
-    RevisionId commitModel(std::string_view projectId, std::string_view branch,
-                           std::vector<ModelChange> changes,
-                           std::optional<RevisionId> expectedHead = std::nullopt);
-    MergeResultV2 mergeBranches(std::string_view projectId, std::string_view target,
-                                std::string_view source,
-                                std::optional<RevisionId> expectedTarget = std::nullopt,
-                                std::optional<RevisionId> expectedSource = std::nullopt);
-    std::optional<ModelRecord> getModelAtRevision(std::string_view projectId,
-                                                  const RevisionId& revision, const Key& key);
-    // Transitional UUIDv7 aliases for existing HTTP consumers.
-    ProjectInfo createProjectV2(std::string_view name);
-    RevisionId createBranchV2(std::string_view projectId, std::string_view name,
+    RevisionId createBranch(std::string_view projectId, std::string_view name,
                               std::optional<std::string_view> source = std::nullopt);
-    BranchCreationResultV2 createBranchWithIdentityV2(
+    BranchCreationResult createBranchWithIdentity(
         std::string_view projectId, std::string_view name,
         std::optional<std::string_view> source = std::nullopt);
-    RevisionId headV2(std::string_view projectId, std::string_view branch);
-    std::optional<RevisionId> optionalHeadV2(std::string_view projectId, std::string_view branch);
-    std::vector<RevisionGraphRevisionV2> historyV2(
+    RevisionId head(std::string_view projectId, std::string_view branch);
+    std::optional<RevisionId> optionalHead(std::string_view projectId, std::string_view branch);
+    std::vector<RevisionGraphRevision> history(
         std::string_view projectId, std::string_view branch, std::size_t maxCount = 100,
         std::optional<RevisionId> after = std::nullopt);
-    RevisionGraphPageV2 revisionGraphV2(
+    RevisionGraphPage revisionGraph(
         std::string_view projectId, std::size_t maxCount = 100,
-        std::optional<RevisionGraphCursorV2> cursor = std::nullopt);
-    RevisionId createBranchAtRevisionV2(std::string_view projectId, std::string_view name,
+        std::optional<RevisionGraphCursor> cursor = std::nullopt);
+    RevisionId createBranchAtRevision(std::string_view projectId, std::string_view name,
                                         std::string_view sourceBranch, const RevisionId& revision);
-    BranchCreationResultV2 createBranchAtRevisionWithIdentityV2(
+    BranchCreationResult createBranchAtRevisionWithIdentity(
         std::string_view projectId, std::string_view name,
         std::string_view sourceBranch, const RevisionId& revision);
     // Branches by UUIDv7, independent of renamable names (DG-01). See
-    // Repository::branchByIdV2() / createBranchFromIdV2(): the creation is
+    // Repository::branchById() / createBranchFromId(): the creation is
     // idempotent for the caller-chosen `createdBranchId`.
-    std::optional<RevisionGraphHeadV2> branchByIdV2(std::string_view projectId,
+    std::optional<RevisionGraphHead> branchById(std::string_view projectId,
                                                     std::string_view branchId);
-    BranchCreationResultV2 createBranchFromIdV2(
+    BranchCreationResult createBranchFromId(
         std::string_view projectId, std::string_view name, std::string_view sourceBranchId,
         std::optional<RevisionId> revision, std::string_view createdBranchId);
-    MergeResultV2 mergeBranchesV2(std::string_view projectId, std::string_view target,
+    MergeResult mergeBranches(std::string_view projectId, std::string_view target,
                                   std::string_view source,
                                   std::optional<RevisionId> expectedTarget = std::nullopt,
                                   std::optional<RevisionId> expectedSource = std::nullopt);
-    RevisionId commitModelV2(std::string_view projectId, std::string_view branch,
+    RevisionId commitModel(std::string_view projectId, std::string_view branch,
                              std::vector<ModelChange> changes,
                              std::optional<RevisionId> expectedHead = std::nullopt);
     // Strict expected-local-HEAD CAS for VC-05 on a private repository.
-    // Unlike commitModelV2(), nullopt means the branch MUST still be unborn.
+    // Unlike commitModel(), nullopt means the branch MUST still be unborn.
     // Does not consume a draft
     // or provide operation-ID replay yet; only use under a commit coordinator.
-    RevisionId commitModelAtExpectedHeadV2(std::string_view projectId,
+    RevisionId commitModelAtExpectedHead(std::string_view projectId,
         std::string_view branch, std::vector<ModelChange> changes,
         std::optional<RevisionId> expectedLocalHead);
-    std::optional<ModelRecord> getModelAtRevisionV2(std::string_view projectId,
+    std::optional<ModelRecord> getModelAtRevision(std::string_view projectId,
                                                    const RevisionId& revision, const Key& key);
     // Persistent identity of this DVMDB catalogue / repository root (UUIDv7).
     // Not a user identity and not an authorization credential.
     std::string repositoryId() const;
     // Metadata only: these calls NEVER mutate a local or remote branch HEAD.
     // Missing tracking entry differs from an observed null (unborn) HEAD.
-    RepositoryRoleV1 repositoryRoleV1() const;
-    void configureRepositoryRoleV1(RepositoryRoleV1 role);
-    std::vector<RemoteRepositoryV1> remoteRepositoriesV1() const;
+    RepositoryRole repositoryRole() const;
+    void configureRepositoryRole(RepositoryRole role);
+    std::vector<RemoteRepository> remoteRepositories() const;
     // Re-registering the same ID/endpoint is idempotent. Conflicting endpoint
     // or a remote equal to this repository UUID is rejected.
-    void registerRemoteRepositoryV1(std::string_view remoteRepositoryId,
+    void registerRemoteRepository(std::string_view remoteRepositoryId,
                                     std::string_view endpoint);
-    std::vector<RemoteTrackingRefV1> remoteTrackingRefsV1() const;
+    std::vector<RemoteTrackingRef> remoteTrackingRefs() const;
     // expectedObservedHead: nullopt => no tracking record exists;
     // engaged with null inner value => record exists with unborn HEAD;
     // engaged with revision => record exists with that exact HEAD.
     // The caller must obtain the observation from a verified fetch; recording
     // it does not verify an endpoint or grant access to that endpoint.
-    void recordRemoteTrackingRefV1(
-        const RemoteTrackingRefV1& observation,
+    void recordRemoteTrackingRef(
+        const RemoteTrackingRef& observation,
         std::optional<std::optional<RevisionId>> expectedObservedHead);
     // Begin a durable, empty draft at an exact currently observed local HEAD.
     // An unborn branch supplies null base. Only a private repository can
     // create drafts. Does not commit or change any branch HEAD.
-    WorkingCopyInfoV1 createWorkingCopyV1(
+    WorkingCopyInfo createWorkingCopy(
         std::string_view projectId, std::string_view branch,
         std::optional<RevisionId> baseRevision, std::string_view sessionId);
     // The same, addressing the branch by UUIDv7. With a caller-chosen draftId
     // the creation is idempotent: a repeated request returns the existing
     // draft if project, branch, base and session match; otherwise Conflict.
-    WorkingCopyInfoV1 createWorkingCopyForBranchV1(
+    WorkingCopyInfo createWorkingCopyForBranch(
         std::string_view projectId, std::string_view branchId,
         std::optional<RevisionId> baseRevision, std::string_view sessionId,
         std::optional<std::string_view> draftId = std::nullopt);
-    WorkingCopyInfoV1 workingCopyV1(std::string_view draftId) const;
-    std::vector<WorkingCopyInfoV1> listWorkingCopiesV1() const;
+    WorkingCopyInfo workingCopy(std::string_view draftId) const;
+    std::vector<WorkingCopyInfo> listWorkingCopies() const;
     // Only one nonexpired writer may hold a draft lease. The same session
     // may reacquire, invalidating its previous token. Expired leases may be
     // explicitly taken over by a different session; no candidate is lost.
-    WorkingCopyLeaseV1 acquireWorkingCopyLeaseV1(
+    WorkingCopyLease acquireWorkingCopyLease(
         std::string_view draftId, std::string_view sessionId, std::uint32_t seconds);
     // All changes are applied atomically to the draft's candidate overlay.
     // The full resulting record is fsynced before this returns; Save never
     // touches committed HEADs or immutable revisions.
-    WorkingCopyInfoV1 saveWorkingCopyChangesV1(
+    WorkingCopyInfo saveWorkingCopyChanges(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes);
     // Atomically persist MODEL transaction frames and the corresponding candidate
     // model changes. Original event UUIDs are retained across retries. A replay
     // of the immediately preceding identical batch is idempotent.
-    WorkingCopyInfoV1 saveWorkingCopyTransactionsV1(
+    WorkingCopyInfo saveWorkingCopyTransactions(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes,
@@ -281,41 +260,21 @@ public:
     // request is bound to its UUIDv7 operation ID, draft generation, writer
     // fencing token and exact expected local HEAD (null means unborn).
     // Replays of an accepted request return the same immutable revision UUID.
-    LocalCommitInfoV1 commitWorkingCopyV1(
+    LocalCommitInfo commitWorkingCopy(
         std::string_view operationId, std::string_view draftId,
         std::string_view sessionId, std::string_view fencingToken,
         std::uint64_t expectedGeneration,
         std::optional<RevisionId> expectedLocalHead);
     // Durable status query. A pending record is reconciled against committed
     // ancestry before returning, including after a process restart.
-    LocalCommitInfoV1 localCommitStatusV1(std::string_view operationId);
-    void releaseWorkingCopyLeaseV1(
+    LocalCommitInfo localCommitStatus(std::string_view operationId);
+    void releaseWorkingCopyLease(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken);
     std::vector<ProjectInfo> listProjects() const;
     ProjectInfo project(std::string_view id) const;
     std::vector<std::string> listBranches(std::string_view projectId);
-    // Unconverted legacy and v1-imported branch references return nullopt.
     std::optional<BranchId> branchId(std::string_view projectId, std::string_view branch);
-    // SHA-based native fixtures are retained until old pack/storage tests are
-    // migrated. They are NOT the canonical application interface and must
-    // never be invoked on a UUIDv7 project's repository.
-    ProjectInfo createProjectShaFixture(std::string_view name);
-    void adoptBranchIdShaFixture(std::string_view projectId, std::string_view branch,
-                                 const BranchId& identity, const Hash& expectedHead);
-    Revision createBranchShaFixture(std::string_view projectId, std::string_view name,
-                                    std::optional<std::string_view> fromBranch = std::nullopt,
-                                    std::optional<Hash> fromRevision = std::nullopt);
-    void renameBranchShaFixture(std::string_view projectId, std::string_view previous,
-                                std::string_view renamed, const Hash& expectedHead);
-    Revision headShaFixture(std::string_view projectId, std::string_view branch);
-    std::vector<Revision> historyShaFixture(std::string_view projectId, std::string_view branch,
-                                           std::size_t maxCount,
-                                           std::optional<Hash> after = std::nullopt);
-    Revision revisionShaFixture(std::string_view projectId, const Hash& id);
-    RevisionGraphPage revisionGraphShaFixture(std::string_view projectId, std::size_t maxCount = 100,
-                                              std::optional<RevisionGraphCursor> cursor = std::nullopt);
-
     // Execute a scoped operation with this project's repository and its
     // operation mutex held (other projects are not blocked). Callbacks must
     // not retain the Repository or call ProjectService. This is the
@@ -332,6 +291,7 @@ public:
     // uploads). The catalogue lock is held only while creating it.
     ScratchFile createScratchFile(std::string_view projectId);
 
+    // Canonical lowercase UUIDv7.
     static bool validProjectId(std::string_view id);
     static bool validBranchName(std::string_view name);
 private:
@@ -349,15 +309,15 @@ private:
     void ensureHealthy() const;
     // requestedProjectId: caller-chosen UUIDv7, idempotent by (ID, name).
     // With unborn == false it provisions a clone target (no branch at all).
-    ProjectInfo createProjectImpl(std::string_view name, bool v2, bool unborn = false,
+    ProjectInfo createProjectImpl(std::string_view name, bool unborn = false,
                                   std::optional<std::string> requestedProjectId = std::nullopt);
 
     std::filesystem::path root_;
     std::string repository_id_;
-    RepositoryRoleV1 repository_role_ = RepositoryRoleV1::Unconfigured;
-    std::map<std::string, RemoteRepositoryV1> remotes_;
+    RepositoryRole repository_role_ = RepositoryRole::Unconfigured;
+    std::map<std::string, RemoteRepository> remotes_;
     using TrackingKey = std::tuple<std::string, std::string, std::string>;
-    std::map<TrackingKey, RemoteTrackingRefV1> tracking_;
+    std::map<TrackingKey, RemoteTrackingRef> tracking_;
     void persistTrackingMetadata(); // called with catalogue mutex held
     std::filesystem::path projects_;
     int lockFd_ = -1;

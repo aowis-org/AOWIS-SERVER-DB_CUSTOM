@@ -62,9 +62,6 @@ def main():
                   ('POST', '/dvmdb/v1/projects/:id/hydraulic-merges')]:
         if route not in registered:
             raise AssertionError(f'missing canonical UUIDv7 route: {route}')
-    # Default creation and SHA-HEAD paths cannot silently coexist.
-    if 'service.createProject(name)' in source or 'service.createBranch(pathParam' in source:
-        raise AssertionError('obsolete default SHA project/branch handler remains')
     print(f'{len(registered)} UUIDv7 canonical HTTP methods match the OpenAPI contract')
 
 

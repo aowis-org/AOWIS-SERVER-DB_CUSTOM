@@ -2,6 +2,7 @@
 // filesystem), never in TMPDIR. Linked against the fault-test engine build,
 // which can force the named mkostemp() fallback used without O_TMPFILE.
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <chrono>
 #include <cstdint>
@@ -19,6 +20,8 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::BundleLimits;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
@@ -105,7 +108,7 @@ std::size_t entries(const std::filesystem::path& directory) {
 // A model history whose verification uses every scratch-backed structure:
 // bundle index, visit marks, trie summaries and (beyond 8192 edges) the
 // external reference sort.
-Hash buildModelHistory(Repository& repository) {
+RevisionId buildModelHistory(ProjectRepository& repository) {
     repository.createBranch("main");
     std::vector<ModelChange> targets;
     for (unsigned i = 1; i <= 64; ++i)
@@ -120,20 +123,20 @@ Hash buildModelHistory(Repository& repository) {
         source[15] = static_cast<std::uint8_t>(i);
         sources.push_back(ModelChange{source, ModelRecord{1, referenced, Bytes{2}}});
     }
-    return repository.commitModel("main", sources).id; // 160 x 64 = 10240 edges
+    return repository.commitModel("main", sources); // 160 x 64 = 10240 edges
 }
 
 void testLocationAndPermissions() {
     TestDirectory directory("location");
     const std::filesystem::path path = directory.path / "repo";
     {
-        Repository repository(path);
+        ProjectRepository repository(path);
         expect(repository.scratchDirectory() == path / "tmp", "scratch directory not inside repository");
         expect(std::filesystem::is_directory(path / "tmp"), "scratch directory not created");
     }
     std::filesystem::permissions(path / "tmp", std::filesystem::perms::all,
                                  std::filesystem::perm_options::replace);
-    Repository reopened(path);
+    ProjectRepository reopened(path);
     expect(std::filesystem::status(path / "tmp").permissions() == std::filesystem::perms::owner_all,
            "scratch directory permissions not restricted to the owner");
 }
@@ -143,11 +146,11 @@ void testIndependentOfTmpdir(bool namedFallback) {
     ScopedEnvironment tmpdir("TMPDIR", (directory.path / "no-such-tmpdir").string());
     std::optional<ScopedEnvironment> named;
     if (namedFallback) named.emplace("AOWIS_DVMDB_TEST_NAMED_SCRATCH", "1");
-    Repository source(directory.path / "source");
-    const Hash head = buildModelHistory(source);
-    source.exportBranchBundle("main", directory.path / "full.bundle");
-    Repository target(directory.path / "target");
-    expect(target.importBranchBundle(directory.path / "full.bundle", "main").head == head,
+    ProjectRepository source(directory.path / "source");
+    const RevisionId head = buildModelHistory(source);
+    source.exportBundle("main", directory.path / "full.bundle");
+    ProjectRepository target(directory.path / "target");
+    expect(target.importBundle(directory.path / "full.bundle", "main").head == head,
            "import without usable TMPDIR failed");
     const aowis::dvmdb::VerificationReport report = target.verifyRepository();
     expect(report.modelSnapshots >= 2, "verification did not inspect model snapshots");
@@ -158,12 +161,12 @@ void testIndependentOfTmpdir(bool namedFallback) {
 void testLeftoverCleanup() {
     TestDirectory directory("leftovers");
     const std::filesystem::path path = directory.path / "repo";
-    { Repository repository(path); }
+    { ProjectRepository repository(path); }
     { std::ofstream(path / "tmp" / "aowis-scratch-bundle-index-Ab12Cd") << "crashed"; }
     { std::ofstream(path / "tmp" / "aowis-scratch-reference-edges-Zz99Yy") << "crashed"; }
     { std::ofstream(path / "tmp" / "keep-me.txt") << "unrelated"; }
     std::filesystem::create_directory(path / "tmp" / "aowis-scratch-directory");
-    { Repository repository(path); }
+    { ProjectRepository repository(path); }
     expect(!std::filesystem::exists(path / "tmp" / "aowis-scratch-bundle-index-Ab12Cd") &&
            !std::filesystem::exists(path / "tmp" / "aowis-scratch-reference-edges-Zz99Yy"),
            "leftover scratch files were not removed on open");
@@ -175,23 +178,23 @@ void testLeftoverCleanup() {
 void testUnsafeScratchPath() {
     TestDirectory directory("unsafe");
     const std::filesystem::path path = directory.path / "repo";
-    { Repository repository(path); }
+    { ProjectRepository repository(path); }
     std::filesystem::remove(path / "tmp");
     std::filesystem::create_directory(directory.path / "elsewhere");
     std::filesystem::create_directory_symlink(directory.path / "elsewhere", path / "tmp");
     expectKind(StorageErrorKind::Corruption, "symlinked scratch directory",
-               [&] { Repository repository(path); });
+               [&] { ProjectRepository repository(path); });
     std::filesystem::remove(path / "tmp");
     { std::ofstream(path / "tmp") << "not a directory"; }
     bool refused = false;
-    try { Repository repository(path); } catch (const StorageError&) { refused = true; }
+    try { ProjectRepository repository(path); } catch (const StorageError&) { refused = true; }
     catch (const std::filesystem::filesystem_error&) { refused = true; }
     expect(refused, "regular file at scratch path accepted");
 }
 
 void testScratchFileApi() {
     TestDirectory directory("api");
-    Repository repository(directory.path / "repo");
+    ProjectRepository repository(directory.path / "repo");
     ScratchFile file = repository.createScratchFile();
     expect(file.fd() >= 0, "scratch file has no descriptor");
     expect(entries(repository.scratchDirectory()) == 0, "anonymous scratch file has a visible name");
@@ -216,46 +219,46 @@ void testScratchFileApi() {
 
 void testDescriptorTransfer() {
     TestDirectory directory("descriptor");
-    Repository source(directory.path / "source");
-    const Hash head = buildModelHistory(source);
-    const Hash base = source.history("main", 2).back().id;
+    ProjectRepository source(directory.path / "source");
+    const RevisionId head = buildModelHistory(source);
+    const RevisionId base = source.history("main", 2).back().id;
 
     ScratchFile full = source.createScratchFile();
-    source.exportBranchBundle("main", full.fd());
+    source.exportBundle("main", full.fd());
     expect(fileSize(full.fd()) > 0, "export to descriptor wrote nothing");
-    Repository target(directory.path / "target");
-    expect(target.importBranchBundle(full.fd(), "main").head == head, "import from descriptor failed");
-    expect(target.importBranchBundle(full.fd(), "main").status ==
+    ProjectRepository target(directory.path / "target");
+    expect(target.importBundle(full.fd(), "main").head == head, "import from descriptor failed");
+    expect(target.importBundle(full.fd(), "main").status ==
            aowis::dvmdb::BundleImportStatus::UpToDate, "descriptor import not repeatable");
 
-    Repository partial(directory.path / "partial");
+    ProjectRepository partial(directory.path / "partial");
     ScratchFile older = source.createScratchFile();
-    source.exportIncrementalBranchBundle("main", base, older.fd());
+    source.exportIncrementalBundle("main", base, older.fd());
     expectKind(StorageErrorKind::Conflict, "incremental descriptor import without base",
-               [&] { (void)partial.importBranchBundle(older.fd(), "main"); });
+               [&] { (void)partial.importBundle(older.fd(), "main"); });
 
     expectKind(StorageErrorKind::InvalidInput, "export into a non-empty descriptor",
-               [&] { source.exportBranchBundle("main", full.fd()); });
+               [&] { source.exportBundle("main", full.fd()); });
     ScratchFile limited = source.createScratchFile();
     expectKind(StorageErrorKind::LimitExceeded, "export over the byte limit",
-               [&] { source.exportBranchBundle("main", limited.fd(), BundleLimits{4096, 0, 0}); });
+               [&] { source.exportBundle("main", limited.fd(), BundleLimits{4096, 0, 0}); });
     expect(fileSize(limited.fd()) == 0, "failed descriptor export left a partial bundle");
     int pipeEnds[2]{};
     expect(::pipe(pipeEnds) == 0, "pipe failed");
     expectKind(StorageErrorKind::InvalidInput, "import from a pipe",
-               [&] { (void)target.importBranchBundle(pipeEnds[0], "other"); });
+               [&] { (void)target.importBundle(pipeEnds[0], "other"); });
     expectKind(StorageErrorKind::InvalidInput, "export into a pipe",
-               [&] { source.exportBranchBundle("main", pipeEnds[1]); });
+               [&] { source.exportBundle("main", pipeEnds[1]); });
     ::close(pipeEnds[0]);
     ::close(pipeEnds[1]);
 }
 
 void testInternalScratchBudget() {
     TestDirectory directory("quota");
-    Repository source(directory.path / "source");
-    const Hash head = buildModelHistory(source);
+    ProjectRepository source(directory.path / "source");
+    const RevisionId head = buildModelHistory(source);
     const std::filesystem::path bundle = directory.path / "baseline.bundle";
-    source.exportBranchBundle("main", bundle);
+    source.exportBundle("main", bundle);
     expect(aowis::dvmdb::internalScratchReservedBytes() == 0,
            "full export leaked internal scratch accounting");
 
@@ -264,14 +267,14 @@ void testInternalScratchBudget() {
     aowis::dvmdb::setInternalScratchLimit(1024);
     ScratchFile output = source.createScratchFile();
     expectKind(StorageErrorKind::Busy, "full export internal scratch budget",
-               [&] { source.exportBranchBundle("main", output.fd()); });
+               [&] { source.exportBundle("main", output.fd()); });
     expect(fileSize(output.fd()) == 0, "scratch rejection left a partial bundle");
     expect(aowis::dvmdb::internalScratchReservedBytes() == 0,
            "failed export did not release internal scratch accounting");
 
-    Repository target(directory.path / "target");
+    ProjectRepository target(directory.path / "target");
     expectKind(StorageErrorKind::Busy, "import internal scratch budget",
-               [&] { (void)target.importBranchBundle(bundle, "main"); });
+               [&] { (void)target.importBundle(bundle, "main"); });
     expect(target.listBranches().empty(), "failed import published a branch");
     expect(aowis::dvmdb::internalScratchReservedBytes() == 0,
            "failed import did not release internal scratch accounting");
@@ -279,9 +282,9 @@ void testInternalScratchBudget() {
     // Budget can be reconfigured after operations finish. All paths work
     // again without recreating the repositories or changing stored history.
     aowis::dvmdb::setInternalScratchLimit(256ULL * 1024ULL * 1024ULL);
-    source.exportBranchBundle("main", output.fd());
+    source.exportBundle("main", output.fd());
     expect(fileSize(output.fd()) > 0, "export did not resume after raising quota");
-    expect(target.importBranchBundle(bundle, "main").head == head,
+    expect(target.importBundle(bundle, "main").head == head,
            "import did not resume after raising quota");
     expect(aowis::dvmdb::internalScratchReservedBytes() == 0,
            "successful imports or exports leaked scratch accounting");
@@ -298,36 +301,36 @@ void testPartialScratchWrite() {
     TestDirectory directory("partial-write");
     const std::filesystem::path repo = directory.path / "source";
     const std::filesystem::path bundle = directory.path / "good.bundle";
-    Repository source(repo);
-    const Hash head = buildModelHistory(source);
+    ProjectRepository source(repo);
+    const RevisionId head = buildModelHistory(source);
     ScratchFile output = source.createScratchFile();
     {
         ScopedEnvironment point("AOWIS_DVMDB_TEST_FAULT", "scratch.partial.write");
         ScopedEnvironment action("AOWIS_DVMDB_TEST_ACTION", "error");
         expectKind(StorageErrorKind::ResourceExhausted, "partial scratch export write",
-                   [&] { source.exportBranchBundle("main", output.fd()); });
+                   [&] { source.exportBundle("main", output.fd()); });
     }
     expect(fileSize(output.fd()) == 0, "partial scratch export wrote output");
     expect(aowis::dvmdb::internalScratchReservedBytes() == 0,
            "partial scratch export leaked quota reservations");
-    source.exportBranchBundle("main", bundle);
+    source.exportBundle("main", bundle);
     const std::filesystem::path targetPath = directory.path / "target";
     {
-        Repository target(targetPath);
+        ProjectRepository target(targetPath);
         {
             ScopedEnvironment point("AOWIS_DVMDB_TEST_FAULT", "scratch.partial.write");
             ScopedEnvironment action("AOWIS_DVMDB_TEST_ACTION", "error");
             expectKind(StorageErrorKind::ResourceExhausted, "partial scratch import write",
-                       [&] { (void)target.importBranchBundle(bundle, "main"); });
+                       [&] { (void)target.importBundle(bundle, "main"); });
         }
         expect(target.listBranches().empty(), "partial scratch import published branch");
         expect(aowis::dvmdb::internalScratchReservedBytes() == 0,
                "partial scratch import leaked quota reservations");
     }
-    Repository reopened(targetPath);
+    ProjectRepository reopened(targetPath);
     expect(reopened.listBranches().empty(), "partial scratch import published on reopen");
     reopened.verifyRepository();
-    expect(reopened.importBranchBundle(bundle, "main").head == head,
+    expect(reopened.importBundle(bundle, "main").head == head,
            "import retry after partial scratch failed");
     reopened.verifyRepository();
     expect(aowis::dvmdb::internalScratchReservedBytes() == 0,

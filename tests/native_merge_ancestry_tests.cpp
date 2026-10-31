@@ -1,10 +1,12 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <array>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -15,6 +17,8 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
@@ -25,7 +29,6 @@ using aowis::dvmdb::MergeStatus;
 using aowis::dvmdb::ModelChange;
 using aowis::dvmdb::ModelRecord;
 using aowis::dvmdb::Repository;
-using aowis::dvmdb::Revision;
 
 void expect(bool condition, const std::string& diagnostic) {
     if (!condition) throw std::runtime_error(diagnostic);
@@ -66,45 +69,64 @@ Bytes value(std::uint32_t sequence) {
     return Bytes(encoded.begin(), encoded.end());
 }
 
-std::set<Hash> fullAncestors(Repository& repository, const Hash& tip) {
-    std::set<Hash> result;
-    std::vector<Hash> pending{tip};
-    while (!pending.empty()) {
-        const Hash current = pending.back();
-        pending.pop_back();
-        if (!result.insert(current).second) continue;
-        const Revision record = repository.revision(current);
-        for (const Hash& parent : record.parents) pending.push_back(parent);
+// Parent lists read through the public revision API, memoized so the
+// exhaustive oracle below costs one record read per revision.
+class ParentCache final {
+public:
+    explicit ParentCache(ProjectRepository& repository) : repository_(repository) {}
+
+    const std::vector<RevisionId>& parents(const RevisionId& id) {
+        std::map<RevisionId, std::vector<RevisionId>>::iterator found = this->parents_.find(id);
+        if (found == this->parents_.end()) {
+            found = this->parents_.emplace(id, this->repository_.revision(id).parents).first;
+        }
+        return found->second;
     }
-    return result;
-}
+
+    std::set<RevisionId> fullAncestors(const RevisionId& tip) {
+        std::set<RevisionId> result;
+        std::vector<RevisionId> pending{tip};
+        while (!pending.empty()) {
+            const RevisionId current = pending.back();
+            pending.pop_back();
+            if (!result.insert(current).second) continue;
+            for (const RevisionId& parent : parents(current)) pending.push_back(parent);
+        }
+        return result;
+    }
+
+private:
+    ProjectRepository& repository_;
+    std::map<RevisionId, std::vector<RevisionId>> parents_;
+};
 
 struct ExpectedMerge {
     MergeStatus status = MergeStatus::UpToDate;
-    std::optional<Hash> base;
+    std::optional<RevisionId> base;
     bool ambiguous = false;
 };
 
 // Deliberately independent, exhaustive oracle: build both complete ancestry
 // graphs and compare every common candidate against every other common
 // candidate. The production algorithm instead prunes its source traversal.
-ExpectedMerge expectedMerge(Repository& repository, const Hash& target, const Hash& source) {
-    const std::set<Hash> targetHistory = fullAncestors(repository, target);
-    const std::set<Hash> sourceHistory = fullAncestors(repository, source);
+ExpectedMerge expectedMerge(ProjectRepository& repository, const RevisionId& target, const RevisionId& source) {
+    ParentCache graph(repository);
+    const std::set<RevisionId> targetHistory = graph.fullAncestors(target);
+    const std::set<RevisionId> sourceHistory = graph.fullAncestors(source);
     if (targetHistory.contains(source)) return {MergeStatus::UpToDate, source, false};
     if (sourceHistory.contains(target)) return {MergeStatus::FastForward, target, false};
 
-    std::vector<Hash> common;
-    for (const Hash& candidate : targetHistory) {
+    std::vector<RevisionId> common;
+    for (const RevisionId& candidate : targetHistory) {
         if (sourceHistory.contains(candidate)) common.push_back(candidate);
     }
     expect(!common.empty(), "fixture contains unrelated initial histories");
-    std::vector<Hash> lowest;
-    for (const Hash& candidate : common) {
+    std::vector<RevisionId> lowest;
+    for (const RevisionId& candidate : common) {
         bool dominated = false;
-        for (const Hash& other : common) {
+        for (const RevisionId& other : common) {
             if (candidate == other) continue;
-            if (fullAncestors(repository, other).contains(candidate)) {
+            if (graph.fullAncestors(other).contains(candidate)) {
                 dominated = true;
                 break;
             }
@@ -123,7 +145,7 @@ std::uint32_t randomValue(std::uint32_t& state) {
     return state;
 }
 
-void makeCommit(Repository& repository, const std::string& branch,
+void makeCommit(ProjectRepository& repository, const std::string& branch,
                 std::uint32_t sequence, bool modelIndexed) {
     if (modelIndexed) {
         const ModelRecord record{1, {}, value(sequence)};
@@ -134,45 +156,47 @@ void makeCommit(Repository& repository, const std::string& branch,
     }
 }
 
-void checkMerge(Repository& repository, const std::string& target,
+void checkMerge(ProjectRepository& repository, const std::string& target,
                 const std::string& source) {
-    const Hash before = repository.head(target).id;
-    const Hash incoming = repository.head(source).id;
+    const RevisionId before = repository.head(target);
+    const RevisionId incoming = repository.head(source);
     const ExpectedMerge expected = expectedMerge(repository, before, incoming);
     if (expected.ambiguous) {
         bool rejected = false;
         try {
-            (void)repository.mergeBranches(target, source);
+            (void)repository.merge(target, source);
         } catch (const std::runtime_error& error) {
             rejected = std::string(error.what()).find("multiple independent merge bases") !=
                        std::string::npos;
         }
         expect(rejected, "criss-cross ancestry was not rejected");
-        expect(repository.head(target).id == before, "ambiguous merge modified target");
+        expect(repository.head(target) == before, "ambiguous merge modified target");
         return;
     }
-    const MergeResult actual = repository.mergeBranches(target, source);
+    const MergeResult actual = repository.merge(target, source);
     expect(actual.status == expected.status, "incorrect merge status");
     expect(expected.base && actual.base == *expected.base, "incorrect merge base");
     expect(actual.targetBefore == before && actual.sourceHead == incoming,
            "merge returned incorrect original branch heads");
-    expect(repository.head(source).id == incoming, "merge modified source branch");
+    expect(repository.head(source) == incoming, "merge modified source branch");
     if (expected.status == MergeStatus::Merged) {
         expect(actual.conflicts.empty(), "independent UUID edits unexpectedly conflicted");
-        expect(actual.revision.parents == std::vector<Hash>({before, incoming}),
+        expect(actual.resultHead.has_value() &&
+               repository.revision(*actual.resultHead).parents ==
+                   std::vector<RevisionId>({before, incoming}),
                "merge did not record both parents");
-        expect(repository.head(target).id == actual.revision.id,
+        expect(repository.head(target) == *actual.resultHead,
                "merge did not publish revision");
     } else if (expected.status == MergeStatus::FastForward) {
-        expect(repository.head(target).id == incoming, "fast forward lost source identity");
+        expect(repository.head(target) == incoming, "fast forward lost source identity");
     } else {
-        expect(repository.head(target).id == before, "up-to-date merge altered head");
+        expect(repository.head(target) == before, "up-to-date merge altered head");
     }
 }
 
 void testRandomizedMergeDag(bool modelIndexed) {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo");
+    ProjectRepository repository(temporary.path() / "repo");
     repository.createBranch("b0");
     makeCommit(repository, "b0", 1, modelIndexed);
     const std::array<std::string, 5> branches{"b0", "b1", "b2", "b3", "b4"};
@@ -206,7 +230,7 @@ void testRandomizedMergeDag(bool modelIndexed) {
 
 void testCrissCross() {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo");
+    ProjectRepository repository(temporary.path() / "repo");
     repository.createBranch("main");
     makeCommit(repository, "main", 1, false);
     repository.createBranch("left", "main");
@@ -222,12 +246,12 @@ void testCrissCross() {
 
 void testDominatedCommonFrontier() {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo");
+    ProjectRepository repository(temporary.path() / "repo");
     repository.createBranch("main");
     makeCommit(repository, "main", 1, false);
     repository.createBranch("old", "main");
     makeCommit(repository, "main", 2, false);
-    const Hash expectedBase = repository.head("main").id;
+    const RevisionId expectedBase = repository.head("main");
     repository.createBranch("feature", "main");
     makeCommit(repository, "main", 3, false);
     makeCommit(repository, "old", 4, false);
@@ -236,7 +260,7 @@ void testDominatedCommonFrontier() {
     // second path through an older one. Only the newer common node is a
     // lowest common ancestor, even if traversal visits the older one first.
     checkMerge(repository, "feature", "old");
-    const MergeResult result = repository.mergeBranches("main", "feature");
+    const MergeResult result = repository.merge("main", "feature");
     expect(result.status == MergeStatus::Merged && result.base == expectedBase,
            "dominated common-frontier candidate chosen as a merge base");
     checkMerge(repository, "feature", "old");
@@ -245,12 +269,12 @@ void testDominatedCommonFrontier() {
 
 void testLongSharedHistory() {
     TemporaryDirectory temporary;
-    Repository repository(temporary.path() / "repo");
+    ProjectRepository repository(temporary.path() / "repo");
     repository.createBranch("main");
     for (std::uint32_t sequence = 1; sequence <= 260; ++sequence) {
         makeCommit(repository, "main", sequence, false);
     }
-    const Hash fork = repository.head("main").id;
+    const RevisionId fork = repository.head("main");
     repository.createBranch("feature", "main");
     for (std::uint32_t sequence = 261; sequence <= 295; ++sequence) {
         makeCommit(repository, "main", sequence, false);
@@ -258,7 +282,7 @@ void testLongSharedHistory() {
     for (std::uint32_t sequence = 296; sequence <= 330; ++sequence) {
         makeCommit(repository, "feature", sequence, false);
     }
-    const MergeResult merged = repository.mergeBranches("main", "feature");
+    const MergeResult merged = repository.merge("main", "feature");
     expect(merged.status == MergeStatus::Merged && merged.base == fork,
            "deeply shared history yielded incorrect base");
     checkMerge(repository, "main", "feature");

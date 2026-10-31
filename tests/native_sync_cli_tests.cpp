@@ -59,7 +59,7 @@ int run(const std::filesystem::path& cli, const std::vector<std::string>& argume
     return WEXITSTATUS(status);
 }
 
-void exerciseRevisionV2(const std::filesystem::path& cli) {
+void exerciseRevision(const std::filesystem::path& cli) {
     using aowis::dvmdb::ProjectId;
     using aowis::dvmdb::RevisionId;
     TemporaryDirectory temp;
@@ -75,58 +75,58 @@ void exerciseRevisionV2(const std::filesystem::path& cli) {
     std::optional<aowis::dvmdb::BranchId> identity;
     {
         Repository repository(source);
-        (void)repository.createBranchV2(project, "main");
-        base = repository.headV2(project, "main");
+        (void)repository.createBranch(project, "main");
+        base = repository.head(project, "main");
         identity = repository.branchId("main");
     }
     expect(run(cli, {"export", source.string(), project.toString(), "main", full.string()}) == 0,
-           "v2 full CLI export failed");
+           "full CLI export failed");
     {
         std::ifstream file(full, std::ios::binary);
         char header[8]{};
         file.read(header, sizeof(header));
         expect(file && std::string(header, sizeof(header)) == "AOWREV21",
-               "v2 CLI full transfer used the wrong wire format");
+               "CLI full transfer used the wrong wire format");
     }
     expect(run(cli, {"export", source.string(), project.toString(), "main", full.string()}) == 1,
-           "v2 CLI export overwrote existing bundle");
+           "CLI export overwrote existing bundle");
     expect(run(cli, {"import", destination.string(), project.toString(), full.string(), "incoming"}) == 0,
-           "v2 full CLI import failed");
+           "full CLI import failed");
     expect(run(cli, {"import", destination.string(), project.toString(), full.string(), "incoming"}) == 0,
-           "v2 full CLI replay failed");
+           "full CLI replay failed");
     expect(run(cli, {"head", destination.string(), project.toString(), "incoming"}) == 0,
-           "v2 HEAD CLI lookup failed");
+           "HEAD CLI lookup failed");
     {
         Repository repository(destination);
-        expect(repository.headV2(project, "incoming") == base &&
+        expect(repository.head(project, "incoming") == base &&
                repository.branchId("incoming") == identity,
-               "v2 CLI round trip lost revision or branch identity");
+               "CLI round trip lost revision or branch identity");
     }
     {
         Repository repository(source);
-        tip = repository.commitV2(project, "main", {{key, Bytes{7, 8, 9}}}, base);
+        tip = repository.commit(project, "main", {{key, Bytes{7, 8, 9}}}, base);
     }
     expect(run(cli, {"export-incremental", source.string(), project.toString(), "main",
                      base.toString(), delta.string()}) == 0,
-           "v2 incremental CLI export failed");
+           "incremental CLI export failed");
     {
         std::ifstream file(delta, std::ios::binary);
         char header[8]{};
         file.read(header, sizeof(header));
         expect(file && std::string(header, sizeof(header)) == "AOWREV22",
-               "v2 CLI delta transfer used the wrong wire format");
+               "CLI delta transfer used the wrong wire format");
     }
     expect(run(cli, {"import", destination.string(), project.toString(), delta.string(), "incoming"}) == 0,
-           "v2 incremental CLI import failed");
+           "incremental CLI import failed");
     {
         Repository repository(destination);
-        expect(repository.headV2(project, "incoming") == tip &&
+        expect(repository.head(project, "incoming") == tip &&
                repository.branchId("incoming") == identity,
-               "v2 incremental CLI import lost revision or branch identity");
+               "incremental CLI import lost revision or branch identity");
     }
     expect(run(cli, {"import", destination.string(), ProjectId::generate().toString(),
                      full.string(), "other"}) == 1,
-           "cross-project CLI v2 import was accepted");
+           "cross-project CLI import was accepted");
     expect(run(cli, {"export-incremental", source.string(), project.toString(), "main",
                      "invalid-uuid", (temp.path / "bad.aowbundle").string()}) == 1,
            "invalid UUIDv7 base was accepted");
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
     try {
         expect(argc == 2, "usage: native_sync_cli_tests SYNC_CLI");
         const std::filesystem::path cli = std::filesystem::absolute(argv[1]);
-        exerciseRevisionV2(cli);
+        exerciseRevision(cli);
         std::cout << "Offline synchronization CLI tests passed\n";
         return 0;
     } catch (const std::exception& error) {

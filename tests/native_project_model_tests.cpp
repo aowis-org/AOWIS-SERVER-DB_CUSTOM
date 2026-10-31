@@ -1,5 +1,5 @@
 #include "aowis/dvmdb/project_service.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 
 #include <atomic>
 #include <filesystem>
@@ -45,7 +45,7 @@ ModelRecord record(std::uint8_t value, std::vector<Key> references = {}) {
     return result;
 }
 
-void testV2ModelWorkflow() {
+void testModelWorkflow() {
     Temporary temp;
     fs::create_directories(temp.path);
     ProjectId project = ProjectId::generate();
@@ -59,70 +59,70 @@ void testV2ModelWorkflow() {
     BranchId featureBranch = BranchId::generate();
     {
         ProjectService service(temp.path);
-        const ProjectInfo info = service.createProjectV2("New UUID model project");
+        const ProjectInfo info = service.createProject("New UUID model project");
         project = *ProjectId::parse(info.id);
-        root = service.headV2(info.id, "main");
-        check(service.optionalHeadV2(info.id, "main") == std::optional<RevisionId>{root},
+        root = service.head(info.id, "main");
+        check(service.optionalHead(info.id, "main") == std::optional<RevisionId>{root},
               "optional HEAD disagrees with committed HEAD");
         check(service.listBranches(info.id) == std::vector<std::string>{"main"},
               "initial branch missing");
-        rejects([&] { (void)service.getModelAtRevisionV2(info.id, root, a); },
+        rejects([&] { (void)service.getModelAtRevision(info.id, root, a); },
                 ProjectErrorKind::InvalidInput, "raw initial revision exposed model reads");
         service.withRepository(info.id, [&](Repository& repo) {
             mainBranch = *repo.branchId("main");
-            const RevisionRecordV2 initial = decodeRevisionRecordV2(*repo.readRevisionV2(project, root));
+            const RevisionRecord initial = decodeRevisionRecord(*repo.readRevision(project, root));
             check(initial.parents.empty() && !initial.modelIndexed, "initial revision not raw empty");
         });
-        first = service.commitModelV2(info.id, "main", {{a, record(11)}}, root);
-        check(first != root && service.headV2(info.id, "main") == first,
+        first = service.commitModel(info.id, "main", {{a, record(11)}}, root);
+        check(first != root && service.head(info.id, "main") == first,
               "model commit did not advance UUID HEAD");
-        check(service.getModelAtRevisionV2(info.id, first, a)->payload == Bytes{11},
+        check(service.getModelAtRevision(info.id, first, a)->payload == Bytes{11},
               "model payload was not stored");
         service.withRepository(info.id, [&](Repository& repo) {
-            const std::vector<Difference> changes = repo.diffRevisionsV2(project, root, first, 1);
+            const std::vector<Difference> changes = repo.diffRevisions(project, root, first, 1);
             check(changes.size() == 1 && changes.front().key == a &&
                   !changes.front().before && changes.front().after.has_value(),
                   "UUIDv7 immutable diff did not report model addition");
-            const std::vector<Difference> replay = repo.diffRevisionsV2(project, first, first, 0);
+            const std::vector<Difference> replay = repo.diffRevisions(project, first, first, 0);
             check(replay.empty(), "same-revision UUID diff was not empty");
         });
-        rejects([&] { (void)service.getModelAtRevisionV2(info.id, root, a); },
+        rejects([&] { (void)service.getModelAtRevision(info.id, root, a); },
                 ProjectErrorKind::InvalidInput, "initial revision was mutated");
-        const RevisionId shared = service.createBranchV2(info.id, "feature", "main");
+        const RevisionId shared = service.createBranch(info.id, "feature", "main");
         check(shared == first, "branch creation duplicated revision");
         service.withRepository(info.id, [&](Repository& repo) {
             featureBranch = *repo.branchId("feature");
         });
         check(mainBranch != featureBranch, "branch UUIDs are not unique");
-        second = service.commitModelV2(info.id, "main", {{b, record(22, {a, a})}}, first);
-        feature = service.commitModelV2(info.id, "feature", {{b, record(33)}}, first);
-        check(second != feature && service.headV2(info.id, "main") == second &&
-              service.headV2(info.id, "feature") == feature,
+        second = service.commitModel(info.id, "main", {{b, record(22, {a, a})}}, first);
+        feature = service.commitModel(info.id, "feature", {{b, record(33)}}, first);
+        check(second != feature && service.head(info.id, "main") == second &&
+              service.head(info.id, "feature") == feature,
               "forked UUID revisions did not advance independently");
         service.withRepository(info.id, [&](Repository& repo) {
-            const std::vector<Difference> changes = repo.diffRevisionsV2(project, root, second, 2);
+            const std::vector<Difference> changes = repo.diffRevisions(project, root, second, 2);
             check(changes.size() == 2 && changes[0].key == a && changes[1].key == b,
                   "UUIDv7 immutable diff missed changed model records");
             bool limited = false;
-            try { (void)repo.diffRevisionsV2(project, root, second, 1); }
+            try { (void)repo.diffRevisions(project, root, second, 1); }
             catch (const StorageError& error) {
                 limited = error.kind() == StorageErrorKind::LimitExceeded;
             }
             check(limited, "UUIDv7 immutable diff ignored its result limit");
         });
-        check(service.getModelAtRevisionV2(info.id, second, b)->payload == Bytes{22} &&
-              service.getModelAtRevisionV2(info.id, feature, b)->payload == Bytes{33},
+        check(service.getModelAtRevision(info.id, second, b)->payload == Bytes{22} &&
+              service.getModelAtRevision(info.id, feature, b)->payload == Bytes{33},
               "branch snapshots not isolated");
-        rejects([&] { (void)service.commitModelV2(info.id, "main", {}, first); },
+        rejects([&] { (void)service.commitModel(info.id, "main", {}, first); },
                 ProjectErrorKind::Conflict, "stale HEAD was accepted");
-        rejects([&] { (void)service.commitModelV2(info.id, "main", {{a, std::nullopt}}, second); },
+        rejects([&] { (void)service.commitModel(info.id, "main", {{a, std::nullopt}}, second); },
                 ProjectErrorKind::InvalidInput, "deletion of referenced model was accepted");
-        rejects([&] { (void)service.commitModelV2(info.id, "main", {{key(3), record(44, {key(9)})}}, second); },
+        rejects([&] { (void)service.commitModel(info.id, "main", {{key(3), record(44, {key(9)})}}, second); },
                 ProjectErrorKind::InvalidInput, "dangling reference was accepted");
-        check(service.headV2(info.id, "main") == second,
+        check(service.head(info.id, "main") == second,
               "rejected commit advanced HEAD");
         service.withRepository(info.id, [&](Repository& repo) {
-            const RevisionRecordV2 current = decodeRevisionRecordV2(*repo.readRevisionV2(project, second));
+            const RevisionRecord current = decodeRevisionRecord(*repo.readRevision(project, second));
             check(current.modelIndexed && current.parents.size() == 1 &&
                   current.parents.front().id == first,
                   "model index or UUID parent lost");
@@ -133,10 +133,10 @@ void testV2ModelWorkflow() {
         ProjectService service(temp.path);
         check(service.listProjects().size() == 1, "reopen lost project catalogue");
         const std::string id = project.toString();
-        check(service.headV2(id, "main") == second &&
-              service.headV2(id, "feature") == feature,
+        check(service.head(id, "main") == second &&
+              service.head(id, "feature") == feature,
               "reopen changed branch HEAD identities");
-        check(service.getModelAtRevisionV2(id, second, b)->references == std::vector<Key>{a},
+        check(service.getModelAtRevision(id, second, b)->references == std::vector<Key>{a},
               "reopen lost deduplicated model references");
         service.withRepository(id, [&](Repository& repo) {
             check(*repo.branchId("main") == mainBranch &&
@@ -156,21 +156,21 @@ void testStrictLocalCommitHeadPin() {
     const Key later = key(62);
     {
         ProjectService service(temp.path);
-        const ProjectInfo project = service.createUnbornProjectV2("strict local commit CAS");
+        const ProjectInfo project = service.createUnbornProject("strict local commit CAS");
         projectId = project.id;
-        check(!service.optionalHeadV2(projectId, "main"),
+        check(!service.optionalHead(projectId, "main"),
               "new project must start with unborn HEAD");
         rejects([&] {
-            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+            (void)service.commitModelAtExpectedHead(projectId, "main",
                     {{created, record(1)}}, std::nullopt);
         }, ProjectErrorKind::Conflict, "local commit accepted an unconfigured repository");
-        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
+        service.configureRepositoryRole(RepositoryRole::Private);
         rejects([&] {
-            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+            (void)service.commitModelAtExpectedHead(projectId, "main",
                     {{created, record(1)}}, RevisionId::generate());
         }, ProjectErrorKind::Conflict, "born expected HEAD accepted on unborn branch");
-        check(!service.optionalHeadV2(projectId, "main") &&
-              service.revisionGraphV2(projectId).revisions.empty(),
+        check(!service.optionalHead(projectId, "main") &&
+              service.revisionGraph(projectId).revisions.empty(),
               "rejected unborn commit wrote revision or HEAD");
 
         // Two sessions both pinning explicit null must not each create an
@@ -180,7 +180,7 @@ void testStrictLocalCommitHeadPin() {
         std::atomic<bool> unexpected{false};
         const auto attempt = [&]() {
             try {
-                (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+                (void)service.commitModelAtExpectedHead(projectId, "main",
                          {{created, record(42)}}, std::nullopt);
                 ++successes;
             } catch (const ProjectError& error) {
@@ -194,31 +194,31 @@ void testStrictLocalCommitHeadPin() {
         writerB.join();
         check(!unexpected && successes == 1 && conflicts == 1,
               "concurrent first commits did not enforce exact unborn HEAD");
-        const std::optional<RevisionId> committed = service.optionalHeadV2(projectId, "main");
+        const std::optional<RevisionId> committed = service.optionalHead(projectId, "main");
         check(committed.has_value() &&
-              service.getModelAtRevisionV2(projectId, *committed, created)->payload == Bytes{42},
+              service.getModelAtRevision(projectId, *committed, created)->payload == Bytes{42},
               "strict first commit lost its model data");
         first = *committed;
         rejects([&] {
-            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+            (void)service.commitModelAtExpectedHead(projectId, "main",
                      {{later, record(43)}}, std::nullopt);
         }, ProjectErrorKind::Conflict, "stale explicit-null commit advanced born HEAD");
         rejects([&] {
-            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+            (void)service.commitModelAtExpectedHead(projectId, "main",
                      {{later, record(43)}}, RevisionId::generate());
         }, ProjectErrorKind::Conflict, "wrong committed HEAD pin was accepted");
-        check(service.optionalHeadV2(projectId, "main") == first,
+        check(service.optionalHead(projectId, "main") == first,
               "rejected local commit moved HEAD");
-        second = service.commitModelAtExpectedHeadV2(projectId, "main",
+        second = service.commitModelAtExpectedHead(projectId, "main",
                      {{later, record(43)}}, first);
-        check(second != first && service.optionalHeadV2(projectId, "main") == second,
+        check(second != first && service.optionalHead(projectId, "main") == second,
               "correct expected HEAD did not advance local branch");
         const ProjectId nativeProject = *ProjectId::parse(projectId);
         service.withRepository(projectId, [&](Repository& repository) {
-            const RevisionRecordV2 initial = decodeRevisionRecordV2(
-                    *repository.readRevisionV2(nativeProject, first));
-            const RevisionRecordV2 advanced = decodeRevisionRecordV2(
-                    *repository.readRevisionV2(nativeProject, second));
+            const RevisionRecord initial = decodeRevisionRecord(
+                    *repository.readRevision(nativeProject, first));
+            const RevisionRecord advanced = decodeRevisionRecord(
+                    *repository.readRevision(nativeProject, second));
             check(initial.parents.empty() && advanced.parents.size() == 1 &&
                   advanced.parents.front().id == first,
                   "strict local CAS created incorrect immutable ancestry");
@@ -226,9 +226,9 @@ void testStrictLocalCommitHeadPin() {
     }
     {
         ProjectService reopened(temp.path);
-        check(reopened.optionalHeadV2(projectId, "main") == second &&
-              reopened.getModelAtRevisionV2(projectId, second, created)->payload == Bytes{42} &&
-              reopened.getModelAtRevisionV2(projectId, second, later)->payload == Bytes{43},
+        check(reopened.optionalHead(projectId, "main") == second &&
+              reopened.getModelAtRevision(projectId, second, created)->payload == Bytes{42} &&
+              reopened.getModelAtRevision(projectId, second, later)->payload == Bytes{43},
               "strict local commit did not survive reopen");
     }
 }
@@ -236,7 +236,7 @@ void testStrictLocalCommitHeadPin() {
 
 int main() {
     try {
-        testV2ModelWorkflow();
+        testModelWorkflow();
         testStrictLocalCommitHeadPin();
         std::cout << "UUIDv7 project model commit, fork, references and reopen passed\n";
         return 0;

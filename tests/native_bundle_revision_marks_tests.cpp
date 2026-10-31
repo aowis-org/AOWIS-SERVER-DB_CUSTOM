@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <array>
 #include <cstdint>
@@ -14,8 +15,10 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 
-using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::RevisionBundleImport;
 using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
@@ -59,7 +62,7 @@ Key uuid(unsigned sequence) {
     return result;
 }
 
-void commit(Repository& repository, std::string_view branch,
+void commit(ProjectRepository& repository, std::string_view branch,
             unsigned sequence, bool modelIndexed) {
     const Bytes payload{static_cast<std::uint8_t>(sequence & 255U),
                         static_cast<std::uint8_t>((sequence >> 8U) & 255U)};
@@ -71,7 +74,7 @@ void commit(Repository& repository, std::string_view branch,
     }
 }
 
-void verifySameHistory(Repository& source, Repository& imported) {
+void verifySameHistory(ProjectRepository& source, ProjectRepository& imported) {
     const VerificationReport reference = source.verifyRepository();
     const VerificationReport actual = imported.verifyRepository();
     check(actual.revisions == reference.revisions &&
@@ -81,16 +84,16 @@ void verifySameHistory(Repository& source, Repository& imported) {
           "imported revision graph differs from verified source");
 }
 
-void expectRejected(Repository& repository, const std::filesystem::path& path,
+void expectRejected(ProjectRepository& repository, const std::filesystem::path& path,
                     std::string_view branch, std::string_view reason) {
-    const Hash originalHead = repository.head(branch).id;
+    const RevisionId originalHead = repository.head(branch);
     const std::uint64_t previousObjects = repository.objectCount();
     try {
-        (void)repository.importBranchBundle(path, branch);
+        (void)repository.importBundle(path, branch);
     } catch (const std::runtime_error& error) {
         check(std::string_view(error.what()).find(reason) != std::string_view::npos,
               "bundle rejected for an unexpected reason");
-        check(repository.head(branch).id == originalHead &&
+        check(repository.head(branch) == originalHead &&
               repository.objectCount() == previousObjects,
               "rejected import mutated destination state");
         return;
@@ -100,18 +103,18 @@ void expectRejected(Repository& repository, const std::filesystem::path& path,
 
 void testRevisionMarks(bool modelIndexed) {
     TemporaryDirectory temporary;
-    Repository source(temporary.path() / "source");
-    Repository destination(temporary.path() / "destination");
+    ProjectRepository source(temporary.path() / "source");
+    ProjectRepository destination(temporary.path() / "destination");
     source.createBranch("main");
     const unsigned commonCommits = modelIndexed ? 20U : 190U;
     const unsigned divergentCommits = modelIndexed ? 18U : 70U;
     for (unsigned index = 1; index <= commonCommits; ++index) {
         commit(source, "main", index, modelIndexed);
     }
-    const Hash ancestor = source.head("main").id;
+    const RevisionId ancestor = source.head("main");
     const std::filesystem::path full = temporary.path() / "base.aowbundle";
-    source.exportBranchBundle("main", full);
-    check(destination.importBranchBundle(full, "main").status ==
+    source.exportBundle("main", full);
+    check(destination.importBundle(full, "main").status ==
           BundleImportStatus::Created, "failed to import base graph");
     verifySameHistory(source, destination);
 
@@ -120,52 +123,61 @@ void testRevisionMarks(bool modelIndexed) {
         commit(source, "main", 10000U + index, modelIndexed);
         commit(source, "side", 20000U + index, modelIndexed);
     }
-    const Hash sideTip = source.head("side").id;
-    const MergeResult merge = source.mergeBranches("main", "side");
+    const RevisionId sideTip = source.head("side");
+    const MergeResult merge = source.merge("main", "side");
     check(merge.status == MergeStatus::Merged && merge.conflicts.empty() &&
-          merge.revision.parents.size() == 2 &&
-          merge.revision.parents[1] == sideTip,
+          source.revision(*merge.resultHead).parents.size() == 2 &&
+          source.revision(*merge.resultHead).parents[1] == sideTip,
           "fixture did not create a two-parent merge DAG");
-    const Hash incoming = source.head("main").id;
+    const RevisionId incoming = source.head("main");
     const std::filesystem::path delta = temporary.path() / "merge.aowbundle";
-    source.exportIncrementalBranchBundle("main", ancestor, delta);
+    source.exportIncrementalBundle("main", ancestor, delta);
 
-    // A stored revision on an unrelated local side branch is not an ancestor
-    // of the imported tip. This rejection must still work with the new
-    // ordinal-based revision lookup (no imported revision std::set).
-    destination.createBranch("local", "main");
-    commit(destination, "local", 999999U, modelIndexed);
-    const Hash unrelated = destination.head("local").id;
-    const std::filesystem::path invalid = temporary.path() / "wrong-base.aowbundle";
-    std::filesystem::copy_file(delta, invalid);
+    // A sender may name the recipient's real HEAD as base and still send a
+    // tip that does not descend from it, moving the branch sideways. Here
+    // the recipient's HEAD is a local revision the sender never had; the
+    // ordinal-based revision lookup must still prove the base is not an
+    // ancestor of the incoming tip.
     {
-        std::fstream stream(invalid, std::ios::binary | std::ios::in | std::ios::out);
-        check(stream.good(), "open forged incremental bundle");
-        stream.seekp(48);
-        stream.write(reinterpret_cast<const char*>(unrelated.data()),
-                     static_cast<std::streamsize>(unrelated.size()));
-        check(stream.good(), "write forged incremental base");
+        ProjectRepository forked(temporary.path() / "forked");
+        check(forked.importBundle(full, "main").status == BundleImportStatus::Created,
+              "failed to seed forked recipient");
+        commit(forked, "main", 999999U, modelIndexed);
+        const RevisionId unrelated = forked.head("main");
+        const aowis::dvmdb::Hash unrelatedHash = forked.revision(unrelated).recordHash;
+        const std::filesystem::path invalid = temporary.path() / "wrong-base.aowbundle";
+        std::filesystem::copy_file(delta, invalid);
+        {
+            std::fstream stream(invalid, std::ios::binary | std::ios::in | std::ios::out);
+            check(stream.good(), "open forged incremental bundle");
+            stream.seekp(96); // base revision UUID, then its record digest
+            stream.write(reinterpret_cast<const char*>(unrelated.uuid().bytes.data()),
+                         static_cast<std::streamsize>(unrelated.uuid().bytes.size()));
+            stream.write(reinterpret_cast<const char*>(unrelatedHash.data()),
+                         static_cast<std::streamsize>(unrelatedHash.size()));
+            check(stream.good(), "write forged incremental base");
+        }
+        check(aowis::dvmdb::test::bundleLayout(invalid).headerBytes == 144,
+              "forged fixture is not a provenance-free delta");
+        expectRejected(forked, invalid, "main", "not an ancestor");
     }
-    expectRejected(destination, invalid, "main", "not an ancestor");
 
-    const BundleImportResult updated = destination.importBranchBundle(delta, "main");
+    const RevisionBundleImport updated = destination.importBundle(delta, "main");
     check(updated.status == BundleImportStatus::FastForward && updated.head == incoming,
           "incremental import with second-parent ancestry did not fast-forward");
-    check(destination.importBranchBundle(delta, "main").status ==
+    check(destination.importBundle(delta, "main").status ==
           BundleImportStatus::UpToDate, "incremental retry is not idempotent");
     check(destination.revision(sideTip).parents.size() == 1,
           "second-parent history was not imported");
-    // Since destination has a distinct local branch, compare the immutable
-    // merged history through its individual revision roots, not branch count.
-    check(destination.head("main").id == incoming &&
+    check(destination.head("main") == incoming &&
           destination.verifyRepository().revisions >=
               source.verifyRepository().revisions,
           "import lost reachable imported merge ancestors");
 
     const std::filesystem::path complete = temporary.path() / "complete.aowbundle";
-    source.exportBranchBundle("main", complete);
-    Repository independent(temporary.path() / "independent");
-    check(independent.importBranchBundle(complete, "main").status ==
+    source.exportBundle("main", complete);
+    ProjectRepository independent(temporary.path() / "independent");
+    check(independent.importBundle(complete, "main").status ==
           BundleImportStatus::Created, "fresh full merge DAG import failed");
     verifySameHistory(source, independent);
 }

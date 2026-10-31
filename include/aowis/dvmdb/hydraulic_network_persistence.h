@@ -134,7 +134,7 @@ struct HydraulicMergeSelections {
     std::vector<HydraulicFieldChoice> fields;
     std::vector<HydraulicObjectChoice> objects;
 };
-MergeResultV2 mergeHydraulicBranches(Repository& repository, const ProjectId& project,
+MergeResult mergeHydraulicBranches(Repository& repository, const ProjectId& project,
                                        std::string_view target, std::string_view source,
                                        const HydraulicMergeSelections& selections);
 

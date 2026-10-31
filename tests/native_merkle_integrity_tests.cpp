@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <array>
 #include <chrono>
@@ -16,6 +17,8 @@
 #include <unistd.h>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
 using aowis::dvmdb::Key;
@@ -59,7 +62,17 @@ struct TemporaryDirectory {
     std::filesystem::path path;
 };
 
+// A UUIDv7 revision built into a bundle: its identity and record digest.
+struct BuiltRevision {
+    RevisionId id;
+    Hash hash{};
+};
+
+// Byte-exact AOWREV21/AOWREV22 bundles with arbitrary (possibly malformed)
+// Merkle trees, for the importer's structural verifier.
 struct BundleBuilder {
+    explicit BundleBuilder(aowis::dvmdb::ProjectId owner) : project(owner) {}
+    aowis::dvmdb::ProjectId project;
     std::map<Hash, Bytes> objects;
 
     Hash add(const Bytes& payload) {
@@ -90,28 +103,29 @@ struct BundleBuilder {
         return add(content);
     }
 
-    Hash revision(const Hash& root, const Hash& references = Hash{},
-                  bool model = false, const std::optional<Hash>& parent = std::nullopt) {
-        Bytes content{'S'};
-        appendHash(content, root);
-        appendHash(content, references);
-        content.push_back(model ? 1U : 0U);
-        content.push_back(parent ? 1U : 0U);
-        if (parent) appendHash(content, *parent);
-        return add(content);
+    BuiltRevision revision(const Hash& root, const Hash& references = Hash{},
+                           bool model = false,
+                           const std::optional<BuiltRevision>& parent = std::nullopt) {
+        aowis::dvmdb::RevisionRecord record{RevisionId::generate(), this->project, root,
+                                              references, model, {}};
+        if (parent) record.parents.push_back({parent->id, parent->hash});
+        return BuiltRevision{record.id, add(aowis::dvmdb::encodeRevisionRecord(record))};
     }
 
-    void write(const std::filesystem::path& path, const Hash& tip,
-               const std::optional<Hash>& base = std::nullopt,
+    void write(const std::filesystem::path& path, const BuiltRevision& tip,
+               const std::optional<BuiltRevision>& base = std::nullopt,
                const std::optional<aowis::dvmdb::BranchId>& branchId = std::nullopt) const {
-        Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C',
-                     static_cast<std::uint8_t>(base ? '4' : '3')};
-        appendHash(bundle, tip);
-        appendU64(bundle, static_cast<std::uint64_t>(this->objects.size()));
-        if (base) appendHash(bundle, *base);
+        Bytes bundle{'A', 'O', 'W', 'R', 'E', 'V', '2',
+                     static_cast<std::uint8_t>(base ? '2' : '1')};
         const aowis::dvmdb::BranchId id = branchId.value_or(aowis::dvmdb::BranchId::generate());
-        const std::array<std::uint8_t, 16>& uuid = id.uuid().bytes;
-        bundle.insert(bundle.end(), uuid.begin(), uuid.end());
+        for (const aowis::dvmdb::UuidV7& uuid : {this->project.uuid(), id.uuid(), tip.id.uuid()})
+            bundle.insert(bundle.end(), uuid.bytes.begin(), uuid.bytes.end());
+        appendHash(bundle, tip.hash);
+        appendU64(bundle, static_cast<std::uint64_t>(this->objects.size()));
+        if (base) {
+            bundle.insert(bundle.end(), base->id.uuid().bytes.begin(), base->id.uuid().bytes.end());
+            appendHash(bundle, base->hash);
+        }
         for (const std::pair<const Hash, Bytes>& entry : this->objects) {
             appendHash(bundle, entry.first);
             appendU64(bundle, static_cast<std::uint64_t>(entry.second.size()));
@@ -192,14 +206,14 @@ Hash makeTree(BundleBuilder& builder, TreeKind kind, Defect defect) {
     throw std::runtime_error("unhandled malformed tree fixture");
 }
 
-void expectRejected(Repository& target, const std::filesystem::path& bundle,
+void expectRejected(ProjectRepository& target, const std::filesystem::path& bundle,
                     const std::string& label, const std::string& expectedError) {
     const std::uint64_t objects = target.objectCount();
     const std::uint64_t pack = target.packSize();
-    const Hash head = target.head("stable").id;
+    const RevisionId head = target.head("stable");
     bool failed = false;
     try {
-        (void)target.importBranchBundle(bundle, "untrusted");
+        (void)target.importBundle(bundle, "untrusted");
     } catch (const std::runtime_error& error) {
         failed = true;
         expect(std::string(error.what()).find(expectedError) != std::string::npos,
@@ -208,14 +222,14 @@ void expectRejected(Repository& target, const std::filesystem::path& bundle,
     expect(failed, "malformed trie imported: " + label);
     expect(target.listBranches() == std::vector<std::string>{"stable"},
            "rejected bundle published branch: " + label);
-    expect(target.head("stable").id == head &&
+    expect(target.head("stable") == head &&
                target.objectCount() == objects && target.packSize() == pack,
            "rejected bundle modified repository: " + label);
 }
 
 void testMalformedTrees() {
     TemporaryDirectory temporary("malformed");
-    Repository target(temporary.path / "target");
+    ProjectRepository target(temporary.path / "target");
     target.createBranch("stable");
     target.commit("stable", {{key(42), Bytes{'s', 'a', 'f', 'e'}}});
 
@@ -242,9 +256,9 @@ void testMalformedTrees() {
             // Invalid tree in either model index must be caught as well as in
             // the raw data tree. A valid model/ref tree in the other position
             // ensures that validation actually reaches the malformed one.
-            BundleBuilder builder;
+            BundleBuilder builder(target.project());
             const Hash badRoot = makeTree(builder, kind, fixture.defect);
-            Hash tip{};
+            std::optional<BuiltRevision> tip;
             if (kind == TreeKind::Raw) {
                 tip = builder.revision(badRoot);
             } else if (kind == TreeKind::Model) {
@@ -258,7 +272,7 @@ void testMalformedTrees() {
                 (kind == TreeKind::Raw ? " / raw" : kind == TreeKind::Model ?
                  " / model" : " / reference");
             const std::filesystem::path file = temporary.path / "malformed.aowbundle";
-            builder.write(file, tip);
+            builder.write(file, *tip);
             expectRejected(target, file, label, fixture.error);
             std::filesystem::remove(file);
         }
@@ -268,20 +282,20 @@ void testMalformedTrees() {
 
 void testValidCompressedAndSharedTrees() {
     TemporaryDirectory temporary("valid");
-    Repository target(temporary.path / "target");
-    BundleBuilder builder;
+    ProjectRepository target(temporary.path / "target");
+    BundleBuilder builder(target.project());
     const Hash value = addValue(builder, TreeKind::Raw);
     const Hash one = builder.leaf(key(1), value);
     const Hash two = builder.leaf(key(2), value);
     const Hash three = builder.leaf(key(0x11), value);
     const Hash inner = builder.branch(31, Key{}, {{1, one}, {2, two}});
     const Hash root = builder.branch(30, Key{}, {{0, inner}, {1, three}});
-    const Hash first = builder.revision(root);
-    const Hash tip = builder.revision(root, Hash{}, false, first);
+    const BuiltRevision first = builder.revision(root);
+    const BuiltRevision tip = builder.revision(root, Hash{}, false, first);
     const std::filesystem::path bundle = temporary.path / "valid.aowbundle";
     builder.write(bundle, tip);
-    target.importBranchBundle(bundle, "valid");
-    expect(target.head("valid").id == tip &&
+    target.importBundle(bundle, "valid");
+    expect(target.head("valid") == tip.id &&
                target.scan("valid").size() == 3 &&
                target.get("valid", key(1)) == Bytes{'d', 'a', 't', 'a'} &&
                target.get("valid", key(2)) == Bytes{'d', 'a', 't', 'a'} &&
@@ -292,8 +306,8 @@ void testValidCompressedAndSharedTrees() {
 
 void testValidNonzeroCompressedPrefix() {
     TemporaryDirectory temporary("nonzero-prefix");
-    Repository target(temporary.path / "target");
-    BundleBuilder builder;
+    ProjectRepository target(temporary.path / "target");
+    BundleBuilder builder(target.project());
     const Hash value = addValue(builder, TreeKind::Raw);
     Key first{};
     first[0] = 0xab;
@@ -307,11 +321,11 @@ void testValidNonzeroCompressedPrefix() {
     const Hash left = builder.leaf(first, value);
     const Hash right = builder.leaf(second, value);
     const Hash root = builder.branch(12, prefix, {{2, left}, {3, right}});
-    const Hash tip = builder.revision(root);
+    const BuiltRevision tip = builder.revision(root);
     const std::filesystem::path bundle = temporary.path / "nonzero.aowbundle";
     builder.write(bundle, tip);
-    target.importBranchBundle(bundle, "valid");
-    expect(target.head("valid").id == tip && target.scan("valid").size() == 2 &&
+    target.importBundle(bundle, "valid");
+    expect(target.head("valid") == tip.id && target.scan("valid").size() == 2 &&
                target.get("valid", first) == Bytes{'d', 'a', 't', 'a'} &&
                target.get("valid", second) == Bytes{'d', 'a', 't', 'a'},
            "valid nonzero compressed prefix was not accepted");
@@ -319,8 +333,8 @@ void testValidNonzeroCompressedPrefix() {
 
 void testValidMaximumTrieDepth() {
     TemporaryDirectory temporary("maximum-depth");
-    Repository target(temporary.path / "target");
-    BundleBuilder builder;
+    ProjectRepository target(temporary.path / "target");
+    BundleBuilder builder(target.project());
     const Hash value = addValue(builder, TreeKind::Raw);
     const Key zero{};
     Hash root = builder.leaf(zero, value);
@@ -333,11 +347,11 @@ void testValidMaximumTrieDepth() {
         root = builder.branch(static_cast<std::uint8_t>(depth), zero,
                               {{0, root}, {1, leaf}});
     }
-    const Hash tip = builder.revision(root);
+    const BuiltRevision tip = builder.revision(root);
     const std::filesystem::path bundle = temporary.path / "deep.aowbundle";
     builder.write(bundle, tip);
-    target.importBranchBundle(bundle, "deep");
-    expect(target.head("deep").id == tip &&
+    target.importBundle(bundle, "deep");
+    expect(target.head("deep") == tip.id &&
                target.scan("deep").size() == 33 &&
                target.get("deep", zero) == Bytes{'d', 'a', 't', 'a'},
            "valid maximum-depth compressed Merkle tree was rejected");
@@ -345,30 +359,31 @@ void testValidMaximumTrieDepth() {
 
 void testMalformedIncremental() {
     TemporaryDirectory temporary("incremental");
-    Repository source(temporary.path / "source");
-    Repository target(temporary.path / "target");
+    ProjectRepository source(temporary.path / "source");
+    ProjectRepository target(temporary.path / "target");
     source.createBranch("stable");
-    const Hash base = source.commit("stable", {{key(33), Bytes{'b', 'a', 's', 'e'}}}).id;
+    const RevisionId base = source.commit("stable", {{key(33), Bytes{'b', 'a', 's', 'e'}}});
     const std::filesystem::path baseline = temporary.path / "baseline.aowbundle";
-    source.exportBranchBundle("stable", baseline);
-    target.importBranchBundle(baseline, "stable");
+    source.exportBundle("stable", baseline);
+    target.importBundle(baseline, "stable");
 
-    BundleBuilder builder;
+    BundleBuilder builder(target.project());
     const Hash root = makeTree(builder, TreeKind::Raw, Defect::DuplicateUuid);
-    const Hash incoming = builder.revision(root, Hash{}, false, base);
+    const BuiltRevision baseRevision{base, source.revision(base).recordHash};
+    const BuiltRevision incoming = builder.revision(root, Hash{}, false, baseRevision);
     const std::filesystem::path delta = temporary.path / "bad-delta.aowbundle";
-    builder.write(delta, incoming, base, source.branchId("stable"));
+    builder.write(delta, incoming, baseRevision, source.branchId("stable"));
     const std::uint64_t objects = target.objectCount();
     const std::uint64_t pack = target.packSize();
     bool failed = false;
     try {
-        (void)target.importBranchBundle(delta, "stable");
+        (void)target.importBundle(delta, "stable");
     } catch (const std::runtime_error& error) {
         failed = true;
         expect(std::string(error.what()).find("wrong slot") != std::string::npos,
                "incremental rejected for reason other than invalid trie path");
     }
-    expect(failed && target.head("stable").id == base &&
+    expect(failed && target.head("stable") == base &&
                target.objectCount() == objects && target.packSize() == pack,
            "malformed incremental Merkle history changed existing branch");
     target.verifyPack();

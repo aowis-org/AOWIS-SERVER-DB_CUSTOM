@@ -1,6 +1,6 @@
 #include "aowis/dvmdb/dvmdb_http_routes.h"
 #include "aowis/dvmdb/storage_error.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
@@ -64,13 +64,13 @@ const char* const routeWorkingCopyEventSave = "/dvmdb/v1/working-copies/:draft/s
 const char* const routeWorkingCopyLease = "/dvmdb/v1/working-copies/:draft/lease";
 const char* const routeWorkingCopyRelease = "/dvmdb/v1/working-copies/:draft/release";
 const char* const routeBranches = "/dvmdb/v1/projects/:id/branches";
-const char* const routeRevisionBundleV2 = "/dvmdb/v1/projects/:id/branches/:branch/bundle";
-const char* const revisionBundleMimeV2 = "application/vnd.aowis.revision-bundle-v2";
+const char* const routeRevisionBundle = "/dvmdb/v1/projects/:id/branches/:branch/bundle";
+const char* const revisionBundleMime = "application/vnd.aowis.revision-bundle-v2";
 const char* const routeNetworks = "/dvmdb/v1/projects/:id/branches/:branch/networks";
 const char* const routeEdits = "/dvmdb/v1/projects/:id/branches/:branch/networks/:network/edits";
-const char* const routeModelCommitsV2 = "/dvmdb/v1/projects/:id/branches/:branch/model-commits";
-const char* const routeMergesV2 = "/dvmdb/v1/projects/:id/merges";
-const char* const routeHydraulicMergesV2 = "/dvmdb/v1/projects/:id/hydraulic-merges";
+const char* const routeModelCommits = "/dvmdb/v1/projects/:id/branches/:branch/model-commits";
+const char* const routeMerges = "/dvmdb/v1/projects/:id/merges";
+const char* const routeHydraulicMerges = "/dvmdb/v1/projects/:id/hydraulic-merges";
 
 // A handled request produces a JSON body and a status.
 struct Reply {
@@ -230,17 +230,17 @@ Hash parseHash(const std::string& value) {
     return parsed;
 }
 
-RevisionId parseRevisionIdV2(const std::string& text) {
+RevisionId parseRevisionId(const std::string& text) {
     const std::optional<RevisionId> id = RevisionId::parse(text);
     requireInput(id.has_value(), "revision ID must be a valid UUIDv7");
     return *id;
 }
 
-QString revisionIdStringV2(const RevisionId& id) {
+QString revisionIdString(const RevisionId& id) {
     return QString::fromStdString(id.toString());
 }
 
-Key parseModelKeyV2(const std::string& text) {
+Key parseModelKey(const std::string& text) {
     requireInput(text.size() == 36, "model key must be a canonical UUID");
     const QString value = QString::fromStdString(text);
     const QUuid uuid(value);
@@ -253,12 +253,12 @@ Key parseModelKeyV2(const std::string& text) {
     return result;
 }
 
-QString modelKeyStringV2(const Key& key) {
+QString modelKeyString(const Key& key) {
     return QUuid::fromRfc4122(QByteArray(reinterpret_cast<const char*>(key.data()), 16))
         .toString(QUuid::WithoutBraces);
 }
 
-Bytes decodeModelPayloadV2(const QJsonObject& object) {
+Bytes decodeModelPayload(const QJsonObject& object) {
     requireInput(object.value("payloadBase64").isString(), "missing model payloadBase64");
     const QByteArray encoded = object.value("payloadBase64").toString().toLatin1();
     requireInput(encoded.size() <= static_cast<qsizetype>(maxJsonModelBytes),
@@ -288,20 +288,20 @@ std::uint64_t strictUint64(const QJsonObject& object, const QString& field) {
 }
 
 QJsonValue optionalRevisionJson(const std::optional<RevisionId>& id) {
-    return id ? QJsonValue(revisionIdStringV2(*id)) : QJsonValue(QJsonValue::Null);
+    return id ? QJsonValue(revisionIdString(*id)) : QJsonValue(QJsonValue::Null);
 }
 
-QJsonObject workingCopyJson(const WorkingCopyInfoV1& draft, bool includeChanges = true) {
+QJsonObject workingCopyJson(const WorkingCopyInfo& draft, bool includeChanges = true) {
     QJsonArray changes;
     if (includeChanges) for (const ModelChange& change : draft.candidateChanges) {
-        const QString uuid = modelKeyStringV2(change.key);
+        const QString uuid = modelKeyString(change.key);
         if (!change.record) {
             changes.append(QJsonObject{{"uuid", uuid}, {"delete", true}});
             continue;
         }
         QJsonArray references;
         for (const Key& reference : change.record->references)
-            references.append(modelKeyStringV2(reference));
+            references.append(modelKeyString(reference));
         const Bytes& payload = change.record->payload;
         const QByteArray bytes = payload.empty() ? QByteArray() :
             QByteArray(reinterpret_cast<const char*>(payload.data()),
@@ -327,7 +327,7 @@ QJsonObject workingCopyJson(const WorkingCopyInfoV1& draft, bool includeChanges 
     if (includeChanges) {
         result.insert(QStringLiteral("changes"), changes);
         QJsonArray events;
-        for (const WorkingCopyEventV1& event : draft.journal) {
+        for (const WorkingCopyEvent& event : draft.journal) {
             const QByteArray bytes(reinterpret_cast<const char*>(event.encoded.data()),
                                    static_cast<qsizetype>(event.encoded.size()));
             events.append(QJsonObject{{"id", QString::fromStdString(event.id)},
@@ -340,7 +340,7 @@ QJsonObject workingCopyJson(const WorkingCopyInfoV1& draft, bool includeChanges 
 
 // Identical native model-record encoding for committed batches and private
 // draft overlays. Draft saves never invoke the commit operation.
-std::vector<ModelChange> parseModelChangesV2(const QJsonObject& object, bool forCommit = false) {
+std::vector<ModelChange> parseModelChanges(const QJsonObject& object, bool forCommit = false) {
     requireInput(object.value("changes").isArray(), "missing changes array");
     const QJsonArray entries = object.value("changes").toArray();
     requireInput(!entries.isEmpty() && entries.size() <= 128,
@@ -353,7 +353,7 @@ std::vector<ModelChange> parseModelChangesV2(const QJsonObject& object, bool for
         requireInput(value.isObject(), "model change must be an object");
         const QJsonObject item = value.toObject();
         requireKeys(item, {"uuid", "delete", "kind", "references", "payloadBase64"});
-        const Key key = parseModelKeyV2(requiredString(item, "uuid"));
+        const Key key = parseModelKey(requiredString(item, "uuid"));
         requireInput(seen.insert(key).second,
                      forCommit ? "duplicate model UUID in commit" : "duplicate model UUID in save");
         if (item.value("delete") == QJsonValue(true)) {
@@ -375,23 +375,23 @@ std::vector<ModelChange> parseModelChangesV2(const QJsonObject& object, bool for
         record.kind = static_cast<std::uint16_t>(number);
         for (const QJsonValue& reference : references) {
             requireInput(reference.isString(), "model reference must be a UUID");
-            record.references.push_back(parseModelKeyV2(reference.toString().toStdString()));
+            record.references.push_back(parseModelKey(reference.toString().toStdString()));
         }
-        record.payload = decodeModelPayloadV2(item);
+        record.payload = decodeModelPayload(item);
         changes.push_back(ModelChange{key, std::move(record)});
     }
     return changes;
 }
 
 
-QJsonObject revisionJsonV2(const RevisionGraphRevisionV2& revision) {
+QJsonObject revisionJson(const RevisionGraphRevision& revision) {
     QJsonArray parents;
     QJsonArray parentHashes;
-    for (const RevisionGraphParentV2& parent : revision.parents) {
-        parents.append(revisionIdStringV2(parent.id));
+    for (const RevisionGraphParent& parent : revision.parents) {
+        parents.append(revisionIdString(parent.id));
         parentHashes.append(QString::fromStdString(toHex(parent.expectedRecordHash)));
     }
-    return QJsonObject{{"id", revisionIdStringV2(revision.id)},
+    return QJsonObject{{"id", revisionIdString(revision.id)},
                        {"recordHash", QString::fromStdString(toHex(revision.recordHash))},
                        {"root", QString::fromStdString(toHex(revision.root))},
                        {"referencesRoot", QString::fromStdString(toHex(revision.referencesRoot))},
@@ -407,7 +407,7 @@ QJsonValue optionalHashJson(const std::optional<Hash>& hash) {
     return hash ? QJsonValue(hashString(*hash)) : QJsonValue(QJsonValue::Null);
 }
 
-QJsonObject mergeJsonV2(const MergeResultV2& result) {
+QJsonObject mergeJson(const MergeResult& result) {
     QString status = QStringLiteral("up_to_date");
     switch (result.status) {
     case MergeStatus::UpToDate: break;
@@ -417,11 +417,11 @@ QJsonObject mergeJsonV2(const MergeResultV2& result) {
     }
     const std::function<QJsonValue(const std::optional<RevisionId>&)> revisionValue =
         [](const std::optional<RevisionId>& id) -> QJsonValue {
-            return id ? QJsonValue(revisionIdStringV2(*id)) : QJsonValue(QJsonValue::Null);
+            return id ? QJsonValue(revisionIdString(*id)) : QJsonValue(QJsonValue::Null);
         };
     QJsonArray conflicts;
     for (const MergeConflict& conflict : result.conflicts) {
-        conflicts.append(QJsonObject{{"uuid", modelKeyStringV2(conflict.key)},
+        conflicts.append(QJsonObject{{"uuid", modelKeyString(conflict.key)},
             {"base", optionalHashJson(conflict.base)},
             {"target", optionalHashJson(conflict.target)},
             {"source", optionalHashJson(conflict.source)},
@@ -455,29 +455,29 @@ QByteArray graphSignature(const QByteArray& payload) {
 }
 
 // One branch HEAD as the graph page and the branch-by-UUID route report it.
-QJsonObject branchHeadJsonV2(const RevisionGraphHeadV2& head) {
+QJsonObject branchHeadJson(const RevisionGraphHead& head) {
     return QJsonObject{{"branch", QString::fromStdString(head.name)},
         {"branchId", QString::fromStdString(head.branchId.toString())},
         {"revision", head.revision
-            ? QJsonValue(revisionIdStringV2(*head.revision)) : QJsonValue(QJsonValue::Null)},
+            ? QJsonValue(revisionIdString(*head.revision)) : QJsonValue(QJsonValue::Null)},
         {"recordHash", head.revision
             ? QJsonValue(hashString(head.recordHash)) : QJsonValue(QJsonValue::Null)},
         {"originBranchId", head.originBranchId
             ? QJsonValue(QString::fromStdString(head.originBranchId->toString()))
             : QJsonValue(QJsonValue::Null)},
         {"forkRevisionId", head.forkRevisionId
-            ? QJsonValue(revisionIdStringV2(*head.forkRevisionId))
+            ? QJsonValue(revisionIdString(*head.forkRevisionId))
             : QJsonValue(QJsonValue::Null)}};
 }
 
-// V2 cursors pin both logical identities and content digests. Reuse the
+// Graph cursors pin both logical identities and content digests. Reuse the
 // process-local HMAC key so callers cannot forge a historical HEAD snapshot.
-QString graphTokenV2(const RevisionGraphCursorV2& cursor, const std::string& projectId) {
+QString graphToken(const RevisionGraphCursor& cursor, const std::string& projectId) {
     QJsonArray heads;
-    for (const RevisionGraphHeadV2& head : cursor.heads) {
+    for (const RevisionGraphHead& head : cursor.heads) {
         heads.append(QJsonArray{QString::fromStdString(head.branchId.toString()),
                                 QString::fromStdString(head.name),
-                                head.revision ? QJsonValue(revisionIdStringV2(*head.revision))
+                                head.revision ? QJsonValue(revisionIdString(*head.revision))
                                               : QJsonValue(QJsonValue::Null),
                                 head.revision ? QJsonValue(hashString(head.recordHash))
                                               : QJsonValue(QJsonValue::Null),
@@ -485,7 +485,7 @@ QString graphTokenV2(const RevisionGraphCursorV2& cursor, const std::string& pro
                                     ? QJsonValue(QString::fromStdString(head.originBranchId->toString()))
                                     : QJsonValue(QJsonValue::Null),
                                 head.forkRevisionId
-                                    ? QJsonValue(revisionIdStringV2(*head.forkRevisionId))
+                                    ? QJsonValue(revisionIdString(*head.forkRevisionId))
                                     : QJsonValue(QJsonValue::Null)});
     }
     const QByteArray payload = QJsonDocument(QJsonObject{
@@ -496,7 +496,7 @@ QString graphTokenV2(const RevisionGraphCursorV2& cursor, const std::string& pro
         QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
 }
 
-RevisionGraphCursorV2 readGraphTokenV2(const std::string& encoded,
+RevisionGraphCursor readGraphToken(const std::string& encoded,
                                        const std::string& projectId) {
     requireInput(!encoded.empty() && encoded.size() <= 230000,
                  "invalid UUIDv7 graph cursor size");
@@ -527,7 +527,7 @@ RevisionGraphCursorV2 readGraphTokenV2(const std::string& encoded,
     requireInput(skip >= 1 && skip <= 250000 &&
                  skip == static_cast<double>(static_cast<std::size_t>(skip)),
                  "invalid UUIDv7 graph cursor offset");
-    RevisionGraphCursorV2 cursor;
+    RevisionGraphCursor cursor;
     cursor.skip = static_cast<std::size_t>(skip);
     const QJsonArray heads = object.value("heads").toArray();
     requireInput(heads.size() <= 1024, "too many UUIDv7 graph heads");
@@ -553,11 +553,11 @@ RevisionGraphCursorV2 readGraphTokenV2(const std::string& encoded,
                      "fork revision requires a source and committed branch HEAD");
         cursor.heads.push_back({*branch, head.at(1).toString().toStdString(),
               head.at(2).isString()
-                  ? std::optional<RevisionId>(parseRevisionIdV2(head.at(2).toString().toStdString()))
+                  ? std::optional<RevisionId>(parseRevisionId(head.at(2).toString().toStdString()))
                   : std::nullopt,
               head.at(3).isString() ? parseHash(head.at(3).toString().toStdString()) : Hash{},
               origin, head.size() == 6 && head.at(5).isString()
-                  ? std::optional<RevisionId>(parseRevisionIdV2(head.at(5).toString().toStdString()))
+                  ? std::optional<RevisionId>(parseRevisionId(head.at(5).toString().toStdString()))
                   : std::nullopt});
     }
     return cursor;
@@ -659,35 +659,35 @@ hydraulic::HydraulicMergeSide mergeSide(const QJsonValue& value) {
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
 // Pin a branch at one UUIDv7 revision for all hydraulic network reads. A
 // historical revision must be an ancestor through either merge parent.
-RevisionId revisionForReadV2(Repository& repository, const ProjectId& project,
+RevisionId revisionForRead(Repository& repository, const ProjectId& project,
                              const std::string& branch, const httplib::Request& request) {
     requireBranch(repository, branch);
-    const RevisionId tip = repository.headV2(project, branch);
+    const RevisionId tip = repository.head(project, branch);
     const std::optional<std::string> requested = queryValue(request, "revision");
     if (!requested) return tip;
-    const RevisionId selected = parseRevisionIdV2(*requested);
-    if (!repository.revisionReachableFromV2(project, tip, selected))
+    const RevisionId selected = parseRevisionId(*requested);
+    if (!repository.revisionReachableFrom(project, tip, selected))
         throw StorageError(StorageErrorKind::NotFound, "revision is not an ancestor of branch HEAD");
     return selected;
 }
 
-ProjectId requestProjectV2(const httplib::Request& request) {
+ProjectId requestProject(const httplib::Request& request) {
     const std::optional<ProjectId> project = ProjectId::parse(pathParam(request, "id"));
     requireInput(project.has_value(), "project ID must be a UUIDv7");
     return *project;
 }
 
-void requireModelIndexedV2(Repository& repository, const ProjectId& project,
+void requireModelIndexed(Repository& repository, const ProjectId& project,
                            const RevisionId& revisionId, const char* missing) {
-    const std::optional<Bytes> bytes = repository.readRevisionV2(project, revisionId);
+    const std::optional<Bytes> bytes = repository.readRevision(project, revisionId);
     if (!bytes) throw StorageError(StorageErrorKind::NotFound, "revision UUID not found");
-    const RevisionRecordV2 snapshot = decodeRevisionRecordV2(*bytes);
+    const RevisionRecord snapshot = decodeRevisionRecord(*bytes);
     if (snapshot.modelIndexed) return;
     if (snapshot.root == Hash{}) throw ProjectError(ProjectErrorKind::NotFound, missing);
     throw ProjectError(ProjectErrorKind::InvalidInput, "revision is not model-indexed");
 }
 
-std::vector<hydraulic::HydraulicEntityChange> parseHydraulicChangesV2(const QJsonObject& object) {
+std::vector<hydraulic::HydraulicEntityChange> parseHydraulicChanges(const QJsonObject& object) {
     requireKeys(object, {"expectedHead", "changes"});
     requireInput(object.value("changes").isArray(), "missing changes array");
     const QJsonArray input = object.value("changes").toArray();
@@ -731,9 +731,9 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
         route == routeWorkingCopyInitializeNetwork ||
         route == routeWorkingCopyRelease) return maxJsonSmallBytes;
     if (route == routeWorkingCopySave || route == routeWorkingCopyEventSave) return maxJsonModelBytes;
-    if (route == routeMergesV2 ||
-        route == routeHydraulicMergesV2) return maxJsonMergeBytes;
-    if (route == routeNetworks || route == routeEdits || route == routeModelCommitsV2) return maxJsonModelBytes;
+    if (route == routeMerges ||
+        route == routeHydraulicMerges) return maxJsonMergeBytes;
+    if (route == routeNetworks || route == routeEdits || route == routeModelCommits) return maxJsonModelBytes;
     return std::nullopt;
 }
 
@@ -741,7 +741,7 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
                           const std::shared_ptr<TransferStagingBudget>& stagingBudget) {
     // Only AOWREV21/22 bundles are exposed over HTTP. The catalogue project
     // identity is authoritative; no name-derived filenames are used.
-    server.Get(routeRevisionBundleV2, [&service, limits, stagingBudget](
+    server.Get(routeRevisionBundle, [&service, limits, stagingBudget](
         const httplib::Request& request, httplib::Response& response) {
         try {
             const std::string id = pathParam(request, "id");
@@ -766,9 +766,9 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
             std::shared_ptr<ScratchFile> exported = std::make_shared<ScratchFile>();
             service.withRepository(id, [&](Repository& repository) {
                 *exported = repository.createScratchFile();
-                if (base) repository.exportIncrementalRevisionBundleV2(*project, branch, *base,
+                if (base) repository.exportIncrementalRevisionBundle(*project, branch, *base,
                                                                          exported->fd(), limits);
-                else repository.exportRevisionBundleV2(*project, branch, exported->fd(), limits);
+                else repository.exportRevisionBundle(*project, branch, exported->fd(), limits);
             });
             const std::uint64_t size = descriptorSize(exported->fd());
             if (limits.maxBytes != 0 && size > limits.maxBytes) {
@@ -777,7 +777,7 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
                 return;
             }
             response.status = 200;
-            response.set_content_provider(static_cast<std::size_t>(size), revisionBundleMimeV2,
+            response.set_content_provider(static_cast<std::size_t>(size), revisionBundleMime,
                 [exported, reservation](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
                     (void)reservation;
                     std::array<char, 64 * 1024> buffer{};
@@ -792,7 +792,7 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
         }
     });
 
-    server.Post(routeRevisionBundleV2, [&service, limits, stagingBudget](
+    server.Post(routeRevisionBundle, [&service, limits, stagingBudget](
         const httplib::Request& request, httplib::Response& response,
         const httplib::ContentReader& reader) {
         bool bodyConsumed = false;
@@ -856,9 +856,9 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
                 return;
             }
             requireInput(received != 0, "empty revision bundle");
-            std::optional<RevisionBundleImportV2> imported;
+            std::optional<RevisionBundleImport> imported;
             service.withRepository(operation, [&](Repository& repository) {
-                imported = repository.importRevisionBundleV2(*project, spool.fd(), branch, limits);
+                imported = repository.importRevisionBundle(*project, spool.fd(), branch, limits);
             });
             const QString status = imported->status == BundleImportStatus::Created ?
                 QStringLiteral("created") : imported->status == BundleImportStatus::FastForward ?
@@ -880,10 +880,10 @@ void registerBundleRoutes(httplib::Server& server, ProjectService& service, Bund
 void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
     // Distinct domain-validated merge route; generic merges do not perform
     // hydraulic semantic validation.
-    server.Post(routeHydraulicMergesV2, [&service](const httplib::Request& request,
+    server.Post(routeHydraulicMerges, [&service](const httplib::Request& request,
                                                    httplib::Response& response) {
         guarded(response, [&]() {
-            const ProjectId project = requestProjectV2(request);
+            const ProjectId project = requestProject(request);
             const QJsonObject object = parseBody(request, maxJsonMergeBytes);
             requireKeys(object, {"target", "source", "expectedTargetHead", "expectedSourceHead",
                                  "fieldChoices", "objectChoices"});
@@ -891,8 +891,8 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             const std::string source = requiredString(object, "source");
             requireInput(target != source, "hydraulic merge requires different branches");
             hydraulic::HydraulicMergeSelections selections{
-                parseRevisionIdV2(requiredString(object, "expectedTargetHead")),
-                parseRevisionIdV2(requiredString(object, "expectedSourceHead")), {}, {}};
+                parseRevisionId(requiredString(object, "expectedTargetHead")),
+                parseRevisionId(requiredString(object, "expectedSourceHead")), {}, {}};
             requireInput(!object.contains("fieldChoices") || object.value("fieldChoices").isArray(),
                          "fieldChoices must be an array");
             requireInput(!object.contains("objectChoices") || object.value("objectChoices").isArray(),
@@ -919,12 +919,12 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
                     parseUuid(requiredString(choice, "entityUuid")),
                     mergeSide(choice.value("side"))});
             }
-            MergeResultV2 result;
+            MergeResult result;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
                 result = hydraulic::mergeHydraulicBranches(
                     repository, project, target, source, selections);
             });
-            return Reply{result.status == MergeStatus::Conflicts ? 409 : 200, mergeJsonV2(result)};
+            return Reply{result.status == MergeStatus::Conflicts ? 409 : 200, mergeJson(result)};
         });
     });
     // Canonical hydraulic routes use UUIDv7 revision identities and preserve
@@ -932,17 +932,17 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
     server.Get("/dvmdb/v1/projects/:id/branches/:branch/networks/:network",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const ProjectId project = requestProjectV2(request);
+            const ProjectId project = requestProject(request);
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
             QJsonObject result;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
-                const RevisionId revision = revisionForReadV2(repository, project,
+                const RevisionId revision = revisionForRead(repository, project,
                                                                pathParam(request, "branch"), request);
-                requireModelIndexedV2(repository, project, revision, "hydraulic network not found");
+                requireModelIndexed(repository, project, revision, "hydraulic network not found");
                 const std::optional<NetworkHydraulic> network =
                     hydraulic::loadHydraulicNetworkAtRevision(repository, project, revision, networkUuid);
                 if (!network) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
-                result = QJsonObject{{"revision", revisionIdStringV2(revision)},
+                result = QJsonObject{{"revision", revisionIdString(revision)},
                                      {"uuid", uuidString(networkUuid)},
                                      {"payloadBase64", encodePayload(ModelCodec<NetworkHydraulic>::encode(*network))}};
             });
@@ -951,10 +951,10 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
     });
     server.Post(routeNetworks, [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const ProjectId project = requestProjectV2(request);
+            const ProjectId project = requestProject(request);
             const QJsonObject object = parseBody(request, maxJsonModelBytes);
             requireKeys(object, {"expectedHead", "payloadBase64"});
-            const RevisionId expected = parseRevisionIdV2(requiredString(object, "expectedHead"));
+            const RevisionId expected = parseRevisionId(requiredString(object, "expectedHead"));
             QString error;
             const std::optional<NetworkHydraulic> network = ModelCodec<NetworkHydraulic>::decode(
                 decodePayload(object, "payloadBase64"), &error);
@@ -967,13 +967,13 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
                 requireBranch(repository, branch);
                 committed = hydraulic::saveHydraulicNetwork(repository, project, branch, *network, expected);
             });
-            return Reply{201, QJsonObject{{"id", revisionIdStringV2(committed)}}};
+            return Reply{201, QJsonObject{{"id", revisionIdString(committed)}}};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/branches/:branch/networks/:network/entities",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const ProjectId project = requestProjectV2(request);
+            const ProjectId project = requestProject(request);
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
             const std::optional<std::string> typeText = queryValue(request, "type");
             bool validType = false;
@@ -981,16 +981,16 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
             requireInput(validType && type < 18, "entity type must be integer in 0..17");
             QJsonObject result;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
-                const RevisionId revision = revisionForReadV2(repository, project,
+                const RevisionId revision = revisionForRead(repository, project,
                                                                pathParam(request, "branch"), request);
-                requireModelIndexedV2(repository, project, revision, "hydraulic network not found");
+                requireModelIndexed(repository, project, revision, "hydraulic network not found");
                 const std::optional<QList<QUuid>> ids = hydraulic::listHydraulicEntityIdsAtRevisionLimited(
                     repository, project, revision, networkUuid,
                     static_cast<hydraulic::HydraulicEntityType>(type), maxHttpEntityIds);
                 if (!ids) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found");
                 QJsonArray entries;
                 for (const QUuid& uuid : *ids) entries.append(uuidString(uuid));
-                result = QJsonObject{{"revision", revisionIdStringV2(revision)},
+                result = QJsonObject{{"revision", revisionIdString(revision)},
                                      {"type", static_cast<int>(type)}, {"uuids", entries}};
             });
             return Reply{200, result};
@@ -999,18 +999,18 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
     server.Get("/dvmdb/v1/projects/:id/branches/:branch/networks/:network/entities/:entity",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const ProjectId project = requestProjectV2(request);
+            const ProjectId project = requestProject(request);
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
             const QUuid entity = parseUuid(pathParam(request, "entity"));
             QJsonObject result;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
-                const RevisionId revision = revisionForReadV2(repository, project,
+                const RevisionId revision = revisionForRead(repository, project,
                                                                pathParam(request, "branch"), request);
-                requireModelIndexedV2(repository, project, revision, "hydraulic network not found");
+                requireModelIndexed(repository, project, revision, "hydraulic network not found");
                 const std::optional<HydraulicEntity> item = hydraulic::loadHydraulicEntityAtRevision(
                     repository, project, revision, networkUuid, entity);
                 if (!item) throw ProjectError(ProjectErrorKind::NotFound, "hydraulic entity not found");
-                result = QJsonObject{{"revision", revisionIdStringV2(revision)},
+                result = QJsonObject{{"revision", revisionIdString(revision)},
                                      {"uuid", uuidString(entity)}, {"type", static_cast<int>(item->index())},
                                      {"payloadBase64", encodePayload(encodeEntity(*item))}};
             });
@@ -1019,11 +1019,11 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
     });
     server.Post(routeEdits, [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const ProjectId project = requestProjectV2(request);
+            const ProjectId project = requestProject(request);
             const QUuid networkUuid = parseUuid(pathParam(request, "network"));
             const QJsonObject object = parseBody(request, maxJsonModelBytes);
-            const RevisionId expected = parseRevisionIdV2(requiredString(object, "expectedHead"));
-            const std::vector<hydraulic::HydraulicEntityChange> changes = parseHydraulicChangesV2(object);
+            const RevisionId expected = parseRevisionId(requiredString(object, "expectedHead"));
+            const std::vector<hydraulic::HydraulicEntityChange> changes = parseHydraulicChanges(object);
             RevisionId committed = expected;
             service.withRepository(pathParam(request, "id"), [&](Repository& repository) {
                 const std::string branch = pathParam(request, "branch");
@@ -1031,7 +1031,7 @@ void registerHydraulicRoutes(httplib::Server& server, ProjectService& service) {
                 committed = hydraulic::editHydraulicNetwork(repository, project, branch, networkUuid,
                                                                changes, expected);
             });
-            return Reply{200, QJsonObject{{"id", revisionIdStringV2(committed)}}};
+            return Reply{200, QJsonObject{{"id", revisionIdString(committed)}}};
         });
     });
 
@@ -1112,18 +1112,18 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     server.Get("/dvmdb/v1/repository/tracking", [&service](const httplib::Request&,
                                                             httplib::Response& response) {
         guarded(response, [&]() {
-            const RepositoryRoleV1 role = service.repositoryRoleV1();
-            const QString roleName = role == RepositoryRoleV1::Private ? QStringLiteral("private") :
-                role == RepositoryRoleV1::Shared ? QStringLiteral("shared") :
+            const RepositoryRole role = service.repositoryRole();
+            const QString roleName = role == RepositoryRole::Private ? QStringLiteral("private") :
+                role == RepositoryRole::Shared ? QStringLiteral("shared") :
                 QStringLiteral("unconfigured");
             QJsonArray remotes;
-            for (const RemoteRepositoryV1& remote : service.remoteRepositoriesV1()) {
+            for (const RemoteRepository& remote : service.remoteRepositories()) {
                 remotes.append(QJsonObject{
                     {"repositoryId", QString::fromStdString(remote.repositoryId)},
                     {"endpoint", QString::fromStdString(remote.endpoint)}});
             }
             QJsonArray tracked;
-            for (const RemoteTrackingRefV1& ref : service.remoteTrackingRefsV1()) {
+            for (const RemoteTrackingRef& ref : service.remoteTrackingRefs()) {
                 tracked.append(QJsonObject{
                     {"remoteRepositoryId", QString::fromStdString(ref.remoteRepositoryId)},
                     {"projectId", QString::fromStdString(ref.projectId)},
@@ -1154,9 +1154,9 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                          "role must be private or shared");
             if (expectedId != service.repositoryId())
                 throw ProjectError(ProjectErrorKind::Conflict, "repository identity changed");
-            const RepositoryRoleV1 requested = name == "private"
-                ? RepositoryRoleV1::Private : RepositoryRoleV1::Shared;
-            service.configureRepositoryRoleV1(requested);
+            const RepositoryRole requested = name == "private"
+                ? RepositoryRole::Private : RepositoryRole::Shared;
+            service.configureRepositoryRole(requested);
             return Reply{200, QJsonObject{
                 {"repositoryId", QString::fromStdString(service.repositoryId())},
                 {"role", QString::fromStdString(name)}}};
@@ -1172,10 +1172,10 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     // not revision-graph commits. Repository role is checked in the native API.
     server.Get(routeWorkingCopies, [&service](const httplib::Request&, httplib::Response& response) {
         guarded(response, [&]() {
-            const std::vector<WorkingCopyInfoV1> drafts = service.listWorkingCopiesV1();
+            const std::vector<WorkingCopyInfo> drafts = service.listWorkingCopies();
             requireInput(drafts.size() <= 1000, "too many working copies for one HTTP response");
             QJsonArray items;
-            for (const WorkingCopyInfoV1& draft : drafts)
+            for (const WorkingCopyInfo& draft : drafts)
                 items.append(workingCopyJson(draft, false));
             return Reply{200, QJsonObject{{"workingCopies", items}}};
         });
@@ -1189,13 +1189,13 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const QJsonValue base = body.value("baseRevision");
             requireInput(base.isNull() || base.isString(), "baseRevision must be UUIDv7 or null");
             const std::optional<RevisionId> revision = base.isString()
-                ? std::optional<RevisionId>(parseRevisionIdV2(base.toString().toStdString()))
+                ? std::optional<RevisionId>(parseRevisionId(base.toString().toStdString()))
                 : std::nullopt;
             // Branch by UUIDv7 (DG-01). A caller-chosen draft `id` makes the
             // creation idempotent: a resent request returns the same draft.
             const std::optional<std::string> draftId = body.contains("id")
                 ? std::optional<std::string>(requiredString(body, "id")) : std::nullopt;
-            return Reply{201, workingCopyJson(service.createWorkingCopyForBranchV1(
+            return Reply{201, workingCopyJson(service.createWorkingCopyForBranch(
                 requiredString(body, "projectId"), requiredString(body, "branchId"), revision,
                 requiredString(body, "sessionId"),
                 draftId ? std::optional<std::string_view>(*draftId) : std::nullopt))};
@@ -1204,7 +1204,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     server.Get("/dvmdb/v1/working-copies/:draft", [&service](const httplib::Request& request,
                                                               httplib::Response& response) {
         guarded(response, [&]() {
-            return Reply{200, workingCopyJson(service.workingCopyV1(pathParam(request, "draft")))};
+            return Reply{200, workingCopyJson(service.workingCopy(pathParam(request, "draft")))};
         });
     });
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
@@ -1214,7 +1214,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     server.Get("/dvmdb/v1/working-copies/:draft/networks/:network",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const WorkingCopyInfoV1 draft = service.workingCopyV1(pathParam(request, "draft"));
+            const WorkingCopyInfo draft = service.workingCopy(pathParam(request, "draft"));
             const std::string networkText = pathParam(request, "network");
             requireInput(UuidV7::parse(networkText).has_value(), "networkId must be UUIDv7");
             const QUuid network(QString::fromStdString(networkText));
@@ -1227,7 +1227,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 const std::map<Key, std::optional<ModelRecord>>::const_iterator found = overlay.find(key);
                 if (found != overlay.end()) return found->second;
                 if (!draft.baseRevision) return std::nullopt;
-                return service.getModelAtRevisionV2(draft.projectId, *draft.baseRevision, key);
+                return service.getModelAtRevision(draft.projectId, *draft.baseRevision, key);
             };
             const std::optional<NetworkHydraulic> result =
                 hydraulic::loadDraftHydraulicNetwork(reader, network);
@@ -1255,7 +1255,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const double seconds = body.value("seconds").toDouble();
             requireInput(seconds >= 1 && seconds <= 120 && seconds == static_cast<double>(static_cast<int>(seconds)),
                          "lease seconds must be 1..120 integer");
-            const WorkingCopyLeaseV1 lease = service.acquireWorkingCopyLeaseV1(
+            const WorkingCopyLease lease = service.acquireWorkingCopyLease(
                 pathParam(request, "draft"), requiredString(body, "sessionId"),
                 static_cast<std::uint32_t>(seconds));
             return Reply{200, QJsonObject{{"token", QString::fromStdString(lease.token)},
@@ -1268,7 +1268,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         guarded(response, [&]() {
             const QJsonObject body = parseBody(request, maxJsonModelBytes);
             requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes"});
-            const std::vector<ModelChange> changes = parseModelChangesV2(body);
+            const std::vector<ModelChange> changes = parseModelChanges(body);
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
             for (const ModelChange& change : changes)
                 requireInput(!change.record ||
@@ -1276,7 +1276,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                               change.record->kind != 101),
                              "native hydraulic manifest/chunk writes are server-owned");
 #endif
-            return Reply{200, workingCopyJson(service.saveWorkingCopyChangesV1(
+            return Reply{200, workingCopyJson(service.saveWorkingCopyChanges(
                 pathParam(request, "draft"), requiredString(body, "sessionId"),
                 requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"), changes))};
         });
@@ -1305,7 +1305,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const ModelChange initial = hydraulic::emptyDraftHydraulicNetworkRoot(
                 QUuid(QString::fromStdString(networkId)), name);
             const std::string draftId = pathParam(request, "draft");
-            const WorkingCopyInfoV1 draft = service.workingCopyV1(draftId);
+            const WorkingCopyInfo draft = service.workingCopy(draftId);
             requireInput(!draft.baseRevision.has_value(),
                          "first-network initialization requires an unborn working copy");
             // A successful response may be lost. Only the same still-leased
@@ -1332,7 +1332,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 !draft.journal.empty())
                 throw ProjectError(ProjectErrorKind::Conflict,
                                    "first network requires an untouched working copy");
-            const WorkingCopyInfoV1 saved = service.saveWorkingCopyChangesV1(
+            const WorkingCopyInfo saved = service.saveWorkingCopyChanges(
                 draftId, session, token, expected, {initial});
             return Reply{200, workingCopyJson(saved)};
         });
@@ -1343,7 +1343,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         guarded(response, [&]() {
             const QJsonObject body = parseBody(request, maxJsonModelBytes);
             requireKeys(body, {"sessionId", "fencingToken", "expectedGeneration", "changes", "events", "membership"});
-            const std::vector<ModelChange> changes = parseModelChangesV2(body);
+            const std::vector<ModelChange> changes = parseModelChanges(body);
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
             for (const ModelChange& change : changes)
                 requireInput(!change.record ||
@@ -1419,8 +1419,8 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                  collection == static_cast<double>(static_cast<std::uint16_t>(collection)),
                                  "invalid membership kind or collection index");
                     hydraulic::DraftMembershipIntent intent;
-                    intent.network = parseModelKeyV2(requiredString(entry, "networkId"));
-                    intent.member = parseModelKeyV2(requiredString(entry, "entityId"));
+                    intent.network = parseModelKey(requiredString(entry, "networkId"));
+                    intent.member = parseModelKey(requiredString(entry, "entityId"));
                     intent.kind = static_cast<std::uint16_t>(kind);
                     intent.collection = static_cast<std::uint16_t>(collection);
                     intent.inserted = entry.value("inserted").toBool();
@@ -1435,7 +1435,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 logicalRequestFingerprint = QCryptographicHash::hash(
                     requestBytes, QCryptographicHash::Sha256).toHex().toStdString();
                 const std::string draftId = pathParam(request, "draft");
-                const WorkingCopyInfoV1 draft = service.workingCopyV1(draftId);
+                const WorkingCopyInfo draft = service.workingCopy(draftId);
                 const std::uint64_t expected = strictUint64(body, "expectedGeneration");
                 if (draft.generation == expected && !intents.empty()) {
                     std::map<Key, std::optional<ModelRecord>> existing;
@@ -1447,7 +1447,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                             existing.find(key);
                         if (it != existing.end()) return it->second;
                         if (!draft.baseRevision) return std::nullopt;
-                        return service.getModelAtRevisionV2(draft.projectId, *draft.baseRevision, key);
+                        return service.getModelAtRevision(draft.projectId, *draft.baseRevision, key);
                     };
                     // Every membership transition must be the exact
                     // before/after image in the MODEL event journal. Otherwise
@@ -1521,7 +1521,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                                    "hydraulic membership requires the model persistence build");
 #endif
             }
-            const WorkingCopyInfoV1 saved = service.saveWorkingCopyTransactionsV1(
+            const WorkingCopyInfo saved = service.saveWorkingCopyTransactions(
                 pathParam(request, "draft"), requiredString(body, "sessionId"),
                 requiredString(body, "fencingToken"), strictUint64(body, "expectedGeneration"),
                 materialized, events, logicalRequestFingerprint);
@@ -1544,7 +1544,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         guarded(response, [&]() {
             const QJsonObject body = parseBody(request, maxJsonSmallBytes);
             requireKeys(body, {"sessionId", "fencingToken"});
-            service.releaseWorkingCopyLeaseV1(pathParam(request, "draft"),
+            service.releaseWorkingCopyLease(pathParam(request, "draft"),
                 requiredString(body, "sessionId"), requiredString(body, "fencingToken"));
             return Reply{200, QJsonObject{{"released", true}}};
         });
@@ -1569,11 +1569,11 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             // answer instead of creating a second project.
             if (object.contains("id")) {
                 requireInput(unborn.toBool(false), "a caller-chosen project id requires unborn: true");
-                return Reply{201, projectJson(service.createUnbornProjectV2(
+                return Reply{201, projectJson(service.createUnbornProject(
                     name, requiredString(object, "id")))};
             }
             return Reply{201, projectJson(unborn.toBool(false)
-                ? service.createUnbornProjectV2(name) : service.createProjectV2(name))};
+                ? service.createUnbornProject(name) : service.createProject(name))};
         });
     });
     server.Post("/dvmdb/v1/projects/clone-target", [&service](const httplib::Request& request,
@@ -1583,7 +1583,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             requireKeys(object, {"projectId", "name"});
             const std::string id = requiredString(object, "projectId");
             const std::string name = requiredString(object, "name");
-            return Reply{200, projectJson(service.provisionCloneTargetV2(id, name))};
+            return Reply{200, projectJson(service.provisionCloneTarget(id, name))};
         });
     });
     // An unborn branch has no revision to export as a bundle. Only an empty
@@ -1596,7 +1596,7 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const std::string project = pathParam(request, "id");
             const std::string branchId = requiredString(object, "branchId");
             const std::string name = requiredString(object, "name");
-            service.provisionUnbornBranchV2(project, name, branchId);
+            service.provisionUnbornBranch(project, name, branchId);
             return Reply{200, QJsonObject{{"branchId", QString::fromStdString(branchId)},
                 {"branch", QString::fromStdString(name)},
                 {"revision", QJsonValue(QJsonValue::Null)}}};
@@ -1634,20 +1634,20 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const std::string identity = object.contains("id")
                 ? requiredString(object, "id") : BranchId::generate().toString();
             const std::optional<RevisionId> revision = object.contains("revision")
-                ? std::optional<RevisionId>(parseRevisionIdV2(requiredString(object, "revision")))
+                ? std::optional<RevisionId>(parseRevisionId(requiredString(object, "revision")))
                 : std::nullopt;
             // Return the identity/provenance captured by the atomic native
             // branch write. Never re-resolve a mutable branch name afterward.
-            const BranchCreationResultV2 created =
-                service.createBranchFromIdV2(project, name, source, revision, identity);
-            return Reply{201, QJsonObject{{"id", revisionIdStringV2(created.revisionId)},
+            const BranchCreationResult created =
+                service.createBranchFromId(project, name, source, revision, identity);
+            return Reply{201, QJsonObject{{"id", revisionIdString(created.revisionId)},
                 {"branch", QString::fromStdString(name)},
                 {"branchId", QString::fromStdString(created.branchId.toString())},
                 {"originBranchId", created.originBranchId
                     ? QJsonValue(QString::fromStdString(created.originBranchId->toString()))
                     : QJsonValue(QJsonValue::Null)},
                 {"forkRevisionId", created.forkRevisionId
-                    ? QJsonValue(revisionIdStringV2(*created.forkRevisionId))
+                    ? QJsonValue(revisionIdString(*created.forkRevisionId))
                     : QJsonValue(QJsonValue::Null)}}};
         });
     });
@@ -1659,14 +1659,14 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const std::string projectId = pathParam(request, "id");
             const std::string previous = pathParam(request, "branch");
             const std::string renamed = requiredString(object, "name");
-            const RevisionId expected = parseRevisionIdV2(requiredString(object, "expectedHead"));
+            const RevisionId expected = parseRevisionId(requiredString(object, "expectedHead"));
             const std::optional<ProjectId> project = ProjectId::parse(projectId);
             requireInput(project.has_value(), "project must be UUIDv7");
             service.withRepository(projectId, [&](Repository& repository) {
-                repository.renameBranchV2(*project, previous, renamed, expected);
+                repository.renameBranch(*project, previous, renamed, expected);
             });
             return Reply{200, QJsonObject{{"name", QString::fromStdString(renamed)},
-                                           {"head", revisionIdStringV2(expected)}}};
+                                           {"head", revisionIdString(expected)}}};
         });
     });
     // A branch by UUIDv7 (DG-01): its current name, HEAD and provenance.
@@ -1675,11 +1675,11 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
     server.Get("/dvmdb/v1/projects/:id/branch-ids/:branchId",
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
-            const std::optional<RevisionGraphHeadV2> head = service.branchByIdV2(
+            const std::optional<RevisionGraphHead> head = service.branchById(
                 pathParam(request, "id"), pathParam(request, "branchId"));
             if (!head) return errorReply(404, QStringLiteral("not_found"),
                                          QStringLiteral("branch UUIDv7 not found"));
-            return Reply{200, branchHeadJsonV2(*head)};
+            return Reply{200, branchHeadJson(*head)};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/branches/:branch/head",
@@ -1687,8 +1687,8 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         guarded(response, [&]() {
             const std::string project = pathParam(request, "id");
             const std::string branch = pathParam(request, "branch");
-            const std::optional<RevisionId> head = service.optionalHeadV2(project, branch);
-            return Reply{200, QJsonObject{{"id", head ? QJsonValue(revisionIdStringV2(*head))
+            const std::optional<RevisionId> head = service.optionalHead(project, branch);
+            return Reply{200, QJsonObject{{"id", head ? QJsonValue(revisionIdString(*head))
                                                       : QJsonValue(QJsonValue::Null)}}};
         });
     });
@@ -1704,11 +1704,11 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             }
             std::optional<RevisionId> after;
             if (const std::optional<std::string> value = queryValue(request, "after"))
-                after = parseRevisionIdV2(*value);
+                after = parseRevisionId(*value);
             QJsonArray revisions;
-            for (const RevisionGraphRevisionV2& revision : service.historyV2(
+            for (const RevisionGraphRevision& revision : service.history(
                     pathParam(request, "id"), pathParam(request, "branch"), limit, after))
-                revisions.append(revisionJsonV2(revision));
+                revisions.append(revisionJson(revision));
             return Reply{200, QJsonObject{{"revisions", revisions}}};
         });
     });
@@ -1716,21 +1716,21 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                [&service](const httplib::Request& request, httplib::Response& response) {
         guarded(response, [&]() {
             const std::string projectId = pathParam(request, "id");
-            const RevisionId revisionId = parseRevisionIdV2(pathParam(request, "revision"));
+            const RevisionId revisionId = parseRevisionId(pathParam(request, "revision"));
             const std::optional<ProjectId> project = ProjectId::parse(projectId);
             requireInput(project.has_value(), "project must be UUIDv7");
-            std::optional<RevisionRecordV2> record;
+            std::optional<RevisionRecord> record;
             service.withRepository(projectId, [&](Repository& repository) {
-                const std::optional<Bytes> bytes = repository.readRevisionV2(*project, revisionId);
-                if (bytes) record = decodeRevisionRecordV2(*bytes);
+                const std::optional<Bytes> bytes = repository.readRevision(*project, revisionId);
+                if (bytes) record = decodeRevisionRecord(*bytes);
             });
             if (!record) throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
-            const Hash digest = hashRevisionRecordV2(*record);
-            RevisionGraphRevisionV2 described{record->id, digest, record->root,
+            const Hash digest = hashRevisionRecord(*record);
+            RevisionGraphRevision described{record->id, digest, record->root,
                                               record->referencesRoot, record->modelIndexed, {}};
-            for (const RevisionParentV2& parent : record->parents)
+            for (const RevisionParent& parent : record->parents)
                 described.parents.push_back({parent.id, parent.expectedRecordHash});
-            return Reply{200, revisionJsonV2(described)};
+            return Reply{200, revisionJson(described)};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/revision-graph",
@@ -1744,38 +1744,38 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 requireInput(ok && number > 0 && number <= 1000, "invalid graph limit");
                 limit = number;
             }
-            std::optional<RevisionGraphCursorV2> cursor;
+            std::optional<RevisionGraphCursor> cursor;
             if (const std::optional<std::string> value = queryValue(request, "cursor"))
-                cursor = readGraphTokenV2(*value, project);
-            const RevisionGraphPageV2 page = service.revisionGraphV2(project, limit, std::move(cursor));
+                cursor = readGraphToken(*value, project);
+            const RevisionGraphPage page = service.revisionGraph(project, limit, std::move(cursor));
             QJsonArray heads;
-            for (const RevisionGraphHeadV2& head : page.heads)
-                heads.append(branchHeadJsonV2(head));
+            for (const RevisionGraphHead& head : page.heads)
+                heads.append(branchHeadJson(head));
             QJsonArray revisions;
-            for (const RevisionGraphRevisionV2& revision : page.revisions)
-                revisions.append(revisionJsonV2(revision));
+            for (const RevisionGraphRevision& revision : page.revisions)
+                revisions.append(revisionJson(revision));
             return Reply{200, QJsonObject{{"heads", heads}, {"revisions", revisions},
                 {"complete", !page.next.has_value()},
-                {"nextCursor", page.next ? QJsonValue(graphTokenV2(*page.next, project))
+                {"nextCursor", page.next ? QJsonValue(graphToken(*page.next, project))
                                          : QJsonValue(QJsonValue::Null)}}};
         });
     });
     // This is a generic native ModelRecord batch, not the high-level hydraulic
     // editor: the caller supplies opaque model payload bytes. The native store
     // enforces reference integrity but does not decode hydraulic field semantics.
-    server.Post(routeModelCommitsV2, [&service](const httplib::Request& request,
+    server.Post(routeModelCommits, [&service](const httplib::Request& request,
                                                  httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject object = parseBody(request, maxJsonModelBytes);
             requireKeys(object, {"expectedHead", "changes"});
-            const RevisionId expected = parseRevisionIdV2(requiredString(object, "expectedHead"));
-            std::vector<ModelChange> changes = parseModelChangesV2(object, true);
-            const RevisionId saved = service.commitModelV2(pathParam(request, "id"),
+            const RevisionId expected = parseRevisionId(requiredString(object, "expectedHead"));
+            std::vector<ModelChange> changes = parseModelChanges(object, true);
+            const RevisionId saved = service.commitModel(pathParam(request, "id"),
                                            pathParam(request, "branch"), std::move(changes), expected);
-            return Reply{201, QJsonObject{{"id", revisionIdStringV2(saved)}}};
+            return Reply{201, QJsonObject{{"id", revisionIdString(saved)}}};
         });
     });
-    server.Post(routeMergesV2, [&service](const httplib::Request& request,
+    server.Post(routeMerges, [&service](const httplib::Request& request,
                                           httplib::Response& response) {
         guarded(response, [&]() {
             const QJsonObject object = parseBody(request, maxJsonMergeBytes);
@@ -1783,11 +1783,11 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             const std::string target = requiredString(object, "target");
             const std::string source = requiredString(object, "source");
             requireInput(target != source, "merge branches must differ");
-            const RevisionId expectedTarget = parseRevisionIdV2(requiredString(object, "expectedTargetHead"));
-            const RevisionId expectedSource = parseRevisionIdV2(requiredString(object, "expectedSourceHead"));
-            const MergeResultV2 result = service.mergeBranchesV2(pathParam(request, "id"),
+            const RevisionId expectedTarget = parseRevisionId(requiredString(object, "expectedTargetHead"));
+            const RevisionId expectedSource = parseRevisionId(requiredString(object, "expectedSourceHead"));
+            const MergeResult result = service.mergeBranches(pathParam(request, "id"),
                                              target, source, expectedTarget, expectedSource);
-            return Reply{result.status == MergeStatus::Conflicts ? 409 : 200, mergeJsonV2(result)};
+            return Reply{result.status == MergeStatus::Conflicts ? 409 : 200, mergeJson(result)};
         });
     });
     server.Get("/dvmdb/v1/projects/:id/diff", [&service](const httplib::Request& request,
@@ -1795,23 +1795,23 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
         guarded(response, [&]() {
             const std::optional<std::string> from = queryValue(request, "from");
             const std::optional<std::string> to = queryValue(request, "to");
-            requireInput(from && to, "diff-v2 requires from and to UUIDv7 revisions");
-            const RevisionId before = parseRevisionIdV2(*from);
-            const RevisionId after = parseRevisionIdV2(*to);
+            requireInput(from && to, "diff requires from and to UUIDv7 revisions");
+            const RevisionId before = parseRevisionId(*from);
+            const RevisionId after = parseRevisionId(*to);
             const std::string project = pathParam(request, "id");
             const std::optional<ProjectId> projectId = ProjectId::parse(project);
             requireInput(projectId.has_value(), "project ID must be UUIDv7");
             QJsonArray changes;
             service.withRepository(project, [&](Repository& repository) {
-                for (const Difference& difference : repository.diffRevisionsV2(
+                for (const Difference& difference : repository.diffRevisions(
                         *projectId, before, after, maxHttpDiffRecords)) {
-                    changes.append(QJsonObject{{"uuid", modelKeyStringV2(difference.key)},
+                    changes.append(QJsonObject{{"uuid", modelKeyString(difference.key)},
                         {"before", optionalHashJson(difference.before)},
                         {"after", optionalHashJson(difference.after)}});
                 }
             });
-            return Reply{200, QJsonObject{{"from", revisionIdStringV2(before)},
-                {"to", revisionIdStringV2(after)}, {"changes", changes}}};
+            return Reply{200, QJsonObject{{"from", revisionIdString(before)},
+                {"to", revisionIdString(after)}, {"changes", changes}}};
         });
     });
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC

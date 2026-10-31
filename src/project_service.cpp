@@ -1,7 +1,7 @@
 #include "branch_name_validation.h"
 #include "aowis/dvmdb/project_service.h"
 #include "aowis/dvmdb/object_id.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -185,16 +185,16 @@ std::string loadRepositoryIdentity(const std::filesystem::path& root) {
 // logical project and logical branch UUIDv7, never by a mutable name.
 using TrackingKeyOnDisk = std::tuple<std::string, std::string, std::string>;
 struct TrackingStateOnDisk {
-    RepositoryRoleV1 role = RepositoryRoleV1::Unconfigured;
-    std::map<std::string, RemoteRepositoryV1> remotes;
-    std::map<TrackingKeyOnDisk, RemoteTrackingRefV1> refs;
+    RepositoryRole role = RepositoryRole::Unconfigured;
+    std::map<std::string, RemoteRepository> remotes;
+    std::map<TrackingKeyOnDisk, RemoteTrackingRef> refs;
 };
 
-std::string roleToken(RepositoryRoleV1 role) {
+std::string roleToken(RepositoryRole role) {
     switch (role) {
-    case RepositoryRoleV1::Unconfigured: return "unconfigured";
-    case RepositoryRoleV1::Private: return "private";
-    case RepositoryRoleV1::Shared: return "shared";
+    case RepositoryRole::Unconfigured: return "unconfigured";
+    case RepositoryRole::Private: return "private";
+    case RepositoryRole::Shared: return "shared";
     }
     throw ProjectError(ProjectErrorKind::InvalidInput, "invalid repository role");
 }
@@ -274,16 +274,16 @@ TrackingStateOnDisk loadTrackingState(const std::filesystem::path& root,
     check(static_cast<bool>(std::getline(input, line)) && line == "AOWIS-TRACKING-1",
           "invalid repository tracking metadata marker");
     check(static_cast<bool>(std::getline(input, line)), "missing repository tracking role");
-    if (line == "role\tunconfigured") result.role = RepositoryRoleV1::Unconfigured;
-    else if (line == "role\tprivate") result.role = RepositoryRoleV1::Private;
-    else if (line == "role\tshared") result.role = RepositoryRoleV1::Shared;
+    if (line == "role\tunconfigured") result.role = RepositoryRole::Unconfigured;
+    else if (line == "role\tprivate") result.role = RepositoryRole::Private;
+    else if (line == "role\tshared") result.role = RepositoryRole::Shared;
     else check(false, "invalid repository tracking role");
     while (std::getline(input, line)) {
         const std::vector<std::string> fields = trackingFields(line);
         if (fields.size() == 3 && fields[0] == "remote") {
             check(UuidV7::parse(fields[1]).has_value() && fields[1] != localRepositoryId,
                   "invalid remote repository UUID in tracking registry");
-            const RemoteRepositoryV1 remote{fields[1], decodeRemoteEndpoint(fields[2])};
+            const RemoteRepository remote{fields[1], decodeRemoteEndpoint(fields[2])};
             check(result.remotes.emplace(remote.repositoryId, remote).second &&
                   result.remotes.size() <= 64, "duplicate or excessive remote registry entries");
         } else if (fields.size() == 5 && fields[0] == "ref") {
@@ -292,7 +292,7 @@ TrackingStateOnDisk loadTrackingState(const std::filesystem::path& root,
                   UuidV7::parse(fields[3]).has_value() &&
                   (fields[4] == "-" || RevisionId::parse(fields[4]).has_value()),
                   "invalid qualified remote tracking ref");
-            RemoteTrackingRefV1 ref{fields[1], fields[2], fields[3], std::nullopt};
+            RemoteTrackingRef ref{fields[1], fields[2], fields[3], std::nullopt};
             if (fields[4] != "-") ref.observedHead = *RevisionId::parse(fields[4]);
             check(result.refs.emplace(TrackingKeyOnDisk{ref.remoteRepositoryId, ref.projectId,
                   ref.branchId}, ref).second && result.refs.size() <= 10000,
@@ -301,10 +301,10 @@ TrackingStateOnDisk loadTrackingState(const std::filesystem::path& root,
     }
     check(input.eof() && !input.bad(), "cannot read full repository tracking metadata");
     std::set<std::string> endpoints;
-    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : result.remotes)
+    for (const std::pair<const std::string, RemoteRepository>& entry : result.remotes)
         check(endpoints.insert(entry.second.endpoint).second,
               "remote endpoint assigned to multiple repository UUIDs");
-    for (const std::pair<const TrackingKeyOnDisk, RemoteTrackingRefV1>& record : result.refs)
+    for (const std::pair<const TrackingKeyOnDisk, RemoteTrackingRef>& record : result.refs)
         check(result.remotes.contains(record.second.remoteRepositoryId),
               "tracking ref references an unregistered repository");
     return result;
@@ -312,10 +312,10 @@ TrackingStateOnDisk loadTrackingState(const std::filesystem::path& root,
 
 void storeTrackingState(const std::filesystem::path& root, const TrackingStateOnDisk& state) {
     std::string body = "AOWIS-TRACKING-1\nrole\t" + roleToken(state.role) + "\n";
-    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : state.remotes)
+    for (const std::pair<const std::string, RemoteRepository>& entry : state.remotes)
         body += "remote\t" + entry.first + "\t" + encodeName(entry.second.endpoint) + "\n";
-    for (const std::pair<const TrackingKeyOnDisk, RemoteTrackingRefV1>& entry : state.refs) {
-        const RemoteTrackingRefV1& ref = entry.second;
+    for (const std::pair<const TrackingKeyOnDisk, RemoteTrackingRef>& entry : state.refs) {
+        const RemoteTrackingRef& ref = entry.second;
         body += "ref\t" + ref.remoteRepositoryId + "\t" + ref.projectId + "\t" +
             ref.branchId + "\t" + (ref.observedHead ? ref.observedHead->toString() : "-") + "\n";
     }
@@ -405,14 +405,9 @@ ProjectError::ProjectError(ProjectErrorKind kind, std::string message)
 ProjectErrorKind ProjectError::kind() const noexcept { return this->kind_; }
 
 bool ProjectService::validProjectId(std::string_view id) {
-    if (id.size() != 36) return false;
-    for (std::size_t i = 0; i < id.size(); ++i) {
-        if (i == 8 || i == 13 || i == 18 || i == 23) {
-            if (id[i] != '-') return false;
-        } else if (!((id[i] >= '0' && id[i] <= '9') ||
-                     (id[i] >= 'a' && id[i] <= 'f'))) return false;
-    }
-    return true;
+    // Canonical lowercase UUIDv7 only; other UUID versions are not projects.
+    const std::optional<ProjectId> parsed = ProjectId::parse(id);
+    return parsed.has_value() && parsed->toString() == id;
 }
 
 bool ProjectService::validBranchName(std::string_view name) {
@@ -482,7 +477,7 @@ Bytes unhexBytes(std::string_view encoded) {
 // entity schema belongs to MODEL; the HTTP endpoint additionally decodes it
 // with ModelEditTransactionCodec. This Qt-free service verifies framing,
 // length, SHA-256, and the event's intrinsic UUIDv7 before persisting it.
-WorkingCopyEventV1 verifiedEditEvent(const Bytes& encoded) {
+WorkingCopyEvent verifiedEditEvent(const Bytes& encoded) {
     constexpr std::size_t header = 9;
     constexpr std::size_t digest = 32;
     if (encoded.size() < header + 16 + digest || encoded.size() > 8 * 1024 * 1024 + header + digest ||
@@ -503,11 +498,11 @@ WorkingCopyEventV1 verifiedEditEvent(const Bytes& encoded) {
     const std::string id = uuid.toString();
     if (!UuidV7::parse(id).has_value())
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid edit event UUIDv7");
-    return WorkingCopyEventV1{id, encoded};
+    return WorkingCopyEvent{id, encoded};
 }
 
 std::string saveBatchFingerprint(const std::vector<ModelChange>& changes,
-                                 const std::vector<WorkingCopyEventV1>& events) {
+                                 const std::vector<WorkingCopyEvent>& events) {
     // Canonical, unambiguous length-delimited digest of the complete request.
     // Sort changes by key because candidate overlay order is entity identity.
     std::map<Key, std::optional<ModelRecord>> ordered;
@@ -528,7 +523,7 @@ std::string saveBatchFingerprint(const std::vector<ModelChange>& changes,
         bytes.insert(bytes.end(), record.begin(), record.end());
     }
     appendSize(events.size());
-    for (const WorkingCopyEventV1& event : events) {
+    for (const WorkingCopyEvent& event : events) {
         appendSize(event.encoded.size());
         bytes.insert(bytes.end(), event.encoded.begin(), event.encoded.end());
     }
@@ -536,7 +531,7 @@ std::string saveBatchFingerprint(const std::vector<ModelChange>& changes,
     return hexBytes(hash.data(), hash.size());
 }
 
-std::string draftBody(const WorkingCopyInfoV1& draft) {
+std::string draftBody(const WorkingCopyInfo& draft) {
     std::string body = std::string(workingCopyMarker)
         + "project\t" + draft.projectId + "\n"
         + "branch\t" + draft.branchId + "\n"
@@ -561,7 +556,7 @@ std::string draftBody(const WorkingCopyInfoV1& draft) {
               StorageErrorKind::InvalidInput);
     }
     body += "events\t" + std::to_string(draft.journal.size()) + "\n";
-    for (const WorkingCopyEventV1& event : draft.journal) {
+    for (const WorkingCopyEvent& event : draft.journal) {
         body += "event\t" + event.id + "\t" +
             hexBytes(event.encoded.data(), event.encoded.size()) + "\n";
         check(body.size() <= workingCopyMaxBytes, "draft event journal exceeds storage limit",
@@ -573,7 +568,7 @@ std::string draftBody(const WorkingCopyInfoV1& draft) {
     return body;
 }
 
-WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
+WorkingCopyInfo readWorkingCopy(const std::filesystem::path& path) {
     check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path)
           && std::filesystem::file_size(path) <= workingCopyMaxBytes,
           "unsafe or oversized working-copy record: " + path.string());
@@ -595,7 +590,7 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
               "invalid working-copy record field: " + std::string(name));
         return line.substr(name.size() + 1);
     };
-    WorkingCopyInfoV1 draft;
+    WorkingCopyInfo draft;
     draft.id = id;
     draft.projectId = nextField("project");
     draft.branchId = nextField("branch");
@@ -645,7 +640,7 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
             const std::size_t tab = field.find('\t');
             check(tab == 36 && field.find('\t', tab + 1) == std::string::npos,
                   "malformed draft journal event");
-            const WorkingCopyEventV1 event = verifiedEditEvent(
+            const WorkingCopyEvent event = verifiedEditEvent(
                 unhexBytes(std::string_view(field).substr(tab + 1)));
             check(field.substr(0, tab) == event.id && eventIds.insert(event.id).second,
                   "invalid or duplicate draft journal event");
@@ -680,7 +675,7 @@ WorkingCopyInfoV1 readWorkingCopy(const std::filesystem::path& path) {
 // Stage, fsync, rename and fsync the parent. A crash yields either the old
 // complete record or the new complete record, never an acknowledged half-save.
 void replaceWorkingCopyRecord(const std::filesystem::path& root,
-                              const WorkingCopyInfoV1& draft) {
+                              const WorkingCopyInfo& draft) {
     const std::filesystem::path directory = workingCopyDirectory(root);
     const std::filesystem::path published = directory / draft.id;
     const std::filesystem::path stage = directory / (".updating-" + UuidV7::generate().toString());
@@ -715,7 +710,7 @@ void replaceWorkingCopyRecord(const std::filesystem::path& root,
 }
 
 void createWorkingCopyRecord(const std::filesystem::path& root,
-                             const WorkingCopyInfoV1& draft) {
+                             const WorkingCopyInfo& draft) {
     const std::filesystem::path directory = workingCopyDirectory(root);
     if (!std::filesystem::exists(directory)) {
         syscallChecked(std::filesystem::create_directory(directory), "create working-copy directory");
@@ -750,6 +745,9 @@ void createWorkingCopyRecord(const std::filesystem::path& root,
         syscallChecked(::unlink(staging.c_str()) == 0, "remove staged working copy");
         syncDirectory(directory);
     } catch (...) {
+        // The staged name is never authoritative; drop it whether or not the
+        // published link exists, so a failed publication leaves no remnant.
+        (void)::unlink(staging.c_str());
         throw;
     }
 }
@@ -761,7 +759,7 @@ constexpr std::string_view localCommitMarker = "AOWIS-LOCAL-COMMIT-1\n";
 constexpr std::size_t localCommitMaxBytes = 8 * 1024 * 1024 + 2048;
 
 struct PersistedLocalCommit {
-    LocalCommitInfoV1 info;
+    LocalCommitInfo info;
     std::string requestDigest;
     std::vector<ModelChange> changes;
 };
@@ -788,17 +786,17 @@ std::string localRequestDigest(std::string_view repositoryId,
         (expected ? expected->toString() : "-") + "\n");
 }
 
-std::string localStateToken(LocalCommitStateV1 state) {
+std::string localStateToken(LocalCommitState state) {
     switch (state) {
-    case LocalCommitStateV1::Pending: return "pending";
-    case LocalCommitStateV1::Succeeded: return "succeeded";
-    case LocalCommitStateV1::Rejected: return "rejected";
+    case LocalCommitState::Pending: return "pending";
+    case LocalCommitState::Succeeded: return "succeeded";
+    case LocalCommitState::Rejected: return "rejected";
     }
     throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local commit state");
 }
 
 std::string localCommitBody(const PersistedLocalCommit& operation) {
-    const LocalCommitInfoV1& info = operation.info;
+    const LocalCommitInfo& info = operation.info;
     std::string body = std::string(localCommitMarker) +
         "repository\t" + info.repositoryId + "\n" +
         "project\t" + info.projectId + "\n" +
@@ -850,7 +848,7 @@ PersistedLocalCommit readLocalCommit(const std::filesystem::path& path) {
             return line.substr(key.size() + 1);
         };
     PersistedLocalCommit result;
-    LocalCommitInfoV1& info = result.info;
+    LocalCommitInfo& info = result.info;
     info.id = id;
     info.repositoryId = nextField("repository");
     info.projectId = nextField("project");
@@ -862,9 +860,9 @@ PersistedLocalCommit readLocalCommit(const std::filesystem::path& path) {
     result.requestDigest = nextField("request-digest");
     info.payloadDigest = nextField("payload-digest");
     const std::string state = nextField("state");
-    if (state == "pending") info.state = LocalCommitStateV1::Pending;
-    else if (state == "succeeded") info.state = LocalCommitStateV1::Succeeded;
-    else if (state == "rejected") info.state = LocalCommitStateV1::Rejected;
+    if (state == "pending") info.state = LocalCommitState::Pending;
+    else if (state == "succeeded") info.state = LocalCommitState::Succeeded;
+    else if (state == "rejected") info.state = LocalCommitState::Rejected;
     else check(false, "invalid local commit status");
     const std::string rejection = nextField("rejection");
     if (rejection != "-") info.rejection = rejection;
@@ -909,7 +907,7 @@ PersistedLocalCommit readLocalCommit(const std::filesystem::path& path) {
           info.payloadDigest == localDigest(result.requestDigest + "\n" +
               saveBatchFingerprint(result.changes, {}) + "\n"),
           "local commit payload digest mismatch");
-    check((info.state == LocalCommitStateV1::Rejected) == !info.rejection.empty() &&
+    check((info.state == LocalCommitState::Rejected) == !info.rejection.empty() &&
           (info.rejection.empty() || info.rejection == "conflict" ||
            info.rejection == "invalid-input" || info.rejection == "not-found"),
           "invalid local commit rejection");
@@ -971,14 +969,14 @@ void persistLocalCommit(const std::filesystem::path& root,
 // written. Never treat the presence of an orphan revision as proof of Commit:
 // the reserved UUID must be reachable from this branch's current HEAD.
 bool recoverLocalCommit(Repository& repository, const PersistedLocalCommit& operation) {
-    if (operation.info.state != LocalCommitStateV1::Pending) return false;
+    if (operation.info.state != LocalCommitState::Pending) return false;
     const std::optional<ProjectId> project = ProjectId::parse(operation.info.projectId);
     const std::optional<BranchId> branch = BranchId::parse(operation.info.branchId);
     const std::optional<RevisionId> revision = RevisionId::parse(operation.info.reservedRevisionId);
-    const std::optional<RevisionGraphHeadV2> head = repository.branchByIdV2(*project, *branch);
+    const std::optional<RevisionGraphHead> head = repository.branchById(*project, *branch);
     if (!head || !head->revision) return false;
     return *head->revision == *revision ||
-           repository.revisionReachableFromV2(*project, *head->revision, *revision);
+           repository.revisionReachableFrom(*project, *head->revision, *revision);
 }
 
 
@@ -1053,7 +1051,7 @@ std::string ProjectService::repositoryId() const {
     return this->repository_id_;
 }
 
-RepositoryRoleV1 ProjectService::repositoryRoleV1() const {
+RepositoryRole ProjectService::repositoryRole() const {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
     return this->repository_role_;
@@ -1070,28 +1068,28 @@ void ProjectService::persistTrackingMetadata() {
     catch (...) { this->uncertain_ = true; throw; }
 }
 
-void ProjectService::configureRepositoryRoleV1(RepositoryRoleV1 role) {
+void ProjectService::configureRepositoryRole(RepositoryRole role) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    if (role == RepositoryRoleV1::Unconfigured)
+    if (role == RepositoryRole::Unconfigured)
         throw ProjectError(ProjectErrorKind::InvalidInput, "choose private or shared role explicitly");
     if (this->repository_role_ == role) return;
-    if (this->repository_role_ != RepositoryRoleV1::Unconfigured)
+    if (this->repository_role_ != RepositoryRole::Unconfigured)
         throw ProjectError(ProjectErrorKind::Conflict, "repository role already configured");
     this->repository_role_ = role;
     persistTrackingMetadata();
 }
 
-std::vector<RemoteRepositoryV1> ProjectService::remoteRepositoriesV1() const {
+std::vector<RemoteRepository> ProjectService::remoteRepositories() const {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    std::vector<RemoteRepositoryV1> output;
-    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : this->remotes_)
+    std::vector<RemoteRepository> output;
+    for (const std::pair<const std::string, RemoteRepository>& entry : this->remotes_)
         output.push_back(entry.second);
     return output;
 }
 
-void ProjectService::registerRemoteRepositoryV1(std::string_view remoteRepositoryId,
+void ProjectService::registerRemoteRepository(std::string_view remoteRepositoryId,
                                                  std::string_view endpoint) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
@@ -1100,35 +1098,35 @@ void ProjectService::registerRemoteRepositoryV1(std::string_view remoteRepositor
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid remote identity or endpoint");
     const std::string id(remoteRepositoryId);
     const std::string url(endpoint);
-    const std::map<std::string, RemoteRepositoryV1>::const_iterator existing =
+    const std::map<std::string, RemoteRepository>::const_iterator existing =
         this->remotes_.find(id);
     if (existing != this->remotes_.end()) {
         if (existing->second.endpoint == url) return;
         throw ProjectError(ProjectErrorKind::Conflict,
                            "remote repository UUID already registered at another endpoint");
     }
-    for (const std::pair<const std::string, RemoteRepositoryV1>& entry : this->remotes_) {
+    for (const std::pair<const std::string, RemoteRepository>& entry : this->remotes_) {
         if (entry.second.endpoint == url)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "remote endpoint already registered under another UUID");
     }
     if (this->remotes_.size() >= 64)
         throw ProjectError(ProjectErrorKind::InvalidInput, "remote registry limit exceeded");
-    this->remotes_.emplace(id, RemoteRepositoryV1{id, url});
+    this->remotes_.emplace(id, RemoteRepository{id, url});
     persistTrackingMetadata();
 }
 
-std::vector<RemoteTrackingRefV1> ProjectService::remoteTrackingRefsV1() const {
+std::vector<RemoteTrackingRef> ProjectService::remoteTrackingRefs() const {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    std::vector<RemoteTrackingRefV1> output;
-    for (const std::pair<const TrackingKey, RemoteTrackingRefV1>& entry : this->tracking_)
+    std::vector<RemoteTrackingRef> output;
+    for (const std::pair<const TrackingKey, RemoteTrackingRef>& entry : this->tracking_)
         output.push_back(entry.second);
     return output;
 }
 
-void ProjectService::recordRemoteTrackingRefV1(
-    const RemoteTrackingRefV1& observation,
+void ProjectService::recordRemoteTrackingRef(
+    const RemoteTrackingRef& observation,
     std::optional<std::optional<RevisionId>> expectedObservedHead) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
@@ -1139,7 +1137,7 @@ void ProjectService::recordRemoteTrackingRefV1(
                            "tracking ref must target a registered repository and UUIDv7 project/branch");
     const TrackingKey key{observation.remoteRepositoryId, observation.projectId,
                           observation.branchId};
-    const std::map<TrackingKey, RemoteTrackingRefV1>::const_iterator current =
+    const std::map<TrackingKey, RemoteTrackingRef>::const_iterator current =
         this->tracking_.find(key);
     if (!expectedObservedHead.has_value()) {
         if (current != this->tracking_.end())
@@ -1160,27 +1158,23 @@ std::size_t ProjectService::maxPendingOperations() const noexcept {
     return this->maxPending_;
 }
 
-ProjectInfo ProjectService::createProject(std::string_view name) {
-    return createProjectImpl(name, true);
-}
-
-ProjectInfo ProjectService::createUnbornProjectV2(std::string_view name,
+ProjectInfo ProjectService::createUnbornProject(std::string_view name,
                                                  std::optional<std::string_view> projectId) {
     if (projectId && !ProjectId::parse(*projectId))
         throw ProjectError(ProjectErrorKind::InvalidInput, "requested project ID must be UUIDv7");
-    return createProjectImpl(name, true, true,
+    return createProjectImpl(name, true,
                              projectId ? std::optional<std::string>(std::string(*projectId))
                                        : std::nullopt);
 }
 
-ProjectInfo ProjectService::provisionCloneTargetV2(std::string_view projectId,
+ProjectInfo ProjectService::provisionCloneTarget(std::string_view projectId,
                                                     std::string_view name) {
     if (!ProjectId::parse(projectId))
         throw ProjectError(ProjectErrorKind::InvalidInput, "clone target project must be UUIDv7");
-    return createProjectImpl(name, true, false, std::string(projectId));
+    return createProjectImpl(name, false, std::string(projectId));
 }
 
-void ProjectService::provisionUnbornBranchV2(std::string_view projectId,
+void ProjectService::provisionUnbornBranch(std::string_view projectId,
                                              std::string_view name,
                                              std::string_view branchId) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
@@ -1191,24 +1185,20 @@ void ProjectService::provisionUnbornBranchV2(std::string_view projectId,
     {
         std::lock_guard<std::mutex> guard(this->mutex_);
         ensureHealthy();
-        if (this->repository_role_ != RepositoryRoleV1::Private)
+        if (this->repository_role_ != RepositoryRole::Private)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "unborn checkout requires a private repository");
     }
     withRepository(projectId, [&](Repository& repository) {
-        repository.provisionUnbornBranchV2(*project, name, *identity);
+        repository.provisionUnbornBranch(*project, name, *identity);
     });
 }
 
-ProjectInfo ProjectService::createProjectShaFixture(std::string_view name) {
-    return createProjectImpl(name, false);
+ProjectInfo ProjectService::createProject(std::string_view name) {
+    return createProjectImpl(name);
 }
 
-ProjectInfo ProjectService::createProjectV2(std::string_view name) {
-    return createProjectImpl(name, true);
-}
-
-ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2, bool unborn,
+ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool unborn,
                                              std::optional<std::string> requestedProjectId) {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
@@ -1250,14 +1240,12 @@ ProjectInfo ProjectService::createProjectImpl(std::string_view name, bool v2, bo
             if (cloneTarget) {
                 // No local branch, revision or model is fabricated: importing
                 // the verified bundle establishes the original branch UUID.
-            } else if (v2) {
+            } else {
                 const std::optional<ProjectId> project = ProjectId::parse(info.id);
                 if (!project) throw StorageError(StorageErrorKind::Internal,
                                                  "new project UUIDv7 did not validate");
-                if (unborn) repository.createUnbornBranchV2(*project, "main");
-                else (void)repository.createBranchV2(*project, "main");
-            } else {
-                repository.createBranch("main");
+                if (unborn) repository.createUnbornBranch(*project, "main");
+                else (void)repository.createBranch(*project, "main");
             }
         }
         syncDirectory(staging / "repository" / "refs" / "heads");
@@ -1311,7 +1299,7 @@ std::shared_ptr<Repository> ProjectService::openRepository(Project& project) con
     return project.repository;
 }
 
-WorkingCopyInfoV1 ProjectService::createWorkingCopyV1(
+WorkingCopyInfo ProjectService::createWorkingCopy(
         std::string_view projectId, std::string_view branch,
         std::optional<RevisionId> baseRevision, std::string_view sessionId) {
     if (!UuidV7::parse(sessionId).has_value() || !validBranchName(branch))
@@ -1319,11 +1307,11 @@ WorkingCopyInfoV1 ProjectService::createWorkingCopyV1(
     const std::optional<BranchId> localBranch = branchId(projectId, branch);
     if (!localBranch)
         throw ProjectError(ProjectErrorKind::InvalidInput, "draft requires a UUIDv7 branch");
-    return createWorkingCopyForBranchV1(projectId, localBranch->toString(), baseRevision,
+    return createWorkingCopyForBranch(projectId, localBranch->toString(), baseRevision,
                                         sessionId);
 }
 
-WorkingCopyInfoV1 ProjectService::createWorkingCopyForBranchV1(
+WorkingCopyInfo ProjectService::createWorkingCopyForBranch(
         std::string_view projectId, std::string_view branchId,
         std::optional<RevisionId> baseRevision, std::string_view sessionId,
         std::optional<std::string_view> draftId) {
@@ -1333,16 +1321,16 @@ WorkingCopyInfoV1 ProjectService::createWorkingCopyForBranchV1(
     {
         std::lock_guard<std::mutex> guard(this->mutex_);
         ensureHealthy();
-        if (this->repository_role_ != RepositoryRoleV1::Private)
+        if (this->repository_role_ != RepositoryRole::Private)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "working copies require an explicitly private repository");
     }
     // This first VC-04 slice supports exact HEAD checkout only. A concurrent
     // commit after this read cannot change the immutable pinned draft base.
-    const std::optional<RevisionGraphHeadV2> branch = branchByIdV2(projectId, branchId);
+    const std::optional<RevisionGraphHead> branch = branchById(projectId, branchId);
     if (!branch)
         throw ProjectError(ProjectErrorKind::NotFound, "branch UUIDv7 not found");
-    WorkingCopyInfoV1 draft;
+    WorkingCopyInfo draft;
     draft.id = draftId ? std::string(*draftId) : UuidV7::generate().toString();
     draft.projectId = std::string(projectId);
     draft.branchId = branch->branchId.toString();
@@ -1354,7 +1342,7 @@ WorkingCopyInfoV1 ProjectService::createWorkingCopyForBranchV1(
     if (draftId && (std::filesystem::exists(existing) || std::filesystem::is_symlink(existing))) {
         // Repeated request (e.g. a transport resent the POST after a lost
         // response): answer with the draft it created, in its current state.
-        const WorkingCopyInfoV1 stored = readWorkingCopy(existing);
+        const WorkingCopyInfo stored = readWorkingCopy(existing);
         if (stored.projectId != draft.projectId || stored.branchId != draft.branchId ||
             stored.baseRevision != draft.baseRevision || stored.sessionId != draft.sessionId)
             throw ProjectError(ProjectErrorKind::Conflict,
@@ -1369,7 +1357,7 @@ WorkingCopyInfoV1 ProjectService::createWorkingCopyForBranchV1(
     return draft;
 }
 
-WorkingCopyInfoV1 ProjectService::workingCopyV1(std::string_view draftId) const {
+WorkingCopyInfo ProjectService::workingCopy(std::string_view draftId) const {
     if (!UuidV7::parse(draftId).has_value())
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid working-copy UUIDv7");
     std::lock_guard<std::mutex> guard(this->mutex_);
@@ -1380,10 +1368,10 @@ WorkingCopyInfoV1 ProjectService::workingCopyV1(std::string_view draftId) const 
     return readWorkingCopy(path);
 }
 
-std::vector<WorkingCopyInfoV1> ProjectService::listWorkingCopiesV1() const {
+std::vector<WorkingCopyInfo> ProjectService::listWorkingCopies() const {
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    std::vector<WorkingCopyInfoV1> result;
+    std::vector<WorkingCopyInfo> result;
     const std::filesystem::path directory = workingCopyDirectory(this->root_);
     if (!std::filesystem::exists(directory) && !std::filesystem::is_symlink(directory))
         return result;
@@ -1403,25 +1391,25 @@ std::vector<WorkingCopyInfoV1> ProjectService::listWorkingCopiesV1() const {
         result.push_back(readWorkingCopy(entry.path()));
     }
     std::sort(result.begin(), result.end(),
-              [](const WorkingCopyInfoV1& left, const WorkingCopyInfoV1& right) {
+              [](const WorkingCopyInfo& left, const WorkingCopyInfo& right) {
                   return left.id < right.id;
               });
     return result;
 }
 
-WorkingCopyLeaseV1 ProjectService::acquireWorkingCopyLeaseV1(
+WorkingCopyLease ProjectService::acquireWorkingCopyLease(
         std::string_view draftId, std::string_view sessionId, std::uint32_t seconds) {
     if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
         seconds < 1 || seconds > 120)
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft lease parameters");
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    if (this->repository_role_ != RepositoryRoleV1::Private)
+    if (this->repository_role_ != RepositoryRole::Private)
         throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
-    WorkingCopyInfoV1 draft = readWorkingCopy(path);
+    WorkingCopyInfo draft = readWorkingCopy(path);
     const std::uint64_t now = nowEpochMs();
     if (draft.leaseSessionId && draft.leaseExpiresAtMs > now &&
         *draft.leaseSessionId != sessionId)
@@ -1431,10 +1419,10 @@ WorkingCopyLeaseV1 ProjectService::acquireWorkingCopyLeaseV1(
     draft.leaseExpiresAtMs = now + static_cast<std::uint64_t>(seconds) * 1000;
     try { replaceWorkingCopyRecord(this->root_, draft); }
     catch (...) { this->uncertain_ = true; throw; }
-    return WorkingCopyLeaseV1{*draft.leaseToken, draft.leaseExpiresAtMs, draft.generation};
+    return WorkingCopyLease{*draft.leaseToken, draft.leaseExpiresAtMs, draft.generation};
 }
 
-WorkingCopyInfoV1 ProjectService::saveWorkingCopyChangesV1(
+WorkingCopyInfo ProjectService::saveWorkingCopyChanges(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes) {
@@ -1443,12 +1431,12 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyChangesV1(
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft save parameters");
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    if (this->repository_role_ != RepositoryRoleV1::Private)
+    if (this->repository_role_ != RepositoryRole::Private)
         throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
-    WorkingCopyInfoV1 draft = readWorkingCopy(path);
+    WorkingCopyInfo draft = readWorkingCopy(path);
     if (!draft.journal.empty())
         throw ProjectError(ProjectErrorKind::Conflict,
                            "journalled draft requires atomic event saves");
@@ -1480,7 +1468,7 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyChangesV1(
     return draft;
 }
 
-WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
+WorkingCopyInfo ProjectService::saveWorkingCopyTransactions(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken, std::uint64_t expectedGeneration,
         const std::vector<ModelChange>& changes,
@@ -1490,10 +1478,10 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
         !UuidV7::parse(fencingToken).has_value() || changes.size() > workingCopyMaxChanges ||
         encodedTransactions.empty() || encodedTransactions.size() > 128)
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid draft event-save parameters");
-    std::vector<WorkingCopyEventV1> events;
+    std::vector<WorkingCopyEvent> events;
     std::set<std::string> incoming;
     for (const Bytes& bytes : encodedTransactions) {
-        WorkingCopyEventV1 event = verifiedEditEvent(bytes);
+        WorkingCopyEvent event = verifiedEditEvent(bytes);
         if (!incoming.insert(event.id).second)
             throw ProjectError(ProjectErrorKind::InvalidInput, "duplicate edit event UUID");
         events.push_back(std::move(event));
@@ -1508,12 +1496,12 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid logical event request fingerprint");
     std::lock_guard<std::mutex> guard(this->mutex_);
     ensureHealthy();
-    if (this->repository_role_ != RepositoryRoleV1::Private)
+    if (this->repository_role_ != RepositoryRole::Private)
         throw ProjectError(ProjectErrorKind::Conflict, "draft requires a private repository");
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
-    WorkingCopyInfoV1 draft = readWorkingCopy(path);
+    WorkingCopyInfo draft = readWorkingCopy(path);
     if (!draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
         !draft.leaseToken || *draft.leaseToken != fencingToken ||
         draft.leaseExpiresAtMs <= nowEpochMs())
@@ -1527,8 +1515,8 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
         draft.generation == std::numeric_limits<std::uint64_t>::max())
         throw ProjectError(ProjectErrorKind::Conflict, "draft generation changed");
     std::set<std::string> applied;
-    for (const WorkingCopyEventV1& event : draft.journal) applied.insert(event.id);
-    for (const WorkingCopyEventV1& event : events)
+    for (const WorkingCopyEvent& event : draft.journal) applied.insert(event.id);
+    for (const WorkingCopyEvent& event : events)
         if (applied.contains(event.id))
             throw ProjectError(ProjectErrorKind::Conflict, "edit event already saved");
     if (draft.journal.size() + events.size() > workingCopyMaxEvents)
@@ -1551,7 +1539,7 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
     return draft;
 }
 
-LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
+LocalCommitInfo ProjectService::commitWorkingCopy(
         std::string_view operationId, std::string_view draftId,
         std::string_view sessionId, std::string_view fencingToken,
         std::uint64_t expectedGeneration,
@@ -1567,7 +1555,7 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
     {
         std::lock_guard<std::mutex> guard(this->mutex_);
         ensureHealthy();
-        if (this->repository_role_ != RepositoryRoleV1::Private)
+        if (this->repository_role_ != RepositoryRole::Private)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "local Commit requires a private repository");
         if (std::filesystem::exists(operationPath) || std::filesystem::is_symlink(operationPath)) {
@@ -1583,14 +1571,14 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
     const std::string requestDigest = localRequestDigest(
         this->repository_id_, draftId, sessionId, fencingToken,
         expectedGeneration, expectedLocalHead);
-    LocalCommitInfoV1 outcome;
+    LocalCommitInfo outcome;
     // Keep the project's operation mutex across the complete intent/commit/
     // outcome sequence, and the catalogue mutex across draft+ledger access.
     // No concurrent Save can replace the candidate during local Commit.
     withRepository(projectId, [&](Repository& repository) {
         std::lock_guard<std::mutex> guard(this->mutex_);
         ensureHealthy();
-        if (this->repository_role_ != RepositoryRoleV1::Private)
+        if (this->repository_role_ != RepositoryRole::Private)
             throw ProjectError(ProjectErrorKind::Conflict, "not a private repository");
         const bool exists = std::filesystem::exists(operationPath) ||
                             std::filesystem::is_symlink(operationPath);
@@ -1607,7 +1595,7 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
                 std::string(draftId);
             if (!std::filesystem::exists(draftPath) && !std::filesystem::is_symlink(draftPath))
                 throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
-            const WorkingCopyInfoV1 draft = readWorkingCopy(draftPath);
+            const WorkingCopyInfo draft = readWorkingCopy(draftPath);
             if (draft.projectId != projectId || draft.sessionId != sessionId ||
                 draft.baseRevision != expectedLocalHead ||
                 !draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
@@ -1624,9 +1612,9 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
             if (!project || !branch)
                 throw ProjectError(ProjectErrorKind::InvalidInput,
                                    "local Commit requires UUIDv7 project and branch");
-            const std::optional<RevisionGraphHeadV2> current =
-                translated<std::optional<RevisionGraphHeadV2>>([&]() {
-                    return repository.branchByIdV2(*project, *branch);
+            const std::optional<RevisionGraphHead> current =
+                translated<std::optional<RevisionGraphHead>>([&]() {
+                    return repository.branchById(*project, *branch);
                 });
             // HEAD is checked again below, after durable intent creation.
             // Even a stale valid request gets a permanent rejected outcome.
@@ -1646,13 +1634,13 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
             try { persistLocalCommit(this->root_, operation, true); }
             catch (...) { this->uncertain_ = true; throw; }
         }
-        if (operation.info.state == LocalCommitStateV1::Pending &&
+        if (operation.info.state == LocalCommitState::Pending &&
             translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
-            operation.info.state = LocalCommitStateV1::Succeeded;
+            operation.info.state = LocalCommitState::Succeeded;
             try { persistLocalCommit(this->root_, operation, false); }
             catch (...) { this->uncertain_ = true; throw; }
         }
-        if (operation.info.state != LocalCommitStateV1::Pending) {
+        if (operation.info.state != LocalCommitState::Pending) {
             outcome = operation.info;
             return;
         }
@@ -1660,9 +1648,9 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
         const std::optional<BranchId> branch = BranchId::parse(operation.info.branchId);
         const std::optional<RevisionId> reserved =
             RevisionId::parse(operation.info.reservedRevisionId);
-        const std::optional<RevisionGraphHeadV2> current =
-            translated<std::optional<RevisionGraphHeadV2>>([&]() {
-                return repository.branchByIdV2(*project, *branch);
+        const std::optional<RevisionGraphHead> current =
+            translated<std::optional<RevisionGraphHead>>([&]() {
+                return repository.branchById(*project, *branch);
             });
         // If HEAD has moved to something other than the expected base, do not
         // reapply an ambiguous pending write. The same ID remains queryable.
@@ -1670,7 +1658,7 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
             if (exists)
                 throw ProjectError(ProjectErrorKind::Conflict,
                                    "local Commit pending; branch advanced without this revision");
-            operation.info.state = LocalCommitStateV1::Rejected;
+            operation.info.state = LocalCommitState::Rejected;
             operation.info.rejection = current ? "conflict" : "not-found";
             try { persistLocalCommit(this->root_, operation, false); }
             catch (...) { this->uncertain_ = true; throw; }
@@ -1678,14 +1666,14 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
             return;
         }
         try {
-            (void)repository.commitModelV2(*project, current->name, operation.changes,
+            (void)repository.commitModel(*project, current->name, operation.changes,
                                            operation.info.expectedHead, true, reserved);
-            operation.info.state = LocalCommitStateV1::Succeeded;
+            operation.info.state = LocalCommitState::Succeeded;
         } catch (const StorageError& error) {
             if (error.kind() == StorageErrorKind::Conflict ||
                 error.kind() == StorageErrorKind::InvalidInput ||
                 error.kind() == StorageErrorKind::NotFound) {
-                operation.info.state = LocalCommitStateV1::Rejected;
+                operation.info.state = LocalCommitState::Rejected;
                 operation.info.rejection = error.kind() == StorageErrorKind::Conflict ? "conflict" :
                     (error.kind() == StorageErrorKind::InvalidInput ? "invalid-input" : "not-found");
             } else {
@@ -1701,7 +1689,7 @@ LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
     return outcome;
 }
 
-LocalCommitInfoV1 ProjectService::localCommitStatusV1(std::string_view operationId) {
+LocalCommitInfo ProjectService::localCommitStatus(std::string_view operationId) {
     if (!UuidV7::parse(operationId).has_value())
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local Commit operation ID");
     const std::filesystem::path path = localCommitDirectory(this->root_) /
@@ -1714,7 +1702,7 @@ LocalCommitInfoV1 ProjectService::localCommitStatusV1(std::string_view operation
             throw ProjectError(ProjectErrorKind::NotFound, "local Commit operation not found");
         projectId = readLocalCommit(path).info.projectId;
     }
-    LocalCommitInfoV1 outcome;
+    LocalCommitInfo outcome;
     withRepository(projectId, [&](Repository& repository) {
         std::lock_guard<std::mutex> guard(this->mutex_);
         ensureHealthy();
@@ -1722,9 +1710,9 @@ LocalCommitInfoV1 ProjectService::localCommitStatusV1(std::string_view operation
         if (operation.info.repositoryId != this->repository_id_)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "local Commit belongs to another repository");
-        if (operation.info.state == LocalCommitStateV1::Pending &&
+        if (operation.info.state == LocalCommitState::Pending &&
             translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
-            operation.info.state = LocalCommitStateV1::Succeeded;
+            operation.info.state = LocalCommitState::Succeeded;
             try { persistLocalCommit(this->root_, operation, false); }
             catch (...) { this->uncertain_ = true; throw; }
         }
@@ -1733,7 +1721,7 @@ LocalCommitInfoV1 ProjectService::localCommitStatusV1(std::string_view operation
     return outcome;
 }
 
-void ProjectService::releaseWorkingCopyLeaseV1(
+void ProjectService::releaseWorkingCopyLease(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken) {
     if (!UuidV7::parse(draftId).has_value() || !UuidV7::parse(sessionId).has_value() ||
@@ -1744,7 +1732,7 @@ void ProjectService::releaseWorkingCopyLeaseV1(
     const std::filesystem::path path = workingCopyDirectory(this->root_) / std::string(draftId);
     if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
         throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
-    WorkingCopyInfoV1 draft = readWorkingCopy(path);
+    WorkingCopyInfo draft = readWorkingCopy(path);
     // No holder at all: the lease is already released, e.g. by this same
     // request before a transport resent it. Releasing is idempotent; a
     // lease held by anyone else is still never released with a stale token.
@@ -1790,75 +1778,43 @@ std::optional<BranchId> ProjectService::branchId(std::string_view projectId,
     });
 }
 
-void ProjectService::adoptBranchIdShaFixture(std::string_view projectId, std::string_view branch,
-                                   const BranchId& identity, const Hash& expectedHead) {
-    if (!validBranchName(branch))
-        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
-    withRepository(projectId, [&](Repository& repository) {
-        repository.adoptBranchId(branch, identity, expectedHead);
-    });
-}
-
-Revision ProjectService::createBranchShaFixture(std::string_view projectId, std::string_view name,
-                                      std::optional<std::string_view> fromBranch,
-                                      std::optional<Hash> fromRevision) {
-    if (!validBranchName(name) || (fromBranch && !validBranchName(*fromBranch)) ||
-        (fromRevision && !fromBranch))
-        throw ProjectError(ProjectErrorKind::InvalidInput,
-                           "invalid branch name or revision source");
-    Revision created;
-    // Check and creation form one operation of this project.
-    withRepository(projectId, [&](Repository& repository) {
-        if (repository.hasBranch(name))
-            throw ProjectError(ProjectErrorKind::Conflict, "branch already exists");
-        if (fromBranch && !repository.hasBranch(*fromBranch))
-            throw ProjectError(ProjectErrorKind::NotFound, "source branch not found");
-        created = translated<Revision>([&]() {
-            if (fromRevision) repository.createBranchAtRevision(name, *fromBranch, *fromRevision);
-            else repository.createBranch(name, fromBranch);
-            return repository.head(name);
-        });
-    });
-    return created;
-}
-
-RevisionId ProjectService::createBranchV2(std::string_view projectId,
+RevisionId ProjectService::createBranch(std::string_view projectId,
               std::string_view name, std::optional<std::string_view> source) {
-    return createBranchWithIdentityV2(projectId, name, source).revisionId;
+    return createBranchWithIdentity(projectId, name, source).revisionId;
 }
 
-BranchCreationResultV2 ProjectService::createBranchWithIdentityV2(
+BranchCreationResult ProjectService::createBranchWithIdentity(
         std::string_view projectId, std::string_view name,
         std::optional<std::string_view> source) {
     if (!validBranchName(name) || (source && !validBranchName(*source)))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
-    std::optional<BranchCreationResultV2> created;
+    std::optional<BranchCreationResult> created;
     withRepository(projectId, [&](Repository& repository) {
-        created = translated<BranchCreationResultV2>([&]() {
-            return repository.createBranchWithIdentityV2(*project, name, source);
+        created = translated<BranchCreationResult>([&]() {
+            return repository.createBranchWithIdentity(*project, name, source);
         });
     });
     return *created;
 }
 
-std::optional<RevisionGraphHeadV2> ProjectService::branchByIdV2(std::string_view projectId,
+std::optional<RevisionGraphHead> ProjectService::branchById(std::string_view projectId,
                                                                 std::string_view branchId) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     const std::optional<BranchId> branch = BranchId::parse(branchId);
     if (!project || !branch)
         throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project and branch required");
-    std::optional<RevisionGraphHeadV2> found;
+    std::optional<RevisionGraphHead> found;
     withRepository(projectId, [&](Repository& repository) {
-        found = translated<std::optional<RevisionGraphHeadV2>>([&]() {
-            return repository.branchByIdV2(*project, *branch);
+        found = translated<std::optional<RevisionGraphHead>>([&]() {
+            return repository.branchById(*project, *branch);
         });
     });
     return found;
 }
 
-BranchCreationResultV2 ProjectService::createBranchFromIdV2(
+BranchCreationResult ProjectService::createBranchFromId(
         std::string_view projectId, std::string_view name, std::string_view sourceBranchId,
         std::optional<RevisionId> revision, std::string_view createdBranchId) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
@@ -1869,37 +1825,37 @@ BranchCreationResultV2 ProjectService::createBranchFromIdV2(
     if (!project || !source || !created)
         throw ProjectError(ProjectErrorKind::InvalidInput,
                            "UUIDv7 project, source branch and new branch required");
-    std::optional<BranchCreationResultV2> result;
+    std::optional<BranchCreationResult> result;
     withRepository(projectId, [&](Repository& repository) {
-        result = translated<BranchCreationResultV2>([&]() {
-            return repository.createBranchFromIdV2(*project, name, *source, revision, *created);
+        result = translated<BranchCreationResult>([&]() {
+            return repository.createBranchFromId(*project, name, *source, revision, *created);
         });
     });
     return *result;
 }
 
-RevisionId ProjectService::createBranchAtRevisionV2(std::string_view projectId,
+RevisionId ProjectService::createBranchAtRevision(std::string_view projectId,
                 std::string_view name, std::string_view sourceBranch, const RevisionId& revision) {
-    return createBranchAtRevisionWithIdentityV2(projectId, name, sourceBranch, revision).revisionId;
+    return createBranchAtRevisionWithIdentity(projectId, name, sourceBranch, revision).revisionId;
 }
 
-BranchCreationResultV2 ProjectService::createBranchAtRevisionWithIdentityV2(
+BranchCreationResult ProjectService::createBranchAtRevisionWithIdentity(
         std::string_view projectId, std::string_view name,
         std::string_view sourceBranch, const RevisionId& revision) {
     if (!validBranchName(name) || !validBranchName(sourceBranch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
-    std::optional<BranchCreationResultV2> created;
+    std::optional<BranchCreationResult> created;
     withRepository(projectId, [&](Repository& repository) {
-        created = translated<BranchCreationResultV2>([&]() {
-            return repository.createBranchAtRevisionWithIdentityV2(*project, name, sourceBranch, revision);
+        created = translated<BranchCreationResult>([&]() {
+            return repository.createBranchAtRevisionWithIdentity(*project, name, sourceBranch, revision);
         });
     });
     return *created;
 }
 
-MergeResultV2 ProjectService::mergeBranchesV2(std::string_view projectId,
+MergeResult ProjectService::mergeBranches(std::string_view projectId,
                 std::string_view target, std::string_view source,
                 std::optional<RevisionId> expectedTarget,
                 std::optional<RevisionId> expectedSource) {
@@ -1907,37 +1863,37 @@ MergeResultV2 ProjectService::mergeBranchesV2(std::string_view projectId,
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
-    MergeResultV2 result;
+    MergeResult result;
     withRepository(projectId, [&](Repository& repository) {
-        result = translated<MergeResultV2>([&]() {
-            return repository.mergeBranchesV2(*project, target, source,
+        result = translated<MergeResult>([&]() {
+            return repository.mergeBranches(*project, target, source,
                                                expectedTarget, expectedSource);
         });
     });
     return result;
 }
 
-std::optional<RevisionId> ProjectService::optionalHeadV2(std::string_view projectId, std::string_view branch) {
+std::optional<RevisionId> ProjectService::optionalHead(std::string_view projectId, std::string_view branch) {
     if (!validBranchName(branch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     const std::shared_ptr<Project> entry = findProject(projectId);
     return translated<std::optional<RevisionId>>([&]() {
-        return openRepository(*entry)->optionalHeadV2(*project, branch);
+        return openRepository(*entry)->optionalHead(*project, branch);
     });
 }
 
-RevisionId ProjectService::headV2(std::string_view projectId, std::string_view branch) {
+RevisionId ProjectService::head(std::string_view projectId, std::string_view branch) {
     if (!validBranchName(branch))
         throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     const std::shared_ptr<Project> entry = findProject(projectId);
-    return translated<RevisionId>([&]() { return openRepository(*entry)->headV2(*project, branch); });
+    return translated<RevisionId>([&]() { return openRepository(*entry)->head(*project, branch); });
 }
 
-std::vector<RevisionGraphRevisionV2> ProjectService::historyV2(
+std::vector<RevisionGraphRevision> ProjectService::history(
         std::string_view projectId, std::string_view branch, std::size_t maxCount,
         std::optional<RevisionId> after) {
     if (!validBranchName(branch))
@@ -1945,23 +1901,23 @@ std::vector<RevisionGraphRevisionV2> ProjectService::historyV2(
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     const std::shared_ptr<Project> entry = findProject(projectId);
-    return translated<std::vector<RevisionGraphRevisionV2>>([&]() {
-        return openRepository(*entry)->historyV2(*project, branch, maxCount, after);
+    return translated<std::vector<RevisionGraphRevision>>([&]() {
+        return openRepository(*entry)->history(*project, branch, maxCount, after);
     });
 }
 
-RevisionGraphPageV2 ProjectService::revisionGraphV2(
+RevisionGraphPage ProjectService::revisionGraph(
         std::string_view projectId, std::size_t maxCount,
-        std::optional<RevisionGraphCursorV2> cursor) {
+        std::optional<RevisionGraphCursor> cursor) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     const std::shared_ptr<Project> entry = findProject(projectId);
-    return translated<RevisionGraphPageV2>([&]() {
-        return openRepository(*entry)->revisionGraphV2(*project, maxCount, std::move(cursor));
+    return translated<RevisionGraphPage>([&]() {
+        return openRepository(*entry)->revisionGraph(*project, maxCount, std::move(cursor));
     });
 }
 
-RevisionId ProjectService::commitModelV2(std::string_view projectId,
+RevisionId ProjectService::commitModel(std::string_view projectId,
                           std::string_view branch, std::vector<ModelChange> changes,
                           std::optional<RevisionId> expectedHead) {
     if (!validBranchName(branch))
@@ -1971,20 +1927,20 @@ RevisionId ProjectService::commitModelV2(std::string_view projectId,
     RevisionId committed = RevisionId::generate();
     withRepository(projectId, [&](Repository& repository) {
         committed = translated<RevisionId>([&]() {
-            return repository.commitModelV2(*project, branch, std::move(changes), expectedHead);
+            return repository.commitModel(*project, branch, std::move(changes), expectedHead);
         });
     });
     return committed;
 }
 
-RevisionId ProjectService::commitModelAtExpectedHeadV2(
+RevisionId ProjectService::commitModelAtExpectedHead(
         std::string_view projectId, std::string_view branch,
         std::vector<ModelChange> changes,
         std::optional<RevisionId> expectedLocalHead) {
     {
         std::lock_guard<std::mutex> guard(this->mutex_);
         ensureHealthy();
-        if (this->repository_role_ != RepositoryRoleV1::Private)
+        if (this->repository_role_ != RepositoryRole::Private)
             throw ProjectError(ProjectErrorKind::Conflict,
                                "local commit requires a private repository");
     }
@@ -1995,67 +1951,36 @@ RevisionId ProjectService::commitModelAtExpectedHeadV2(
     RevisionId committed = RevisionId::generate();
     withRepository(projectId, [&](Repository& repository) {
         committed = translated<RevisionId>([&]() {
-            return repository.commitModelV2(*project, branch,
+            return repository.commitModel(*project, branch,
                                             std::move(changes), expectedLocalHead, true);
         });
     });
     return committed;
 }
 
-std::optional<ModelRecord> ProjectService::getModelAtRevisionV2(
+std::optional<ModelRecord> ProjectService::getModelAtRevision(
         std::string_view projectId, const RevisionId& revisionId, const Key& key) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     const std::shared_ptr<Project> entry = findProject(projectId);
     return translated<std::optional<ModelRecord>>([&]() {
-        return openRepository(*entry)->getModelAtRevisionV2(*project, revisionId, key);
+        return openRepository(*entry)->getModelAtRevision(*project, revisionId, key);
     });
 }
 
-RevisionId ProjectService::createBranch(std::string_view projectId, std::string_view name,
-          std::optional<std::string_view> source, std::optional<RevisionId> fromRevision) {
-    if (fromRevision) {
-        if (!source)
-            throw ProjectError(ProjectErrorKind::InvalidInput,
-                               "historical branch source requires a source branch");
-        return createBranchAtRevisionV2(projectId, name, *source, *fromRevision);
-    }
-    return createBranchV2(projectId, name, source);
-}
-
-RevisionId ProjectService::head(std::string_view projectId, std::string_view branch) {
-    return headV2(projectId, branch);
-}
-
-std::vector<RevisionGraphRevisionV2> ProjectService::history(
-        std::string_view projectId, std::string_view branch, std::size_t maxCount,
-        std::optional<RevisionId> after) {
-    if (maxCount == 0 || maxCount > 1000)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid history limit");
-    return historyV2(projectId, branch, maxCount, after);
-}
-
-RevisionGraphPageV2 ProjectService::revisionGraph(
-        std::string_view projectId, std::size_t maxCount,
-        std::optional<RevisionGraphCursorV2> cursor) {
-    if (maxCount == 0 || maxCount > 1000)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid revision graph limit");
-    return revisionGraphV2(projectId, maxCount, std::move(cursor));
-}
-
-RevisionGraphRevisionV2 ProjectService::revision(std::string_view projectId, const RevisionId& id) {
+RevisionGraphRevision ProjectService::revision(std::string_view projectId, const RevisionId& id) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     const std::shared_ptr<Project> found = findProject(projectId);
-    return translated<RevisionGraphRevisionV2>([&]() {
-        const std::optional<Bytes> bytes = openRepository(*found)->readRevisionV2(*project, id);
+    return translated<RevisionGraphRevision>([&]() {
+        const std::optional<Bytes> bytes = openRepository(*found)->readRevision(*project, id);
         if (!bytes) throw ProjectError(ProjectErrorKind::NotFound, "revision not found");
-        const RevisionRecordV2 record = decodeRevisionRecordV2(*bytes);
-        RevisionGraphRevisionV2 result{record.id, hashRevisionRecordV2(record),
+        const RevisionRecord record = decodeRevisionRecord(*bytes);
+        RevisionGraphRevision result{record.id, hashRevisionRecord(record),
                                       record.root, record.referencesRoot, record.modelIndexed, {}};
         result.parents.reserve(record.parents.size());
-        for (const RevisionParentV2& parent : record.parents)
-            result.parents.push_back(RevisionGraphParentV2{parent.id, parent.expectedRecordHash});
+        for (const RevisionParent& parent : record.parents)
+            result.parents.push_back(RevisionGraphParent{parent.id, parent.expectedRecordHash});
         return result;
     });
 }
@@ -2068,75 +1993,10 @@ void ProjectService::renameBranch(std::string_view projectId, std::string_view p
     if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
     withRepository(projectId, [&](Repository& repository) {
         translated<int>([&]() {
-            repository.renameBranchV2(*project, previous, renamed, expectedHead);
+            repository.renameBranch(*project, previous, renamed, expectedHead);
             return 0;
         });
     });
-}
-
-RevisionId ProjectService::commitModel(std::string_view projectId, std::string_view branch,
-                  std::vector<ModelChange> changes, std::optional<RevisionId> expectedHead) {
-    return commitModelV2(projectId, branch, std::move(changes), expectedHead);
-}
-
-MergeResultV2 ProjectService::mergeBranches(std::string_view projectId,
-                  std::string_view target, std::string_view source,
-                  std::optional<RevisionId> expectedTarget,
-                  std::optional<RevisionId> expectedSource) {
-    return mergeBranchesV2(projectId, target, source, expectedTarget, expectedSource);
-}
-
-std::optional<ModelRecord> ProjectService::getModelAtRevision(
-                  std::string_view projectId, const RevisionId& revision, const Key& key) {
-    return getModelAtRevisionV2(projectId, revision, key);
-}
-
-void ProjectService::renameBranchShaFixture(std::string_view projectId, std::string_view previous,
-                                  std::string_view renamed, const Hash& expectedHead) {
-    if (!validBranchName(previous) || !validBranchName(renamed))
-        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
-    withRepository(projectId, [&](Repository& repository) {
-        translated<int>([&]() { repository.renameBranch(previous, renamed, expectedHead); return 0; });
-    });
-}
-
-Revision ProjectService::headShaFixture(std::string_view projectId, std::string_view branch) {
-    if (!validBranchName(branch))
-        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
-    const std::shared_ptr<Project> found = findProject(projectId);
-    return translated<Revision>([&]() {
-        const std::shared_ptr<Repository> repository = openRepository(*found);
-        if (!repository->hasBranch(branch))
-            throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
-        return repository->head(branch);
-    });
-}
-
-std::vector<Revision> ProjectService::historyShaFixture(std::string_view projectId,
-                    std::string_view branch, std::size_t maxCount, std::optional<Hash> after) {
-    if (!validBranchName(branch) || maxCount == 0 || maxCount > 1000)
-        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch or history limit");
-    const std::shared_ptr<Project> found = findProject(projectId);
-    return translated<std::vector<Revision>>([&]() {
-        const std::shared_ptr<Repository> repository = openRepository(*found);
-        if (!repository->hasBranch(branch))
-            throw ProjectError(ProjectErrorKind::NotFound, "branch not found");
-        return repository->history(branch, maxCount, after);
-    });
-}
-
-RevisionGraphPage ProjectService::revisionGraphShaFixture(std::string_view projectId,
-                                                    std::size_t maxCount,
-                                                    std::optional<RevisionGraphCursor> cursor) {
-    const std::shared_ptr<Project> found = findProject(projectId);
-    return translated<RevisionGraphPage>([&]() {
-        return openRepository(*found)->revisionGraph(maxCount, std::move(cursor));
-    });
-}
-
-Revision ProjectService::revisionShaFixture(std::string_view projectId, const Hash& id) {
-    const std::shared_ptr<Project> found = findProject(projectId);
-    return translated<Revision>([&]() { return openRepository(*found)->revision(id); });
 }
 
 ScratchFile ProjectService::createScratchFile(std::string_view projectId) {

@@ -106,11 +106,11 @@ std::vector<ProjectSnapshot> capture(const std::filesystem::path& root,
                 const std::optional<aowis::dvmdb::BranchId> id = repository.branchId(name);
                 require(id.has_value(), "branch lost its UUIDv7 identity");
                 branch.id = id->toString();
-                for (const aowis::dvmdb::RevisionGraphRevisionV2& record :
-                     repository.historyV2(project, name, 100)) branch.ancestry.push_back(record.id);
+                for (const aowis::dvmdb::RevisionGraphRevision& record :
+                     repository.history(project, name, 100)) branch.ancestry.push_back(record.id);
                 require(branch.ancestry.size() >= 2, "UUIDv7 first-parent history is incomplete");
                 const Key lookup = name == "main" ? key(0x21) : key(0x31);
-                branch.value = repository.getModelAtRevisionV2(project, branch.ancestry.front(), lookup);
+                branch.value = repository.getModelAtRevision(project, branch.ancestry.front(), lookup);
                 require(branch.value.has_value(), "model record missing from UUIDv7 tip");
                 snapshot.branches.push_back(std::move(branch));
             }
@@ -159,7 +159,7 @@ void exercise(const std::string& python, const std::string& script,
             projects.push_back(info);
             const ProjectId project = *ProjectId::parse(info.id);
             const RevisionId initial = service.head(info.id, "main");
-            const RevisionId fork = service.createBranch(info.id, "feature", "main", initial);
+            const RevisionId fork = service.createBranchAtRevision(info.id, "feature", "main", initial);
             require(fork == initial, "fork invented a revision");
             const ModelRecord first = model(100, 16, static_cast<std::uint8_t>(index));
             historical.push_back(service.commitModel(info.id, "main", {{key(0x21), first}}, initial));
@@ -169,7 +169,7 @@ void exercise(const std::string& python, const std::string& script,
             const ModelRecord latest = model(102, length, static_cast<std::uint8_t>(index + 2));
             (void)service.commitModel(info.id, "main", {{key(0x21), latest}}, historical.back());
             service.withRepository(info.id, [&](Repository& repository) {
-                require(repository.getModelAtRevisionV2(project, historical.back(), key(0x21))->payload == first.payload,
+                require(repository.getModelAtRevision(project, historical.back(), key(0x21))->payload == first.payload,
                         "historical immutable model snapshot changed");
             });
         }
@@ -191,7 +191,7 @@ void exercise(const std::string& python, const std::string& script,
                                   {{key(0x61), model(103, 18, 0x59)}}, expected);
         service.withRepository(projects[0].id, [&](Repository& repository) {
             const std::optional<ModelRecord> old =
-                repository.getModelAtRevisionV2(project, historical[0], key(0x21));
+                repository.getModelAtRevision(project, historical[0], key(0x21));
             require(old.has_value() && old->payload.size() == 16,
                     "historical UUIDv7 data changed after restore and commit");
             repository.verifyRepository();

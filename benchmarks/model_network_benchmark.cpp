@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "../tests/project_repository.h"
 
 #include <chrono>
 #include <cstdint>
@@ -21,7 +22,7 @@ using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Key;
 using aowis::dvmdb::ModelChange;
 using aowis::dvmdb::ModelRecord;
-using aowis::dvmdb::Repository;
+using Repository = aowis::dvmdb::test::ProjectRepository;
 
 // Uses the UUID layout of a deterministic test fixture, not real UUIDv7.
 Key keyFor(std::uint8_t kind, std::uint64_t number) {
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
         const double importMs = elapsed(importing);
         const std::chrono::steady_clock::time_point checkingReferences = std::chrono::steady_clock::now();
         const Key indexedNode = keyFor(1, 0);
-        const std::size_t incomingReferences = repository->referencingModel("main", indexedNode).size();
+        const std::size_t incomingReferences = repository->referencing("main", indexedNode).size();
         const double referenceLookupMs = elapsed(checkingReferences);
         const std::chrono::steady_clock::time_point checkingDeletion = std::chrono::steady_clock::now();
         bool deletionRejected = false;
@@ -128,7 +129,7 @@ int main(int argc, char** argv) {
         }
         const double revisionMs = elapsed(revising);
         const std::chrono::steady_clock::time_point comparing = std::chrono::steady_clock::now();
-        const std::size_t differenceCount = repository->diff("baseline", "main").size();
+        const std::size_t differenceCount = repository->diffBranches("baseline", "main").size();
         const double diffMs = elapsed(comparing);
         const std::chrono::steady_clock::time_point reading = std::chrono::steady_clock::now();
         std::uint64_t checked = 0;
@@ -142,13 +143,13 @@ int main(int argc, char** argv) {
         }
         const double scanMs = elapsed(reading);
         if (checked != pipes * 2 + 1) throw std::runtime_error("network entity count differs");
-        const aowis::dvmdb::Revision last = repository->head("main");
+        const aowis::dvmdb::test::CommittedRevision last = repository->headRevision("main");
         const std::uint64_t packBytes = repository->packSize();
         const std::uint64_t packObjects = repository->objectCount();
         repository.reset();
         const std::chrono::steady_clock::time_point reopening = std::chrono::steady_clock::now();
         Repository reopened(path);
-        if (reopened.head("main").root != last.root) throw std::runtime_error("reopen root mismatch");
+        if (reopened.headRevision("main").root != last.root) throw std::runtime_error("reopen root mismatch");
         if (!reopened.getModel("main", keyFor(2, pipes - 1))) {
             throw std::runtime_error("missing reopened pipe");
         }

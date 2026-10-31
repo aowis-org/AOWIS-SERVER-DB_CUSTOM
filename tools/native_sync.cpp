@@ -22,7 +22,7 @@ using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Repository;
 using aowis::dvmdb::ProjectId;
 using aowis::dvmdb::RevisionId;
-using aowis::dvmdb::RevisionBundleImportV2;
+using aowis::dvmdb::RevisionBundleImport;
 
 // Canonical CLI accepts only project-scoped UUIDv7 transfer operations.
 void usage() {
@@ -46,12 +46,11 @@ RevisionId requiredRevisionId(std::string_view value) {
     return *parsed;
 }
 
+// Read-only regular-file descriptor for import.
 class BundleDescriptor {
 public:
-    BundleDescriptor(const std::filesystem::path& path, bool writing)
-        : path_(path), writing_(writing) {
-        this->fd_ = ::open(path.c_str(), O_CLOEXEC | O_NOFOLLOW |
-            (writing ? (O_CREAT | O_EXCL | O_RDWR) : O_RDONLY), 0600);
+    explicit BundleDescriptor(const std::filesystem::path& path) {
+        this->fd_ = ::open(path.c_str(), O_CLOEXEC | O_NOFOLLOW | O_RDONLY);
         if (this->fd_ < 0) throw std::system_error(errno, std::generic_category(), "open revision bundle");
         struct stat metadata{};
         if (::fstat(this->fd_, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
@@ -62,21 +61,11 @@ public:
     }
     ~BundleDescriptor() {
         if (this->fd_ >= 0) (void)::close(this->fd_);
-        if (this->writing_ && !this->finished_) (void)::unlink(this->path_.c_str());
     }
     BundleDescriptor(const BundleDescriptor&) = delete;
     BundleDescriptor& operator=(const BundleDescriptor&) = delete;
     int fd() const noexcept { return this->fd_; }
-    void finish() {
-        if (this->writing_) {
-            if (::fsync(this->fd_) != 0) throw std::system_error(errno, std::generic_category(), "sync revision bundle");
-        }
-        this->finished_ = true;
-    }
 private:
-    std::filesystem::path path_;
-    bool writing_ = false;
-    bool finished_ = false;
     int fd_ = -1;
 };
 
@@ -97,10 +86,10 @@ int main(int argc, char** argv) {
         const ProjectId project = requiredProjectId(argv[3]);
         Repository repository(argv[2]);
         if (command == "head") {
-            std::cout << repository.headV2(project, argv[4]).toString() << '\n';
+            std::cout << repository.head(project, argv[4]).toString() << '\n';
         } else if (command == "branch-id") {
-            // Ensure the requested branch belongs to this project's v2 DAG.
-            (void)repository.headV2(project, argv[4]);
+            // Ensure the requested branch belongs to this project's revision DAG.
+            (void)repository.head(project, argv[4]);
             const std::optional<BranchId> id = repository.branchId(argv[4]);
             if (!id) throw std::runtime_error("branch has no UUIDv7 identity");
             std::cout << id->toString() << '\n';
@@ -109,14 +98,13 @@ int main(int argc, char** argv) {
             const std::filesystem::path output = incremental ? argv[6] : argv[5];
             const std::optional<RevisionId> base = incremental
                 ? std::optional<RevisionId>(requiredRevisionId(argv[5])) : std::nullopt;
-            BundleDescriptor bundle(output, true);
-            if (base) repository.exportIncrementalRevisionBundleV2(project, argv[4], *base, bundle.fd());
-            else repository.exportRevisionBundleV2(project, argv[4], bundle.fd());
-            bundle.finish();
+            // Published atomically: a crash never leaves a partial bundle at `output`.
+            if (base) repository.exportIncrementalRevisionBundle(project, argv[4], *base, output);
+            else repository.exportRevisionBundle(project, argv[4], output);
             std::cout << "exported revision bundle for " << argv[4] << " to " << output.string() << '\n';
         } else {
-            BundleDescriptor bundle(argv[4], false);
-            const RevisionBundleImportV2 result = repository.importRevisionBundleV2(project, bundle.fd(), argv[5]);
+            BundleDescriptor bundle(argv[4]);
+            const RevisionBundleImport result = repository.importRevisionBundle(project, bundle.fd(), argv[5]);
             const char* outcome = result.status == BundleImportStatus::Created ? "created" :
                 result.status == BundleImportStatus::FastForward ? "fast-forward" : "up-to-date";
             std::cout << outcome << " " << argv[5] << " at " << result.head.toString()

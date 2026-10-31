@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/model_codec_adapter.h"
+#include "project_repository.h"
 
 #include <QCoreApplication>
 #include <QDate>
@@ -16,7 +17,8 @@ namespace {
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Key;
 using aowis::dvmdb::ModelChange;
-using aowis::dvmdb::Repository;
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 namespace hydraulic = aowis::dvmdb::hydraulic;
 
 void expect(bool condition, const char* message) {
@@ -74,7 +76,7 @@ void testCanonicalCodecAndRepository() {
         expect(hydraulic::uuidFromKey(hydraulic::keyFromUuid(idA)) == idA,
                "UUID key transform inconsistent");
         {
-            Repository store(path);
+            ProjectRepository store(path);
             store.createBranch("main");
             const std::vector<ModelChange> changes{hydraulic::changeFor(a), hydraulic::changeFor(b), hydraulic::changeFor(pipe)};
             store.commitModel("main", changes);
@@ -83,24 +85,28 @@ void testCanonicalCodecAndRepository() {
                    stored->payload == expectedA, "native store modified canonical native model bytes");
             QString error;
             const std::optional<HydraulicNodeJunction> readA =
-                hydraulic::readJunction(store, "main", hydraulic::keyFromUuid(idA), &error);
+                hydraulic::readJunction(store.native(), store.project(), store.head("main"), hydraulic::keyFromUuid(idA), &error);
             expect(readA.has_value() && readA->id == a.id && readA->elevation_m == a.elevation_m,
                    "native model junction roundtrip failed");
             const std::optional<HydraulicLinkPipe> readPipe =
-                hydraulic::readPipe(store, "main", hydraulic::keyFromUuid(pipe.uuid), &error);
+                hydraulic::readPipe(store.native(), store.project(), store.head("main"), hydraulic::keyFromUuid(pipe.uuid), &error);
             expect(readPipe.has_value() && readPipe->node_uuid_from == idA &&
                    readPipe->node_uuid_to == idB && readPipe->diameter_mm == pipe.diameter_mm,
                    "native model pipe roundtrip failed");
-            expect(!hydraulic::readJunction(store, "main", hydraulic::keyFromUuid(pipe.uuid), &error),
+            expect(!hydraulic::readJunction(store.native(), store.project(), store.head("main"), hydraulic::keyFromUuid(pipe.uuid), &error),
                    "reading a pipe as a junction must fail");
+            const RevisionId mainRevision = store.head("main");
             store.createBranch("other", "main");
             pipe.diameter_mm = 112.75;
             store.commitModel("other", {hydraulic::changeFor(pipe)});
-            expect(hydraulic::readPipe(store, "main", hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 90.625,
+            expect(hydraulic::readPipe(store.native(), store.project(), store.head("main"), hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 90.625,
                    "branch isolation failed");
-            expect(hydraulic::readPipe(store, "other", hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 112.75,
+            expect(hydraulic::readPipe(store.native(), store.project(), store.head("other"), hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 112.75,
                    "branch update failed");
-            expect(store.diff("main", "other").size() == 1,
+            expect(hydraulic::readPipe(store.native(), store.project(), mainRevision,
+                                       hydraulic::keyFromUuid(pipe.uuid))->diameter_mm == 90.625,
+                   "historical revision read changed after branch edit");
+            expect(store.diffBranches("main", "other").size() == 1,
                    "codec-level branch diff failed");
             bool rejected = false;
             try {
@@ -109,9 +115,9 @@ void testCanonicalCodecAndRepository() {
             expect(rejected, "referenced junction deletion was accepted");
         }
         {
-            Repository reopened(path);
+            ProjectRepository reopened(path);
             const std::optional<HydraulicLinkPipe> stored =
-                hydraulic::readPipe(reopened, "other", hydraulic::keyFromUuid(pipe.uuid));
+                hydraulic::readPipe(reopened.native(), reopened.project(), reopened.head("other"), hydraulic::keyFromUuid(pipe.uuid));
             expect(stored.has_value() && stored->diameter_mm == 112.75,
                    "reopened canonical model pipe missing");
         }

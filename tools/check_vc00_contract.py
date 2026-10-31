@@ -17,15 +17,15 @@ def main() -> int:
     args = parser.parse_args()
     checks = [
         ('Native branch creation writes an initial revision',
-         ROOT / 'src/native_store.cpp', r'RevisionId Repository::createBranchV2\b[\s\S]*?id = writeRevisionV2Locked\('),
+         ROOT / 'src/native_store.cpp', r'RevisionId Repository::createBranch\b[\s\S]*?id = writeRevisionLocked\('),
         ('Native HEAD API returns mandatory revision',
-         ROOT / 'include/aowis/dvmdb/native_store.h', r'RevisionId headV2\('),
+         ROOT / 'include/aowis/dvmdb/native_store.h', r'RevisionId head\('),
         ('Service HEAD API returns mandatory revision',
-         ROOT / 'include/aowis/dvmdb/project_service.h', r'RevisionId headV2\('),
+         ROOT / 'include/aowis/dvmdb/project_service.h', r'RevisionId head\('),
         ('Project creation invokes root branch creation',
-         ROOT / 'src/project_service.cpp', r'repository\.createBranchV2\(\*project, "main"\)'),
+         ROOT / 'src/project_service.cpp', r'repository\.createBranch\(\*project, "main"\)'),
         ('REST graph serializes HEAD as a revision string',
-         ROOT / 'src/dvmdb_http_routes.cpp', r'\{"revision", revisionIdStringV2\(head\.revision\)\}'),
+         ROOT / 'src/dvmdb_http_routes.cpp', r'\{"revision", revisionIdString\(head\.revision\)\}'),
     ]
     if args.gui_root:
         gui = args.gui_root.resolve()

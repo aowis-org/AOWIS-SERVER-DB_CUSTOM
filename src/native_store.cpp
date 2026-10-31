@@ -1,7 +1,7 @@
 #include "branch_name_validation.h"
 #include "aowis/dvmdb/native_store.h"
-#include "aowis/dvmdb/revision_resolver_v2.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_resolver.h"
+#include "aowis/dvmdb/revision_record.h"
 #include "aowis/dvmdb/storage_error.h"
 #include "native_test_faults.h"
 
@@ -33,22 +33,6 @@
 namespace aowis::dvmdb {
 namespace {
 
-constexpr std::array<std::uint8_t, 8> bundleMagic{
-    'A', 'O', 'W', 'S', 'Y', 'N', 'C', '1'
-};
-constexpr std::array<std::uint8_t, 8> incrementalBundleMagic{
-    'A', 'O', 'W', 'S', 'Y', 'N', 'C', '2'
-};
-constexpr std::array<std::uint8_t, 8> identifiedBundleMagic{
-    'A', 'O', 'W', 'S', 'Y', 'N', 'C', '3'
-};
-constexpr std::array<std::uint8_t, 8> identifiedIncrementalBundleMagic{
-    'A', 'O', 'W', 'S', 'Y', 'N', 'C', '4'
-};
-constexpr std::uint64_t bundleHeaderBytes = 48; // marker, tip, object count
-constexpr std::uint64_t incrementalBundleHeaderBytes = 80; // plus required recipient base
-constexpr std::uint64_t identifiedBundleHeaderBytes = 64; // plus UUIDv7 branch identity
-constexpr std::uint64_t identifiedIncrementalHeaderBytes = 96; // base + UUIDv7 branch identity
 constexpr std::uint64_t bundleEntryBytes = 40;  // hash, big-endian size
 
 constexpr std::size_t headerSize = 45;
@@ -1074,8 +1058,8 @@ int nibbleHex(char character) {
 struct StoredBranch {
     BranchId id;
     std::string name;
-    Hash head{}; // SHA HEAD for BRANCH-1, integrity digest for BRANCH-2
-    std::optional<RevisionId> revisionV2;
+    Hash head{}; // SHA-256 record digest of the HEAD revision (zero when unborn)
+    std::optional<RevisionId> revision;
     std::optional<BranchId> originBranchId; // Immutable creation provenance, not a revision parent.
     std::optional<RevisionId> forkRevisionId; // Immutable historical fork point; never a DAG edge.
 };
@@ -1091,7 +1075,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         if (filename.starts_with(".stage-")) continue; // crash leftover, never published
         const std::optional<BranchId> parsed = BranchId::parse(filename);
         require(Err::Corruption, parsed.has_value() && filename == parsed->toString(),
-                "unsupported branch-ref format: expected UUIDv7 filename (pre-release reset required)");
+                "unsupported branch-ref format: expected UUIDv7 filename");
         require(Err::Corruption, !entry.is_symlink() && entry.is_regular_file(),
                 "symlink or special UUID branch record");
         const int fd = ::open(entry.path().c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -1114,25 +1098,25 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
             }
             systemCall(::close(fd) == 0, "close UUID branch record");
         } catch (...) { ::close(fd); throw; }
-        constexpr std::string_view prefixV1 = "AOWIS-BRANCH-1\n";
-        constexpr std::string_view prefixV2 = "AOWIS-BRANCH-2\n";
-        constexpr std::string_view prefixV3 = "AOWIS-BRANCH-3\n";
-        constexpr std::string_view prefixV4 = "AOWIS-BRANCH-4\n";
-        constexpr std::string_view prefixV5 = "AOWIS-BRANCH-5\n";
-        const bool forkV5 = bytes.starts_with(prefixV5);
-        const bool unbornV4 = bytes.starts_with(prefixV4);
-        const bool originV3 = forkV5 || bytes.starts_with(prefixV3);
-        const bool revisionV2 = originV3 || bytes.starts_with(prefixV2);
-        require(Err::Corruption, unbornV4 || revisionV2 || bytes.starts_with(prefixV1),
-                "invalid UUID branch record marker");
-        const std::size_t prefixSize = forkV5 ? prefixV5.size() : unbornV4 ? prefixV4.size() : originV3 ? prefixV3.size()
-            : revisionV2 ? prefixV2.size() : prefixV1.size();
+        // BRANCH-2 committed HEAD, BRANCH-3 plus origin, BRANCH-4 unborn,
+        // BRANCH-5 plus origin and fork revision.
+        constexpr std::string_view committedPrefix = "AOWIS-BRANCH-2\n";
+        constexpr std::string_view originPrefix = "AOWIS-BRANCH-3\n";
+        constexpr std::string_view unbornPrefix = "AOWIS-BRANCH-4\n";
+        constexpr std::string_view forkPrefix = "AOWIS-BRANCH-5\n";
+        const bool hasFork = bytes.starts_with(forkPrefix);
+        const bool isUnborn = bytes.starts_with(unbornPrefix);
+        const bool hasOrigin = hasFork || bytes.starts_with(originPrefix);
+        const bool isCommitted = hasOrigin || bytes.starts_with(committedPrefix);
+        require(Err::Corruption, isUnborn || isCommitted, "unsupported branch record format");
+        const std::size_t prefixSize = hasFork ? forkPrefix.size() : isUnborn ? unbornPrefix.size()
+            : hasOrigin ? originPrefix.size() : committedPrefix.size();
         const std::size_t split = bytes.find('\n', prefixSize);
         require(Err::Corruption, split != std::string::npos, "invalid UUID branch record name");
         const std::string name = bytes.substr(prefixSize, split - prefixSize);
         try { checkBranch(name); }
         catch (const StorageError&) { throw StorageError(Err::Corruption, "invalid stored branch name"); }
-        if (unbornV4) {
+        if (isUnborn) {
             require(Err::Corruption, bytes.substr(split + 1) == "-\n-\n" &&
                     names.insert(name).second, "invalid unborn UUIDv7 branch record");
             result.push_back(StoredBranch{*parsed, name, Hash{}, std::nullopt, std::nullopt, std::nullopt});
@@ -1140,7 +1124,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
         }
         std::optional<RevisionId> revisionId;
         std::size_t hashOffset = split + 1;
-        if (revisionV2) {
+        if (isCommitted) {
             const std::size_t uuidEnd = bytes.find('\n', hashOffset);
             require(Err::Corruption, uuidEnd != std::string::npos, "missing branch revision UUID");
             const std::string_view uuidText(bytes.data() + hashOffset, uuidEnd - hashOffset);
@@ -1150,7 +1134,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
             hashOffset = uuidEnd + 1;
         }
         std::optional<BranchId> origin;
-        if (originV3) {
+        if (hasOrigin) {
             const std::size_t originEnd = bytes.find('\n', hashOffset);
             require(Err::Corruption, originEnd != std::string::npos,
                     "missing creation origin in UUID branch record");
@@ -1163,7 +1147,7 @@ std::vector<StoredBranch> readStoredBranches(const std::filesystem::path& reposi
             hashOffset = originEnd + 1;
         }
         std::optional<RevisionId> forkRevision;
-        if (forkV5) {
+        if (hasFork) {
             const std::size_t forkEnd = bytes.find('\n', hashOffset);
             require(Err::Corruption, forkEnd != std::string::npos, "missing immutable fork revision");
             const std::string_view text(bytes.data() + hashOffset, forkEnd - hashOffset);
@@ -1204,21 +1188,20 @@ void publishStoredBranch(const std::filesystem::path& repository,
                          const StoredBranch& branch, bool create) {
     const std::filesystem::path heads = repository / "refs" / "heads";
     const std::filesystem::path destination = heads / branch.id.toString();
-    // Preserve legacy branch encodings on read. New forks use BRANCH-5 to
-    // retain their immutable source branch and selected revision across commits.
-    const std::string payload = (!branch.revisionV2 && isZero(branch.head))
+    // BRANCH-4: unborn. BRANCH-2: committed HEAD. BRANCH-3 adds the origin
+    // branch; BRANCH-5 also the immutable fork revision.
+    require(Err::Internal, branch.revision.has_value() == !isZero(branch.head),
+            "branch record needs both a UUIDv7 HEAD and its digest, or neither");
+    const std::string payload = !branch.revision
         ? std::string("AOWIS-BRANCH-4\n") + branch.name + "\n-\n-\n"
-        : branch.revisionV2
-        ? (branch.originBranchId
-            ? (branch.forkRevisionId ? std::string("AOWIS-BRANCH-5\n") : std::string("AOWIS-BRANCH-3\n")) + branch.name + "\n" +
-                branch.revisionV2->toString() + "\n" +
-                branch.originBranchId->toString() + "\n" +
-                (branch.forkRevisionId ? branch.forkRevisionId->toString() + "\n" : std::string()) +
-                toHex(branch.head) + "\n"
-            : std::string("AOWIS-BRANCH-2\n") + branch.name + "\n" +
-                branch.revisionV2->toString() + "\n" + toHex(branch.head) + "\n")
-        : std::string("AOWIS-BRANCH-1\n") + branch.name + "\n" +
-            toHex(branch.head) + "\n";
+        : branch.originBranchId
+        ? (branch.forkRevisionId ? std::string("AOWIS-BRANCH-5\n") : std::string("AOWIS-BRANCH-3\n")) +
+            branch.name + "\n" + branch.revision->toString() + "\n" +
+            branch.originBranchId->toString() + "\n" +
+            (branch.forkRevisionId ? branch.forkRevisionId->toString() + "\n" : std::string()) +
+            toHex(branch.head) + "\n"
+        : std::string("AOWIS-BRANCH-2\n") + branch.name + "\n" +
+            branch.revision->toString() + "\n" + toHex(branch.head) + "\n";
     const BranchId stagingId = BranchId::generate();
     const std::filesystem::path temporary = heads / (".stage-" + stagingId.toString());
     int fd = ::open(temporary.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -1263,20 +1246,8 @@ void publishStoredBranch(const std::filesystem::path& repository,
 struct LogicalVerification {
     std::uint64_t reachableObjects = 0;
     std::uint64_t revisionCount = 0;
-    // Locally resident historical revisions still need a hash set. Imported
-    // revisions instead use the file-backed visitation marks by bundle ordinal.
-    std::set<Hash> localRevisions;
-    std::function<bool(const Hash&)> containsBundledRevision;
-    // Trusted local revisions referenced by bundled revisions. Their own
-    // ancestry was not walked; see ExternalVerificationMarks::trustedLocal.
-    std::set<Hash> boundaryRevisions;
     std::uint64_t treeNodes = 0;
     std::uint64_t modelSnapshots = 0;
-
-    bool containsRevision(const Hash& hash) const {
-        return this->localRevisions.contains(hash) || this->boundaryRevisions.contains(hash) ||
-               (this->containsBundledRevision && this->containsBundledRevision(hash));
-    }
 };
 
 // Only imported bundle hashes use external visitation marks. Incremental
@@ -1913,15 +1884,6 @@ LogicalVerification verifyLogicalGraph(
     summary.reachableObjects = static_cast<std::uint64_t>(checkedKinds.size()) +
         (externalMarks.markedCount ? externalMarks.markedCount() : 0);
     summary.revisionCount = verifiedRevisionCount;
-    summary.localRevisions = std::move(localRevisions);
-    summary.boundaryRevisions = std::move(boundaryRevisions);
-    if (externalMarks.read) {
-        const std::function<std::optional<std::uint8_t>(const Hash&)> read = externalMarks.read;
-        summary.containsBundledRevision = [read](const Hash& hash) {
-            const std::optional<std::uint8_t> kinds = read(hash);
-            return kinds && ((*kinds & 1U) != 0U);
-        };
-    }
     summary.treeNodes = static_cast<std::uint64_t>(verifiedTrees.size()) +
         (externalMarks.treeCount ? externalMarks.treeCount() : 0);
     summary.modelSnapshots = static_cast<std::uint64_t>(verifiedModelSnapshots.size());
@@ -1995,9 +1957,7 @@ Repository::Repository(std::filesystem::path directory)
                                 flags | O_CREAT, 0644);
         systemCall(this->indexFd_ >= 0, "open active content index");
         refreshIndex();
-        require(Err::Corruption, !std::filesystem::exists(this->directory_ / "refs" / "branch-ids"),
-                "obsolete name-keyed branch identity directory; recreate pre-release database");
-        (void)readStoredBranches(this->directory_); // Reject older name-keyed refs on open.
+        (void)readStoredBranches(this->directory_); // Validate every branch record on open.
         syncDirectory(this->directory_);
         syncDirectory(this->directory_ / "refs");
     } catch (...) {
@@ -2755,69 +2715,6 @@ void Repository::diffHashes(const Hash& from, const Hash& to,
         diffHashes(child == slot ? from : Hash{}, right.children[child], output, limit);
 }
 
-Revision Repository::readRevision(const Hash& hash) {
-    const Bytes payload = load(hash);
-    // Native prototype format 2. No pre-release migration is supported.
-    // S | content root | reverse-reference root | indexed flag | parent count | parents
-    require(Err::Corruption, payload.size() >= 67 && payload[0] == 'S', "invalid native revision object");
-    const std::uint8_t flags = payload[65];
-    const std::size_t parentCount = payload[66];
-    require(Err::Corruption, flags <= 1 && parentCount <= 2 && payload.size() == 67 + 32 * parentCount,
-            "invalid native revision metadata");
-    Revision revision{};
-    revision.id = hash;
-    revision.root = readHash(payload, 1);
-    revision.referencesRoot = readHash(payload, 33);
-    revision.modelIndexed = (flags == 1);
-    require(Err::Corruption, revision.modelIndexed || isZero(revision.referencesRoot),
-            "raw revision contains a model reference index");
-    for (std::size_t i = 0; i < parentCount; ++i) {
-        revision.parents.push_back(readHash(payload, 67 + i * 32));
-    }
-    return revision;
-}
-
-bool Repository::revisionReachableFrom(const Hash& tip, const Hash& candidate) {
-    require(Err::InvalidInput, !isZero(candidate), "zero revision hash is invalid");
-    std::vector<Hash> pending{tip};
-    std::unordered_set<Hash, HashHasher> seen;
-    while (!pending.empty()) {
-        const Hash current = pending.back();
-        pending.pop_back();
-        require(Err::Corruption, !isZero(current), "invalid zero revision parent");
-        if (!seen.insert(current).second) continue;
-        // Verify the record even for the requested candidate: a supplied
-        // hash of an arbitrary content object is not a valid revision.
-        const Revision revision = readRevision(current);
-        if (current == candidate) return true;
-        for (const Hash& parent : revision.parents) pending.push_back(parent);
-    }
-    return false;
-}
-
-Hash Repository::branchHead(std::string_view name) {
-    const std::optional<StoredBranch> branch = findStoredBranch(this->directory_, name);
-    require(Err::NotFound, branch.has_value(), "branch does not exist: " + std::string(name));
-    require(Err::Unavailable, !branch->revisionV2, "UUIDv7 branch requires v2 revision API");
-    return branch->head;
-}
-
-void Repository::publishRef(std::string_view name, const Hash& commitHash, bool mustBeAbsent,
-                            std::optional<BranchId> requestedId) {
-    checkBranch(name);
-    const std::optional<StoredBranch> existing = findStoredBranch(this->directory_, name);
-    require(Err::Conflict, !(mustBeAbsent && existing), "branch already exists");
-    require(Err::NotFound, mustBeAbsent || existing.has_value(), "branch does not exist");
-    require(Err::Unavailable, !existing || !existing->revisionV2, "UUIDv7 branch requires v2 revision API");
-    const BranchId id = existing ? existing->id : requestedId.value_or(BranchId::generate());
-    require(Err::Conflict, !existing || !requestedId || existing->id == *requestedId,
-            "branch UUIDv7 conflicts with requested identity");
-    publishStoredBranch(this->directory_, StoredBranch{id, std::string(name), commitHash, std::nullopt,
-                                                           existing ? existing->originBranchId : std::nullopt,
-                                                           std::nullopt},
-                        !existing.has_value());
-}
-
 std::optional<BranchId> Repository::branchIdLocked(std::string_view name) {
     const std::optional<StoredBranch> branch = findStoredBranch(this->directory_, name);
     return branch ? std::optional<BranchId>(branch->id) : std::nullopt;
@@ -2831,106 +2728,59 @@ std::optional<BranchId> Repository::branchId(std::string_view name) {
     return branchIdLocked(name);
 }
 
-void Repository::adoptBranchId(std::string_view name, const BranchId& identity,
-                               const Hash& expectedHead) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    require(Err::Conflict, branchHead(name) == expectedHead &&
-                branchIdLocked(name) == std::optional<BranchId>(identity),
-            "branch already has a different UUIDv7 identity or HEAD");
-    // Pre-release format requires UUIDv7 from creation; no legacy conversion.
-}
-
-void Repository::renameBranch(std::string_view previous, std::string_view renamed,
-                              const Hash& expectedHead) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    checkBranch(previous);
-    checkBranch(renamed);
-    require(Err::Conflict, previous != renamed, "branch rename must change the name");
-    const std::optional<StoredBranch> source = findStoredBranch(this->directory_, previous);
-    require(Err::NotFound, source.has_value(), "source branch not found");
-    require(Err::Unavailable, !source->revisionV2, "UUIDv7 branch requires v2 rename API");
-    require(Err::Conflict, source->head == expectedHead, "branch HEAD advanced before rename");
-    require(Err::Conflict, !findStoredBranch(this->directory_, renamed), "new branch name already exists");
-    publishStoredBranch(this->directory_, StoredBranch{source->id, std::string(renamed), source->head,
-                                                           std::nullopt, source->originBranchId, source->forkRevisionId}, false);
-}
-
-void Repository::createBranch(std::string_view name, std::optional<std::string_view> from) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    checkBranch(name);
-    require(Err::Conflict, !findStoredBranch(this->directory_, name), "branch already exists");
-    for (const StoredBranch& existing : readStoredBranches(this->directory_))
-        require(Err::Unavailable, !existing.revisionV2, "cannot mix SHA and UUID revision HEADs");
-    Hash initial{};
-    if (from) {
-        initial = branchHead(*from);
-    } else {
-        Bytes revision{'S'};
-        appendHash(revision, Hash{});
-        appendHash(revision, Hash{});
-        revision.push_back(0);
-        revision.push_back(0);
-        initial = store(std::move(revision));
-        syncPack();
-    }
-    publishRef(name, initial, true);
-}
-
 // UUIDv7 ancestry uses both merge parents. Revision IDs are never inferred from
 // record digests; every visited UUID is authenticated through the resolver.
-bool Repository::revisionReachableFromV2(const ProjectId& project, const RevisionId& tip,
+bool Repository::revisionReachableFrom(const ProjectId& project, const RevisionId& tip,
                                         const RevisionId& candidate) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
+    require(Err::NotFound, resolver.contains(tip), "ancestry revision not found");
+    // A UUID that is not published at all cannot be an ancestor: answer
+    // without walking the history (e.g. an arbitrary ?revision= query).
+    if (!resolver.contains(candidate)) return false;
     std::set<RevisionId> visited;
     std::vector<RevisionId> pending{tip};
     while (!pending.empty()) {
         const RevisionId current = pending.back();
         pending.pop_back();
         if (!visited.insert(current).second) continue;
-        require(Err::LimitExceeded, visited.size() <= 250000, "v2 ancestry traversal limit exceeded");
-        const std::optional<ResolvedRevisionV2> record = resolver.resolve(current, reader);
-        require(Err::NotFound, record.has_value(), "v2 ancestry revision not found");
         if (current == candidate) return true;
-        for (const RevisionParentV2& parent : record->record.parents) pending.push_back(parent.id);
+        const std::optional<ResolvedRevision> record = resolver.resolve(current, reader);
+        require(Err::Corruption, record.has_value(), "ancestry revision is missing");
+        for (const RevisionParent& parent : record->record.parents) pending.push_back(parent.id);
     }
     return false;
 }
 
-RevisionId Repository::createBranchAtRevisionV2(const ProjectId& project,
+RevisionId Repository::createBranchAtRevision(const ProjectId& project,
         std::string_view name, std::string_view sourceBranch, const RevisionId& revision) {
-    return createBranchAtRevisionWithIdentityV2(project, name, sourceBranch, revision).revisionId;
+    return createBranchAtRevisionWithIdentity(project, name, sourceBranch, revision).revisionId;
 }
 
-BranchCreationResultV2 Repository::createBranchAtRevisionWithIdentityV2(
+BranchCreationResult Repository::createBranchAtRevisionWithIdentity(
         const ProjectId& project, std::string_view name,
         std::string_view sourceBranch, const RevisionId& revision) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    return createBranchAtRevisionLockedV2(project, name, sourceBranch, revision,
+    return createBranchAtRevisionLocked(project, name, sourceBranch, revision,
                                           BranchId::generate());
 }
 
-BranchCreationResultV2 Repository::createBranchAtRevisionLockedV2(
+BranchCreationResult Repository::createBranchAtRevisionLocked(
         const ProjectId& project, std::string_view name,
         std::string_view sourceBranch, const RevisionId& revision, const BranchId& createdId) {
     checkBranch(name);
     require(Err::Conflict, !findStoredBranch(this->directory_, name), "branch already exists");
-    const RevisionRecordV2 source = branchRevisionV2Locked(project, sourceBranch);
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    const RevisionRecord source = branchRevisionLocked(project, sourceBranch);
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
@@ -2941,44 +2791,41 @@ BranchCreationResultV2 Repository::createBranchAtRevisionLockedV2(
         const RevisionId current = pending.back();
         pending.pop_back();
         if (!visited.insert(current).second) continue;
-        require(Err::LimitExceeded, visited.size() <= 250000, "v2 ancestry traversal limit exceeded");
-        const std::optional<ResolvedRevisionV2> record = resolver.resolve(current, reader);
-        require(Err::Corruption, record.has_value(), "v2 branch ancestry is missing a revision");
+        const std::optional<ResolvedRevision> record = resolver.resolve(current, reader);
+        require(Err::Corruption, record.has_value(), "branch ancestry is missing a revision");
         if (current == revision) {
             selectedHash = record->recordHash;
             break;
         }
-        for (const RevisionParentV2& parent : record->record.parents) pending.push_back(parent.id);
+        for (const RevisionParent& parent : record->record.parents) pending.push_back(parent.id);
     }
     require(Err::InvalidInput, selectedHash.has_value(),
             "revision is not reachable from source branch");
     const BranchId sourceId = findStoredBranch(this->directory_, sourceBranch)->id;
     publishStoredBranch(this->directory_, StoredBranch{createdId,
             std::string(name), *selectedHash, revision, sourceId, revision}, true);
-    return BranchCreationResultV2{createdId, revision, sourceId, revision};
+    return BranchCreationResult{createdId, revision, sourceId, revision};
 }
 
-MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
+MergeResult Repository::mergeBranches(const ProjectId& project,
         std::string_view target, std::string_view source,
         std::optional<RevisionId> expectedTarget, std::optional<RevisionId> expectedSource,
         const MergeOptions& options) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    require(Err::InvalidInput, !options.expectedTargetHead && !options.expectedSourceHead,
-            "v2 merge expects UUIDv7 HEAD pins, not SHA-256 revision pins");
-    const RevisionRecordV2 targetHead = branchRevisionV2Locked(project, target);
-    const RevisionRecordV2 sourceHead = branchRevisionV2Locked(project, source);
+    const RevisionRecord targetHead = branchRevisionLocked(project, target);
+    const RevisionRecord sourceHead = branchRevisionLocked(project, source);
     require(Err::Conflict, !expectedTarget || *expectedTarget == targetHead.id,
-            "target HEAD advanced before v2 merge");
+            "target HEAD advanced before merge");
     require(Err::Conflict, !expectedSource || *expectedSource == sourceHead.id,
-            "source HEAD advanced before v2 merge");
+            "source HEAD advanced before merge");
     const std::function<void()> checkSelections = [&options]() {
         if (!options.checkSelections) return;
         const std::optional<std::string> error = options.checkSelections();
         require(Err::InvalidInput, !error, error.value_or("unused merge resolution choices"));
     };
-    MergeResultV2 result;
+    MergeResult result;
     result.targetBefore = targetHead.id;
     result.sourceHead = sourceHead.id;
     result.resultHead = targetHead.id;
@@ -2988,18 +2835,18 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
         return result;
     }
 
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    std::map<RevisionId, RevisionRecordV2> cached;
-    const std::function<const RevisionRecordV2&(const RevisionId&)> fetch =
-        [&resolver, &reader, &cached](const RevisionId& id) -> const RevisionRecordV2& {
-            const std::map<RevisionId, RevisionRecordV2>::const_iterator found = cached.find(id);
+    std::map<RevisionId, RevisionRecord> cached;
+    const std::function<const RevisionRecord&(const RevisionId&)> fetch =
+        [&resolver, &reader, &cached](const RevisionId& id) -> const RevisionRecord& {
+            const std::map<RevisionId, RevisionRecord>::const_iterator found = cached.find(id);
             if (found != cached.end()) return found->second;
-            const std::optional<ResolvedRevisionV2> loaded = resolver.resolve(id, reader);
-            require(Err::Corruption, loaded.has_value(), "v2 merge ancestry is missing a revision");
+            const std::optional<ResolvedRevision> loaded = resolver.resolve(id, reader);
+            require(Err::Corruption, loaded.has_value(), "merge ancestry is missing a revision");
             return cached.emplace(id, loaded->record).first->second;
         };
     const std::function<void(std::vector<RevisionId>&, std::set<RevisionId>&)> traverse =
@@ -3009,8 +2856,8 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
                 pending.pop_back();
                 if (!visited.insert(current).second) continue;
                 require(Err::LimitExceeded, visited.size() <= 250000,
-                        "v2 merge ancestry limit exceeded");
-                for (const RevisionParentV2& parent : fetch(current).parents)
+                        "merge ancestry limit exceeded");
+                for (const RevisionParent& parent : fetch(current).parents)
                     pending.push_back(parent.id);
             }
         };
@@ -3022,10 +2869,32 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
         result.base = sourceHead.id;  // source already merged, possibly through second parent
         return result;
     }
-    std::set<RevisionId> sourceAncestors;
+    // The first target-common revision encountered on each source path
+    // dominates all of its own ancestors. Stop walking that path there:
+    // descending into the shared history only to rediscover older common
+    // revisions is unnecessary. This bounds source-side work by the
+    // divergent graph plus the common frontier in typical histories.
+    std::set<RevisionId> sourceVisited;
+    std::set<RevisionId> commonFrontier;
+    bool targetIsAncestor = false;
     pending.push_back(sourceHead.id);
-    traverse(pending, sourceAncestors);
-    if (sourceAncestors.contains(targetHead.id)) {
+    while (!pending.empty()) {
+        const RevisionId current = pending.back();
+        pending.pop_back();
+        if (!sourceVisited.insert(current).second) continue;
+        if (current == targetHead.id) {
+            targetIsAncestor = true;
+            break;
+        }
+        if (targetAncestors.contains(current)) {
+            commonFrontier.insert(current);
+            continue;
+        }
+        require(Err::LimitExceeded, sourceVisited.size() <= 250000,
+                "merge ancestry limit exceeded");
+        for (const RevisionParent& parent : fetch(current).parents) pending.push_back(parent.id);
+    }
+    if (targetIsAncestor) {
         checkSelections();
         result.base = targetHead.id;
             if (options.validate) {
@@ -3070,40 +2939,49 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
                 }
             }
         const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, target);
-        require(Err::Internal, stored && stored->revisionV2 == result.targetBefore,
-                "v2 target branch disappeared before fast forward");
+        require(Err::Internal, stored && stored->revision == result.targetBefore,
+                "target branch disappeared before fast forward");
         publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
-                hashRevisionRecordV2(sourceHead), sourceHead.id, stored->originBranchId, stored->forkRevisionId}, false);
+                hashRevisionRecord(sourceHead), sourceHead.id, stored->originBranchId, stored->forkRevisionId}, false);
         result.status = MergeStatus::FastForward;
         result.resultHead = sourceHead.id;
         return result;
     }
-    std::set<RevisionId> common;
-    for (const RevisionId& id : sourceAncestors)
-        if (targetAncestors.contains(id)) common.insert(id);
-    require(Err::Conflict, !common.empty(), "v2 branches have no common ancestor");
-    // A criss-cross history may contain multiple incomparable merge bases.
-    // Reject it rather than arbitrarily choosing one and losing edits.
+    require(Err::Conflict, !commonFrontier.empty(), "branches have no common revision ancestor");
+    // Different merge paths can expose frontier nodes that are themselves
+    // ancestors of other frontier nodes (criss-cross DAGs). Remove dominated
+    // candidates, visiting any ancestor at most once. The common
+    // single-frontier case performs no extra history traversal at all.
+    // Several incomparable bases are rejected rather than arbitrarily
+    // choosing one and losing edits.
     std::set<RevisionId> dominated;
-    for (const RevisionId& candidate : common) {
-        pending.clear();
-        for (const RevisionParentV2& parent : fetch(candidate).parents) pending.push_back(parent.id);
-        std::set<RevisionId> visited;
-        traverse(pending, visited);
-        for (const RevisionId& ancestor : visited)
-            if (common.contains(ancestor)) dominated.insert(ancestor);
+    if (commonFrontier.size() > 1) {
+        std::set<RevisionId> visitedAncestors;
+        for (const RevisionId& candidate : commonFrontier) {
+            pending.clear();
+            for (const RevisionParent& parent : fetch(candidate).parents)
+                pending.push_back(parent.id);
+            while (!pending.empty()) {
+                const RevisionId current = pending.back();
+                pending.pop_back();
+                if (!visitedAncestors.insert(current).second) continue;
+                if (commonFrontier.contains(current)) dominated.insert(current);
+                for (const RevisionParent& parent : fetch(current).parents)
+                    pending.push_back(parent.id);
+            }
+        }
     }
     std::vector<RevisionId> lowest;
-    for (const RevisionId& candidate : common)
+    for (const RevisionId& candidate : commonFrontier)
         if (!dominated.contains(candidate)) lowest.push_back(candidate);
     require(Err::Conflict, lowest.size() == 1,
-            "v2 criss-cross merge requires recursive merge-base resolution");
-    const RevisionRecordV2& base = fetch(lowest.front());
+            "multiple independent merge bases require recursive merging");
+    const RevisionRecord& base = fetch(lowest.front());
     result.base = base.id;
     require(Err::InvalidInput, targetHead.modelIndexed == sourceHead.modelIndexed &&
             (base.modelIndexed == targetHead.modelIndexed ||
              (!base.modelIndexed && isZero(base.root) && targetHead.modelIndexed)),
-            "incompatible v2 raw and model histories");
+            "incompatible raw and model histories");
 
     std::vector<Difference> targetDiff;
     std::vector<Difference> sourceDiff;
@@ -3415,13 +3293,13 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
     } else {
         newRoot = applyEncodedChangesLocked(targetHead.root, rawChanges);
     }
-    const RevisionId merged = writeRevisionV2Locked(project, newRoot, referencesRoot,
+    const RevisionId merged = writeRevisionLocked(project, newRoot, referencesRoot,
                       targetHead.modelIndexed, {targetHead.id, sourceHead.id});
-    const std::optional<ResolvedRevisionV2> saved = resolver.resolve(merged, reader);
-    require(Err::Internal, saved.has_value(), "v2 merge record was not persisted");
+    const std::optional<ResolvedRevision> saved = resolver.resolve(merged, reader);
+    require(Err::Internal, saved.has_value(), "merge record was not persisted");
     const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, target);
-    require(Err::Internal, stored && stored->revisionV2 == result.targetBefore,
-            "v2 target branch disappeared before merge publication");
+    require(Err::Internal, stored && stored->revision == result.targetBefore,
+            "target branch disappeared before merge publication");
     publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
                                                         saved->recordHash, merged,
                                                         stored->originBranchId, stored->forkRevisionId}, false);
@@ -3430,49 +3308,49 @@ MergeResultV2 Repository::mergeBranchesV2(const ProjectId& project,
     return result;
 }
 
-RevisionId Repository::writeRevisionV2(const ProjectId& project, const Hash& root,
+RevisionId Repository::writeRevision(const ProjectId& project, const Hash& root,
                                        const Hash& referencesRoot, bool modelIndexed,
                                        const std::vector<RevisionId>& parents) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    return writeRevisionV2Locked(project, root, referencesRoot, modelIndexed, parents);
+    return writeRevisionLocked(project, root, referencesRoot, modelIndexed, parents);
 }
 
-RevisionId Repository::writeRevisionV2Locked(const ProjectId& project, const Hash& root,
+RevisionId Repository::writeRevisionLocked(const ProjectId& project, const Hash& root,
                                              const Hash& referencesRoot, bool modelIndexed,
                                              const std::vector<RevisionId>& parents,
                                              std::optional<RevisionId> reservedRevisionId) {
     require(Err::InvalidInput, modelIndexed || isZero(referencesRoot),
-            "raw v2 revision cannot contain a reference index");
-    require(Err::InvalidInput, parents.size() <= 2, "v2 revision has too many parents");
+            "raw revision cannot contain a reference index");
+    require(Err::InvalidInput, parents.size() <= 2, "revision has too many parents");
     // A hash provided by a caller is never accepted as a claim that a tree
     // exists. Validate the actual content object and its node format.
     if (!isZero(root)) (void)readNode(root);
     if (!isZero(referencesRoot)) (void)readNode(referencesRoot);
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 readObject = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader readObject = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    RevisionRecordV2 record{(reservedRevisionId ? *reservedRevisionId : RevisionId::generate()),
+    RevisionRecord record{(reservedRevisionId ? *reservedRevisionId : RevisionId::generate()),
                             project, root, referencesRoot, modelIndexed, {}};
     for (const RevisionId& parentId : parents) {
-        const std::optional<ResolvedRevisionV2> parent = resolver.resolve(parentId, readObject);
-        require(Err::NotFound, parent.has_value(), "v2 parent revision UUID was not found");
-        record.parents.push_back(RevisionParentV2{parentId, parent->recordHash});
+        const std::optional<ResolvedRevision> parent = resolver.resolve(parentId, readObject);
+        require(Err::NotFound, parent.has_value(), "parent revision UUID was not found");
+        record.parents.push_back(RevisionParent{parentId, parent->recordHash});
     }
-    const Bytes encoded = encodeRevisionRecordV2(record);
+    const Bytes encoded = encodeRevisionRecord(record);
     const Hash packedHash = store(encoded);
     // Pack fsync precedes UUID binding publication. A crash may leave an
     // unreachable immutable pack object; it must never leave a dangling UUID.
     syncPack();
     const Hash publishedHash = resolver.publish(encoded, readObject);
-    require(Err::Internal, publishedHash == packedHash, "v2 pack hash differs from resolver");
+    require(Err::Internal, publishedHash == packedHash, "pack hash differs from resolver");
     return record.id;
 }
 
-std::optional<Bytes> Repository::readRevisionV2(const ProjectId& project, const RevisionId& id) {
+std::optional<Bytes> Repository::readRevision(const ProjectId& project, const RevisionId& id) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -3481,35 +3359,35 @@ std::optional<Bytes> Repository::readRevisionV2(const ProjectId& project, const 
     const std::filesystem::path namespacePath = this->directory_ / "revision-v2";
     if (!std::filesystem::exists(namespacePath) && !std::filesystem::is_symlink(namespacePath))
         return std::nullopt;
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 readObject = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader readObject = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> resolved = resolver.resolve(id, readObject);
+    const std::optional<ResolvedRevision> resolved = resolver.resolve(id, readObject);
     if (!resolved) return std::nullopt;
     return load(resolved->recordHash);
 }
 
-// The v2 ref stores UUID identity *and* the expected packed record digest.
+// The branch ref stores UUID identity *and* the expected packed record digest.
 // Resolve and compare both under the repository lock before reading/mutating.
-RevisionRecordV2 Repository::branchRevisionV2Locked(const ProjectId& project,
+RevisionRecord Repository::branchRevisionLocked(const ProjectId& project,
                                                    std::string_view branch) {
     const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
     require(Err::NotFound, stored.has_value(), "branch not found");
-    require(Err::Unavailable, stored->revisionV2.has_value(), "branch has SHA-based HEAD");
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    require(Err::Unavailable, stored->revision.has_value(), "branch is unborn (no committed HEAD)");
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> resolved = resolver.resolve(*stored->revisionV2, reader);
+    const std::optional<ResolvedRevision> resolved = resolver.resolve(*stored->revision, reader);
     require(Err::Corruption, resolved.has_value() && resolved->recordHash == stored->head,
             "branch UUIDv7 HEAD does not match immutable revision SHA-256");
     return resolved->record;
 }
 
-void Repository::createUnbornBranchV2(const ProjectId& project, std::string_view name) {
+void Repository::createUnbornBranch(const ProjectId& project, std::string_view name) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -3517,13 +3395,13 @@ void Repository::createUnbornBranchV2(const ProjectId& project, std::string_view
     require(Err::Conflict, readStoredBranches(this->directory_).empty(),
             "unborn branch requires a repository without branches");
     // The project ownership is pinned by the first immutable revision, as in
-    // createBranchV2. No UUID revision or pack object is written here.
+    // createBranch. No UUID revision or pack object is written here.
     (void)project;
     publishStoredBranch(this->directory_, StoredBranch{
         BranchId::generate(), std::string(name), Hash{}, std::nullopt, std::nullopt, std::nullopt}, true);
 }
 
-void Repository::provisionUnbornBranchV2(const ProjectId& project, std::string_view name,
+void Repository::provisionUnbornBranch(const ProjectId& project, std::string_view name,
                                          const BranchId& identity) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
@@ -3532,7 +3410,7 @@ void Repository::provisionUnbornBranchV2(const ProjectId& project, std::string_v
     (void)project;
     const std::vector<StoredBranch> branches = readStoredBranches(this->directory_);
     if (branches.size() == 1 && branches.front().id == identity &&
-        branches.front().name == name && !branches.front().revisionV2 &&
+        branches.front().name == name && !branches.front().revision &&
         isZero(branches.front().head) && !branches.front().originBranchId &&
         !branches.front().forkRevisionId)
         return;
@@ -3542,53 +3420,53 @@ void Repository::provisionUnbornBranchV2(const ProjectId& project, std::string_v
         identity, std::string(name), Hash{}, std::nullopt, std::nullopt, std::nullopt}, true);
 }
 
-std::optional<RevisionId> Repository::optionalHeadV2(
+std::optional<RevisionId> Repository::optionalHead(
         const ProjectId& project, std::string_view branch) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
     require(Err::NotFound, stored.has_value(), "branch not found");
-    if (!stored->revisionV2 && isZero(stored->head)) return std::nullopt;
-    return branchRevisionV2Locked(project, branch).id;
+    if (!stored->revision && isZero(stored->head)) return std::nullopt;
+    return branchRevisionLocked(project, branch).id;
 }
 
-RevisionId Repository::headV2(const ProjectId& project, std::string_view branch) {
+RevisionId Repository::head(const ProjectId& project, std::string_view branch) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    return branchRevisionV2Locked(project, branch).id;
+    return branchRevisionLocked(project, branch).id;
 }
 
 // A direct resolved node has a verified project UUID, immutable record digest
 // and authenticated parent bindings. Full-DAG callers traverse both parents.
-static RevisionGraphRevisionV2 graphRevisionV2(const ResolvedRevisionV2& resolved) {
-    RevisionGraphRevisionV2 result{resolved.record.id, resolved.recordHash,
+static RevisionGraphRevision graphRevision(const ResolvedRevision& resolved) {
+    RevisionGraphRevision result{resolved.record.id, resolved.recordHash,
         resolved.record.root, resolved.record.referencesRoot,
         resolved.record.modelIndexed, {}};
-    for (const RevisionParentV2& parent : resolved.record.parents)
+    for (const RevisionParent& parent : resolved.record.parents)
         result.parents.push_back({parent.id, parent.expectedRecordHash});
     return result;
 }
 
-std::vector<RevisionGraphRevisionV2> Repository::historyV2(
+std::vector<RevisionGraphRevision> Repository::history(
     const ProjectId& project, std::string_view branch, std::size_t maxCount,
     std::optional<RevisionId> after) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     require(Err::InvalidInput, maxCount >= 1 && maxCount <= 1000,
-            "v2 history page size must be between 1 and 1000");
+            "history page size must be between 1 and 1000");
     const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
     require(Err::NotFound, stored.has_value(), "branch not found");
-    if (!stored->revisionV2 && isZero(stored->head)) {
+    if (!stored->revision && isZero(stored->head)) {
         require(Err::InvalidInput, !after,
                 "unborn branch cannot have a history cursor");
         return {};
     }
-    const RevisionRecordV2 tip = branchRevisionV2Locked(project, branch);
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    const RevisionRecord tip = branchRevisionLocked(project, branch);
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
@@ -3600,9 +3478,9 @@ std::vector<RevisionGraphRevisionV2> Repository::historyV2(
         bool found = false;
         for (;;) {
             require(Err::LimitExceeded, ++traversed <= 250000,
-                    "v2 first-parent ancestry traversal budget exceeded");
-            const std::optional<ResolvedRevisionV2> resolved = resolver.resolveDirect(current, reader);
-            require(Err::Corruption, resolved.has_value(), "missing v2 first-parent revision");
+                    "first-parent ancestry traversal budget exceeded");
+            const std::optional<ResolvedRevision> resolved = resolver.resolve(current, reader);
+            require(Err::Corruption, resolved.has_value(), "missing first-parent revision");
             if (current == *after) {
                 found = true;
                 if (resolved->record.parents.empty()) return {};
@@ -3612,80 +3490,78 @@ std::vector<RevisionGraphRevisionV2> Repository::historyV2(
             if (resolved->record.parents.empty()) break;
             current = resolved->record.parents.front().id;
         }
-        require(Err::InvalidInput, found, "v2 history cursor is not on branch first-parent chain");
+        require(Err::InvalidInput, found, "history cursor is not on branch first-parent chain");
     }
-    std::vector<RevisionGraphRevisionV2> result;
+    std::vector<RevisionGraphRevision> result;
     result.reserve(maxCount);
     for (;;) {
         require(Err::LimitExceeded, ++traversed <= 250000,
-                "v2 first-parent ancestry traversal budget exceeded");
-        const std::optional<ResolvedRevisionV2> resolved = resolver.resolveDirect(current, reader);
-        require(Err::Corruption, resolved.has_value(), "missing v2 first-parent revision");
-        result.push_back(graphRevisionV2(*resolved));
+                "first-parent ancestry traversal budget exceeded");
+        const std::optional<ResolvedRevision> resolved = resolver.resolve(current, reader);
+        require(Err::Corruption, resolved.has_value(), "missing first-parent revision");
+        result.push_back(graphRevision(*resolved));
         if (result.size() == maxCount || resolved->record.parents.empty()) break;
         current = resolved->record.parents.front().id;
     }
     return result;
 }
 
-RevisionGraphPageV2 Repository::revisionGraphV2(
+RevisionGraphPage Repository::revisionGraph(
     const ProjectId& project, std::size_t maxCount,
-    std::optional<RevisionGraphCursorV2> cursor) {
+    std::optional<RevisionGraphCursor> cursor) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     constexpr std::size_t maxRevisions = 250000;
     constexpr std::size_t maxBranches = 1024;
     require(Err::InvalidInput, maxCount >= 1 && maxCount <= 1000,
-            "v2 graph page size must be between 1 and 1000");
-    RevisionGraphPageV2 page;
+            "graph page size must be between 1 and 1000");
+    RevisionGraphPage page;
     std::size_t skip = 0;
     if (cursor) {
         require(Err::InvalidInput, cursor->heads.size() <= maxBranches &&
-                cursor->skip <= maxRevisions, "invalid v2 graph cursor bounds");
+                cursor->skip <= maxRevisions, "invalid graph cursor bounds");
         skip = cursor->skip;
         page.heads = std::move(cursor->heads);
         std::string previous;
         std::set<BranchId> identities;
-        for (const RevisionGraphHeadV2& head : page.heads) {
+        for (const RevisionGraphHead& head : page.heads) {
             checkBranch(head.name);
             require(Err::InvalidInput, (previous.empty() || previous < head.name) &&
                     (head.revision.has_value() == (head.recordHash != Hash{})) &&
                     identities.insert(head.branchId).second,
-                    "invalid v2 graph cursor heads");
+                    "invalid graph cursor heads");
             previous = head.name;
         }
     } else {
         for (const StoredBranch& branch : readStoredBranches(this->directory_)) {
-            require(Err::Unavailable, branch.revisionV2.has_value() || isZero(branch.head),
-                    "v2 graph requires UUIDv7 revision HEADs");
-            page.heads.push_back({branch.id, branch.name, branch.revisionV2,
+            page.heads.push_back({branch.id, branch.name, branch.revision,
                                   branch.head, branch.originBranchId, branch.forkRevisionId});
             require(Err::LimitExceeded, page.heads.size() <= maxBranches,
-                    "v2 graph exceeds branch snapshot limit");
+                    "graph exceeds branch snapshot limit");
         }
     }
     if (page.heads.empty()) return page;
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
     // Authenticate every captured HEAD independently of current moving refs.
     // An obsolete branch may have disappeared, but its pinned immutable
     // revision remains traversable until compaction; do not reread HEADs.
-    std::map<RevisionId, ResolvedRevisionV2> cached;
-    const auto get = [&](const RevisionId& id) -> const ResolvedRevisionV2& {
+    std::map<RevisionId, ResolvedRevision> cached;
+    const auto get = [&](const RevisionId& id) -> const ResolvedRevision& {
         const auto found = cached.find(id);
         if (found != cached.end()) return found->second;
-        const std::optional<ResolvedRevisionV2> value = resolver.resolveDirect(id, reader);
-        require(Err::Corruption, value.has_value(), "missing v2 graph revision");
+        const std::optional<ResolvedRevision> value = resolver.resolve(id, reader);
+        require(Err::Corruption, value.has_value(), "missing graph revision");
         return cached.emplace(id, *value).first->second;
     };
-    for (const RevisionGraphHeadV2& head : page.heads) {
+    for (const RevisionGraphHead& head : page.heads) {
         if (head.revision)
             require(Err::Corruption, get(*head.revision).recordHash == head.recordHash,
-                    "v2 graph HEAD UUID/SHA mismatch");
+                    "graph HEAD UUID/SHA mismatch");
     }
     std::vector<RevisionId> pending;
     pending.reserve(page.heads.size());
@@ -3699,78 +3575,76 @@ RevisionGraphPageV2 Repository::revisionGraphV2(
         pending.pop_back();
         if (!seen.insert(id).second) continue;
         require(Err::LimitExceeded, visited < maxRevisions,
-                "v2 graph exceeds revision traversal budget");
-        const ResolvedRevisionV2& resolved = get(id);
+                "graph exceeds revision traversal budget");
+        const ResolvedRevision& resolved = get(id);
         for (auto it = resolved.record.parents.rbegin(); it != resolved.record.parents.rend(); ++it)
             pending.push_back(it->id);
         if (visited++ < skip) continue;
         if (page.revisions.size() == maxCount) {
-            page.next = RevisionGraphCursorV2{page.heads, skip + maxCount};
+            page.next = RevisionGraphCursor{page.heads, skip + maxCount};
             break;
         }
-        page.revisions.push_back(graphRevisionV2(resolved));
+        page.revisions.push_back(graphRevision(resolved));
     }
     require(Err::InvalidInput, !cursor || visited > skip,
-            "v2 graph cursor is beyond captured history");
+            "graph cursor is beyond captured history");
     return page;
 }
 
-void Repository::renameBranchV2(const ProjectId& project, std::string_view previous,
+void Repository::renameBranch(const ProjectId& project, std::string_view previous,
                                 std::string_view renamed, const RevisionId& expectedHead) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     checkBranch(renamed);
     require(Err::Conflict, previous != renamed, "branch rename must change the name");
-    const RevisionRecordV2 previousRevision = branchRevisionV2Locked(project, previous);
+    const RevisionRecord previousRevision = branchRevisionLocked(project, previous);
     require(Err::Conflict, previousRevision.id == expectedHead,
             "branch HEAD advanced before rename");
     require(Err::Conflict, !findStoredBranch(this->directory_, renamed),
             "new branch name already exists");
     const std::optional<StoredBranch> existing = findStoredBranch(this->directory_, previous);
-    require(Err::Internal, existing && existing->revisionV2, "v2 branch disappeared");
+    require(Err::Internal, existing && existing->revision, "branch disappeared");
     publishStoredBranch(this->directory_, StoredBranch{existing->id, std::string(renamed),
-                                 existing->head, existing->revisionV2, existing->originBranchId, existing->forkRevisionId}, false);
+                                 existing->head, existing->revision, existing->originBranchId, existing->forkRevisionId}, false);
 }
 
-RevisionId Repository::createBranchV2(const ProjectId& project, std::string_view name,
+RevisionId Repository::createBranch(const ProjectId& project, std::string_view name,
                                        std::optional<std::string_view> from) {
-    return createBranchWithIdentityV2(project, name, from).revisionId;
+    return createBranchWithIdentity(project, name, from).revisionId;
 }
 
-BranchCreationResultV2 Repository::createBranchWithIdentityV2(
+BranchCreationResult Repository::createBranchWithIdentity(
         const ProjectId& project, std::string_view name,
         std::optional<std::string_view> from) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    return createBranchLockedV2(project, name, from, BranchId::generate());
+    return createBranchLocked(project, name, from, BranchId::generate());
 }
 
-BranchCreationResultV2 Repository::createBranchLockedV2(
+BranchCreationResult Repository::createBranchLocked(
         const ProjectId& project, std::string_view name,
         std::optional<std::string_view> from, const BranchId& createdId) {
     checkBranch(name);
     require(Err::Conflict, !findStoredBranch(this->directory_, name), "branch already exists");
     const std::vector<StoredBranch> branches = readStoredBranches(this->directory_);
-    for (const StoredBranch& existing : branches)
-        require(Err::Unavailable, existing.revisionV2.has_value(), "cannot mix SHA and UUID revision HEADs");
     RevisionId id = RevisionId::generate();
     Hash checksum{};
     if (from) {
-        const RevisionRecordV2 source = branchRevisionV2Locked(project, *from);
+        const RevisionRecord source = branchRevisionLocked(project, *from);
         id = source.id;
-        checksum = hashRevisionRecordV2(source);
+        checksum = hashRevisionRecord(source);
     } else {
         require(Err::InvalidInput, branches.empty(),
                 "new branch requires a source once project has a root revision");
-        id = writeRevisionV2Locked(project, Hash{}, Hash{}, false, {});
-        RevisionResolverV2 resolver(this->directory_, project);
-        const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+        id = writeRevisionLocked(project, Hash{}, Hash{}, false, {});
+        RevisionResolver resolver(this->directory_, project);
+        const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
             if (!containsIndex(digest)) return std::nullopt;
             return load(digest);
         };
-        const std::optional<ResolvedRevisionV2> root = resolver.resolve(id, reader);
+        const std::optional<ResolvedRevision> root = resolver.resolve(id, reader);
         require(Err::Internal, root.has_value(), "new root revision did not resolve");
         checksum = root->recordHash;
     }
@@ -3780,33 +3654,31 @@ BranchCreationResultV2 Repository::createBranchLockedV2(
         ? std::optional<RevisionId>(id) : std::nullopt;
     publishStoredBranch(this->directory_, StoredBranch{createdId, std::string(name),
                                                         checksum, id, sourceId, forkId}, true);
-    return BranchCreationResultV2{createdId, id, sourceId, forkId};
+    return BranchCreationResult{createdId, id, sourceId, forkId};
 }
 
-std::optional<RevisionGraphHeadV2> Repository::branchByIdV2(const ProjectId& project,
+std::optional<RevisionGraphHead> Repository::branchById(const ProjectId& project,
                                                            const BranchId& branch) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
     for (const StoredBranch& stored : readStoredBranches(this->directory_)) {
         if (stored.id != branch) continue;
-        require(Err::Unavailable, stored.revisionV2.has_value() || isZero(stored.head),
-                "UUIDv7 branch lookup requires a v2 branch");
         std::optional<RevisionId> revision;
         Hash recordHash{};
-        if (stored.revisionV2) {
+        if (stored.revision) {
             // Same integrity check as every other HEAD read: the stored
             // digest must be the immutable record of the stored revision.
-            revision = branchRevisionV2Locked(project, stored.name).id;
+            revision = branchRevisionLocked(project, stored.name).id;
             recordHash = stored.head;
         }
-        return RevisionGraphHeadV2{stored.id, stored.name, revision, recordHash,
+        return RevisionGraphHead{stored.id, stored.name, revision, recordHash,
                                    stored.originBranchId, stored.forkRevisionId};
     }
     return std::nullopt;
 }
 
-BranchCreationResultV2 Repository::createBranchFromIdV2(
+BranchCreationResult Repository::createBranchFromId(
         const ProjectId& project, std::string_view name, const BranchId& source,
         std::optional<RevisionId> revision, const BranchId& created) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
@@ -3823,15 +3695,15 @@ BranchCreationResultV2 Repository::createBranchFromIdV2(
                         (!revision || stored.forkRevisionId == revision) &&
                         stored.forkRevisionId.has_value(),
                     "branch UUIDv7 already identifies a different branch");
-            return BranchCreationResultV2{stored.id, *stored.forkRevisionId,
+            return BranchCreationResult{stored.id, *stored.forkRevisionId,
                                           stored.originBranchId, stored.forkRevisionId};
         }
         if (stored.id == source) sourceBranch = std::move(stored);
     }
     require(Err::NotFound, sourceBranch.has_value(), "source branch UUIDv7 not found");
     if (revision)
-        return createBranchAtRevisionLockedV2(project, name, sourceBranch->name, *revision, created);
-    return createBranchLockedV2(project, name, sourceBranch->name, created);
+        return createBranchAtRevisionLocked(project, name, sourceBranch->name, *revision, created);
+    return createBranchLocked(project, name, sourceBranch->name, created);
 }
 
 bool Repository::hasBranch(std::string_view branch) {
@@ -3846,616 +3718,6 @@ std::vector<std::string> Repository::listBranches() {
     std::vector<std::string> result;
     for (const StoredBranch& branch : readStoredBranches(this->directory_)) result.push_back(branch.name);
     return result;
-}
-
-Revision Repository::head(std::string_view branch) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    return readRevision(branchHead(branch));
-}
-
-Revision Repository::revision(const Hash& revisionId) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    return clientRevision(revisionId);
-}
-
-// Revision identities supplied by callers (HTTP clients, CLI arguments) may be
-// unknown or may name a tree/value object. Both are NotFound, never storage
-// corruption; a checksum failure of an existing object remains Corruption.
-Revision Repository::clientRevision(const Hash& revisionId) {
-    require(Err::InvalidInput, !isZero(revisionId), "zero revision hash is invalid");
-    require(Err::NotFound, containsIndex(revisionId), "revision not found");
-    const Bytes payload = load(revisionId);
-    require(Err::NotFound, payload.size() >= 67 && payload[0] == 'S' && payload[65] <= 1 &&
-                payload[66] <= 2 && payload.size() == 67U + 32U * payload[66],
-            "object is not a revision");
-    return readRevision(revisionId);
-}
-
-std::vector<Revision> Repository::history(std::string_view branch, std::size_t maxCount,
-                                          std::optional<Hash> after) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    require(Err::InvalidInput, maxCount <= 1000, "history page exceeds 1000 revisions");
-    Hash current = branchHead(branch);
-    if (after) {
-        require(Err::InvalidInput, !isZero(*after), "zero history cursor is invalid");
-        // A cursor from another branch (or a side parent of a merge) must
-        // not silently switch the history being paged.
-        for (;;) {
-            const Revision item = readRevision(current);
-            if (item.id == *after) {
-                current = item.parents.empty() ? Hash{} : item.parents.front();
-                break;
-            }
-            require(Err::InvalidInput, !item.parents.empty(), "history cursor not on branch first-parent chain");
-            current = item.parents.front();
-        }
-    }
-    std::vector<Revision> result;
-    result.reserve(maxCount);
-    while (!isZero(current) && result.size() < maxCount) {
-        const Revision item = readRevision(current);
-        result.push_back(item);
-        current = item.parents.empty() ? Hash{} : item.parents.front();
-    }
-    return result;
-}
-
-RevisionGraphPage Repository::revisionGraph(std::size_t maxCount,
-                                                std::optional<RevisionGraphCursor> cursor) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    // A deliberate work budget protects the HTTP worker (and the native GUI)
-    // from unbounded traversal. Exceeding it is explicit, never a truncated DAG.
-    constexpr std::size_t maxRevisions = 250000;
-    constexpr std::size_t maxBranches = 1024;
-    require(Err::InvalidInput, maxCount >= 1 && maxCount <= 1000,
-            "graph page size must be between 1 and 1000");
-
-    RevisionGraphPage page;
-    std::size_t skip = 0;
-    if (cursor) {
-        require(Err::InvalidInput, cursor->heads.size() <= maxBranches &&
-                cursor->skip <= maxRevisions, "invalid graph cursor bounds");
-        skip = cursor->skip;
-        page.heads = std::move(cursor->heads);
-        std::string previous;
-        for (const RevisionGraphHead& head : page.heads) {
-            checkBranch(head.name);
-            require(Err::InvalidInput, !isZero(head.revision) &&
-                    (previous.empty() || previous < head.name), "invalid graph cursor heads");
-            previous = head.name;
-        }
-    } else {
-        for (const StoredBranch& branch : readStoredBranches(this->directory_)) {
-            page.heads.push_back({branch.name, branch.head});
-            require(Err::LimitExceeded, page.heads.size() <= maxBranches,
-                    "graph exceeds branch snapshot limit");
-        }
-    }
-
-    // Deterministic iterative DFS, walking *both* merge parents. Process the
-    // branch refs in sorted order and parents in stored order. Replaying the
-    // immutable snapshot until skip reconstructs the visited set across pages,
-    // so a shared ancestor is returned exactly once without server sessions.
-    // Order is stable DFS, not a global topological sort between roots.
-    std::vector<Hash> pending;
-    pending.reserve(page.heads.size());
-    for (auto it = page.heads.rbegin(); it != page.heads.rend(); ++it)
-        pending.push_back(it->revision);
-    std::set<Hash> seen;
-    std::size_t visited = 0;
-    while (!pending.empty()) {
-        const Hash id = pending.back();
-        pending.pop_back();
-        if (!seen.insert(id).second) continue;
-        require(Err::LimitExceeded, visited < maxRevisions,
-                "graph exceeds revision traversal budget");
-        // A stored HEAD set remains valid after normal branch advances,
-        // because revision objects are immutable. Offline compaction can
-        // invalidate an old cursor; such reads fail rather than lie.
-        const Revision item = readRevision(id);
-        for (auto it = item.parents.rbegin(); it != item.parents.rend(); ++it)
-            pending.push_back(*it);
-        if (visited++ < skip) continue;
-        if (page.revisions.size() == maxCount) {
-            page.next = RevisionGraphCursor{page.heads, skip + maxCount};
-            break;
-        }
-        page.revisions.push_back(item);
-    }
-    require(Err::InvalidInput, !cursor || visited > skip,
-            "graph cursor is beyond the captured history");
-    return page;
-}
-
-bool Repository::revisionOnBranch(std::string_view branch, const Hash& revisionId) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    (void)clientRevision(revisionId); // NotFound before walking any history
-    return revisionReachableFrom(branchHead(branch), revisionId);
-}
-
-void Repository::createBranchAtRevision(std::string_view name, std::string_view sourceBranch,
-                                        const Hash& revisionId) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    checkBranch(name);
-    require(Err::Conflict, !findStoredBranch(this->directory_, name), "branch already exists");
-    require(Err::InvalidInput, revisionReachableFrom(branchHead(sourceBranch), revisionId),
-            "revision is not reachable from source branch");
-    publishRef(name, revisionId, true);
-}
-
-MergeResult Repository::mergeBranches(std::string_view target, std::string_view source,
-                                      const MergeOptions& options) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision targetHead = readRevision(branchHead(target));
-    const Revision sourceHead = readRevision(branchHead(source));
-    require(Err::Conflict, !options.expectedTargetHead || *options.expectedTargetHead == targetHead.id,
-            "target branch advanced since merge resolution was prepared");
-    require(Err::Conflict, !options.expectedSourceHead || *options.expectedSourceHead == sourceHead.id,
-            "source branch advanced since merge resolution was prepared");
-    const std::function<void()> checkSelections = [&options]() {
-        if (!options.checkSelections) return;
-        const std::optional<std::string> problem = options.checkSelections();
-        require(Err::InvalidInput, !problem, problem.value_or("unconsumed merge resolution choices"));
-    };
-    MergeResult result{};
-    result.targetBefore = targetHead.id;
-    result.sourceHead = sourceHead.id;
-    result.revision = targetHead;
-    if (targetHead.id == sourceHead.id) {
-        checkSelections();
-        result.base = targetHead.id;
-        return result;
-    }
-
-    // Track only target revision identities, not full Revision objects.
-    // Short-circuit up-to-date merges as soon as the source tip is found,
-    // including when it is a *second* parent of an earlier merge.
-    std::unordered_set<Hash, HashHasher> targetAncestors;
-    std::vector<Hash> pending{targetHead.id};
-    while (!pending.empty()) {
-        const Hash current = pending.back();
-        pending.pop_back();
-        require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
-        if (!targetAncestors.insert(current).second) continue;
-        if (current == sourceHead.id) {
-            checkSelections();
-            result.base = sourceHead.id;
-            return result; // source already incorporated
-        }
-        const Revision record = readRevision(current);
-        for (const Hash& parent : record.parents) pending.push_back(parent);
-    }
-
-    // The first target-common revision encountered on each source path
-    // dominates all of its own ancestors. Stop walking that path there:
-    // descending into the shared history only to rediscover older common
-    // revisions is unnecessary. This bounds source-side work by the
-    // divergent graph plus the common frontier in typical histories.
-    std::unordered_set<Hash, HashHasher> sourceVisited;
-    std::unordered_set<Hash, HashHasher> commonFrontier;
-    pending.push_back(sourceHead.id);
-    while (!pending.empty()) {
-        const Hash current = pending.back();
-        pending.pop_back();
-        require(Err::Corruption, !isZero(current), "zero revision parent in merge ancestry");
-        if (!sourceVisited.insert(current).second) continue;
-        if (current == targetHead.id) {
-            // The target is an ancestor of the source. When the caller has
-            // supplied domain validation, the source snapshot is the entire
-            // proposed result and must be checked BEFORE publishing its ref.
-            // This does not create a revision or modify the source branch.
-            checkSelections();
-            result.base = targetHead.id;
-            if (options.validate) {
-                // A domain validator expects typed model records; a raw
-                // snapshot must never bypass it through a fast-forward.
-                if (!sourceHead.modelIndexed) {
-                    result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
-                        std::nullopt, std::nullopt,
-                        "cannot validate a non-model-indexed source snapshot"});
-                    result.status = MergeStatus::Conflicts;
-                    return result;
-                }
-                const std::function<std::optional<ModelRecord>(const Key&)> readSource =
-                    [this, &sourceHead](const Key& key) -> std::optional<ModelRecord> {
-                        const std::optional<Hash> hash = lookup(sourceHead.root, key);
-                        if (!hash) return std::nullopt;
-                        const Bytes value = load(*hash);
-                        require(Err::Corruption, !value.empty() && value.front() == 'V',
-                                "invalid model envelope in fast-forward validation");
-                        return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
-                    };
-                const MergeCandidate candidate{
-                    readSource,
-                    [this, &sourceHead](
-                        const std::function<void(const Key&, const ModelRecord&)>& visitor) {
-                        std::vector<std::pair<Key, Hash>> hashes;
-                        listHashes(sourceHead.root, hashes);
-                        for (const std::pair<Key, Hash>& entry : hashes) {
-                            const Bytes value = load(entry.second);
-                            require(Err::Corruption, !value.empty() && value.front() == 'V',
-                                    "invalid model envelope in fast-forward validation");
-                            visitor(entry.first,
-                                    decodeModelRecord(Bytes(value.begin() + 1, value.end())));
-                        }
-                    }
-                };
-                if (const std::optional<std::string> invalid = options.validate(candidate)) {
-                    result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
-                        std::nullopt, std::nullopt, *invalid});
-                    result.status = MergeStatus::Conflicts;
-                    return result;
-                }
-            }
-            publishRef(target, sourceHead.id, false);
-            result.status = MergeStatus::FastForward;
-            result.revision = sourceHead;
-            return result;
-        }
-        if (targetAncestors.contains(current)) {
-            commonFrontier.insert(current);
-            continue;
-        }
-        const Revision record = readRevision(current);
-        for (const Hash& parent : record.parents) pending.push_back(parent);
-    }
-    require(Err::Conflict, !commonFrontier.empty(), "branches have no common revision ancestor");
-
-    // Different merge paths can expose common-frontier nodes which are
-    // themselves ancestors of other frontier nodes (criss-cross DAGs).
-    // Remove dominated candidates, visiting any ancestor at most once.
-    // The overwhelmingly common single-frontier case performs no extra
-    // history traversal at all.
-    std::unordered_set<Hash, HashHasher> dominated;
-    if (commonFrontier.size() > 1) {
-        std::unordered_set<Hash, HashHasher> visitedAncestors;
-        for (const Hash& candidate : commonFrontier) {
-            const Revision record = readRevision(candidate);
-            std::vector<Hash> ancestry = record.parents;
-            while (!ancestry.empty()) {
-                const Hash current = ancestry.back();
-                ancestry.pop_back();
-                if (!visitedAncestors.insert(current).second) continue;
-                if (commonFrontier.contains(current)) dominated.insert(current);
-                const Revision ancestor = readRevision(current);
-                for (const Hash& parent : ancestor.parents) ancestry.push_back(parent);
-            }
-        }
-    }
-    std::vector<Hash> lowest;
-    for (const Hash& candidate : commonFrontier) {
-        if (!dominated.contains(candidate)) lowest.push_back(candidate);
-    }
-    require(Err::Conflict, lowest.size() == 1, "multiple independent merge bases require recursive merging");
-    result.base = lowest.front();
-    const Revision base = readRevision(result.base);
-    require(Err::InvalidInput, targetHead.modelIndexed == sourceHead.modelIndexed &&
-            (base.modelIndexed == targetHead.modelIndexed ||
-             (!base.modelIndexed && isZero(base.root) && targetHead.modelIndexed)),
-            "cannot merge incompatible raw and model-indexed histories");
-
-    std::vector<Difference> targetDiff;
-    std::vector<Difference> sourceDiff;
-    diffHashes(base.root, targetHead.root, targetDiff);
-    diffHashes(base.root, sourceHead.root, sourceDiff);
-    struct Values {
-        std::optional<Hash> base;
-        std::optional<Hash> target;
-        std::optional<Hash> source;
-    };
-    std::map<Key, Values> differences;
-    for (const Difference& change : targetDiff) {
-        differences.emplace(change.key, Values{change.before, change.after, change.before});
-    }
-    for (const Difference& change : sourceDiff) {
-        std::map<Key, Values>::iterator existing = differences.find(change.key);
-        if (existing == differences.end()) {
-            differences.emplace(change.key,
-                                Values{change.before, change.before, change.after});
-        } else {
-            existing->second.source = change.after;
-        }
-    }
-    std::map<Key, std::optional<Hash>> selected;
-    // Resolutions are checked without writing any pack objects. The
-    // resolver sees authenticated canonical model records at all three
-    // immutable snapshots and must not access this Repository recursively.
-    std::map<Key, ModelRecord> resolved;
-    for (const std::pair<const Key, Values>& item : differences) {
-        const Values& values = item.second;
-        if (values.target == values.source) continue;
-        if (values.target != values.base && values.source != values.base) {
-            if (options.chooseConflict && targetHead.modelIndexed) {
-                const MergeConflict conflict{item.first, values.base, values.target,
-                    values.source, "concurrent changes to the same UUID"};
-                const std::optional<MergeChoiceSide> choice = options.chooseConflict(conflict);
-                if (choice) {
-                    // Also include target-side selections in the candidate
-                    // preview, so reference/semantic validation cannot be
-                    // skipped when the chosen object is already at target.
-                    selected.emplace(item.first, *choice == MergeChoiceSide::Source
-                        ? values.source : values.target);
-                    continue;
-                }
-            }
-            if (options.resolve && targetHead.modelIndexed && base.modelIndexed &&
-                values.base && values.target && values.source) {
-                const auto decodeAt = [this](const Hash& hash) {
-                    const Bytes envelope = load(hash);
-                    require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
-                            "invalid model envelope in merge conflict");
-                    return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
-                };
-                const ModelRecord original = decodeAt(*values.base);
-                const ModelRecord left = decodeAt(*values.target);
-                const ModelRecord right = decodeAt(*values.source);
-                if (original.kind == left.kind && left.kind == right.kind) {
-                    MergeResolution resolution = options.resolve(item.first, original, left, right);
-                    if (resolution.record && resolution.conflictingFields.empty() &&
-                        resolution.record->kind == left.kind) {
-                        resolved.emplace(item.first, std::move(*resolution.record));
-                        continue;
-                    }
-                    if (!resolution.conflictingFields.empty()) {
-                        std::string detail = "conflicting model fields: ";
-                        for (const std::string& field : resolution.conflictingFields) {
-                            if (detail.back() != ' ') detail += ", ";
-                            detail += field;
-                        }
-                        result.conflicts.push_back(MergeConflict{item.first, values.base,
-                            values.target, values.source, std::move(detail)});
-                        continue;
-                    }
-                }
-            }
-            if (options.resolveConcurrentAddition && targetHead.modelIndexed &&
-                !values.base && values.target && values.source) {
-                const auto decodeAt = [this](const Hash& hash) {
-                    const Bytes envelope = load(hash);
-                    require(Err::Corruption, !envelope.empty() && envelope.front() == 'V',
-                            "invalid model envelope in concurrent addition");
-                    return decodeModelRecord(Bytes(envelope.begin() + 1, envelope.end()));
-                };
-                const ModelRecord left = decodeAt(*values.target);
-                const ModelRecord right = decodeAt(*values.source);
-                MergeResolution resolution = options.resolveConcurrentAddition(
-                    item.first, left, right);
-                if (resolution.record && resolution.conflictingFields.empty() &&
-                    resolution.record->kind == left.kind && left.kind == right.kind) {
-                    resolved.emplace(item.first, std::move(*resolution.record));
-                    continue;
-                }
-            }
-            result.conflicts.push_back(MergeConflict{item.first, values.base,
-                values.target, values.source, "both branches changed the same UUID"});
-        } else if (values.target == values.base) {
-            selected.emplace(item.first, values.source);
-        }
-    }
-    // Validate explicit choices even when other conflicts remain unresolved.
-    // Otherwise a misspelled/unused choice could be silently ignored by
-    // an early conflict return, only to change behavior on a later retry.
-    checkSelections();
-    if (!result.conflicts.empty()) {
-        result.status = MergeStatus::Conflicts;
-        return result;
-    }
-
-    std::vector<ModelChange> modelChanges;
-    std::vector<Change> rawChanges;
-    // Keep the selected records for dependency preflight, so a target can
-    // be checked without decoding unrelated entities.
-    std::map<Key, std::optional<ModelRecord>> selectedRecords;
-    for (const std::pair<const Key, std::optional<Hash>>& item : selected) {
-        if (!item.second) {
-            if (targetHead.modelIndexed) selectedRecords.emplace(item.first, std::nullopt);
-            else rawChanges.push_back(Change{item.first, std::nullopt});
-            continue;
-        }
-        const Bytes value = load(*item.second);
-        require(Err::Corruption, !value.empty() && value.front() == 'V', "invalid merged value envelope");
-        const Bytes payload(value.begin() + 1, value.end());
-        if (targetHead.modelIndexed) {
-            ModelRecord record = decodeModelRecord(payload);
-            selectedRecords.emplace(item.first, std::move(record));
-        } else {
-            rawChanges.push_back(Change{item.first, payload});
-        }
-    }
-    for (std::pair<const Key, ModelRecord>& item : resolved)
-        selectedRecords.emplace(item.first, std::move(item.second));
-    if (targetHead.modelIndexed && options.reconcile) {
-        // Readers inspect authenticated, immutable branch tips; candidate
-        // modifications remain memory-only until ALL preflights complete.
-        const auto readSnapshot = [this](const Hash& root, const Key& key)
-            -> std::optional<ModelRecord> {
-            const std::optional<Hash> hash = lookup(root, key);
-            if (!hash) return std::nullopt;
-            const Bytes value = load(*hash);
-            require(Err::Corruption, !value.empty() && value.front() == 'V',
-                    "invalid model envelope in merge reconciliation");
-            return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
-        };
-        const std::function<std::optional<ModelRecord>(const Key&)> readTarget =
-            [&readSnapshot, &targetHead](const Key& key) {
-                return readSnapshot(targetHead.root, key);
-            };
-        const std::function<std::optional<ModelRecord>(const Key&)> readSource =
-            [&readSnapshot, &sourceHead](const Key& key) {
-                return readSnapshot(sourceHead.root, key);
-            };
-        const std::function<std::optional<ModelRecord>(const Key&)> readMerged =
-            [&selectedRecords, &readTarget](const Key& key) {
-                const std::map<Key, std::optional<ModelRecord>>::const_iterator found =
-                    selectedRecords.find(key);
-                return found == selectedRecords.end() ? readTarget(key) : found->second;
-            };
-        const MergeCandidate candidate{
-            readMerged,
-            [this, &targetHead, &selectedRecords, &readMerged](
-                const std::function<void(const Key&, const ModelRecord&)>& visitor) {
-                std::vector<std::pair<Key, Hash>> hashes;
-                listHashes(targetHead.root, hashes);
-                std::map<Key, std::optional<ModelRecord>>::const_iterator pending =
-                    selectedRecords.begin();
-                for (const std::pair<Key, Hash>& entry : hashes) {
-                    while (pending != selectedRecords.end() && pending->first < entry.first) {
-                        if (pending->second) visitor(pending->first, *pending->second);
-                        ++pending;
-                    }
-                    if (pending != selectedRecords.end() && pending->first == entry.first) {
-                        if (pending->second) visitor(entry.first, *pending->second);
-                        ++pending;
-                    } else {
-                        const std::optional<ModelRecord> record = readMerged(entry.first);
-                        require(Err::Corruption, record.has_value(), "missing record in merge reconciliation");
-                        visitor(entry.first, *record);
-                    }
-                }
-                for (; pending != selectedRecords.end(); ++pending)
-                    if (pending->second) visitor(pending->first, *pending->second);
-            }
-        };
-        const std::function<void(const Key&, std::optional<ModelRecord>)> set =
-            [&selectedRecords](const Key& key, std::optional<ModelRecord> record) {
-                selectedRecords.insert_or_assign(key, std::move(record));
-            };
-        if (const std::optional<std::string> error =
-            options.reconcile(candidate, set, readTarget, readSource)) {
-            result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
-                std::nullopt, std::nullopt, *error});
-            result.status = MergeStatus::Conflicts;
-            return result;
-        }
-    }
-    if (targetHead.modelIndexed) {
-        // Content-hash conflicts are not enough: an unrelated deletion may
-        // invalidate references created independently on the other branch.
-        // Preflight before storing any new objects or publishing a ref.
-        for (const std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
-            if (!item.second) continue;
-            for (const Key& reference : item.second->references) {
-                const std::map<Key, std::optional<ModelRecord>>::const_iterator pendingTarget =
-                    selectedRecords.find(reference);
-                const bool exists = pendingTarget != selectedRecords.end()
-                    ? pendingTarget->second.has_value()
-                    : lookup(targetHead.root, reference).has_value();
-                if (!exists || reference == Key{} || reference == item.first) {
-                    const std::map<Key, Values>::const_iterator values = differences.find(item.first);
-                    result.conflicts.push_back(MergeConflict{item.first,
-                        values == differences.end() ? std::nullopt : values->second.base,
-                        values == differences.end() ? std::nullopt : values->second.target,
-                        values == differences.end() ? std::nullopt : values->second.source,
-                        "merged record has an invalid reference target"});
-                    break;
-                }
-            }
-        }
-        for (const std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
-            if (item.second) continue;
-            const std::vector<Key> inbound = readReferrers(targetHead.referencesRoot, item.first);
-            for (const Key& referrer : inbound) {
-                const std::map<Key, std::optional<ModelRecord>>::const_iterator updated =
-                    selectedRecords.find(referrer);
-                if (updated != selectedRecords.end() &&
-                    (!updated->second || std::find(updated->second->references.begin(),
-                        updated->second->references.end(), item.first) ==
-                        updated->second->references.end())) continue;
-                const std::map<Key, Values>::const_iterator values = differences.find(item.first);
-                result.conflicts.push_back(MergeConflict{item.first,
-                    values == differences.end() ? std::nullopt : values->second.base,
-                    values == differences.end() ? std::nullopt : values->second.target,
-                    values == differences.end() ? std::nullopt : values->second.source,
-                    "merged deletion leaves a surviving incoming reference"});
-                break;
-            }
-        }
-        if (!result.conflicts.empty()) {
-            result.status = MergeStatus::Conflicts;
-            return result;
-        }
-        if (options.validate) {
-            // Copy-on-write view of the proposed snapshot. Changes override
-            // the current target tree; no callback can mutate the repository.
-            const auto lookupRecord = [this, &targetHead, &selectedRecords](const Key& key)
-                -> std::optional<ModelRecord> {
-                const auto pending = selectedRecords.find(key);
-                if (pending != selectedRecords.end()) return pending->second;
-                const std::optional<Hash> hash = lookup(targetHead.root, key);
-                if (!hash) return std::nullopt;
-                const Bytes value = load(*hash);
-                require(Err::Corruption, !value.empty() && value.front() == 'V',
-                        "invalid model envelope in merge validation");
-                return decodeModelRecord(Bytes(value.begin() + 1, value.end()));
-            };
-            const MergeCandidate candidate{
-                lookupRecord,
-                [this, &targetHead, &selectedRecords, &lookupRecord](
-                    const std::function<void(const Key&, const ModelRecord&)>& visitor) {
-                    std::vector<std::pair<Key, Hash>> hashes;
-                    listHashes(targetHead.root, hashes);
-                    auto pending = selectedRecords.begin();
-                    for (const std::pair<Key, Hash>& entry : hashes) {
-                        while (pending != selectedRecords.end() && pending->first < entry.first) {
-                            if (pending->second) visitor(pending->first, *pending->second);
-                            ++pending;
-                        }
-                        if (pending != selectedRecords.end() && pending->first == entry.first) {
-                            if (pending->second) visitor(entry.first, *pending->second);
-                            ++pending;
-                        } else {
-                            const std::optional<ModelRecord> record = lookupRecord(entry.first);
-                            require(Err::Corruption, record.has_value(), "missing model in merge preview");
-                            visitor(entry.first, *record);
-                        }
-                    }
-                    for (; pending != selectedRecords.end(); ++pending)
-                        if (pending->second) visitor(pending->first, *pending->second);
-                }
-            };
-            if (const std::optional<std::string> invalid = options.validate(candidate)) {
-                result.conflicts.push_back(MergeConflict{Key{}, std::nullopt,
-                    std::nullopt, std::nullopt, *invalid});
-                result.status = MergeStatus::Conflicts;
-                return result;
-            }
-        }
-        modelChanges.reserve(selectedRecords.size());
-        for (std::pair<const Key, std::optional<ModelRecord>>& item : selectedRecords) {
-            modelChanges.push_back(ModelChange{item.first, std::move(item.second)});
-        }
-    }
-    // A merge with no primary changes is still a two-parent revision: the
-    // second parent records that the source history was incorporated.
-    if (targetHead.modelIndexed) {
-        result.revision = commitModelLocked(target, std::move(modelChanges),
-                                            targetHead.id, sourceHead.id);
-    } else {
-        result.revision = commitLocked(target, rawChanges, std::nullopt, sourceHead.id);
-    }
-    result.status = MergeStatus::Merged;
-    return result;
-}
-
-Revision Repository::commit(std::string_view branch, const std::vector<Change>& changes) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    return commitLocked(branch, changes);
 }
 
 Hash Repository::applyEncodedChangesLocked(const Hash& original,
@@ -4483,39 +3745,8 @@ Hash Repository::applyEncodedChangesLocked(const Hash& original,
     return applyTree(original, updates, 0, updates.size(), 0);
 }
 
-Revision Repository::commitLocked(std::string_view branch, const std::vector<Change>& changes,
-                                  std::optional<Hash> referencesRoot,
-                                  std::optional<Hash> mergeParent) {
-    const Hash parent = branchHead(branch);
-    const Revision previous = readRevision(parent);
-    require(Err::InvalidInput, !previous.modelIndexed || referencesRoot.has_value(),
-            "raw commits cannot modify a model-indexed branch");
-    require(Err::InvalidInput, !referencesRoot.has_value() || previous.modelIndexed || isZero(previous.root),
-            "cannot enable model indexing on a populated raw branch");
-    // Sort pointers into the input rather than copying every encoded payload
-    // into a second map. Stable ordering preserves raw commit's last-write-
-    // wins behavior for repeated keys.
-    const Hash newRoot = applyEncodedChangesLocked(previous.root, changes);
-    Bytes encoded{'S'};
-    appendHash(encoded, newRoot);
-    appendHash(encoded, referencesRoot.value_or(Hash{}));
-    encoded.push_back(referencesRoot.has_value() ? 1 : 0);
-    encoded.push_back(mergeParent ? 2 : 1);
-    appendHash(encoded, parent);
-    if (mergeParent) {
-        require(Err::Internal, !isZero(*mergeParent) && *mergeParent != parent, "invalid merge parent");
-        appendHash(encoded, *mergeParent);
-    }
-    const Hash newRevision = store(std::move(encoded));
-    // Publication order is critical: a crash may leave unused packed objects,
-    // but must never leave a published ref pointing to unsynced content.
-    syncPack();
-    publishRef(branch, newRevision, false);
-    return readRevision(newRevision);
-}
 
-
-RevisionId Repository::commitV2(const ProjectId& project, std::string_view branch,
+RevisionId Repository::commit(const ProjectId& project, std::string_view branch,
                                 const std::vector<Change>& changes,
                                 std::optional<RevisionId> expectedHead) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
@@ -4523,25 +3754,25 @@ RevisionId Repository::commitV2(const ProjectId& project, std::string_view branc
     refreshIndex();
     const std::optional<StoredBranch> starting = findStoredBranch(this->directory_, branch);
     require(Err::NotFound, starting.has_value(), "branch not found");
-    const bool unborn = !starting->revisionV2 && isZero(starting->head);
-    const std::optional<RevisionRecordV2> previous = unborn ? std::nullopt :
-        std::optional<RevisionRecordV2>(branchRevisionV2Locked(project, branch));
+    const bool unborn = !starting->revision && isZero(starting->head);
+    const std::optional<RevisionRecord> previous = unborn ? std::nullopt :
+        std::optional<RevisionRecord>(branchRevisionLocked(project, branch));
     require(Err::Conflict, !expectedHead || (previous && previous->id == *expectedHead),
             "branch HEAD changed before commit");
     require(Err::InvalidInput, !previous || !previous->modelIndexed,
             "raw edits cannot modify a model-indexed revision");
     const Hash newRoot = applyEncodedChangesLocked(previous ? previous->root : Hash{}, changes);
-    const RevisionId newId = writeRevisionV2Locked(project, newRoot, Hash{}, false, previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{});
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    const RevisionId newId = writeRevisionLocked(project, newRoot, Hash{}, false, previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{});
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> updated = resolver.resolve(newId, reader);
+    const std::optional<ResolvedRevision> updated = resolver.resolve(newId, reader);
     require(Err::Internal, updated.has_value(), "new revision failed post-write verification");
     const std::optional<StoredBranch> stored = findStoredBranch(this->directory_, branch);
-    require(Err::Internal, stored && stored->id == starting->id && stored->revisionV2 == (previous ? std::optional<RevisionId>(previous->id) : std::nullopt) && (previous || isZero(stored->head)),
-            "branch changed during v2 commit");
+    require(Err::Internal, stored && stored->id == starting->id && stored->revision == (previous ? std::optional<RevisionId>(previous->id) : std::nullopt) && (previous || isZero(stored->head)),
+            "branch changed during commit");
     publishStoredBranch(this->directory_, StoredBranch{stored->id, stored->name,
                             updated->recordHash, newId, stored->originBranchId, stored->forkRevisionId}, false);
     return newId;
@@ -4553,15 +3784,7 @@ std::vector<Key> Repository::readReferrers(const Hash& root, const Key& target) 
     return decodeReferrers(load(*indexValue));
 }
 
-Revision Repository::commitModel(std::string_view branch, std::vector<ModelChange> changes,
-                                 std::optional<Hash> expectedHead) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    return commitModelLocked(branch, std::move(changes), expectedHead, std::nullopt);
-}
-
-RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view branch,
+RevisionId Repository::commitModel(const ProjectId& project, std::string_view branch,
                                       std::vector<ModelChange> changes,
                                       std::optional<RevisionId> expectedHead,
                                       bool requireExactHead,
@@ -4571,9 +3794,9 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
     refreshIndex();
     const std::optional<StoredBranch> starting = findStoredBranch(this->directory_, branch);
     require(Err::NotFound, starting.has_value(), "branch not found");
-    const bool unborn = !starting->revisionV2 && isZero(starting->head);
-    const std::optional<RevisionRecordV2> previous = unborn ? std::nullopt :
-        std::optional<RevisionRecordV2>(branchRevisionV2Locked(project, branch));
+    const bool unborn = !starting->revision && isZero(starting->head);
+    const std::optional<RevisionRecord> previous = unborn ? std::nullopt :
+        std::optional<RevisionRecord>(branchRevisionLocked(project, branch));
     // Local Commit pins an exact HEAD, including null for unborn branches.
     // The check occurs after acquiring the repository lock and refreshing its
     // index; a competing first commit cannot be silently overwritten.
@@ -4591,20 +3814,20 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
     const PreparedModelCommit prepared = prepareModelCommitLocked(
         previous ? previous->root : Hash{}, previous ? previous->referencesRoot : Hash{}, std::move(changes));
     const Hash newRoot = applyEncodedChangesLocked(previous ? previous->root : Hash{}, prepared.encoded);
-    const RevisionId revisionId = writeRevisionV2Locked(
+    const RevisionId revisionId = writeRevisionLocked(
         project, newRoot, prepared.referencesRoot, true,
         previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{},
         reservedRevisionId);
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> saved = resolver.resolve(revisionId, reader);
+    const std::optional<ResolvedRevision> saved = resolver.resolve(revisionId, reader);
     require(Err::Internal, saved.has_value(), "model revision did not resolve after write");
     const std::optional<StoredBranch> branchRecord = findStoredBranch(this->directory_, branch);
     require(Err::Internal, branchRecord && branchRecord->id == starting->id &&
-            branchRecord->revisionV2 == (previous ? std::optional<RevisionId>(previous->id) : std::nullopt) &&
+            branchRecord->revision == (previous ? std::optional<RevisionId>(previous->id) : std::nullopt) &&
             (previous || isZero(branchRecord->head)),
             "model branch HEAD changed during commit");
     publishStoredBranch(this->directory_, StoredBranch{
@@ -4613,7 +3836,54 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
     return revisionId;
 }
 
-std::optional<ModelRecord> Repository::getModelAtRevisionV2(const ProjectId& project,
+std::optional<Bytes> Repository::getAtRevision(const ProjectId& project,
+                                                 const RevisionId& revisionId, const Key& key) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
+        if (!containsIndex(digest)) return std::nullopt;
+        return load(digest);
+    };
+    const std::optional<ResolvedRevision> record = resolver.resolve(revisionId, reader);
+    require(Err::NotFound, record.has_value(), "revision UUID not found");
+    const std::optional<Hash> value = lookup(record->record.root, key);
+    if (!value) return std::nullopt;
+    const Bytes encoded = load(*value);
+    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
+    return Bytes(encoded.begin() + 1, encoded.end());
+}
+
+std::vector<std::pair<Key, Bytes>> Repository::scanAtRevision(const ProjectId& project,
+                                                                const RevisionId& revisionId) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
+        if (!containsIndex(digest)) return std::nullopt;
+        return load(digest);
+    };
+    const std::optional<ResolvedRevision> record = resolver.resolve(revisionId, reader);
+    require(Err::NotFound, record.has_value(), "revision UUID not found");
+    std::vector<std::pair<Key, Hash>> hashes;
+    listHashes(record->record.root, hashes);
+    std::sort(hashes.begin(), hashes.end(), [](const std::pair<Key, Hash>& first,
+                                              const std::pair<Key, Hash>& second) {
+        return first.first < second.first;
+    });
+    std::vector<std::pair<Key, Bytes>> result;
+    result.reserve(hashes.size());
+    for (const std::pair<Key, Hash>& entry : hashes) {
+        const Bytes encoded = load(entry.second);
+        require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
+        result.emplace_back(entry.first, Bytes(encoded.begin() + 1, encoded.end()));
+    }
+    return result;
+}
+
+std::optional<ModelRecord> Repository::getModelAtRevision(const ProjectId& project,
                                                 const RevisionId& revisionId, const Key& key) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
@@ -4621,12 +3891,12 @@ std::optional<ModelRecord> Repository::getModelAtRevisionV2(const ProjectId& pro
     const std::filesystem::path namespacePath = this->directory_ / "revision-v2";
     if (!std::filesystem::exists(namespacePath) && !std::filesystem::is_symlink(namespacePath))
         return std::nullopt;
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> record = resolver.resolve(revisionId, reader);
+    const std::optional<ResolvedRevision> record = resolver.resolve(revisionId, reader);
     require(Err::NotFound, record.has_value(), "revision UUID not found");
     require(Err::InvalidInput, record->record.modelIndexed,
             "model records require a model-indexed revision");
@@ -4638,7 +3908,7 @@ std::optional<ModelRecord> Repository::getModelAtRevisionV2(const ProjectId& pro
     return decodeModelRecord(Bytes(stored.begin() + 1, stored.end()));
 }
 
-std::vector<Key> Repository::referencingModelAtRevisionV2(const ProjectId& project,
+std::vector<Key> Repository::referencingModelAtRevision(const ProjectId& project,
                                                          const RevisionId& revisionId, const Key& key) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
@@ -4646,12 +3916,12 @@ std::vector<Key> Repository::referencingModelAtRevisionV2(const ProjectId& proje
     const std::filesystem::path namespacePath = this->directory_ / "revision-v2";
     if (!std::filesystem::exists(namespacePath) && !std::filesystem::is_symlink(namespacePath))
         throw StorageError(StorageErrorKind::NotFound, "revision UUID not found");
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> snapshot = resolver.resolve(revisionId, reader);
+    const std::optional<ResolvedRevision> snapshot = resolver.resolve(revisionId, reader);
     require(Err::NotFound, snapshot.has_value(), "revision UUID not found");
     require(Err::InvalidInput, snapshot->record.modelIndexed,
             "reverse references require a model-indexed revision");
@@ -4793,150 +4063,20 @@ Repository::PreparedModelCommit Repository::prepareModelCommitLocked(
     return PreparedModelCommit{std::move(encoded), updatedReferences};
 }
 
-Revision Repository::commitModelLocked(std::string_view branch, std::vector<ModelChange> changes,
-                                       std::optional<Hash> expectedHead,
-                                       std::optional<Hash> mergeParent) {
-    const Revision previous = readRevision(branchHead(branch));
-    require(Err::Conflict, !expectedHead || previous.id == *expectedHead,
-            "branch head changed since the model update was prepared");
-    require(Err::InvalidInput, previous.modelIndexed || isZero(previous.root),
-            "cannot commit model records to a populated raw branch");
 
-    const PreparedModelCommit prepared = prepareModelCommitLocked(
-        previous.root, previous.referencesRoot, std::move(changes));
-    return commitLocked(branch, prepared.encoded, prepared.referencesRoot, mergeParent);
-}
-
-std::vector<Key> Repository::referencingModel(std::string_view branch, const Key& key) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision revision = readRevision(branchHead(branch));
-    require(Err::InvalidInput, revision.modelIndexed, "reverse references are unavailable on raw branch");
-    return readReferrers(revision.referencesRoot, key);
-}
-
-std::optional<Bytes> Repository::getAtRevision(const Hash& revisionId, const Key& key) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision snapshot = clientRevision(revisionId);
-    const std::optional<Hash> object = lookup(snapshot.root, key);
-    if (!object) return std::nullopt;
-    const Bytes encoded = load(*object);
-    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
-    return Bytes(encoded.begin() + 1, encoded.end());
-}
-
-std::optional<ModelRecord> Repository::getModelAtRevision(const Hash& revisionId, const Key& key) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision snapshot = clientRevision(revisionId);
-    require(Err::InvalidInput, snapshot.modelIndexed, "model records require a model-indexed revision");
-    const std::optional<Hash> object = lookup(snapshot.root, key);
-    if (!object) return std::nullopt;
-    const Bytes encoded = load(*object);
-    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
-    return decodeModelRecord(Bytes(encoded.begin() + 1, encoded.end()));
-}
-
-std::vector<Key> Repository::referencingModelAtRevision(const Hash& revisionId, const Key& key) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision snapshot = clientRevision(revisionId);
-    require(Err::InvalidInput, snapshot.modelIndexed, "reverse references are unavailable on raw revision");
-    return readReferrers(snapshot.referencesRoot, key);
-}
-
-std::optional<ModelRecord> Repository::getModel(std::string_view branch, const Key& key) {
-    const std::optional<Bytes> raw = get(branch, key);
-    if (!raw) return std::nullopt;
-    return decodeModelRecord(*raw);
-}
-
-std::optional<Bytes> Repository::get(std::string_view branch, const Key& key) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision revision = readRevision(branchHead(branch));
-    const std::optional<Hash> payloadHash = lookup(revision.root, key);
-    if (!payloadHash) return std::nullopt;
-    const Bytes encoded = load(*payloadHash);
-    require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
-    return Bytes(encoded.begin() + 1, encoded.end());
-}
-
-std::vector<std::pair<Key, Bytes>> Repository::scan(std::string_view branch) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision revision = readRevision(branchHead(branch));
-    std::vector<std::pair<Key, Hash>> entries;
-    listHashes(revision.root, entries);
-    std::sort(entries.begin(), entries.end(), [](const std::pair<Key, Hash>& first,
-                                                  const std::pair<Key, Hash>& second) {
-        return first.first < second.first;
-    });
-    std::vector<std::pair<Key, Bytes>> result;
-    result.reserve(entries.size());
-    for (const std::pair<Key, Hash>& entry : entries) {
-        const Bytes encoded = load(entry.second);
-        require(Err::Corruption, !encoded.empty() && encoded.front() == 'V', "invalid value object");
-        result.emplace_back(entry.first, Bytes(encoded.begin() + 1, encoded.end()));
-    }
-    return result;
-}
-
-std::vector<Difference> Repository::diff(std::string_view from, std::string_view to) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision left = readRevision(branchHead(from));
-    const Revision right = readRevision(branchHead(to));
-    std::vector<Difference> result;
-    diffHashes(left.root, right.root, result);
-    std::sort(result.begin(), result.end(), [](const Difference& first, const Difference& second) {
-        return first.key < second.key;
-    });
-    return result;
-}
-
-std::vector<Difference> Repository::diffRevisions(const Hash& fromRevision,
-                                                  const Hash& toRevision) {
-    return diffRevisions(fromRevision, toRevision, std::numeric_limits<std::size_t>::max());
-}
-
-std::vector<Difference> Repository::diffRevisions(const Hash& fromRevision, const Hash& toRevision,
-                                                  std::size_t maxDifferences) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    const Revision before = clientRevision(fromRevision);
-    const Revision after = clientRevision(toRevision);
-    std::vector<Difference> result;
-    diffHashes(before.root, after.root, result, maxDifferences);
-    std::sort(result.begin(), result.end(), [](const Difference& first, const Difference& second) {
-        return first.key < second.key;
-    });
-    return result;
-}
-
-
-std::vector<Difference> Repository::diffRevisionsV2(const ProjectId& project,
+std::vector<Difference> Repository::diffRevisions(const ProjectId& project,
         const RevisionId& fromRevision, const RevisionId& toRevision,
         std::size_t maxDifferences) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    const std::optional<ResolvedRevisionV2> from = resolver.resolve(fromRevision, reader);
-    const std::optional<ResolvedRevisionV2> to = resolver.resolve(toRevision, reader);
+    const std::optional<ResolvedRevision> from = resolver.resolve(fromRevision, reader);
+    const std::optional<ResolvedRevision> to = resolver.resolve(toRevision, reader);
     require(Err::NotFound, from && to, "UUIDv7 diff revision not found in project");
     std::vector<Difference> result;
     diffHashes(from->record.root, to->record.root, result, maxDifferences);
@@ -4947,31 +4087,29 @@ std::vector<Difference> Repository::diffRevisionsV2(const ProjectId& project,
 }
 
 namespace {
-// Before v2 HEAD and retention cutover, old SHA-only reachability cannot
-// prove an indexed v2 revision survives compaction or is logically valid.
 // Audit the published UUIDv7 namespace independently of branch refs. This is
 // intentionally conservative: every published binding is immutable and must
 // survive pack compaction, even if not yet reachable from a branch HEAD (e.g.
 // crash after publishing the binding but before publishing a ref).
-struct V2Audit {
+struct PublishedAudit {
     std::map<Hash, Bytes> logicalRevisions;
     std::map<Hash, RevisionId> publishedIds;
     std::vector<Hash> recordedHashes;
 };
 
-std::optional<ProjectId> persistedV2Project(const std::filesystem::path& directory) {
+std::optional<ProjectId> persistedProject(const std::filesystem::path& directory) {
     const std::filesystem::path namespacePath = directory / "revision-v2";
     if (!std::filesystem::exists(namespacePath)) return std::nullopt;
     require(Err::Corruption, !std::filesystem::is_symlink(namespacePath) &&
-            std::filesystem::is_directory(namespacePath), "unsafe v2 revision directory");
+            std::filesystem::is_directory(namespacePath), "unsafe revision directory");
     const std::filesystem::path manifest = namespacePath / "project";
     const int fd = ::open(manifest.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0 && errno == ENOENT) {
         require(Err::Corruption, !std::filesystem::exists(namespacePath / "ids"),
-                "missing v2 project identity manifest");
+                "missing project identity manifest");
         return std::nullopt;
     }
-    if (fd < 0) throwSystemError("open v2 project identity manifest");
+    if (fd < 0) throwSystemError("open project identity manifest");
     std::array<std::uint8_t, 20> bytes{};
     struct stat st{};
     const bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 20;
@@ -4981,23 +4119,23 @@ std::optional<ProjectId> persistedV2Project(const std::filesystem::path& directo
     }
     (void)::close(fd);
     require(Err::Corruption, valid && bytes[0] == 'P' && bytes[1] == 'R' &&
-            bytes[2] == 'J' && bytes[3] == 2, "invalid v2 project identity manifest");
+            bytes[2] == 'J' && bytes[3] == 2, "invalid project identity manifest");
     UuidV7 uuid{};
     std::copy_n(bytes.begin() + 4, uuid.bytes.size(), uuid.bytes.begin());
     const std::optional<ProjectId> project = ProjectId::parse(uuid.toString());
-    require(Err::Corruption, project.has_value(), "invalid v2 project UUID");
+    require(Err::Corruption, project.has_value(), "invalid project UUID");
     return project;
 }
 
-V2Audit auditPublishedV2(const std::filesystem::path& directory,
-                         const RevisionObjectReaderV2& readObject) {
-    V2Audit result{};
-    const std::optional<ProjectId> project = persistedV2Project(directory);
+PublishedAudit auditPublished(const std::filesystem::path& directory,
+                         const RevisionObjectReader& readObject) {
+    PublishedAudit result{};
+    const std::optional<ProjectId> project = persistedProject(directory);
     if (!project) return result;
-    RevisionResolverV2 resolver(directory, *project);
+    RevisionResolver resolver(directory, *project);
     const std::filesystem::path identities = directory / "revision-v2" / "ids";
     require(Err::Corruption, !std::filesystem::is_symlink(identities) &&
-            std::filesystem::is_directory(identities), "invalid v2 identities directory");
+            std::filesystem::is_directory(identities), "invalid identities directory");
     for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(identities)) {
         const std::string filename = entry.path().filename().string();
         if (filename.starts_with(".stage-")) {
@@ -5005,20 +4143,20 @@ V2Audit auditPublishedV2(const std::filesystem::path& directory,
             require(Err::Corruption, staged.has_value() &&
                     staged->toString() == filename.substr(7) &&
                     entry.is_regular_file() && !entry.is_symlink(),
-                    "unsafe v2 staging entry");
+                    "unsafe staging entry");
             continue; // abandoned private staging file, never published
         }
         require(Err::Corruption, entry.is_regular_file() && !entry.is_symlink(),
-                "unsafe published v2 identity entry");
+                "unsafe published identity entry");
         const std::optional<RevisionId> id = RevisionId::parse(filename);
         require(Err::Corruption, id.has_value() && id->toString() == filename,
                 "non-UUIDv7 revision identity filename");
-        const std::optional<ResolvedRevisionV2> resolved = resolver.resolveDirect(*id, readObject);
-        require(Err::Corruption, resolved.has_value(), "missing published v2 revision");
+        const std::optional<ResolvedRevision> resolved = resolver.resolve(*id, readObject);
+        require(Err::Corruption, resolved.has_value(), "missing published revision");
         // Authenticate the real packed object BEFORE exposing a logical view
         // to the common Merkle/model verifier. Parent digests come only from
         // the canonical record and were checked against UUID bindings above.
-        const RevisionRecordV2& record = resolved->record;
+        const RevisionRecord& record = resolved->record;
         Bytes logical(67 + 32 * record.parents.size(), 0);
         logical[0] = 'S';
         std::copy(record.root.begin(), record.root.end(), logical.begin() + 1);
@@ -5086,20 +4224,20 @@ VerificationReport Repository::verifyRepository() {
     require(Err::Unavailable, !this->needsReopen_, "repository must be reopened after interrupted compaction");
     refreshIndex();
 
-    const RevisionObjectReaderV2 loadV2 = [this](const Hash& hash) -> std::optional<Bytes> {
+    const RevisionObjectReader readPublished = [this](const Hash& hash) -> std::optional<Bytes> {
         if (!containsIndex(hash)) return std::nullopt;
         return load(hash);
     };
-    const V2Audit v2 = auditPublishedV2(this->directory_, loadV2);
+    const PublishedAudit v2 = auditPublished(this->directory_, readPublished);
     std::vector<Hash> tips = v2.recordedHashes;
     const std::vector<StoredBranch> branches = readStoredBranches(this->directory_);
     for (const StoredBranch& branch : branches) {
-        if (branch.revisionV2) {
+        if (branch.revision) {
             const std::map<Hash, RevisionId>::const_iterator published =
                 v2.publishedIds.find(branch.head);
             require(Err::Corruption, published != v2.publishedIds.end() &&
-                    published->second == *branch.revisionV2,
-                    "v2 branch HEAD UUID/SHA does not match the published revision");
+                    published->second == *branch.revision,
+                    "branch HEAD UUID/SHA does not match the published revision");
         }
         if (!isZero(branch.head)) tips.push_back(branch.head);
     }
@@ -5124,6 +4262,12 @@ VerificationReport Repository::verifyRepository() {
     return result;
 }
 
+std::optional<ProjectId> Repository::projectId() {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    return persistedProject(this->directory_);
+}
+
 std::uint64_t Repository::objectCount() {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
@@ -5139,37 +4283,38 @@ std::uint64_t Repository::packSize() {
 }
 
 // UUIDv7 revision bundles carry immutable content and stable object identity,
-// never host pack/index offsets. Legacy full/delta: AOWREV21/AOWREV22.
-// Provenance-aware full/delta: AOWREV23/AOWREV24 (32 extra header bytes).
+// never host pack/index offsets. Full/delta for a branch without fork
+// provenance: AOWREV21/AOWREV22; with provenance: AOWREV23/AOWREV24
+// (32 extra header bytes: origin branch UUID and fork revision UUID).
 // Both use a caller-owned regular file as the on-disk payload stage. Per-object
 // indexes, visited hashes and verification marks live in repository-local
 // scratch files, avoiding payload-sized heap maps and a 64 MiB RAM ceiling.
 namespace {
-constexpr std::array<std::uint8_t, 8> revisionBundleMagicV2{
+constexpr std::array<std::uint8_t, 8> revisionBundleMagic{
     'A', 'O', 'W', 'R', 'E', 'V', '2', '1'
 };
-constexpr std::array<std::uint8_t, 8> revisionDeltaMagicV2{
+constexpr std::array<std::uint8_t, 8> revisionDeltaMagic{
     'A', 'O', 'W', 'R', 'E', 'V', '2', '2'
 };
-constexpr std::array<std::uint8_t, 8> revisionBundleProvenanceMagicV2{
+constexpr std::array<std::uint8_t, 8> revisionBundleProvenanceMagic{
     'A', 'O', 'W', 'R', 'E', 'V', '2', '3'
 };
-constexpr std::array<std::uint8_t, 8> revisionDeltaProvenanceMagicV2{
+constexpr std::array<std::uint8_t, 8> revisionDeltaProvenanceMagic{
     'A', 'O', 'W', 'R', 'E', 'V', '2', '4'
 };
-constexpr std::uint64_t revisionBundleHeaderV2 = 96;
-constexpr std::uint64_t revisionDeltaHeaderV2 = 144;
-constexpr std::uint64_t revisionBundleProvenanceHeaderV2 = 128;
-constexpr std::uint64_t revisionDeltaProvenanceHeaderV2 = 176;
+constexpr std::uint64_t revisionBundleHeader = 96;
+constexpr std::uint64_t revisionDeltaHeader = 144;
+constexpr std::uint64_t revisionBundleProvenanceHeader = 128;
+constexpr std::uint64_t revisionDeltaProvenanceHeader = 176;
 // Bound file/CPU/disk work even when an offline caller leaves BundleLimits
 // unspecified. Operators can impose lower limits through BundleLimits.
-constexpr std::uint64_t revisionBundleMaxBytesV2 = 64ULL * 1024ULL * 1024ULL * 1024ULL;
-constexpr std::uint64_t revisionBundleMaxObjectsV2 = 1000000;
+constexpr std::uint64_t revisionBundleMaxBytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t revisionBundleMaxObjects = 1000000;
 
-Bytes logicalRevisionFromV2(const Bytes& canonical, const ProjectId& project) {
-    const RevisionRecordV2 record = decodeRevisionRecordV2(canonical);
+Bytes logicalRevisionFrom(const Bytes& canonical, const ProjectId& project) {
+    const RevisionRecord record = decodeRevisionRecord(canonical);
     require(Err::Corruption, record.project == project,
-            "v2 bundle revision belongs to a different project");
+            "bundle revision belongs to a different project");
     Bytes logical(67 + 32 * record.parents.size(), 0);
     logical[0] = 'S';
     std::copy(record.root.begin(), record.root.end(), logical.begin() + 1);
@@ -5184,92 +4329,180 @@ Bytes logicalRevisionFromV2(const Bytes& canonical, const ProjectId& project) {
     return logical;
 }
 
-void checkRevisionBundleLimitV2(std::uint64_t size, std::uint64_t objects,
+void checkRevisionBundleLimit(std::uint64_t size, std::uint64_t objects,
                                 const BundleLimits& limits) {
-    require(Err::LimitExceeded, size <= revisionBundleMaxBytesV2 &&
+    require(Err::LimitExceeded, size <= revisionBundleMaxBytes &&
             (limits.maxBytes == 0 || size <= limits.maxBytes),
-            "v2 replication bundle byte budget exceeded");
-    require(Err::LimitExceeded, objects <= revisionBundleMaxObjectsV2 &&
+            "replication bundle byte budget exceeded");
+    require(Err::LimitExceeded, objects <= revisionBundleMaxObjects &&
             (limits.maxObjects == 0 || objects <= limits.maxObjects),
-            "v2 replication bundle object budget exceeded");
+            "replication bundle object budget exceeded");
 }
 } // namespace
 
-void Repository::exportRevisionBundleV2(const ProjectId& project, std::string_view branch,
+namespace {
+// Publish a bundle at a caller-chosen path atomically. `write(fd)` fills an
+// empty private regular file in the destination directory: anonymous
+// (O_TMPFILE) where supported, else a hidden ".aowis-export-XXXXXX" name.
+// After fsync it is linked into place without replacing anything, and the
+// directory is fsynced. A crash or failure never exposes a partial file at
+// `path`; a crashed exporter can leave only the hidden fallback name.
+template <typename Write>
+void publishBundleFile(const std::filesystem::path& path, Write&& write) {
+    const std::filesystem::path parent =
+        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    const std::string destinationName = path.filename().string();
+    require(Err::InvalidInput, !destinationName.empty() && destinationName != "." &&
+            destinationName != "..", "invalid replication bundle destination");
+    int directoryFd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    systemCall(directoryFd >= 0, "open replication bundle destination directory");
+    int fd = -1;
+    std::string temporaryName; // empty for an anonymous O_TMPFILE file
+    try {
+        if (!detail::forceNamedScratchFiles()) {
+            fd = ::openat(directoryFd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+            if (fd < 0 && errno != EOPNOTSUPP && errno != EISDIR &&
+                errno != EINVAL && errno != ENOTSUP)
+                throwSystemError("create anonymous replication bundle");
+        }
+        if (fd < 0) {
+            std::string name = (parent / ".aowis-export-XXXXXX").string();
+            fd = ::mkostemp(name.data(), O_CLOEXEC);
+            systemCall(fd >= 0, "create private replication bundle");
+            temporaryName = std::filesystem::path(name).filename().string();
+        }
+        std::forward<Write>(write)(fd);
+        detail::faultCheckpoint("export.before.publish");
+        // linkat is no-replace: concurrent exporters cannot overwrite one
+        // another, and neither can replace a symlink or an existing file.
+        int linked = 0;
+        if (temporaryName.empty()) {
+            const std::string self = "/proc/self/fd/" + std::to_string(fd);
+            linked = ::linkat(AT_FDCWD, self.c_str(), directoryFd, destinationName.c_str(),
+                              AT_SYMLINK_FOLLOW);
+        } else {
+            linked = ::linkat(directoryFd, temporaryName.c_str(), directoryFd,
+                              destinationName.c_str(), 0);
+        }
+        if (linked != 0 && errno == EEXIST)
+            throw StorageError(Err::Conflict, "replication bundle destination already exists");
+        systemCall(linked == 0, "publish replication bundle");
+        detail::faultCheckpoint("export.after.publish");
+        if (!temporaryName.empty()) {
+            systemCall(::unlinkat(directoryFd, temporaryName.c_str(), 0) == 0,
+                       "remove private replication bundle name");
+            temporaryName.clear();
+        }
+        systemCall(::fsync(directoryFd) == 0, "sync replication bundle directory");
+        detail::faultCheckpoint("export.after.dirsync");
+        // Close only after publication. A close failure does not remove the
+        // already completed and published file.
+        const int closing = fd;
+        fd = -1;
+        systemCall(::close(closing) == 0, "close replication bundle");
+        const int closingDirectory = directoryFd;
+        directoryFd = -1;
+        systemCall(::close(closingDirectory) == 0, "close replication bundle directory");
+    } catch (...) {
+        if (fd >= 0) ::close(fd);
+        if (directoryFd >= 0) {
+            if (!temporaryName.empty()) (void)::unlinkat(directoryFd, temporaryName.c_str(), 0);
+            ::close(directoryFd);
+        }
+        throw;
+    }
+}
+} // namespace
+
+void Repository::exportRevisionBundle(const ProjectId& project, std::string_view branch,
+                                        const std::filesystem::path& bundlePath,
+                                        BundleLimits limits) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    publishBundleFile(bundlePath, [&](int fd) {
+        exportRevisionBundleLocked(project, branch, std::nullopt, fd, limits);
+    });
+}
+
+void Repository::exportIncrementalRevisionBundle(const ProjectId& project,
+        std::string_view branch, const RevisionId& recipientBase,
+        const std::filesystem::path& bundlePath, BundleLimits limits) {
+    std::lock_guard<std::mutex> guarded(this->mutex_);
+    ScopedFileLock locked(this->lockFd_);
+    refreshIndex();
+    publishBundleFile(bundlePath, [&](int fd) {
+        exportRevisionBundleLocked(project, branch, recipientBase, fd, limits);
+    });
+}
+
+void Repository::exportRevisionBundle(const ProjectId& project, std::string_view branch,
                                         int fd, BundleLimits limits) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    exportRevisionBundleV2Locked(project, branch, std::nullopt, fd, limits);
+    exportRevisionBundleLocked(project, branch, std::nullopt, fd, limits);
 }
 
-void Repository::exportIncrementalRevisionBundleV2(const ProjectId& project,
+void Repository::exportIncrementalRevisionBundle(const ProjectId& project,
         std::string_view branch, const RevisionId& recipientBase, int fd, BundleLimits limits) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
-    exportRevisionBundleV2Locked(project, branch, recipientBase, fd, limits);
+    exportRevisionBundleLocked(project, branch, recipientBase, fd, limits);
 }
 
-void Repository::exportRevisionBundleV2Locked(const ProjectId& project,
+void Repository::exportRevisionBundleLocked(const ProjectId& project,
         std::string_view branch, std::optional<RevisionId> base, int fd,
         BundleLimits limits) {
     struct stat destination{};
-    systemCall(fd >= 0 && ::fstat(fd, &destination) == 0, "stat v2 bundle output");
+    systemCall(fd >= 0 && ::fstat(fd, &destination) == 0, "stat bundle output");
     require(Err::InvalidInput, S_ISREG(destination.st_mode) && destination.st_size == 0,
-            "v2 bundle export requires an empty regular file");
+            "bundle export requires an empty regular file");
     const std::optional<StoredBranch> ref = findStoredBranch(this->directory_, branch);
-    require(Err::NotFound, ref.has_value(), "v2 bundle branch was not found");
-    require(Err::Unavailable, ref->revisionV2.has_value(),
-            "v2 replication requires UUIDv7 branch HEAD");
-    const RevisionRecordV2 tip = branchRevisionV2Locked(project, branch);
-    const Hash tipHash = hashRevisionRecordV2(tip);
-    require(Err::Corruption, tipHash == ref->head && tip.id == *ref->revisionV2,
-            "v2 bundle HEAD UUID/SHA mismatch");
-    RevisionResolverV2 resolver(this->directory_, project);
-    const RevisionObjectReaderV2 reader = [this](const Hash& hash) -> std::optional<Bytes> {
+    require(Err::NotFound, ref.has_value(), "bundle branch was not found");
+    require(Err::Unavailable, ref->revision.has_value(),
+            "replication requires UUIDv7 branch HEAD");
+    const RevisionRecord tip = branchRevisionLocked(project, branch);
+    const Hash tipHash = hashRevisionRecord(tip);
+    require(Err::Corruption, tipHash == ref->head && tip.id == *ref->revision,
+            "bundle HEAD UUID/SHA mismatch");
+    RevisionResolver resolver(this->directory_, project);
+    const RevisionObjectReader reader = [this](const Hash& hash) -> std::optional<Bytes> {
         if (!containsIndex(hash)) return std::nullopt;
         return load(hash);
     };
     Hash baseHash{};
     if (base) {
-        const std::optional<ResolvedRevisionV2> resolved = resolver.resolve(*base, reader);
+        const std::optional<ResolvedRevision> resolved = resolver.resolve(*base, reader);
         require(Err::NotFound, resolved.has_value(), "incremental recipient base is not published");
         baseHash = resolved->recordHash;
     }
     enum class Kind { Revision, Tree, Value };
-    // Read and authenticate the whole base graph; it becomes the exclusion
-    // set for the delta, but no raw payload is retained in process memory.
-    DiskBundleHashes baseObjects(this->scratch_);
-    const auto collect = [&](const Hash& root, DiskBundleHashes& visited,
-                             const DiskBundleHashes* excluded,
-                             bool& reachedBase) {
-        std::vector<std::pair<Hash, Kind>> pending{{root, Kind::Revision}};
+    // A full bundle carries the complete graph; it is authenticated and its
+    // semantics re-verified while it is collected. An incremental bundle
+    // carries only the delta against the recipient's base (collectDelta),
+    // so its cost follows the change, not the history.
+    std::optional<DiskBundleHashes> fullObjects;
+    std::set<Hash> deltaObjects;
+    if (base) {
+        bool reachedBase = false;
+        deltaObjects = collectDelta(tipHash, baseHash, revisionBundleMaxObjects, reachedBase);
+        require(Err::Conflict, reachedBase,
+                "incremental recipient base is not an ancestor of source HEAD");
+    } else {
+        fullObjects.emplace(this->scratch_);
+        std::vector<std::pair<Hash, Kind>> pending{{tipHash, Kind::Revision}};
         while (!pending.empty()) {
             const std::pair<Hash, Kind> next = pending.back();
             pending.pop_back();
-            if (isZero(next.first)) continue;
-            if (base && next.second == Kind::Revision && next.first == baseHash)
-                reachedBase = true;
-            if ((excluded && excluded->contains(next.first)) ||
-                !visited.insert(next.first, revisionBundleMaxObjectsV2)) continue;
-            const Bytes bytes = load(next.first);
-            require(Err::Corruption, sha256(bytes) == next.first,
-                    "v2 export pack object checksum mismatch");
-            require(Err::LimitExceeded, limits.maxObjectBytes == 0 ||
-                    bytes.size() <= limits.maxObjectBytes,
-                    "v2 bundle object is larger than configured limit");
+            if (isZero(next.first) || !fullObjects->insert(next.first, revisionBundleMaxObjects))
+                continue;
             if (next.second == Kind::Revision) {
-                const RevisionRecordV2 record = decodeRevisionRecordV2(bytes);
-                require(Err::Corruption, record.project == project,
-                        "v2 export revision belongs to another project");
-                const std::optional<ResolvedRevisionV2> published =
-                    resolver.resolveDirect(record.id, reader);
-                require(Err::Corruption, published && published->recordHash == next.first,
-                        "v2 export contains inconsistent revision binding");
+                const RevisionRecord record = decodeRevisionRecord(load(next.first));
                 pending.emplace_back(record.root, Kind::Tree);
                 pending.emplace_back(record.referencesRoot, Kind::Tree);
-                for (const RevisionParentV2& parent : record.parents)
+                for (const RevisionParent& parent : record.parents)
                     pending.emplace_back(parent.expectedRecordHash, Kind::Revision);
             } else if (next.second == Kind::Tree) {
                 const TreeNode node = readNode(next.first);
@@ -5278,66 +4511,73 @@ void Repository::exportRevisionBundleV2Locked(const ProjectId& project,
                     pending.emplace_back(child, Kind::Tree);
             }
         }
+    }
+    const std::uint64_t objectTotal = base ? static_cast<std::uint64_t>(deltaObjects.size())
+                                           : fullObjects->size();
+    const std::function<void(const std::function<void(const Hash&)>&)> forEachObject =
+        [&](const std::function<void(const Hash&)>& visit) {
+        if (base) for (const Hash& hash : deltaObjects) visit(hash);
+        else fullObjects->forEach(visit);
     };
-    bool ignoredBase = false;
-    if (base) collect(baseHash, baseObjects, nullptr, ignoredBase);
-    DiskBundleHashes objects(this->scratch_);
-    bool reachedBase = false;
-    collect(tipHash, objects, base ? &baseObjects : nullptr, reachedBase);
-    require(Err::Conflict, !base || reachedBase || tipHash == baseHash,
-            "incremental recipient base is not an ancestor of source HEAD");
-    SortedBundleHashes ordered(this->scratch_);
-    objects.forEach([&](const Hash& hash) { ordered.append(hash); });
-    ordered.finalize();
     require(Err::Corruption, !ref->forkRevisionId || ref->originBranchId,
             "branch fork revision has no origin branch identity");
     const bool hasProvenance = ref->originBranchId.has_value() || ref->forkRevisionId.has_value();
     const std::uint64_t headerSize = hasProvenance
-        ? (base ? revisionDeltaProvenanceHeaderV2 : revisionBundleProvenanceHeaderV2)
-        : (base ? revisionDeltaHeaderV2 : revisionBundleHeaderV2);
+        ? (base ? revisionDeltaProvenanceHeader : revisionBundleProvenanceHeader)
+        : (base ? revisionDeltaHeader : revisionBundleHeader);
     std::uint64_t total = headerSize;
-    // Preflight byte limits before exposing any bundle content.
-    while (const std::optional<Hash> hash = ordered.next()) {
-        const Bytes bytes = load(*hash);
+    // Preflight byte limits and authenticate every exported object before
+    // exposing any bundle content.
+    forEachObject([&](const Hash& hash) {
+        const Bytes bytes = load(hash);
+        require(Err::Corruption, sha256(bytes) == hash, "export pack object checksum mismatch");
         require(Err::LimitExceeded, bytes.size() <= maxObjectBytes &&
                 (limits.maxObjectBytes == 0 || bytes.size() <= limits.maxObjectBytes),
-                "v2 export object exceeds configured size limit");
-        require(Err::LimitExceeded, total <= revisionBundleMaxBytesV2 &&
-                bytes.size() + bundleEntryBytes <= revisionBundleMaxBytesV2 - total,
-                "v2 export bundle exceeds hard size limit");
+                "bundle object is larger than configured limit");
+        if (bytes.size() >= 2 && bytes[0] == 'T' && bytes[1] == 2) {
+            const RevisionRecord record = decodeRevisionRecord(bytes);
+            require(Err::Corruption, record.project == project,
+                    "export revision belongs to another project");
+            const std::optional<ResolvedRevision> published = resolver.resolve(record.id, reader);
+            require(Err::Corruption, published && published->recordHash == hash,
+                    "export contains inconsistent revision binding");
+        }
+        require(Err::LimitExceeded, total <= revisionBundleMaxBytes &&
+                bytes.size() + bundleEntryBytes <= revisionBundleMaxBytes - total,
+                "export bundle exceeds hard size limit");
         total += bundleEntryBytes + bytes.size();
-        checkRevisionBundleLimitV2(total, objects.size(), limits);
+        checkRevisionBundleLimit(total, objectTotal, limits);
+    });
+    if (!base) {
+        // The verifier checks canonical trie/model/reference semantics of the
+        // full source graph. It can load from the pack without a payload map.
+        const std::function<Bytes(const Hash&)> verifiedObject = [&](const Hash& hash) {
+            const Bytes bytes = load(hash);
+            if (bytes.size() >= 2 && bytes[0] == 'T' && bytes[1] == 2)
+                return logicalRevisionFrom(bytes, project);
+            return bytes;
+        };
+        (void)verifyLogicalGraph({tipHash}, verifiedObject, this->scratch_);
     }
-    // The verifier checks canonical trie/model/reference semantics of the
-    // full source graph. It can load from the pack without a payload map.
-    const std::function<Bytes(const Hash&)> verifiedObject = [&](const Hash& hash) {
-        const Bytes bytes = load(hash);
-        if (bytes.size() >= 2 && bytes[0] == 'T' && bytes[1] == 2)
-            return logicalRevisionFromV2(bytes, project);
-        return bytes;
-    };
-    (void)verifyLogicalGraph({tipHash}, verifiedObject, this->scratch_);
-    // Reset the sorter: its iterator is one-shot. Rebuild from the private
-    // hash table, which remains disk-resident, and stream into caller's file.
     SortedBundleHashes sorted(this->scratch_);
-    objects.forEach([&](const Hash& hash) { sorted.append(hash); });
+    forEachObject([&](const Hash& hash) { sorted.append(hash); });
     sorted.finalize();
     Bytes header(static_cast<std::size_t>(headerSize), 0);
     const std::array<std::uint8_t, 8>& magic = hasProvenance
-        ? (base ? revisionDeltaProvenanceMagicV2 : revisionBundleProvenanceMagicV2)
-        : (base ? revisionDeltaMagicV2 : revisionBundleMagicV2);
+        ? (base ? revisionDeltaProvenanceMagic : revisionBundleProvenanceMagic)
+        : (base ? revisionDeltaMagic : revisionBundleMagic);
     std::copy(magic.begin(), magic.end(), header.begin());
     std::copy(project.uuid().bytes.begin(), project.uuid().bytes.end(), header.begin() + 8);
     std::copy(ref->id.uuid().bytes.begin(), ref->id.uuid().bytes.end(), header.begin() + 24);
     std::copy(tip.id.uuid().bytes.begin(), tip.id.uuid().bytes.end(), header.begin() + 40);
     std::copy(tipHash.begin(), tipHash.end(), header.begin() + 56);
-    storeU64(header.data() + 88, objects.size());
+    storeU64(header.data() + 88, objectTotal);
     if (base) {
         std::copy(base->uuid().bytes.begin(), base->uuid().bytes.end(), header.begin() + 96);
         std::copy(baseHash.begin(), baseHash.end(), header.begin() + 112);
     }
     if (hasProvenance) {
-        const std::size_t at = base ? revisionDeltaHeaderV2 : revisionBundleHeaderV2;
+        const std::size_t at = base ? revisionDeltaHeader : revisionBundleHeader;
         if (ref->originBranchId) {
             std::copy(ref->originBranchId->uuid().bytes.begin(),
                       ref->originBranchId->uuid().bytes.end(), header.begin() + at);
@@ -5358,42 +4598,70 @@ void Repository::exportRevisionBundleV2Locked(const ProjectId& project,
             writeExact(fd, entry.data(), entry.size(), offset);
             offset += entry.size();
             if (!bytes.empty()) {
+                detail::faultPartialWrite(fd, bytes.data(), bytes.size(), offset,
+                                          "export.partial.object");
                 writeExact(fd, bytes.data(), bytes.size(), offset);
                 offset += bytes.size();
             }
         }
         systemCall(::fsync(fd) == 0, "sync UUIDv7 revision bundle");
     } catch (...) {
-        (void)::ftruncate(fd, 0);
+        if (::ftruncate(fd, 0) != 0) {
+            // Best effort: the caller still owns and discards the descriptor.
+        }
         throw;
     }
 }
 
-RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expectedProject,
-        int fd, std::string_view localBranch, BundleLimits limits) {
+RevisionBundleImport Repository::importRevisionBundle(const ProjectId& expectedProject,
+        int fd, std::string_view localBranch, BundleLimits limits, BundleImportProfile* profile) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
+    if (profile != nullptr) *profile = BundleImportProfile{};
+    const ImportClock::time_point importStart = ImportClock::now();
+    BundleImportProfile counters{};
+    bool verifying = true;
+    // Every local object read while verifying the bundle is counted: an
+    // incremental import must read a number proportional to the delta.
+    const RevisionObjectReader local = [this, &counters, &verifying](const Hash& hash)
+            -> std::optional<Bytes> {
+        if (!containsIndex(hash)) return std::nullopt;
+        Bytes bytes = load(hash);
+        if (verifying) {
+            ++counters.localObjectReads;
+            counters.localObjectBytes += bytes.size();
+        }
+        return bytes;
+    };
+    const std::function<void()> finishProfile = [&]() {
+        if (profile == nullptr) return;
+        profile->bundleObjectReads = counters.bundleObjectReads;
+        profile->bundleObjectBytes = counters.bundleObjectBytes;
+        profile->localObjectReads = counters.localObjectReads;
+        profile->localObjectBytes = counters.localObjectBytes;
+        profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
+    };
     checkBranch(localBranch);
     struct stat source{};
-    systemCall(fd >= 0 && ::fstat(fd, &source) == 0, "stat v2 revision bundle");
+    systemCall(fd >= 0 && ::fstat(fd, &source) == 0, "stat revision bundle");
     require(Err::InvalidInput, S_ISREG(source.st_mode) && source.st_size >= 0 &&
-            static_cast<std::uint64_t>(source.st_size) >= revisionBundleHeaderV2,
-            "invalid v2 replication bundle file");
+            static_cast<std::uint64_t>(source.st_size) >= revisionBundleHeader,
+            "invalid replication bundle file");
     const std::uint64_t size = static_cast<std::uint64_t>(source.st_size);
-    checkRevisionBundleLimitV2(size, 0, limits);
+    checkRevisionBundleLimit(size, 0, limits);
     std::array<std::uint8_t, 8> magic{};
     readExact(fd, magic.data(), magic.size(), 0);
-    const bool incremental = magic == revisionDeltaMagicV2 ||
-                             magic == revisionDeltaProvenanceMagicV2;
-    const bool hasProvenance = magic == revisionBundleProvenanceMagicV2 ||
-                               magic == revisionDeltaProvenanceMagicV2;
-    require(Err::InvalidInput, incremental || hasProvenance || magic == revisionBundleMagicV2,
+    const bool incremental = magic == revisionDeltaMagic ||
+                             magic == revisionDeltaProvenanceMagic;
+    const bool hasProvenance = magic == revisionBundleProvenanceMagic ||
+                               magic == revisionDeltaProvenanceMagic;
+    require(Err::InvalidInput, incremental || hasProvenance || magic == revisionBundleMagic,
             "unsupported UUIDv7 revision replication format");
     const std::uint64_t headerSize = hasProvenance
-        ? (incremental ? revisionDeltaProvenanceHeaderV2 : revisionBundleProvenanceHeaderV2)
-        : (incremental ? revisionDeltaHeaderV2 : revisionBundleHeaderV2);
-    require(Err::InvalidInput, size >= headerSize, "truncated v2 replication header");
+        ? (incremental ? revisionDeltaProvenanceHeader : revisionBundleProvenanceHeader)
+        : (incremental ? revisionDeltaHeader : revisionBundleHeader);
+    require(Err::InvalidInput, size >= headerSize, "truncated replication header");
     Bytes header(static_cast<std::size_t>(headerSize));
     readExact(fd, header.data(), header.size(), 0);
     const auto parseUuid = [&](std::size_t at) -> std::string {
@@ -5407,11 +4675,11 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
     require(Err::InvalidInput, project && branchId && incoming,
             "bundle has invalid UUIDv7 identity");
     require(Err::Conflict, *project == expectedProject,
-            "v2 bundle project does not match explicitly expected project UUID");
+            "bundle project does not match explicitly expected project UUID");
     std::optional<BranchId> originBranchId;
     std::optional<RevisionId> forkRevisionId;
     if (hasProvenance) {
-        const std::size_t at = incremental ? revisionDeltaHeaderV2 : revisionBundleHeaderV2;
+        const std::size_t at = incremental ? revisionDeltaHeader : revisionBundleHeader;
         const auto isNullUuid = [&](std::size_t offset) {
             return std::all_of(header.begin() + static_cast<std::ptrdiff_t>(offset),
                                header.begin() + static_cast<std::ptrdiff_t>(offset + 16),
@@ -5428,26 +4696,24 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
     const std::uint64_t count = readU64(header.data() + 88);
     require(Err::InvalidInput, tipHash != Hash{} && (incremental || count > 0) &&
             count <= (size - headerSize) / bundleEntryBytes,
-            "invalid v2 bundle tip digest or count");
-    checkRevisionBundleLimitV2(size, count, limits);
-    const std::optional<ProjectId> existingProject = persistedV2Project(this->directory_);
+            "invalid bundle tip digest or count");
+    checkRevisionBundleLimit(size, count, limits);
+    const std::optional<ProjectId> existingProject = persistedProject(this->directory_);
     require(Err::Conflict, !existingProject || *existingProject == *project,
             "cannot import revisions into a different project identity");
     const std::vector<StoredBranch> branches = readStoredBranches(this->directory_);
     const StoredBranch* existing = nullptr;
     for (const StoredBranch& branch : branches) {
-        require(Err::Unavailable, branch.revisionV2.has_value(),
-                "v2 replication cannot mix SHA-based branch HEADs");
         require(Err::Conflict, branch.id != *branchId || branch.name == localBranch,
                 "incoming branch UUID is assigned to a different name");
         if (branch.name == localBranch) existing = &branch;
     }
     require(Err::Conflict, !existing || existing->id == *branchId,
-            "v2 replication would rebind branch UUID");
+            "replication would rebind branch UUID");
     if (existing && hasProvenance) {
         require(Err::Conflict, existing->originBranchId == originBranchId &&
                 existing->forkRevisionId == forkRevisionId,
-                "v2 replication branch fork provenance conflicts with local branch");
+                "replication branch fork provenance conflicts with local branch");
     }
     std::optional<RevisionId> base;
     Hash baseHash{};
@@ -5458,16 +4724,12 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
         require(Err::InvalidInput, baseHash != Hash{}, "invalid incremental base digest");
         // A delta is valid for exactly one recipient HEAD. Allow a same-tip
         // replay, but never apply a stale or forked delta to another HEAD.
-        require(Err::Conflict, existing && existing->revisionV2 &&
-                ((existing->revisionV2 == base && existing->head == baseHash) ||
-                 (existing->revisionV2 == incoming && existing->head == tipHash)),
+        require(Err::Conflict, existing && existing->revision &&
+                ((existing->revision == base && existing->head == baseHash) ||
+                 (existing->revision == incoming && existing->head == tipHash)),
                 "incremental recipient HEAD differs from pinned base");
-        RevisionResolverV2 resolver(this->directory_, *project);
-        const RevisionObjectReaderV2 local = [this](const Hash& hash) -> std::optional<Bytes> {
-            if (!containsIndex(hash)) return std::nullopt;
-            return load(hash);
-        };
-        const std::optional<ResolvedRevisionV2> pinned = resolver.resolve(*base, local);
+        RevisionResolver resolver(this->directory_, *project);
+        const std::optional<ResolvedRevision> pinned = resolver.resolve(*base, local);
         require(Err::Conflict, pinned && pinned->recordHash == baseHash,
                 "incremental base UUID/SHA is missing or changed");
     }
@@ -5480,7 +4742,7 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
     std::uint64_t offset = headerSize;
     for (std::uint64_t ordinal = 0; ordinal < count; ++ordinal) {
         require(Err::InvalidInput, size - offset >= bundleEntryBytes,
-                "truncated v2 bundle object entry");
+                "truncated bundle object entry");
         std::array<std::uint8_t, bundleEntryBytes> entry{};
         readExact(fd, entry.data(), entry.size(), offset);
         offset += entry.size();
@@ -5489,12 +4751,12 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
         const std::uint64_t length = readU64(entry.data() + 32);
         require(Err::InvalidInput, hash != Hash{} && (ordinal == 0 || previous < hash) &&
                 length <= maxObjectBytes && length <= size - offset,
-                "invalid v2 bundle object order or size");
+                "invalid bundle object order or size");
         require(Err::LimitExceeded, limits.maxObjectBytes == 0 ||
                 length <= limits.maxObjectBytes,
-                "v2 bundle object exceeds configured limit");
+                "bundle object exceeds configured limit");
         require(Err::InvalidInput, sha256FileRegion(fd, offset, length) == hash,
-                "v2 bundle object checksum mismatch");
+                "bundle object checksum mismatch");
         const BundleLocation location{offset, length};
         entries.append(hash, location);
         if (length >= 2) {
@@ -5503,71 +4765,93 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             if (prefix[0] == 'T' && prefix[1] == 2) {
                 Bytes bytes(static_cast<std::size_t>(length));
                 readExact(fd, bytes.data(), bytes.size(), offset);
-                RevisionRecordV2 record = decodeRevisionRecordV2(bytes);
+                RevisionRecord record = decodeRevisionRecord(bytes);
                 require(Err::InvalidInput, record.project == *project &&
                         revisions.emplace(record.id, std::make_pair(hash, location)).second,
-                        "duplicate or cross-project v2 revision in bundle");
+                        "duplicate or cross-project revision in bundle");
             }
         }
         offset += length;
         previous = hash;
     }
-    require(Err::InvalidInput, offset == size, "v2 bundle has trailing bytes");
+    require(Err::InvalidInput, offset == size, "bundle has trailing bytes");
     entries.finalize();
+    if (profile != nullptr) profile->scanMs = elapsedImportMs(importStart, ImportClock::now());
+    const ImportClock::time_point graphStart = ImportClock::now();
     const auto readBundle = [&](const Hash& hash) -> Bytes {
         const std::optional<BundleLocation> location = entries.find(hash);
-        require(Err::Corruption, location.has_value(), "missing transferred v2 object");
+        require(Err::Corruption, location.has_value(), "missing transferred object");
         Bytes data(static_cast<std::size_t>(location->size));
         if (!data.empty()) readExact(fd, data.data(), data.size(), location->offset);
         require(Err::InvalidInput, sha256(data) == hash,
-                "v2 replication bundle changed during import");
+                "replication bundle changed during import");
+        if (verifying) {
+            ++counters.bundleObjectReads;
+            counters.bundleObjectBytes += data.size();
+        }
         return data;
     };
+    // A local object that is missing or damaged is local Corruption, never a
+    // client error: LocalStorageFailure keeps its kind through the verifier.
     const auto readLocal = [&](const Hash& hash) -> Bytes {
-        require(Err::Corruption, containsIndex(hash), "missing local incremental object");
-        const Bytes bytes = load(hash);
-        require(Err::Corruption, sha256(bytes) == hash,
-                "local incremental pack object checksum mismatch");
-        return bytes;
+        const std::optional<Bytes> bytes = local(hash);
+        if (!bytes || sha256(*bytes) != hash)
+            throw LocalStorageFailure(Err::Corruption,
+                                      "missing or damaged local incremental object");
+        return *bytes;
     };
     const auto bundled = [&](const Hash& hash) -> Bytes {
         Bytes bytes = entries.find(hash) ? readBundle(hash) :
                       (incremental ? readLocal(hash) : Bytes{});
-        require(Err::Corruption, !bytes.empty(), "v2 bundle omits reachable object");
+        require(Err::Corruption, !bytes.empty(), "bundle omits reachable object");
         if (bytes.size() >= 2 && bytes[0] == 'T' && bytes[1] == 2)
-            return logicalRevisionFromV2(bytes, *project);
+            return logicalRevisionFrom(bytes, *project);
         return bytes;
     };
     const std::map<RevisionId, std::pair<Hash, BundleLocation>>::const_iterator tip =
         revisions.find(*incoming);
     require(Err::InvalidInput, (tip != revisions.end() && tip->second.first == tipHash) ||
             (incremental && *incoming == *base && tipHash == baseHash && count == 0),
-            "v2 bundle does not authenticate its HEAD revision");
-    const RevisionRecordLookupV2 getRevision = [&](const RevisionId& id) -> std::optional<Bytes> {
+            "bundle does not authenticate its HEAD revision");
+    const RevisionRecordLookup getRevision = [&](const RevisionId& id) -> std::optional<Bytes> {
         const std::map<RevisionId, std::pair<Hash, BundleLocation>>::const_iterator found =
             revisions.find(id);
         if (found != revisions.end()) return readBundle(found->second.first);
         if (!incremental) return std::nullopt;
-        RevisionResolverV2 resolver(this->directory_, *project);
-        const RevisionObjectReaderV2 local = [this](const Hash& hash) -> std::optional<Bytes> {
-            if (!containsIndex(hash)) return std::nullopt;
-            return load(hash);
-        };
-        const std::optional<ResolvedRevisionV2> resolved = resolver.resolveDirect(id, local);
-        if (!resolved) return std::nullopt;
-        return encodeRevisionRecordV2(resolved->record);
+        try {
+            RevisionResolver resolver(this->directory_, *project);
+            const std::optional<ResolvedRevision> resolved = resolver.resolve(id, local);
+            if (!resolved) return std::nullopt;
+            return encodeRevisionRecord(resolved->record);
+        } catch (const LocalStorageFailure&) {
+            throw;
+        } catch (const StorageError& error) {
+            // Local damage is never the bundle's fault.
+            throw LocalStorageFailure(error.kind(), error.what());
+        }
+    };
+    // A parent the recipient already holds under exactly this record digest
+    // is a verified boundary: its ancestry was checked when it was stored.
+    const TrustedRevision trustedLocal = [&](const RevisionParent& parent) {
+        if (!incremental || revisions.contains(parent.id)) return false;
+        try {
+            RevisionResolver resolver(this->directory_, *project);
+            const std::optional<ResolvedRevision> held = resolver.resolve(parent.id, local);
+            return held.has_value() && held->recordHash == parent.expectedRecordHash;
+        } catch (const StorageError& error) {
+            throw LocalStorageFailure(error.kind(), error.what());
+        }
     };
     try {
-        (void)verifyRevisionAncestryV2(
+        (void)verifyRevisionAncestry(
             tip != revisions.end() ? readBundle(tip->second.first) : *getRevision(*incoming),
-            getRevision, revisionBundleMaxObjectsV2);
-    } catch (const StorageError& error) {
-        if (error.kind() == Err::Corruption)
-            throw StorageError(Err::InvalidInput,
-                               std::string("invalid v2 bundle ancestry: ") + error.what());
-        throw;
+            getRevision, revisionBundleMaxObjects, trustedLocal);
+    } catch (...) {
+        rethrowBundleFailure();
     }
-    if (forkRevisionId) {
+    // An existing branch's provenance was verified when it was stored and
+    // must match (checked above); only new provenance needs the ancestry walk.
+    if (forkRevisionId && !(existing && existing->forkRevisionId == forkRevisionId)) {
         // Provenance cannot identify an unrelated revision: the immutable
         // fork point must be a genuine ancestor of this branch's HEAD.
         std::set<RevisionId> seen;
@@ -5577,21 +4861,21 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             const RevisionId id = pending.back();
             pending.pop_back();
             if (!seen.insert(id).second) continue;
-            require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjectsV2,
-                    "v2 bundle fork provenance exceeds ancestry budget");
+            require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjects,
+                    "bundle fork provenance exceeds ancestry budget");
             if (id == *forkRevisionId) {
                 foundFork = true;
                 break;
             }
             const std::optional<Bytes> encoded = getRevision(id);
             require(Err::InvalidInput, encoded.has_value(),
-                    "v2 bundle fork ancestry has an unavailable revision");
-            const RevisionRecordV2 record = decodeRevisionRecordV2(*encoded);
-            for (const RevisionParentV2& parent : record.parents)
+                    "bundle fork ancestry has an unavailable revision");
+            const RevisionRecord record = decodeRevisionRecord(*encoded);
+            for (const RevisionParent& parent : record.parents)
                 pending.push_back(parent.id);
         }
         require(Err::InvalidInput, foundFork,
-                "v2 bundle fork revision is not an ancestor of branch HEAD");
+                "bundle fork revision is not an ancestor of branch HEAD");
     }
     if (incremental) {
         // A matching recipient base in the header is not enough: an
@@ -5604,21 +4888,25 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             const RevisionId id = pending.back();
             pending.pop_back();
             if (!seen.insert(id).second) continue;
-            require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjectsV2,
-                    "incremental v2 ancestry exceeds traversal budget");
+            require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjects,
+                    "incremental ancestry exceeds traversal budget");
             if (id == *base) {
                 foundBase = true;
                 break;
             }
+            // An honest delta carries every revision that is not an ancestor
+            // of the base, so the base is found through bundled revisions:
+            // never descend into local history here.
+            if (!revisions.contains(id)) continue;
             const std::optional<Bytes> encoded = getRevision(id);
             require(Err::InvalidInput, encoded.has_value(),
-                    "incremental v2 history has an unavailable ancestor");
-            const RevisionRecordV2 revision = decodeRevisionRecordV2(*encoded);
-            for (const RevisionParentV2& parent : revision.parents)
+                    "incremental history has an unavailable ancestor");
+            const RevisionRecord revision = decodeRevisionRecord(*encoded);
+            for (const RevisionParent& parent : revision.parents)
                 pending.push_back(parent.id);
         }
         require(Err::InvalidInput, foundBase,
-                "incremental v2 recipient base is not an ancestor of incoming HEAD");
+                "incremental recipient base is not an ancestor of incoming HEAD");
     }
     BundleVisitMarks marks(entries.size(), this->scratch_);
     BundleTreeSummaries summaries(entries.size(), this->scratch_);
@@ -5653,72 +4941,81 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             return incremental && !entries.find(hash) && containsIndex(hash);
         }
     };
+    LogicalVerificationProfile graphProfile{};
     try {
-        (void)verifyLogicalGraph({tipHash}, bundled, this->scratch_, external);
-        for (std::size_t index = 0; index < entries.size(); ++index)
-            require(Err::InvalidInput, marks.at(index) != 0,
-                    "v2 bundle includes unreachable or redundant objects");
-    } catch (const StorageError& error) {
-        if (error.kind() == Err::Corruption)
-            throw StorageError(Err::InvalidInput,
-                               std::string("invalid v2 bundle graph: ") + error.what());
-        throw;
+        (void)verifyLogicalGraph({tipHash}, bundled, this->scratch_, external,
+                                 profile != nullptr ? &graphProfile : nullptr);
+    } catch (...) {
+        rethrowBundleFailure();
     }
-    if (incremental && existing->revisionV2 == incoming) {
-        return RevisionBundleImportV2{BundleImportStatus::UpToDate, *incoming, 0};
+    if (profile != nullptr) {
+        profile->graphTraversalMs = elapsedImportMs(graphStart, ImportClock::now()) -
+                                    graphProfile.modelReferenceMs;
+        profile->modelReferenceMs = graphProfile.modelReferenceMs;
+    }
+    const ImportClock::time_point reachStart = ImportClock::now();
+    for (std::size_t index = 0; index < entries.size(); ++index)
+        require(Err::InvalidInput, marks.at(index) != 0,
+                "bundle includes unreachable or redundant objects");
+    if (profile != nullptr) profile->reachabilityMs = elapsedImportMs(reachStart, ImportClock::now());
+    const ImportClock::time_point branchStart = ImportClock::now();
+    if (incremental && existing->revision == incoming) {
+        finishProfile();
+        return RevisionBundleImport{BundleImportStatus::UpToDate, *incoming, 0};
     }
     BundleImportStatus status = BundleImportStatus::Created;
     if (existing) {
-        if (existing->revisionV2 == incoming) {
+        if (existing->revision == incoming) {
             require(Err::Conflict, existing->head == tipHash,
                     "existing branch HEAD UUID/SHA differs from incoming");
-            return RevisionBundleImportV2{BundleImportStatus::UpToDate, *incoming, 0};
+            finishProfile();
+            return RevisionBundleImport{BundleImportStatus::UpToDate, *incoming, 0};
         }
-        if (revisions.contains(*existing->revisionV2)) {
-            require(Err::Conflict, revisions.at(*existing->revisionV2).first == existing->head,
+        if (revisions.contains(*existing->revision)) {
+            require(Err::Conflict, revisions.at(*existing->revision).first == existing->head,
                     "existing branch ancestry checksum conflicts with incoming");
             status = BundleImportStatus::FastForward;
         } else if (incremental) {
-            require(Err::Conflict, existing->revisionV2 == base && existing->head == baseHash,
+            require(Err::Conflict, existing->revision == base && existing->head == baseHash,
                     "stale incremental recipient HEAD");
             status = BundleImportStatus::FastForward;
         } else {
-            RevisionResolverV2 resolver(this->directory_, *project);
-            const RevisionObjectReaderV2 local = [this](const Hash& hash) -> std::optional<Bytes> {
-                if (!containsIndex(hash)) return std::nullopt;
-                return load(hash);
-            };
+            RevisionResolver resolver(this->directory_, *project);
             std::set<RevisionId> seen;
-            std::vector<RevisionId> pending{*existing->revisionV2};
+            std::vector<RevisionId> pending{*existing->revision};
             bool ancestor = false;
             while (!pending.empty()) {
                 const RevisionId current = pending.back();
                 pending.pop_back();
                 if (!seen.insert(current).second) continue;
-                require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjectsV2,
-                        "v2 replication ancestry budget exceeded");
-                const std::optional<ResolvedRevisionV2> revision =
-                    resolver.resolveDirect(current, local);
+                require(Err::LimitExceeded, seen.size() <= revisionBundleMaxObjects,
+                        "replication ancestry budget exceeded");
+                const std::optional<ResolvedRevision> revision =
+                    resolver.resolve(current, local);
                 require(Err::Corruption, revision.has_value(),
-                        "missing local v2 revision ancestor");
+                        "missing local revision ancestor");
                 if (current == *incoming) {
                     require(Err::Conflict, revision->recordHash == tipHash,
                             "local revision digest conflicts with incoming");
                     ancestor = true;
                     break;
                 }
-                for (const RevisionParentV2& parent : revision->record.parents)
+                for (const RevisionParent& parent : revision->record.parents)
                     pending.push_back(parent.id);
             }
             require(Err::Conflict, ancestor,
-                    "v2 replication would replace divergent branch history");
-            return RevisionBundleImportV2{BundleImportStatus::UpToDate,
-                                           *existing->revisionV2, 0};
+                    "replication would replace divergent branch history");
+            finishProfile();
+            return RevisionBundleImport{BundleImportStatus::UpToDate,
+                                           *existing->revision, 0};
         }
     }
     // Only after all external data, ancestry and object semantics validate:
     // append immutable objects; fsync; publish UUID mappings parent-first;
     // finally atomically replace the branch HEAD record.
+    if (profile != nullptr) profile->branchCheckMs = elapsedImportMs(branchStart, ImportClock::now());
+    verifying = false;
+    const ImportClock::time_point writeStart = ImportClock::now();
     std::uint64_t imported = 0;
     for (std::size_t index = 0; index < entries.size(); ++index) {
         const std::pair<Hash, BundleLocation> object = entries.at(index);
@@ -5728,15 +5025,15 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             continue;
         }
         require(Err::Internal, store(readBundle(object.first)) == object.first,
-                "v2 imported object digest changed during storage");
+                "imported object digest changed during storage");
         ++imported;
+        detail::faultCheckpoint("import.after.object");
     }
     syncPack();
-    RevisionResolverV2 resolver(this->directory_, *project);
-    const RevisionObjectReaderV2 local = [this](const Hash& hash) -> std::optional<Bytes> {
-        if (!containsIndex(hash)) return std::nullopt;
-        return load(hash);
-    };
+    detail::faultCheckpoint("import.after.sync");
+    if (profile != nullptr) profile->objectWriteMs = elapsedImportMs(writeStart, ImportClock::now());
+    const ImportClock::time_point publishStart = ImportClock::now();
+    RevisionResolver resolver(this->directory_, *project);
     std::set<RevisionId> published;
     std::vector<std::pair<RevisionId, bool>> pending{{*incoming, false}};
     while (!pending.empty()) {
@@ -5747,20 +5044,20 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
             revisions.find(step.first);
         if (found == revisions.end()) {
             require(Err::Corruption, incremental &&
-                    resolver.resolveDirect(step.first, local).has_value(),
-                    "v2 imported ancestry refers to an unpublished local revision");
+                    resolver.resolve(step.first, local).has_value(),
+                    "imported ancestry refers to an unpublished local revision");
             published.insert(step.first);
             continue;
         }
         if (step.second) {
             require(Err::Corruption, resolver.publish(readBundle(found->second.first), local) ==
-                    found->second.first, "v2 imported revision digest changed");
+                    found->second.first, "imported revision digest changed");
             published.insert(step.first);
         } else {
             pending.emplace_back(step.first, true);
-            const RevisionRecordV2 revision =
-                decodeRevisionRecordV2(readBundle(found->second.first));
-            for (const RevisionParentV2& parent : revision.parents)
+            const RevisionRecord revision =
+                decodeRevisionRecord(readBundle(found->second.first));
+            for (const RevisionParent& parent : revision.parents)
                 if (!published.contains(parent.id)) pending.emplace_back(parent.id, false);
         }
     }
@@ -5769,75 +5066,9 @@ RevisionBundleImportV2 Repository::importRevisionBundleV2(const ProjectId& expec
                                                         existing ? existing->originBranchId : originBranchId,
                                                         existing ? existing->forkRevisionId : forkRevisionId},
                         !existing);
-    return RevisionBundleImportV2{status, *incoming, imported};
-}
-
-// physical pack/index pages. Separate repositories retain identical identities.
-void Repository::exportBranchBundle(std::string_view branch,
-                                    const std::filesystem::path& bundlePath, BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, &bundlePath, -1, std::nullopt, limits, true);
-}
-
-void Repository::exportBranchBundle(std::string_view branch, int fd, BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, nullptr, fd, std::nullopt, limits, true);
-}
-
-void Repository::exportIncrementalBranchBundle(std::string_view branch, const Hash& recipientBase,
-                                               int fd, BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, nullptr, fd, recipientBase, limits, true);
-}
-
-void Repository::exportIncrementalBranchBundle(std::string_view branch,
-                                               const Hash& recipientBase,
-                                               const std::filesystem::path& bundlePath, BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, &bundlePath, -1, recipientBase, limits, true);
-}
-
-void Repository::exportIdentifiedBranchBundle(std::string_view branch,
-                                             const std::filesystem::path& bundlePath,
-                                             BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, &bundlePath, -1, std::nullopt, limits, true);
-}
-
-void Repository::exportIdentifiedBranchBundle(std::string_view branch, int fd,
-                                             BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, nullptr, fd, std::nullopt, limits, true);
-}
-
-void Repository::exportIdentifiedIncrementalBranchBundle(
-        std::string_view branch, const Hash& recipientBase,
-        const std::filesystem::path& bundlePath, BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, &bundlePath, -1, recipientBase, limits, true);
-}
-
-void Repository::exportIdentifiedIncrementalBranchBundle(
-        std::string_view branch, const Hash& recipientBase, int fd,
-        BundleLimits limits) {
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    exportBundleLocked(branch, nullptr, fd, recipientBase, limits, true);
+    if (profile != nullptr) profile->publicationMs = elapsedImportMs(publishStart, ImportClock::now());
+    finishProfile();
+    return RevisionBundleImport{status, *incoming, imported};
 }
 
 // Objects of `after` that are not part of the tree `before`, found by walking
@@ -5888,541 +5119,50 @@ void Repository::collectTreeDelta(const Hash& before, const Hash& after, std::se
 // complete relative to its chosen parent, so by induction over the ancestry
 // every object of a new revision is emitted or held by the recipient.
 std::set<Hash> Repository::collectDelta(const Hash& tip, const Hash& base,
-                                        std::uint64_t maxObjects) {
+                                          std::uint64_t maxObjects, bool& reachedBase) {
+    const std::function<RevisionRecord(const Hash&)> record = [this](const Hash& hash) {
+        return decodeRevisionRecord(load(hash));
+    };
     std::unordered_set<Hash, HashHasher> known;
     std::vector<Hash> pending{base};
     while (!pending.empty()) {
         const Hash current = pending.back();
         pending.pop_back();
         if (!known.insert(current).second) continue;
-        for (const Hash& parent : readRevision(current).parents) pending.push_back(parent);
+        for (const RevisionParent& parent : record(current).parents)
+            pending.push_back(parent.expectedRecordHash);
     }
+    reachedBase = false;
     std::set<Hash> output;
     std::unordered_set<Hash, HashHasher> visited;
     pending.assign(1, tip);
     while (!pending.empty()) {
         const Hash current = pending.back();
         pending.pop_back();
+        if (current == base) reachedBase = true;
         if (known.contains(current) || !visited.insert(current).second) continue;
-        const Revision revision = readRevision(current);
+        const RevisionRecord revision = record(current);
         insertBundleObject(output, current, maxObjects);
         // Prefer a parent the recipient already holds: its trees need no
         // transfer and the new revision's diff against it is the smallest.
-        Revision parent{};
-        for (const Hash& candidate : revision.parents) {
-            if (known.contains(candidate)) { parent = readRevision(candidate); break; }
+        Hash parentRoot{};
+        Hash parentReferences{};
+        const RevisionParent* chosen = nullptr;
+        for (const RevisionParent& candidate : revision.parents) {
+            if (known.contains(candidate.expectedRecordHash)) { chosen = &candidate; break; }
         }
-        if (isZero(parent.id) && !revision.parents.empty()) parent = readRevision(revision.parents.front());
-        collectTreeDelta(parent.root, revision.root, output, maxObjects);
-        collectTreeDelta(parent.referencesRoot, revision.referencesRoot, output, maxObjects);
-        for (const Hash& candidate : revision.parents) pending.push_back(candidate);
+        if (chosen == nullptr && !revision.parents.empty()) chosen = &revision.parents.front();
+        if (chosen != nullptr) {
+            const RevisionRecord parent = record(chosen->expectedRecordHash);
+            parentRoot = parent.root;
+            parentReferences = parent.referencesRoot;
+        }
+        collectTreeDelta(parentRoot, revision.root, output, maxObjects);
+        collectTreeDelta(parentReferences, revision.referencesRoot, output, maxObjects);
+        for (const RevisionParent& parent : revision.parents)
+            pending.push_back(parent.expectedRecordHash);
     }
     return output;
-}
-
-// Filesystem-path exports write into a private file in the destination
-// directory, fsync it, then atomically install the finished file without
-// replacing an existing name. Caller-owned descriptor exports retain their
-// previous contract: the caller handles publication and keeps ownership.
-void Repository::exportBundleLocked(std::string_view branch,
-                                    const std::filesystem::path* bundlePath, int targetFd,
-                                    std::optional<Hash> recipientBase, BundleLimits limits,
-                                    bool includeBranchIdentity) {
-    require(Err::Internal, includeBranchIdentity,
-            "SHA-only replication export is unsupported under BRANCH-1");
-
-    const Hash tip = branchHead(branch);
-    const std::optional<BranchId> identity = includeBranchIdentity
-        ? branchIdLocked(branch) : std::nullopt;
-    require(Err::Conflict, !includeBranchIdentity || identity.has_value(),
-            "cannot export branch identity: legacy branch has no authoritative UUIDv7");
-    // Full-history visited state lives in a private, disk-backed hash table.
-    // Keep incremental trie-delta enumeration unchanged: its small-delta
-    // performance must not pay the full-history scratch/index overhead.
-    const auto collectObjects = [&](const Hash& revisionTip, DiskBundleHashes& objects) {
-        enum class Kind { Revision, Tree, Value };
-        std::vector<std::pair<Hash, Kind>> pending{{revisionTip, Kind::Revision}};
-        while (!pending.empty()) {
-            const std::pair<Hash, Kind> entry = pending.back();
-            pending.pop_back();
-            if (isZero(entry.first) || !objects.insert(entry.first, limits.maxObjects)) continue;
-            if (entry.second == Kind::Revision) {
-                const Revision revision = readRevision(entry.first);
-                pending.emplace_back(revision.root, Kind::Tree);
-                pending.emplace_back(revision.referencesRoot, Kind::Tree);
-                for (const Hash& parent : revision.parents)
-                    pending.emplace_back(parent, Kind::Revision);
-            } else if (entry.second == Kind::Tree) {
-                const TreeNode node = readNode(entry.first);
-                if (node.leaf) {
-                    pending.emplace_back(node.value, Kind::Value);
-                } else {
-                    for (const Hash& child : node.children)
-                        pending.emplace_back(child, Kind::Tree);
-                }
-            } else {
-                (void)load(entry.first); // Verify every immutable object on export.
-            }
-        }
-    };
-    // Validate the request before creating an output file. A parent revision
-    // can be shared even if it is not on the first-parent history.
-    if (recipientBase) {
-        require(Err::Conflict, !isZero(*recipientBase) && revisionReachableFrom(tip, *recipientBase),
-                "incremental export base is not an ancestor of the source branch");
-    }
-    std::optional<std::set<Hash>> delta;
-    std::unique_ptr<SortedBundleHashes> sortedFull;
-    std::uint64_t objectCount = 0;
-    if (recipientBase) {
-        delta = collectDelta(tip, *recipientBase, limits.maxObjects);
-        objectCount = delta->size();
-    } else {
-        DiskBundleHashes objects(this->scratch_);
-        collectObjects(tip, objects);
-        objectCount = objects.size();
-        require(Err::InvalidInput, objectCount != 0, "cannot export an empty revision graph");
-        sortedFull = std::make_unique<SortedBundleHashes>(this->scratch_);
-        objects.forEach([&](const Hash& hash) { sortedFull->append(hash); });
-        sortedFull->finalize();
-    }
-    // The count limit was enforced at each unique discovery, before opening
-    // any output file. No partial bundle can be published on rejection.
-    int fd = targetFd;
-    int directoryFd = -1;
-    std::string temporaryName; // empty for an anonymous O_TMPFILE export
-    std::string destinationName;
-    if (bundlePath != nullptr) {
-        const std::filesystem::path parent = bundlePath->parent_path().empty()
-            ? std::filesystem::path(".") : bundlePath->parent_path();
-        destinationName = bundlePath->filename().string();
-        require(Err::InvalidInput, !destinationName.empty() && destinationName != "." &&
-                destinationName != "..", "invalid replication bundle destination");
-        directoryFd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        systemCall(directoryFd >= 0, "open replication bundle destination directory");
-        try {
-            // On supporting filesystems a crash before publication leaves no
-            // directory entry. Named fallback files are deliberately hidden;
-            // they can be removed after a crashed exporter has exited.
-            if (!detail::forceNamedScratchFiles()) {
-                fd = ::openat(directoryFd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
-                if (fd < 0 && errno != EOPNOTSUPP && errno != EISDIR &&
-                    errno != EINVAL && errno != ENOTSUP)
-                    throwSystemError("create anonymous replication bundle");
-            }
-            if (fd < 0) {
-                std::string name = (parent / ".aowis-export-XXXXXX").string();
-                fd = ::mkostemp(name.data(), O_CLOEXEC);
-                systemCall(fd >= 0, "create private replication bundle");
-                temporaryName = std::filesystem::path(name).filename().string();
-            }
-        } catch (...) {
-            ::close(directoryFd);
-            throw;
-        }
-    } else {
-        struct stat target{};
-        systemCall(fd >= 0 && ::fstat(fd, &target) == 0, "stat replication bundle target");
-        require(Err::InvalidInput, S_ISREG(target.st_mode) && target.st_size == 0,
-                "replication bundle target must be an empty regular file");
-    }
-    try {
-        const std::uint64_t headerSize = recipientBase
-            ? (includeBranchIdentity ? identifiedIncrementalHeaderBytes : incrementalBundleHeaderBytes)
-            : (includeBranchIdentity ? identifiedBundleHeaderBytes : bundleHeaderBytes);
-        Bytes header(static_cast<std::size_t>(headerSize));
-        const std::array<std::uint8_t, 8>& magic = includeBranchIdentity
-            ? (recipientBase ? identifiedIncrementalBundleMagic : identifiedBundleMagic)
-            : (recipientBase ? incrementalBundleMagic : bundleMagic);
-        std::copy(magic.begin(), magic.end(), header.begin());
-        std::copy(tip.begin(), tip.end(), header.begin() + 8);
-        storeU64(header.data() + 40, objectCount);
-        if (recipientBase) {
-            std::copy(recipientBase->begin(), recipientBase->end(), header.begin() + 48);
-        }
-        if (identity) {
-            const std::size_t position = recipientBase ? 80 : 48;
-            std::copy(identity->uuid().bytes.begin(), identity->uuid().bytes.end(),
-                      header.begin() + static_cast<std::ptrdiff_t>(position));
-        }
-        writeExact(fd, header.data(), header.size(), 0);
-        std::uint64_t offset = headerSize;
-        require(Err::LimitExceeded, limits.maxBytes == 0 || offset <= limits.maxBytes,
-                "bundle transfer limit: byte count exceeded");
-        const auto appendObject = [&](const Hash& hash) {
-            const Bytes bytes = load(hash);
-            require(Err::LimitExceeded, limits.maxObjectBytes == 0 || bytes.size() <= limits.maxObjectBytes,
-                    "bundle transfer limit: individual object exceeded");
-            require(Err::LimitExceeded, limits.maxBytes == 0 ||
-                    (offset <= limits.maxBytes &&
-                     bytes.size() <= limits.maxBytes - offset &&
-                     bundleEntryBytes <= limits.maxBytes - offset - bytes.size()),
-                    "bundle transfer limit: byte count exceeded");
-            std::array<std::uint8_t, bundleEntryBytes> entry{};
-            std::copy(hash.begin(), hash.end(), entry.begin());
-            storeU64(entry.data() + 32, static_cast<std::uint64_t>(bytes.size()));
-            writeExact(fd, entry.data(), entry.size(), offset);
-            offset += bundleEntryBytes;
-            if (!bytes.empty()) {
-                detail::faultPartialWrite(fd, bytes.data(), bytes.size(), offset,
-                                          "export.partial.object");
-                writeExact(fd, bytes.data(), bytes.size(), offset);
-            }
-            offset += bytes.size();
-        };
-        if (delta) {
-            for (const Hash& hash : *delta) appendObject(hash);
-        } else {
-            while (const std::optional<Hash> hash = sortedFull->next()) appendObject(*hash);
-        }
-        systemCall(::fsync(fd) == 0, "sync replication bundle");
-        if (bundlePath == nullptr) return; // caller-owned descriptor stays open
-        detail::faultCheckpoint("export.before.publish");
-        // linkat is no-replace: two concurrent exporters cannot overwrite
-        // one another, and neither can replace a symlink or existing file.
-        // The completed file is the only content that can become visible at
-        // the requested name, even if the process dies immediately afterward.
-        if (temporaryName.empty()) {
-            systemCall(::linkat(fd, "", directoryFd, destinationName.c_str(), AT_EMPTY_PATH) == 0,
-                       "publish anonymous replication bundle (destination must not exist)");
-        } else {
-            systemCall(::linkat(directoryFd, temporaryName.c_str(), directoryFd,
-                                destinationName.c_str(), 0) == 0,
-                       "publish replication bundle (destination must not exist)");
-        }
-        detail::faultCheckpoint("export.after.publish");
-        if (!temporaryName.empty()) {
-            systemCall(::unlinkat(directoryFd, temporaryName.c_str(), 0) == 0,
-                       "remove private replication bundle name");
-            temporaryName.clear();
-        }
-        systemCall(::fsync(directoryFd) == 0, "sync replication bundle directory");
-        detail::faultCheckpoint("export.after.dirsync");
-        // Close only after publication. A close failure does not remove the
-        // already completed/published file (the caller can retry by name).
-        const int closing = fd;
-        fd = -1;
-        systemCall(::close(closing) == 0, "close replication bundle");
-        const int closingDirectory = directoryFd;
-        directoryFd = -1;
-        systemCall(::close(closingDirectory) == 0, "close replication bundle directory");
-    } catch (...) {
-        if (bundlePath == nullptr) {
-            // Never leave a partial bundle behind. The original failure is
-            // reported; a failing truncate cannot add information to it.
-            if (::ftruncate(targetFd, 0) != 0) errno = 0;
-            throw;
-        }
-        if (fd >= 0) ::close(fd);
-        if (directoryFd >= 0) {
-            if (!temporaryName.empty())
-                (void)::unlinkat(directoryFd, temporaryName.c_str(), 0);
-            ::close(directoryFd);
-        }
-        throw;
-    }
-}
-
-BundleImportResult Repository::importBranchBundle(const std::filesystem::path& bundlePath,
-                                                   std::string_view localBranch, BundleLimits limits,
-                                                   BundleImportProfile* profile) {
-    const int fd = ::open(bundlePath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    systemCall(fd >= 0, "open replication bundle");
-    try {
-        const BundleImportResult result = importBranchBundle(fd, localBranch, limits, profile);
-        ::close(fd);
-        return result;
-    } catch (...) {
-        ::close(fd);
-        throw;
-    }
-}
-
-BundleImportResult Repository::importBranchBundle(int fd, std::string_view localBranch,
-                                                   BundleLimits limits,
-                                                   BundleImportProfile* profile) {
-    const ImportClock::time_point importStart = ImportClock::now();
-    if (profile != nullptr) *profile = BundleImportProfile{};
-    std::lock_guard<std::mutex> guarded(this->mutex_);
-    ScopedFileLock locked(this->lockFd_);
-    refreshIndex();
-    checkBranch(localBranch);
-    {
-        struct stat metadata{};
-        systemCall(::fstat(fd, &metadata) == 0, "stat replication bundle");
-        require(Err::InvalidInput, S_ISREG(metadata.st_mode) && metadata.st_size >= 0 &&
-                static_cast<std::uint64_t>(metadata.st_size) >= bundleHeaderBytes,
-                "invalid replication bundle file");
-        const std::uint64_t fileSize = static_cast<std::uint64_t>(metadata.st_size);
-        require(Err::LimitExceeded, limits.maxBytes == 0 || fileSize <= limits.maxBytes,
-                "bundle transfer limit: byte count exceeded");
-        std::array<std::uint8_t, bundleHeaderBytes> header{};
-        readExact(fd, header.data(), header.size(), 0);
-        const bool fullIdentified = std::equal(identifiedBundleMagic.begin(),
-                                               identifiedBundleMagic.end(), header.begin());
-        const bool deltaIdentified = std::equal(identifiedIncrementalBundleMagic.begin(),
-                                                identifiedIncrementalBundleMagic.end(), header.begin());
-        const bool identified = fullIdentified || deltaIdentified;
-        const bool incremental = deltaIdentified;
-        require(Err::InvalidInput, identified,
-                "unsupported replication bundle format: UUIDv7 branch identity required");
-        const std::uint64_t headerBytes = incremental
-            ? (identified ? identifiedIncrementalHeaderBytes : incrementalBundleHeaderBytes)
-            : (identified ? identifiedBundleHeaderBytes : bundleHeaderBytes);
-        require(Err::InvalidInput, fileSize >= headerBytes, "truncated replication bundle header");
-        Hash recipientBase{};
-        if (incremental) {
-            readExact(fd, recipientBase.data(), recipientBase.size(), bundleHeaderBytes);
-            require(Err::InvalidInput, !isZero(recipientBase), "incremental bundle has zero base revision");
-            const bool known = containsIndex(recipientBase);
-            require(Err::Conflict, known, "incremental bundle base revision is missing locally");
-            (void)readRevision(recipientBase); // Must be a real revision, not another object.
-        }
-        std::optional<BranchId> incomingBranchId;
-        if (identified) {
-            std::array<std::uint8_t, 16> idBytes{};
-            readExact(fd, idBytes.data(), idBytes.size(), incremental ? 80 : 48);
-            const UuidV7 decoded{idBytes};
-            incomingBranchId = BranchId::parse(decoded.toString());
-            require(Err::InvalidInput, incomingBranchId.has_value(),
-                    "replication bundle contains an invalid UUIDv7 branch identity");
-        }
-        Hash incoming{};
-        std::copy_n(header.begin() + 8, 32, incoming.begin());
-        require(Err::InvalidInput, !isZero(incoming), "replication bundle has zero revision head");
-        const std::uint64_t count = readU64(header.data() + 40);
-        require(Err::InvalidInput, (incremental || count != 0) &&
-                count <= (fileSize - headerBytes) / bundleEntryBytes,
-                "invalid replication bundle object count");
-        require(Err::LimitExceeded, limits.maxObjects == 0 || count <= limits.maxObjects,
-                "bundle transfer limit: object count exceeded");
-        BundleLocationIndex entries(count, this->scratch_);
-        std::uint64_t offset = headerBytes;
-        Hash previous{};
-        for (std::uint64_t index = 0; index < count; ++index) {
-            require(Err::InvalidInput, fileSize - offset >= bundleEntryBytes,
-                    "truncated replication bundle entry");
-            std::array<std::uint8_t, bundleEntryBytes> entry{};
-            readExact(fd, entry.data(), entry.size(), offset);
-            offset += bundleEntryBytes;
-            Hash hash{};
-            std::copy_n(entry.begin(), 32, hash.begin());
-            const std::uint64_t size = readU64(entry.data() + 32);
-            require(Err::InvalidInput, !isZero(hash) && (index == 0 || previous < hash),
-                    "replication bundle object hashes must be unique and sorted");
-            require(Err::InvalidInput, size <= maxObjectBytes && size <= fileSize - offset,
-                    "replication bundle object exceeds bounds");
-            require(Err::LimitExceeded, limits.maxObjectBytes == 0 || size <= limits.maxObjectBytes,
-                    "bundle transfer limit: individual object exceeded");
-            require(Err::InvalidInput, sha256FileRegion(fd, offset, size) == hash,
-                    "replication bundle SHA-256 mismatch");
-            entries.append(hash, BundleLocation{offset, size});
-            offset += size;
-            previous = hash;
-        }
-        require(Err::InvalidInput, offset == fileSize, "replication bundle contains trailing bytes");
-        entries.finalize();
-        if (profile != nullptr) {
-            profile->scanMs = elapsedImportMs(importStart, ImportClock::now());
-        }
-        const ImportClock::time_point graphStart = ImportClock::now();
-        const auto containsLocally = [&](const Hash& hash) {
-            return containsIndex(hash);
-        };
-        require(Err::InvalidInput, entries.find(incoming).has_value() ||
-                    (incremental && containsLocally(incoming)),
-                "replication bundle lacks tip revision");
-        const auto bundleObject = [&](const Hash& hash) -> Bytes {
-            const std::optional<BundleLocation> location = entries.find(hash);
-            if (!location) {
-                require(Err::InvalidInput, incremental && containsLocally(hash),
-                        "incremental replication bundle is missing a referenced object");
-                Bytes local;
-                try {
-                    local = load(hash);
-                    require(Err::Corruption, sha256(local) == hash,
-                            "local replication object SHA-256 mismatch");
-                } catch (...) {
-                    // Damage in THIS repository is not a defect of the bundle.
-                    try { throw; }
-                    catch (const StorageError& error) {
-                        throw LocalStorageFailure(error.kind(), "local object " + toHex(hash) +
-                                                  ": " + error.what());
-                    }
-                }
-                if (profile != nullptr) {
-                    ++profile->localObjectReads;
-                    profile->localObjectBytes += local.size();
-                }
-                return local;
-            }
-            Bytes object(static_cast<std::size_t>(location->size));
-            if (!object.empty()) readExact(fd, object.data(), object.size(), location->offset);
-            require(Err::InvalidInput, sha256(object) == hash, "replication bundle changed during import");
-            if (profile != nullptr) {
-                ++profile->bundleObjectReads;
-                profile->bundleObjectBytes += object.size();
-            }
-            return object;
-        };
-        // A content hash authenticates bytes, not trie semantics. Verify each
-        // immutable subtree bottom-up, so a subtree shared between revisions
-        // is checked once per value type. The summary guarantees that ALL its
-        // keys have the prefix preceding the root branch depth (or that it is
-        // a single leaf). Parent checks can therefore use one representative
-        // key without revisiting descendants in each ancestor context.
-        BundleVisitMarks visitMarks(entries.size(), this->scratch_);
-        BundleTreeSummaries treeSummaries(entries.size(), this->scratch_);
-        const ExternalVerificationMarks externalMarks{
-            [&](const Hash& hash) -> std::optional<std::uint8_t> {
-                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
-                if (!ordinal) return std::nullopt;
-                return visitMarks.at(*ordinal);
-            },
-            [&](const Hash& hash, std::uint8_t bits) {
-                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
-                require(Err::Internal, ordinal.has_value(), "missing hash in bundle visitation index");
-                visitMarks.mark(*ordinal, bits);
-            },
-            [&]() { return visitMarks.markedCount(); },
-            [&](const Hash& hash, unsigned kind) -> std::optional<TreeSummary> {
-                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
-                if (!ordinal) return std::nullopt;
-                return treeSummaries.read(*ordinal, kind);
-            },
-            [&](const Hash& hash, unsigned kind, const TreeSummary& summary) {
-                const std::optional<std::size_t> ordinal = entries.ordinal(hash);
-                require(Err::Internal, ordinal.has_value(), "missing hash in bundle trie summary index");
-                treeSummaries.write(*ordinal, kind, summary);
-            },
-            [&]() { return treeSummaries.size(); },
-            [&](const std::function<void(const Hash&)>& visitor) {
-                // Ordinal traversal uses the mapped, sorted index and a
-                // single byte per object. No per-revision hash container.
-                for (std::size_t ordinal = 0; ordinal < entries.size(); ++ordinal) {
-                    if ((visitMarks.at(ordinal) & 1U) != 0U) {
-                        visitor(entries.at(ordinal).first);
-                    }
-                }
-            },
-            [&](const Hash& hash) {
-                return incremental && !entries.find(hash).has_value() && containsLocally(hash);
-            }
-        };
-        LogicalVerificationProfile graphProfile{};
-        LogicalVerification verification{};
-        try {
-            verification = verifyLogicalGraph({incoming}, bundleObject, this->scratch_, externalMarks,
-                                              profile != nullptr ? &graphProfile : nullptr);
-        } catch (...) {
-            rethrowBundleFailure();
-        }
-        if (profile != nullptr) {
-            // Includes setup of visit-mark and trie-summary scratch tables.
-            // The separately reported graph/model stages cover the verifier
-            // itself; any remaining setup work stays in graphTraversalMs.
-            profile->graphTraversalMs = elapsedImportMs(graphStart, ImportClock::now()) -
-                                         graphProfile.modelReferenceMs;
-            profile->modelReferenceMs = graphProfile.modelReferenceMs;
-        }
-        const ImportClock::time_point reachStart = ImportClock::now();
-        for (std::size_t index = 0; index < entries.size(); ++index) {
-            require(Err::InvalidInput, visitMarks.at(index) != 0,
-                    "replication bundle contains unreachable objects");
-        }
-        // Boundary revisions were not walked. Usually the base (and a
-        // fast-forwarded head) is itself a boundary; otherwise search the
-        // local ancestry below the boundaries, once for all candidates.
-        std::optional<std::unordered_set<Hash, HashHasher>> boundaryAncestry;
-        const std::function<bool(const Hash&)> includesRevision = [&](const Hash& candidate) {
-            if (verification.containsRevision(candidate)) return true;
-            if (!boundaryAncestry) {
-                boundaryAncestry.emplace();
-                std::vector<Hash> pending(verification.boundaryRevisions.begin(),
-                                          verification.boundaryRevisions.end());
-                try {
-                    while (!pending.empty()) {
-                        const Hash current = pending.back();
-                        pending.pop_back();
-                        if (!boundaryAncestry->insert(current).second) continue;
-                        for (const Hash& parent : readRevision(current).parents) pending.push_back(parent);
-                    }
-                } catch (const StorageError& error) {
-                    throw StorageError(error.kind(), "local revision ancestry: " +
-                                       std::string(error.what()));
-                }
-            }
-            return boundaryAncestry->contains(candidate);
-        };
-        if (incremental) {
-            require(Err::InvalidInput, includesRevision(recipientBase),
-                    "incremental bundle base is not an ancestor of incoming revision");
-        }
-        if (profile != nullptr) {
-            profile->reachabilityMs = elapsedImportMs(reachStart, ImportClock::now());
-        }
-        const ImportClock::time_point branchStart = ImportClock::now();
-        const bool exists = findStoredBranch(this->directory_, localBranch).has_value();
-        Hash previousHead{};
-        BundleImportStatus status = BundleImportStatus::Created;
-        if (exists) {
-            previousHead = branchHead(localBranch);
-            if (previousHead == incoming ||
-                // A previous import may already have advanced past this tip.
-                (containsIndex(incoming) &&
-                 revisionReachableFrom(previousHead, incoming))) {
-                status = BundleImportStatus::UpToDate;
-            } else {
-                require(Err::Conflict, includesRevision(previousHead),
-                        "replication would overwrite divergent branch history");
-                status = BundleImportStatus::FastForward;
-            }
-        }
-        if (profile != nullptr) {
-            profile->branchCheckMs = elapsedImportMs(branchStart, ImportClock::now());
-        }
-        // Pre-release format: an imported branch MUST carry the same UUIDv7
-        // on every replica. SHA-only legacy bundle import is intentionally rejected.
-        require(Err::InvalidInput, incomingBranchId.has_value(),
-                "legacy bundle has no UUIDv7 branch identity; unsupported pre-release format");
-        const std::optional<BranchId> localId = branchIdLocked(localBranch);
-        require(Err::Conflict, !localId || *localId == *incomingBranchId,
-                "replication would rebind a different branch UUIDv7");
-        for (const StoredBranch& other : readStoredBranches(this->directory_)) {
-            require(Err::Conflict, other.name == localBranch || other.id != *incomingBranchId,
-                    "branch UUIDv7 already belongs to another local name");
-        }
-        if (status == BundleImportStatus::UpToDate) {
-            if (profile != nullptr) {
-                profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
-            }
-            return BundleImportResult{status, previousHead, 0};
-        }
-        const ImportClock::time_point writeStart = ImportClock::now();
-        std::uint64_t imported = 0;
-        for (std::size_t index = 0; index < entries.size(); ++index) {
-            const std::pair<Hash, BundleLocation> entry = entries.at(index);
-            const bool present = containsIndex(entry.first);
-            if (present) continue;
-            Bytes payload = bundleObject(entry.first);
-            require(Err::Internal, store(std::move(payload)) == entry.first,
-                    "replication content hash changed before publication");
-            ++imported;
-            detail::faultCheckpoint("import.after.object");
-        }
-        if (profile != nullptr) {
-            profile->objectWriteMs = elapsedImportMs(writeStart, ImportClock::now());
-        }
-        const ImportClock::time_point publishStart = ImportClock::now();
-        syncPack(); // durable objects before an atomic branch-ref update
-        detail::faultCheckpoint("import.after.sync");
-        publishRef(localBranch, incoming, !exists, incomingBranchId);
-        if (profile != nullptr) {
-            profile->publicationMs = elapsedImportMs(publishStart, ImportClock::now());
-            profile->totalMs = elapsedImportMs(importStart, ImportClock::now());
-        }
-        return BundleImportResult{status, incoming, imported};
-    }
 }
 
 CompactionStats Repository::compact() {
@@ -6431,11 +5171,11 @@ CompactionStats Repository::compact() {
     ScopedMaintenanceExclusive alone(this->lifetimeFd_);
     require(Err::Unavailable, !this->needsReopen_, "repository must be reopened after interrupted compaction");
     refreshIndex();
-    const RevisionObjectReaderV2 loadV2 = [this](const Hash& hash) -> std::optional<Bytes> {
+    const RevisionObjectReader readPublished = [this](const Hash& hash) -> std::optional<Bytes> {
         if (!containsIndex(hash)) return std::nullopt;
         return load(hash);
     };
-    const V2Audit v2 = auditPublishedV2(this->directory_, loadV2);
+    const PublishedAudit v2 = auditPublished(this->directory_, readPublished);
 
     CompactionStats stats{};
     stats.staleFilesRemoved = removeStalePackGenerations();
@@ -6449,31 +5189,29 @@ CompactionStats Repository::compact() {
     // The retention policy is intentionally conservative: preserve EVERY
     // revision on the parent chain of EVERY branch head, plus both trees and
     // every leaf payload (including reverse-reference index values).
-    enum class ReachableKind { Revision, RevisionV2, Tree, Value };
+    enum class ReachableKind { Revision, Tree, Value };
     std::vector<std::pair<Hash, ReachableKind>> pending;
     for (const StoredBranch& branch : readStoredBranches(this->directory_)) {
-        if (branch.revisionV2) {
+        if (branch.revision) {
             const std::map<Hash, RevisionId>::const_iterator published =
                 v2.publishedIds.find(branch.head);
             require(Err::Corruption, published != v2.publishedIds.end() &&
-                    published->second == *branch.revisionV2,
-                    "v2 branch HEAD UUID/SHA does not match the published revision");
+                    published->second == *branch.revision,
+                    "branch HEAD UUID/SHA does not match the published revision");
         }
-        if (!isZero(branch.head))
-            pending.emplace_back(branch.head,
-                                 branch.revisionV2 ? ReachableKind::RevisionV2 : ReachableKind::Revision);
+        if (!isZero(branch.head)) pending.emplace_back(branch.head, ReachableKind::Revision);
     }
     // Retain even unreferenced but *published* UUID bindings; no retained
     // UUID may end up pointing to a compacted-away immutable object.
     for (const Hash& hash : v2.recordedHashes)
-        pending.emplace_back(hash, ReachableKind::RevisionV2);
+        pending.emplace_back(hash, ReachableKind::Revision);
     std::unordered_set<Hash, HashHasher> reachable;
     reachable.reserve(static_cast<std::size_t>(stats.objectsBefore));
     while (!pending.empty()) {
         const std::pair<Hash, ReachableKind> next = pending.back();
         pending.pop_back();
         if (isZero(next.first) || !reachable.insert(next.first).second) continue;
-        if (next.second == ReachableKind::RevisionV2) {
+        if (next.second == ReachableKind::Revision) {
             const std::map<Hash, Bytes>::const_iterator found = v2.logicalRevisions.find(next.first);
             require(Err::Corruption, found != v2.logicalRevisions.end(),
                     "unpublished UUIDv7 revision encountered during compaction");
@@ -6483,14 +5221,7 @@ CompactionStats Repository::compact() {
             pending.emplace_back(root, ReachableKind::Tree);
             pending.emplace_back(referenceRoot, ReachableKind::Tree);
             for (std::size_t i = 0; i < encoded[66]; ++i)
-                pending.emplace_back(readHash(encoded, 67 + 32 * i), ReachableKind::RevisionV2);
-        } else if (next.second == ReachableKind::Revision) {
-            const Revision revision = readRevision(next.first);
-            pending.emplace_back(revision.root, ReachableKind::Tree);
-            pending.emplace_back(revision.referencesRoot, ReachableKind::Tree);
-            for (const Hash& parent : revision.parents) {
-                pending.emplace_back(parent, ReachableKind::Revision);
-            }
+                pending.emplace_back(readHash(encoded, 67 + 32 * i), ReachableKind::Revision);
         } else if (next.second == ReachableKind::Tree) {
             const TreeNode node = readNode(next.first);
             if (node.leaf) {

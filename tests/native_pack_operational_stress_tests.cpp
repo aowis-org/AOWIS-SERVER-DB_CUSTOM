@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -13,6 +14,9 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::ProjectId;
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Hash;
 using aowis::dvmdb::Key;
@@ -56,9 +60,10 @@ void exercise() {
     const std::filesystem::path deltaBundle = root.path / "update.aowbundle";
     constexpr std::uint32_t records = 400;
     constexpr int updates = 240;
-    Hash initial{};
+    const ProjectId project = ProjectId::generate();
+    RevisionId initial = RevisionId::generate();
     {
-        Repository repository(source);
+        ProjectRepository repository(source, project);
         repository.createBranch("main");
         std::vector<ModelChange> changes;
         changes.reserve(records);
@@ -69,12 +74,12 @@ void exercise() {
             if (number > 1) record.references.push_back(key(number - 1));
             changes.emplace_back(ModelChange{key(number), std::move(record)});
         }
-        initial = repository.commitModel("main", std::move(changes)).id;
-        repository.exportBranchBundle("main", initialBundle);
+        initial = repository.commitModel("main", std::move(changes));
+        repository.exportBundle("main", initialBundle);
     }
     {
-        Repository recipient(destination);
-        check(recipient.importBranchBundle(initialBundle, "main").head == initial,
+        ProjectRepository recipient(destination, project);
+        check(recipient.importBundle(initialBundle, "main").head == initial,
               "initial replica differs from original");
         recipient.verifyRepository();
     }
@@ -85,7 +90,7 @@ void exercise() {
     std::atomic<bool> failed{false};
     std::thread writer([&] {
         try {
-            Repository repository(source);
+            ProjectRepository repository(source);
             while (readersReady.load() != 3 && !failed.load())
                 std::this_thread::yield();
             if (failed.load()) { finished.store(true); return; }
@@ -102,20 +107,20 @@ void exercise() {
     for (int reader = 0; reader < 3; ++reader) {
         readers.emplace_back([&] {
             try {
-                Repository repository(source);
+                ProjectRepository repository(source);
                 readersReady.fetch_add(1);
                 std::size_t visits = 0;
                 while (!finished.load() || visits < 250) {
-                    const Hash snapshot = repository.head("main").id;
+                    const RevisionId snapshot = repository.head("main");
                     const std::optional<ModelRecord> first =
-                        repository.getModelAtRevision(snapshot, key(1));
+                        repository.getModelAt(snapshot, key(1));
                     const std::optional<ModelRecord> last =
-                        repository.getModelAtRevision(snapshot, key(records));
+                        repository.getModelAt(snapshot, key(records));
                     check(first.has_value() && last.has_value(),
                           "concurrent historical snapshot is incomplete");
                     check(last->references == std::vector<Key>{key(records - 1)},
                           "concurrent read changed immutable references");
-                    check(repository.getModelAtRevision(initial, key(1))->payload == Bytes{1},
+                    check(repository.getModelAt(initial, key(1))->payload == Bytes{1},
                           "historical snapshot changed during writes");
                     if (!finished.load()) readsDuringWrites.fetch_add(1);
                     ++visits;
@@ -129,9 +134,9 @@ void exercise() {
     check(!failed.load() && readsDuringWrites.load() > 0,
           "concurrent reader/writer stress did not overlap successfully");
 
-    Hash finalHead{};
+    RevisionId finalHead = RevisionId::generate();
     {
-        Repository repository(source);
+        ProjectRepository repository(source);
         bool staleRejected = false;
         try {
             repository.commitModel("main", {ModelChange{key(1), ModelRecord{1, {}, Bytes{9}}}},
@@ -145,40 +150,40 @@ void exercise() {
         repository.commitModel("main", {
             ModelChange{key(records + 2), ModelRecord{1, {key(records)}, Bytes{'m'}}}
         });
-        check(repository.mergeBranches("main", "feature").status == MergeStatus::Merged,
+        check(repository.merge("main", "feature").status == MergeStatus::Merged,
               "disjoint merge failed after sustained writes");
-        check(repository.referencingModel("main", key(records)).size() == 2,
+        check(repository.referencing("main", key(records)).size() == 2,
               "merge lost incoming references");
-        finalHead = repository.head("main").id;
+        finalHead = repository.head("main");
         check(repository.verifyRepository().revisions >= static_cast<std::uint64_t>(updates),
               "history truncated during sustained writes");
-        repository.exportIncrementalBranchBundle("main", initial, deltaBundle);
+        repository.exportIncrementalBundle("main", initial, deltaBundle);
     }
     {
-        Repository recipient(destination);
-        check(recipient.importBranchBundle(deltaBundle, "main").head == finalHead,
+        ProjectRepository recipient(destination, project);
+        check(recipient.importBundle(deltaBundle, "main").head == finalHead,
               "incremental sync lost revision identity");
-        check(recipient.head("main").id == finalHead &&
-              recipient.referencingModel("main", key(records)).size() == 2,
+        check(recipient.head("main") == finalHead &&
+              recipient.referencing("main", key(records)).size() == 2,
               "incremental sync lost merged references");
         recipient.verifyRepository();
     }
     {
-        Repository stillOpen(source);
-        Repository maintenance(source);
+        ProjectRepository stillOpen(source);
+        ProjectRepository maintenance(source);
         bool compactRejected = false;
         try { (void)maintenance.compact(); }
         catch (const std::exception&) { compactRejected = true; }
         check(compactRejected, "compaction accepted another open repository handle");
     }
     {
-        Repository maintenance(source);
+        ProjectRepository maintenance(source);
         const aowis::dvmdb::CompactionStats stats = maintenance.compact();
         check(stats.objectsAfter <= stats.objectsBefore, "compaction increased object count");
     }
     {
-        Repository reopened(source);
-        check(reopened.head("main").id == finalHead,
+        ProjectRepository reopened(source);
+        check(reopened.head("main") == finalHead,
               "compaction changed branch head");
         reopened.verifyRepository();
         reopened.commitModel("main", {

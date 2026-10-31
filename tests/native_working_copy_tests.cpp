@@ -23,10 +23,10 @@ using aowis::dvmdb::ProjectError;
 using aowis::dvmdb::ProjectErrorKind;
 using aowis::dvmdb::ProjectInfo;
 using aowis::dvmdb::ProjectService;
-using aowis::dvmdb::RepositoryRoleV1;
+using aowis::dvmdb::RepositoryRole;
 using aowis::dvmdb::RevisionId;
 using aowis::dvmdb::UuidV7;
-using aowis::dvmdb::WorkingCopyInfoV1;
+using aowis::dvmdb::WorkingCopyInfo;
 
 void require(bool accepted, const char *message) {
     if (!accepted) throw std::runtime_error(message);
@@ -80,15 +80,15 @@ void testWorkingCopyCreationAndRecovery() {
     const std::string sessionTwo = UuidV7::generate().toString();
     {
         ProjectService service(root.path);
-        const ProjectInfo project = service.createUnbornProjectV2("checkout from unborn");
+        const ProjectInfo project = service.createUnbornProject("checkout from unborn");
         projectId = project.id;
         branchId = service.branchId(projectId, "main")->toString();
-        require(service.listWorkingCopiesV1().empty(), "new root contains drafts");
-        expectError([&]() { service.createWorkingCopyV1(projectId, "main", std::nullopt, sessionOne); },
+        require(service.listWorkingCopies().empty(), "new root contains drafts");
+        expectError([&]() { service.createWorkingCopy(projectId, "main", std::nullopt, sessionOne); },
                     ProjectErrorKind::Conflict);
-        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        const WorkingCopyInfoV1 first = service.createWorkingCopyV1(projectId, "main", std::nullopt, sessionOne);
-        const WorkingCopyInfoV1 second = service.createWorkingCopyV1(projectId, "main", std::nullopt, sessionTwo);
+        service.configureRepositoryRole(RepositoryRole::Private);
+        const WorkingCopyInfo first = service.createWorkingCopy(projectId, "main", std::nullopt, sessionOne);
+        const WorkingCopyInfo second = service.createWorkingCopy(projectId, "main", std::nullopt, sessionTwo);
         firstId = first.id;
         secondId = second.id;
         require(first.id != second.id && UuidV7::parse(first.id).has_value(),
@@ -97,37 +97,37 @@ void testWorkingCopyCreationAndRecovery() {
                 first.sessionId == sessionOne && !first.baseRevision.has_value() &&
                 !first.dirty && first.generation == 0,
                 "unborn draft metadata incorrect");
-        require(service.listWorkingCopiesV1().size() == 2 &&
-                !service.optionalHeadV2(projectId, "main").has_value() &&
-                service.revisionGraphV2(projectId).revisions.empty(),
+        require(service.listWorkingCopies().size() == 2 &&
+                !service.optionalHead(projectId, "main").has_value() &&
+                service.revisionGraph(projectId).revisions.empty(),
                 "draft creation modified committed ancestry");
-        expectError([&]() { service.workingCopyV1(sessionOne); }, ProjectErrorKind::NotFound);
-        expectError([&]() { service.workingCopyV1("not-a-uuid"); }, ProjectErrorKind::InvalidInput);
-        committed = service.commitModelV2(projectId, "main", {simpleChange()});
-        committedId = service.createWorkingCopyV1(projectId, "main", committed, sessionOne).id;
-        expectError([&]() { service.createWorkingCopyV1(projectId, "main", std::nullopt, sessionTwo); },
+        expectError([&]() { service.workingCopy(sessionOne); }, ProjectErrorKind::NotFound);
+        expectError([&]() { service.workingCopy("not-a-uuid"); }, ProjectErrorKind::InvalidInput);
+        committed = service.commitModel(projectId, "main", {simpleChange()});
+        committedId = service.createWorkingCopy(projectId, "main", committed, sessionOne).id;
+        expectError([&]() { service.createWorkingCopy(projectId, "main", std::nullopt, sessionTwo); },
                     ProjectErrorKind::Conflict);
-        require(service.optionalHeadV2(projectId, "main") == committed,
+        require(service.optionalHead(projectId, "main") == committed,
                 "working-copy creation moved committed HEAD");
     }
     {
         ProjectService reopened(root.path);
-        require(reopened.repositoryRoleV1() == RepositoryRoleV1::Private &&
-                reopened.listWorkingCopiesV1().size() == 3,
+        require(reopened.repositoryRole() == RepositoryRole::Private &&
+                reopened.listWorkingCopies().size() == 3,
                 "working copies not recovered after restart");
-        const WorkingCopyInfoV1 first = reopened.workingCopyV1(firstId);
-        const WorkingCopyInfoV1 second = reopened.workingCopyV1(secondId);
-        const WorkingCopyInfoV1 third = reopened.workingCopyV1(committedId);
+        const WorkingCopyInfo first = reopened.workingCopy(firstId);
+        const WorkingCopyInfo second = reopened.workingCopy(secondId);
+        const WorkingCopyInfo third = reopened.workingCopy(committedId);
         require(first.projectId == projectId && first.branchId == branchId &&
                 first.sessionId == sessionOne && !first.baseRevision &&
                 second.sessionId == sessionTwo && !second.baseRevision &&
                 third.baseRevision == committed && third.generation == 0 &&
-                reopened.optionalHeadV2(projectId, "main") == committed,
+                reopened.optionalHead(projectId, "main") == committed,
                 "recovered drafts lost pinned base or identity");
         const std::filesystem::path stages = root.path / "working-copies" /
             (".creating-" + UuidV7::generate().toString());
         std::ofstream(stages) << "not-published";
-        require(reopened.listWorkingCopiesV1().size() == 3,
+        require(reopened.listWorkingCopies().size() == 3,
                 "unpublished draft staging was incorrectly advertised");
     }
     // Corruption must never be silently treated as a missing draft.
@@ -139,7 +139,7 @@ void testWorkingCopyCreationAndRecovery() {
     {
         ProjectService reopened(root.path);
         bool rejected = false;
-        try { (void)reopened.listWorkingCopiesV1(); }
+        try { (void)reopened.listWorkingCopies(); }
         catch (const std::exception&) { rejected = true; }
         require(rejected, "corrupt draft was silently accepted");
     }
@@ -163,85 +163,85 @@ void testLeasedTransactionalCandidateSaves() {
     secondRecord.payload = {8, 9};
     {
         ProjectService service(root.path);
-        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        projectId = service.createUnbornProjectV2("private editor saves").id;
-        draftId = service.createWorkingCopyV1(projectId, "main", std::nullopt, writerA).id;
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        service.configureRepositoryRole(RepositoryRole::Private);
+        projectId = service.createUnbornProject("private editor saves").id;
+        draftId = service.createWorkingCopy(projectId, "main", std::nullopt, writerA).id;
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, writerA, UuidV7::generate().toString(), 0,
             {ModelChange{firstKey, firstRecord}}); }, ProjectErrorKind::Conflict);
-        const aowis::dvmdb::WorkingCopyLeaseV1 lease =
-            service.acquireWorkingCopyLeaseV1(draftId, writerA, 120);
+        const aowis::dvmdb::WorkingCopyLease lease =
+            service.acquireWorkingCopyLease(draftId, writerA, 120);
         staleToken = lease.token;
         require(lease.generation == 0 && lease.expiresAtMs != 0,
                 "initial draft lease invalid");
-        expectError([&]() { (void)service.acquireWorkingCopyLeaseV1(draftId, writerB, 120); },
+        expectError([&]() { (void)service.acquireWorkingCopyLease(draftId, writerB, 120); },
                     ProjectErrorKind::Conflict);
-        const WorkingCopyInfoV1 saved = service.saveWorkingCopyChangesV1(
+        const WorkingCopyInfo saved = service.saveWorkingCopyChanges(
             draftId, writerA, lease.token, lease.generation,
             {ModelChange{firstKey, firstRecord}, ModelChange{secondKey, secondRecord}});
         require(saved.dirty && saved.generation == 1 && saved.candidateChanges.size() == 2 &&
                 saved.candidateChanges[0].key == firstKey &&
                 saved.candidateChanges[1].record->payload == secondRecord.payload &&
-                !service.optionalHeadV2(projectId, "main") &&
-                service.revisionGraphV2(projectId).revisions.empty(),
+                !service.optionalHead(projectId, "main") &&
+                service.revisionGraph(projectId).revisions.empty(),
                 "draft save changed committed history or lost candidate changes");
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, writerA, lease.token, 0, {}); }, ProjectErrorKind::Conflict);
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, writerB, lease.token, 1, {}); }, ProjectErrorKind::Conflict);
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, writerA, lease.token, 1,
             {ModelChange{firstKey, firstRecord}, ModelChange{firstKey, firstRecord}}); },
             ProjectErrorKind::InvalidInput);
-        require(service.workingCopyV1(draftId).generation == 1,
+        require(service.workingCopy(draftId).generation == 1,
                 "rejected duplicate-key save changed draft generation");
-        const aowis::dvmdb::WorkingCopyLeaseV1 refreshed =
-            service.acquireWorkingCopyLeaseV1(draftId, writerA, 120);
+        const aowis::dvmdb::WorkingCopyLease refreshed =
+            service.acquireWorkingCopyLease(draftId, writerA, 120);
         require(refreshed.token != lease.token && refreshed.generation == 1,
                 "reacquiring a lease did not rotate its fencing token");
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, writerA, lease.token, 1, {}); }, ProjectErrorKind::Conflict);
-        const WorkingCopyInfoV1 changed = service.saveWorkingCopyChangesV1(
+        const WorkingCopyInfo changed = service.saveWorkingCopyChanges(
             draftId, writerA, refreshed.token, 1,
             {ModelChange{firstKey, std::nullopt}});
         require(changed.generation == 2 && changed.candidateChanges.size() == 2 &&
                 !changed.candidateChanges[0].record.has_value() &&
                 changed.candidateChanges[1].record->payload == secondRecord.payload,
                 "incremental Save failed to merge change overlay");
-        service.releaseWorkingCopyLeaseV1(draftId, writerA, refreshed.token);
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        service.releaseWorkingCopyLease(draftId, writerA, refreshed.token);
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, writerA, refreshed.token, 2, {}); }, ProjectErrorKind::Conflict);
     }
     {
         ProjectService reopened(root.path);
-        const WorkingCopyInfoV1 recovered = reopened.workingCopyV1(draftId);
+        const WorkingCopyInfo recovered = reopened.workingCopy(draftId);
         require(recovered.generation == 2 && recovered.candidateChanges.size() == 2 &&
                 recovered.dirty && !recovered.leaseToken &&
-                !reopened.optionalHeadV2(projectId, "main"),
+                !reopened.optionalHead(projectId, "main"),
                 "restart lost draft saves or changed committed HEAD");
-        const aowis::dvmdb::WorkingCopyLeaseV1 taken =
-            reopened.acquireWorkingCopyLeaseV1(draftId, writerB, 120);
+        const aowis::dvmdb::WorkingCopyLease taken =
+            reopened.acquireWorkingCopyLease(draftId, writerB, 120);
         require(taken.generation == 2 && taken.token != staleToken,
                 "another session could not acquire a released lease");
-        expectError([&]() { (void)reopened.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)reopened.saveWorkingCopyChanges(
             draftId, writerA, staleToken, 2, {}); }, ProjectErrorKind::Conflict);
-        const WorkingCopyInfoV1 third = reopened.saveWorkingCopyChangesV1(
+        const WorkingCopyInfo third = reopened.saveWorkingCopyChanges(
             draftId, writerB, taken.token, 2, {ModelChange{secondKey, secondRecord}});
         require(third.generation == 3 && third.candidateChanges.size() == 2,
                 "new writer lost existing candidate state");
-        reopened.releaseWorkingCopyLeaseV1(draftId, writerB, taken.token);
-        const aowis::dvmdb::WorkingCopyLeaseV1 shortLease =
-            reopened.acquireWorkingCopyLeaseV1(draftId, writerA, 1);
-        expectError([&]() { (void)reopened.acquireWorkingCopyLeaseV1(draftId, writerB, 120); },
+        reopened.releaseWorkingCopyLease(draftId, writerB, taken.token);
+        const aowis::dvmdb::WorkingCopyLease shortLease =
+            reopened.acquireWorkingCopyLease(draftId, writerA, 1);
+        expectError([&]() { (void)reopened.acquireWorkingCopyLease(draftId, writerB, 120); },
                     ProjectErrorKind::Conflict);
         std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-        const aowis::dvmdb::WorkingCopyLeaseV1 takeover =
-            reopened.acquireWorkingCopyLeaseV1(draftId, writerB, 120);
+        const aowis::dvmdb::WorkingCopyLease takeover =
+            reopened.acquireWorkingCopyLease(draftId, writerB, 120);
         require(takeover.generation == 3 && takeover.token != shortLease.token,
                 "expired lease takeover did not preserve generation/fence");
-        expectError([&]() { (void)reopened.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)reopened.saveWorkingCopyChanges(
             draftId, writerA, shortLease.token, 3, {}); }, ProjectErrorKind::Conflict);
-        const WorkingCopyInfoV1 final = reopened.saveWorkingCopyChangesV1(
+        const WorkingCopyInfo final = reopened.saveWorkingCopyChanges(
             draftId, writerB, takeover.token, 3, {});
         require(final.generation == 4 && final.candidateChanges.size() == 2,
                 "successful empty save lost stored candidate changes");
@@ -266,46 +266,46 @@ void testAtomicJournalAndIdempotentReplay() {
     std::string token;
     {
         ProjectService service(root.path);
-        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        projectId = service.createUnbornProjectV2("atomic edit journal").id;
-        draftId = service.createWorkingCopyV1(projectId, "main", std::nullopt, session).id;
-        token = service.acquireWorkingCopyLeaseV1(draftId, session, 120).token;
-        const WorkingCopyInfoV1 saved = service.saveWorkingCopyTransactionsV1(
+        service.configureRepositoryRole(RepositoryRole::Private);
+        projectId = service.createUnbornProject("atomic edit journal").id;
+        draftId = service.createWorkingCopy(projectId, "main", std::nullopt, session).id;
+        token = service.acquireWorkingCopyLease(draftId, session, 120).token;
+        const WorkingCopyInfo saved = service.saveWorkingCopyTransactions(
             draftId, session, token, 0, changes, {event});
         require(saved.generation == 1 && saved.journal.size() == 1 &&
                 saved.journal[0].id == eventId.toString() &&
                 saved.journal[0].encoded == event &&
                 saved.candidateChanges[0].record->payload == record.payload &&
-                !service.optionalHeadV2(projectId, "main").has_value(),
+                !service.optionalHead(projectId, "main").has_value(),
                 "atomic event save lost journal/model or advanced HEAD");
-        const WorkingCopyInfoV1 retry = service.saveWorkingCopyTransactionsV1(
+        const WorkingCopyInfo retry = service.saveWorkingCopyTransactions(
             draftId, session, token, 0, changes, {event});
         require(retry.generation == 1 && retry.journal.size() == 1,
                 "lost-acknowledgement retry duplicated a journal event");
-        expectError([&]() { (void)service.saveWorkingCopyTransactionsV1(
+        expectError([&]() { (void)service.saveWorkingCopyTransactions(
             draftId, session, token, 0, changes, {differentEvent}); }, ProjectErrorKind::Conflict);
-        expectError([&]() { (void)service.saveWorkingCopyTransactionsV1(
+        expectError([&]() { (void)service.saveWorkingCopyTransactions(
             draftId, session, token, 1, changes, {event}); }, ProjectErrorKind::Conflict);
-        expectError([&]() { (void)service.saveWorkingCopyChangesV1(
+        expectError([&]() { (void)service.saveWorkingCopyChanges(
             draftId, session, token, 1, changes); }, ProjectErrorKind::Conflict);
         aowis::dvmdb::Bytes corrupt = aowis::dvmdb::test::editEvent(UuidV7::generate(), entityId);
         corrupt.back() ^= 0x80;
-        expectError([&]() { (void)service.saveWorkingCopyTransactionsV1(
+        expectError([&]() { (void)service.saveWorkingCopyTransactions(
             draftId, session, token, 1, changes, {corrupt}); }, ProjectErrorKind::InvalidInput);
-        require(service.workingCopyV1(draftId).generation == 1,
+        require(service.workingCopy(draftId).generation == 1,
                 "rejected journal save mutated generation");
     }
     {
         ProjectService reopened(root.path);
-        const WorkingCopyInfoV1 persisted = reopened.workingCopyV1(draftId);
+        const WorkingCopyInfo persisted = reopened.workingCopy(draftId);
         require(persisted.generation == 1 && persisted.journal.size() == 1 &&
                 persisted.journal[0].encoded == event &&
                 persisted.candidateChanges.size() == 1,
                 "restart lost journal or materialized candidate");
-        const std::string nextToken = reopened.acquireWorkingCopyLeaseV1(draftId, session, 120).token;
+        const std::string nextToken = reopened.acquireWorkingCopyLease(draftId, session, 120).token;
         const aowis::dvmdb::Bytes next =
             aowis::dvmdb::test::editEvent(UuidV7::generate(), entityId, 2, 3);
-        const WorkingCopyInfoV1 appended = reopened.saveWorkingCopyTransactionsV1(
+        const WorkingCopyInfo appended = reopened.saveWorkingCopyTransactions(
             draftId, session, nextToken, 1, changes, {next});
         require(appended.generation == 2 && appended.journal.size() == 2 &&
                 appended.journal[0].encoded == event && appended.journal[1].encoded == next,
@@ -325,7 +325,7 @@ void testAtomicJournalAndIdempotentReplay() {
     output.close();
     ProjectService reopened(root.path);
     bool rejected = false;
-    try { (void)reopened.workingCopyV1(draftId); }
+    try { (void)reopened.workingCopy(draftId); }
     catch (const std::exception&) { rejected = true; }
     require(rejected, "corrupt on-disk event was accepted");
 }

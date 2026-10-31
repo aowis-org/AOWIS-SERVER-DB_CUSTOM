@@ -258,7 +258,7 @@ std::string makeBundle(const fs::path& root, const std::string& projectText, std
     Repository repository(sourcePath);
     const std::optional<ProjectId> project = ProjectId::parse(projectText);
     require(project.has_value(), "invalid project UUID for stress fixture");
-    const RevisionId initial = repository.createBranchV2(*project, "main");
+    const RevisionId initial = repository.createBranch(*project, "main");
     std::vector<Change> changes;
     changes.reserve(1024);
     for (unsigned index = 0; index < 1024; ++index) {
@@ -275,12 +275,12 @@ std::string makeBundle(const fs::path& root, const std::string& projectText, std
         }
         changes.push_back(Change{key, std::move(value)});
     }
-    expected = repository.commitV2(*project, "main", changes, initial).toString();
+    expected = repository.commit(*project, "main", changes, initial).toString();
     const fs::path output = root / "fixture.bundle";
     const int fd = ::open(output.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     require(fd >= 0, "unable to create revision-v2 fixture");
     try {
-        repository.exportRevisionBundleV2(*project, "main", fd);
+        repository.exportRevisionBundle(*project, "main", fd);
     } catch (...) {
         ::close(fd);
         throw;
@@ -315,7 +315,7 @@ void tightBudget(unsigned short port, const std::string& a, const std::string& b
     {
         RawSocket stalled(port);
         stalled.send("POST " + aRoot + "stalled/bundle HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                     "Content-Type: application/vnd.aowis.bundle\r\nContent-Length: 3000000\r\n\r\n" +
+                     "Content-Type: application/vnd.aowis.revision-bundle-v2\r\nContent-Length: 3000000\r\n\r\n" +
                      fixture.substr(0, 4096));
         bool refused = false;
         unsigned attempts = 0;
@@ -362,7 +362,7 @@ void tightBudget(unsigned short port, const std::string& a, const std::string& b
     require(request(port, "GET", aRoot + "stalled/head").status == 404,
             "aborted transfer created an incomplete branch");
     const HttpResponse imported = request(port, "POST", bRoot + "from_a/bundle", recipientFixture,
-                                           "application/vnd.aowis.bundle");
+                                           "application/vnd.aowis.revision-bundle-v2");
     require(imported.status == 201 && field(imported.body, "head") == recipientHead,
             "valid import after budget cleanup failed");
     {
@@ -408,7 +408,7 @@ void concurrentLoad(unsigned short port, const std::vector<std::string>& ids,
                     bool completed = false;
                     for (unsigned attempt = 0; attempt < 25; ++attempt) {
                         const HttpResponse uploaded = request(port, "POST", path + branch + "/bundle", transfer,
-                                                              "application/vnd.aowis.bundle");
+                                                              "application/vnd.aowis.revision-bundle-v2");
                         if (uploaded.status == 503) {
                             require(uploaded.retry == "1", "busy import omitted Retry-After");
                             ++busy;
@@ -523,7 +523,7 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
                         bool inserted = false;
                         for (unsigned attempt = 0; attempt < 100U; ++attempt) {
                             const HttpResponse result = request(port, "POST", base + branch + "/bundle",
-                                transfer, "application/vnd.aowis.bundle");
+                                transfer, "application/vnd.aowis.revision-bundle-v2");
                             if (result.status == 503) {
                                 require(result.retry == "1", "soak import missing Retry-After");
                                 ++busyResponses;
@@ -610,7 +610,7 @@ void sustainedLoad(const std::string& executable, unsigned seconds, const fs::pa
         const std::vector<std::string> branches = repository.listBranches();
         for (const std::string& branch : branches) {
             if (branch == "main") continue;
-            require(repository.headV2(*aowis::dvmdb::ProjectId::parse(projectIds[index]), branch).toString() == heads[index],
+            require(repository.head(*aowis::dvmdb::ProjectId::parse(projectIds[index]), branch).toString() == heads[index],
                     "soak branch head wrong on disk after service stop");
             ++completedByProject[index];
         }
@@ -649,8 +649,8 @@ int main(int argc, char** argv) {
             aowis::dvmdb::Repository recipient(root.path / "fixture-recipient");
             const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
             require(fd >= 0, "cannot read fixture");
-            const aowis::dvmdb::RevisionBundleImportV2 result =
-                recipient.importRevisionBundleV2(fixtureProject, fd, "received");
+            const aowis::dvmdb::RevisionBundleImport result =
+                recipient.importRevisionBundle(fixtureProject, fd, "received");
             ::close(fd);
             require(result.head.toString() == head, "fixture import head mismatch");
             require(recipient.verifyRepository().revisions >= 2, "fixture import verification failed");
@@ -682,7 +682,7 @@ int main(int argc, char** argv) {
                 projectHeads.push_back(projectHead);
             }
             const HttpResponse imported = request(port, "POST", prefix(projects[0]) + "seed/bundle", projectFixtures[0],
-                                                   "application/vnd.aowis.bundle");
+                                                   "application/vnd.aowis.revision-bundle-v2");
             require(imported.status == 201 && field(imported.body, "head") == projectHeads[0],
                     "initial import failed: HTTP " + std::to_string(imported.status) + " " + imported.body);
             tightBudget(port, projects[0], projects[1], projectHeads[0], projectFixtures[0],
@@ -704,7 +704,7 @@ int main(int argc, char** argv) {
             const std::vector<std::string> branches = repository.listBranches();
             require(branches.size() == (index == 2 ? 9U : 10U), "unexpected post-stress branch count");
             for (const std::string& branch : branches) {
-                require(repository.headV2(*aowis::dvmdb::ProjectId::parse(id), branch).toString() ==
+                require(repository.head(*aowis::dvmdb::ProjectId::parse(id), branch).toString() ==
                             (branch == "main" ? emptyHeads[index] : projectHeads[index]),
                         "post-stress branch points at an unexpected revision");
             }

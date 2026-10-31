@@ -1,5 +1,5 @@
 #include "aowis/dvmdb/project_service.h"
-#include "aowis/dvmdb/revision_record_v2.h"
+#include "aowis/dvmdb/revision_record.h"
 
 #include <filesystem>
 #include <fstream>
@@ -22,9 +22,9 @@ using aowis::dvmdb::ProjectErrorKind;
 using aowis::dvmdb::ProjectId;
 using aowis::dvmdb::ProjectInfo;
 using aowis::dvmdb::ProjectService;
-using aowis::dvmdb::RevisionGraphPageV2;
+using aowis::dvmdb::RevisionGraphPage;
 using aowis::dvmdb::RevisionId;
-using aowis::dvmdb::RevisionGraphRevisionV2;
+using aowis::dvmdb::RevisionGraphRevision;
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
@@ -67,8 +67,8 @@ ModelChange change(std::uint8_t number) {
 }
 
 void exerciseRemoteTracking() {
-    using aowis::dvmdb::RepositoryRoleV1;
-    using aowis::dvmdb::RemoteTrackingRefV1;
+    using aowis::dvmdb::RepositoryRole;
+    using aowis::dvmdb::RemoteTrackingRef;
     TemporaryRoot localRoot;
     TemporaryRoot sharedRoot;
     TemporaryRoot otherSharedRoot;
@@ -81,7 +81,7 @@ void exerciseRemoteTracking() {
     {
         ProjectService shared(sharedRoot.path);
         remoteId = shared.repositoryId();
-        const ProjectInfo project = shared.createUnbornProjectV2("shared unborn project");
+        const ProjectInfo project = shared.createUnbornProject("shared unborn project");
         projectId = project.id;
         branchId = shared.branchId(projectId, "main")->toString();
     }
@@ -96,67 +96,67 @@ void exerciseRemoteTracking() {
     {
         ProjectService second(otherSharedRoot.path);
         secondRemoteId = second.repositoryId();
-        committed = second.commitModelV2(projectId, "main", {change(61)});
+        committed = second.commitModel(projectId, "main", {change(61)});
     }
     {
         ProjectService local(localRoot.path);
-        require(local.repositoryRoleV1() == RepositoryRoleV1::Unconfigured &&
-                local.remoteRepositoriesV1().empty() && local.remoteTrackingRefsV1().empty(),
+        require(local.repositoryRole() == RepositoryRole::Unconfigured &&
+                local.remoteRepositories().empty() && local.remoteTrackingRefs().empty(),
                 "legacy root unexpectedly has a role or remote tracking data");
-        local.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        local.configureRepositoryRoleV1(RepositoryRoleV1::Private);
-        expectError([&]() { local.configureRepositoryRoleV1(RepositoryRoleV1::Shared); },
+        local.configureRepositoryRole(RepositoryRole::Private);
+        local.configureRepositoryRole(RepositoryRole::Private);
+        expectError([&]() { local.configureRepositoryRole(RepositoryRole::Shared); },
                     ProjectErrorKind::Conflict);
-        expectError([&]() { local.registerRemoteRepositoryV1(local.repositoryId(),
+        expectError([&]() { local.registerRemoteRepository(local.repositoryId(),
                     "https://example.test/dvmdb/v1"); }, ProjectErrorKind::InvalidInput);
-        expectError([&]() { local.registerRemoteRepositoryV1(remoteId,
+        expectError([&]() { local.registerRemoteRepository(remoteId,
                     "https://user:pass@example.test/"); }, ProjectErrorKind::InvalidInput);
-        local.registerRemoteRepositoryV1(remoteId, "https://shared.example.test/dvmdb/v1");
-        local.registerRemoteRepositoryV1(remoteId, "https://shared.example.test/dvmdb/v1");
-        expectError([&]() { local.registerRemoteRepositoryV1(secondRemoteId,
+        local.registerRemoteRepository(remoteId, "https://shared.example.test/dvmdb/v1");
+        local.registerRemoteRepository(remoteId, "https://shared.example.test/dvmdb/v1");
+        expectError([&]() { local.registerRemoteRepository(secondRemoteId,
                     "https://shared.example.test/dvmdb/v1"); }, ProjectErrorKind::Conflict);
-        local.registerRemoteRepositoryV1(secondRemoteId, "file:///mnt/shared-dvmdb");
-        expectError([&]() { local.registerRemoteRepositoryV1(remoteId,
+        local.registerRemoteRepository(secondRemoteId, "file:///mnt/shared-dvmdb");
+        expectError([&]() { local.registerRemoteRepository(remoteId,
                     "https://changed.example.test/dvmdb/v1"); }, ProjectErrorKind::Conflict);
-        require(local.remoteRepositoriesV1().size() == 2,
+        require(local.remoteRepositories().size() == 2,
                 "remote registry did not preserve distinct repository UUIDs");
-        const RemoteTrackingRefV1 unborn{remoteId, projectId, branchId, std::nullopt};
-        const RemoteTrackingRefV1 committedRemote{secondRemoteId, projectId, branchId, committed};
-        local.recordRemoteTrackingRefV1(unborn, std::nullopt);
-        local.recordRemoteTrackingRefV1(committedRemote, std::nullopt);
-        require(local.remoteTrackingRefsV1().size() == 2,
+        const RemoteTrackingRef unborn{remoteId, projectId, branchId, std::nullopt};
+        const RemoteTrackingRef committedRemote{secondRemoteId, projectId, branchId, committed};
+        local.recordRemoteTrackingRef(unborn, std::nullopt);
+        local.recordRemoteTrackingRef(committedRemote, std::nullopt);
+        require(local.remoteTrackingRefs().size() == 2,
                 "same logical branch from two remotes collided in tracking namespace");
-        expectError([&]() { local.recordRemoteTrackingRefV1(unborn, std::nullopt); },
+        expectError([&]() { local.recordRemoteTrackingRef(unborn, std::nullopt); },
                     ProjectErrorKind::Conflict);
         ProjectService shared(sharedRoot.path);
-        sharedTip = shared.commitModelV2(projectId, "main", {change(62)});
-        const RemoteTrackingRefV1 firstCommit{remoteId, projectId, branchId, sharedTip};
-        local.recordRemoteTrackingRefV1(firstCommit,
+        sharedTip = shared.commitModel(projectId, "main", {change(62)});
+        const RemoteTrackingRef firstCommit{remoteId, projectId, branchId, sharedTip};
+        local.recordRemoteTrackingRef(firstCommit,
             std::optional<std::optional<RevisionId>>(std::optional<RevisionId>{}));
-        expectError([&]() { local.recordRemoteTrackingRefV1(unborn,
+        expectError([&]() { local.recordRemoteTrackingRef(unborn,
                     std::optional<std::optional<RevisionId>>(std::optional<RevisionId>{})); },
                     ProjectErrorKind::Conflict);
-        require(local.remoteTrackingRefsV1().size() == 2 &&
+        require(local.remoteTrackingRefs().size() == 2 &&
                 !local.listProjects().empty() &&
-                !local.optionalHeadV2(projectId, "main").has_value(),
+                !local.optionalHead(projectId, "main").has_value(),
                 "remote tracking unexpectedly moved the local unborn branch HEAD");
-        const RevisionId localTip = local.commitModelV2(projectId, "main", {change(63)});
+        const RevisionId localTip = local.commitModel(projectId, "main", {change(63)});
         require(localTip != sharedTip && localTip != committed &&
-                shared.optionalHeadV2(projectId, "main") == sharedTip,
+                shared.optionalHead(projectId, "main") == sharedTip,
                 "local commit moved shared repository HEAD");
         ProjectService second(otherSharedRoot.path);
-        require(second.optionalHeadV2(projectId, "main") == committed,
+        require(second.optionalHead(projectId, "main") == committed,
                 "local commit moved another remote repository HEAD");
     }
     {
         ProjectService reopened(localRoot.path);
-        require(reopened.repositoryRoleV1() == RepositoryRoleV1::Private &&
-                reopened.remoteRepositoriesV1().size() == 2 &&
-                reopened.remoteTrackingRefsV1().size() == 2,
+        require(reopened.repositoryRole() == RepositoryRole::Private &&
+                reopened.remoteRepositories().size() == 2 &&
+                reopened.remoteTrackingRefs().size() == 2,
                 "remote registry or tracking state changed across restart");
         bool foundFirst = false;
         bool foundSecond = false;
-        for (const RemoteTrackingRefV1& entry : reopened.remoteTrackingRefsV1()) {
+        for (const RemoteTrackingRef& entry : reopened.remoteTrackingRefs()) {
             require(entry.projectId == projectId && entry.branchId == branchId,
                     "reloaded tracking branch identity changed");
             if (entry.remoteRepositoryId == remoteId && entry.observedHead == sharedTip)
@@ -165,7 +165,7 @@ void exerciseRemoteTracking() {
                 foundSecond = true;
         }
         require(foundFirst && foundSecond, "reloaded tracking lost repository qualification");
-        reopened.recordRemoteTrackingRefV1({remoteId, projectId, branchId, sharedTip},
+        reopened.recordRemoteTrackingRef({remoteId, projectId, branchId, sharedTip},
             std::optional<std::optional<RevisionId>>(std::optional<RevisionId>(sharedTip)));
     }
     {
@@ -199,21 +199,21 @@ void exercise() {
         const ProjectInfo project = service.createProject("canonical native UUIDv7");
         projectName = project.id;
         const ProjectInfo other = service.createProject("another project");
-        const ProjectInfo unborn = service.createUnbornProjectV2("unborn project");
-        const ProjectInfo pending = service.createUnbornProjectV2("persistently unborn project");
+        const ProjectInfo unborn = service.createUnbornProject("unborn project");
+        const ProjectInfo pending = service.createUnbornProject("persistently unborn project");
         pendingUnbornProject = pending.id;
         pendingUnbornBranch = service.branchId(pending.id, "main");
         require(pendingUnbornBranch.has_value(), "new unborn main has no branch identity");
-        require(!service.optionalHeadV2(pending.id, "main").has_value(),
+        require(!service.optionalHead(pending.id, "main").has_value(),
                 "new unborn project has a committed HEAD");
-        require(!service.optionalHeadV2(unborn.id, "main").has_value(),
+        require(!service.optionalHead(unborn.id, "main").has_value(),
                 "unborn project unexpectedly has committed HEAD");
-        require(service.historyV2(unborn.id, "main").empty(),
+        require(service.history(unborn.id, "main").empty(),
                 "unborn project has a nonempty revision history");
-        require(service.revisionGraphV2(unborn.id).revisions.empty(),
+        require(service.revisionGraph(unborn.id).revisions.empty(),
                 "unborn project has graph revisions");
-        const RevisionId firstUnborn = service.commitModelV2(unborn.id, "main", {change(9)});
-        require(service.optionalHeadV2(unborn.id, "main") == firstUnborn,
+        const RevisionId firstUnborn = service.commitModel(unborn.id, "main", {change(9)});
+        require(service.optionalHead(unborn.id, "main") == firstUnborn,
                 "first unborn commit did not publish the HEAD");
         require(service.revision(unborn.id, firstUnborn).parents.empty(),
                 "first unborn commit must have no parents");
@@ -222,7 +222,7 @@ void exercise() {
         initial = service.head(project.id, "main");
         require(initial != service.head(other.id, "main"),
                 "independent empty projects must have different revision identities");
-        const RevisionGraphRevisionV2 first = service.revision(project.id, initial);
+        const RevisionGraphRevision first = service.revision(project.id, initial);
         require(first.id == initial && first.parents.empty(), "canonical initial revision is invalid");
         require(service.history(project.id, "main").size() == 1,
                 "canonical native history cannot read initial revision");
@@ -235,7 +235,7 @@ void exercise() {
         featureTip = service.commitModel(project.id, "feature", {change(2)}, initial);
         require(mainTip != initial && mainTip != featureTip,
                 "distinct commits must create distinct revisions");
-        const aowis::dvmdb::MergeResultV2 result = service.mergeBranches(
+        const aowis::dvmdb::MergeResult result = service.mergeBranches(
             project.id, "main", "feature", mainTip, featureTip);
         require(result.status == MergeStatus::Merged && result.resultHead.has_value(),
                 "disjoint native merge must produce a new revision");
@@ -243,7 +243,7 @@ void exercise() {
         require(service.head(project.id, "main") == merged &&
                 service.head(project.id, "feature") == featureTip,
                 "native merge moved the wrong HEAD");
-        const RevisionGraphRevisionV2 record = service.revision(project.id, merged);
+        const RevisionGraphRevision record = service.revision(project.id, merged);
         require(record.parents.size() == 2 && record.parents[0].id == mainTip &&
                 record.parents[1].id == featureTip, "merge lost ordered parent UUIDs");
         Key firstKey{};
@@ -256,12 +256,12 @@ void exercise() {
         require(!service.getModelAtRevision(project.id, featureTip, firstKey).has_value(),
                 "historical feature snapshot was overwritten");
 
-        const RevisionGraphPageV2 firstPage = service.revisionGraph(project.id, 1);
+        const RevisionGraphPage firstPage = service.revisionGraph(project.id, 1);
         require(firstPage.revisions.size() == 1 && firstPage.next.has_value() &&
                 firstPage.heads.size() == 2, "canonical DAG pagination is incomplete");
-        require(service.createBranch(project.id, "historical", "main", initial) == initial,
+        require(service.createBranchAtRevision(project.id, "historical", "main", initial) == initial,
                 "historical fork must share its selected ancestor revision");
-        const RevisionGraphPageV2 pinned = service.revisionGraph(project.id, 100, firstPage.next);
+        const RevisionGraphPage pinned = service.revisionGraph(project.id, 100, firstPage.next);
         require(pinned.heads.size() == 2 && pinned.revisions.size() == 3,
                 "pinned DAG page changed when a branch was created");
         service.renameBranch(project.id, "feature", "develop", featureTip);
@@ -272,8 +272,6 @@ void exercise() {
                     ProjectErrorKind::Conflict);
         expectError([&]() { (void)service.commitModel(project.id, "main", {change(3)}, initial); },
                     ProjectErrorKind::Conflict);
-        expectError([&]() { (void)service.createBranch(project.id, "invalid", std::nullopt, initial); },
-                    ProjectErrorKind::InvalidInput);
         expectError([&]() { (void)service.revision(project.id, service.head(other.id, "main")); },
                     ProjectErrorKind::NotFound);
         expectError([&]() { (void)service.history(project.id, "main", 0); },
@@ -285,11 +283,11 @@ void exercise() {
                 "repository UUID changed after restart");
         require(reopened.branchId(pendingUnbornProject, "main") == pendingUnbornBranch,
                 "unborn main branch identity changed after service restart");
-        require(!reopened.optionalHeadV2(pendingUnbornProject, "main").has_value(),
+        require(!reopened.optionalHead(pendingUnbornProject, "main").has_value(),
                 "unborn HEAD changed after service restart");
-        require(reopened.historyV2(pendingUnbornProject, "main").empty(),
+        require(reopened.history(pendingUnbornProject, "main").empty(),
                 "reopened unborn project contains fabricated history");
-        const RevisionGraphPageV2 unbornGraph = reopened.revisionGraphV2(pendingUnbornProject);
+        const RevisionGraphPage unbornGraph = reopened.revisionGraph(pendingUnbornProject);
         require(unbornGraph.revisions.empty() && unbornGraph.heads.size() == 1 &&
                 unbornGraph.heads.front().branchId == *pendingUnbornBranch &&
                 !unbornGraph.heads.front().revision.has_value(),
@@ -331,16 +329,16 @@ void exerciseCloneTargetProvision() {
     std::string originalRepositoryId;
     {
     ProjectService target(targetRoot.path);
-    const ProjectInfo provisioned = target.provisionCloneTargetV2(logicalProject, "Shared network");
+    const ProjectInfo provisioned = target.provisionCloneTarget(logicalProject, "Shared network");
     require(provisioned.id == logicalProject && provisioned.name == "Shared network",
             "clone target changed logical project UUID or name");
     require(target.listBranches(logicalProject).empty(),
             "clone target fabricated a branch before receiving its bundle");
-    require(target.provisionCloneTargetV2(logicalProject, "Shared network").id == logicalProject,
+    require(target.provisionCloneTarget(logicalProject, "Shared network").id == logicalProject,
             "retry of clone target provisioning was not idempotent");
-    expectError([&]() { (void)target.provisionCloneTargetV2(logicalProject, "Different"); },
+    expectError([&]() { (void)target.provisionCloneTarget(logicalProject, "Different"); },
                 ProjectErrorKind::Conflict);
-    expectError([&]() { (void)target.provisionCloneTargetV2("not-a-uuid", "Bad"); },
+    expectError([&]() { (void)target.provisionCloneTarget("not-a-uuid", "Bad"); },
                 ProjectErrorKind::InvalidInput);
     originalRepositoryId = target.repositoryId();
     }
@@ -349,21 +347,21 @@ void exerciseCloneTargetProvision() {
         ProjectService source(sourceRoot.path);
         // The logical project has to originate in the source repository, so
         // provision it explicitly here without manufacturing any HEAD.
-        source.provisionCloneTargetV2(logicalProject, "Shared network");
+        source.provisionCloneTarget(logicalProject, "Shared network");
         RevisionId sourceHead = RevisionId::generate();
         std::optional<BranchId> sourceBranch;
         source.withRepository(logicalProject, [&](aowis::dvmdb::Repository& repository) {
-            sourceHead = repository.createBranchV2(*ProjectId::parse(logicalProject), "main");
+            sourceHead = repository.createBranch(*ProjectId::parse(logicalProject), "main");
             sourceBranch = repository.branchId("main");
         });
         aowis::dvmdb::ScratchFile bundle = source.createScratchFile(logicalProject);
         source.withRepository(logicalProject, [&](aowis::dvmdb::Repository& repository) {
-            repository.exportRevisionBundleV2(*ProjectId::parse(logicalProject), "main", bundle.fd());
+            repository.exportRevisionBundle(*ProjectId::parse(logicalProject), "main", bundle.fd());
         });
         ProjectService destination(targetRoot.path);
         destination.withRepository(logicalProject, [&](aowis::dvmdb::Repository& repository) {
-            const aowis::dvmdb::RevisionBundleImportV2 imported =
-                repository.importRevisionBundleV2(*ProjectId::parse(logicalProject), bundle.fd(), "main");
+            const aowis::dvmdb::RevisionBundleImport imported =
+                repository.importRevisionBundle(*ProjectId::parse(logicalProject), bundle.fd(), "main");
             require(imported.status == aowis::dvmdb::BundleImportStatus::Created &&
                     imported.head == sourceHead,
                     "first clone bundle did not publish the original immutable HEAD");

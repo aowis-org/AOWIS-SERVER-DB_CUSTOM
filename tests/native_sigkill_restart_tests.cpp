@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <algorithm>
 #include <array>
@@ -14,10 +15,13 @@
 #include <string_view>
 #include <sys/wait.h>
 #include <thread>
+#include <poll.h>
 #include <unistd.h>
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 namespace fs = std::filesystem;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
@@ -58,7 +62,7 @@ Bytes counterValue(std::uint64_t value) {
     return result;
 }
 
-std::uint64_t readCounter(Repository& repository) {
+std::uint64_t readCounter(ProjectRepository& repository) {
     const std::optional<Bytes> bytes = repository.get("main", key());
     require(bytes.has_value() && bytes->size() == 8U + 32768U,
             "counter payload missing or corrupted");
@@ -77,7 +81,7 @@ void sendAck(int descriptor, const std::string& ack) {
 
 [[noreturn]] void workerWrite(const fs::path& repositoryPath, int ackFd) {
     try {
-        Repository repository(repositoryPath);
+        ProjectRepository repository(repositoryPath);
         std::uint64_t next = readCounter(repository);
         for (;;) {
             ++next;
@@ -93,11 +97,11 @@ void sendAck(int descriptor, const std::string& ack) {
 [[noreturn]] void workerExport(const fs::path& repositoryPath, const fs::path& output,
                                unsigned round, int ackFd) {
     try {
-        Repository repository(repositoryPath);
+        ProjectRepository repository(repositoryPath);
         for (std::uint64_t sequence = 0;; ++sequence) {
             const fs::path bundle = output /
                 ("round-" + std::to_string(round) + "-" + std::to_string(sequence) + ".bundle");
-            repository.exportBranchBundle("main", bundle);
+            repository.exportBundle("main", bundle);
             sendAck(ackFd, bundle.filename().string());
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
@@ -126,14 +130,33 @@ std::vector<std::string> interrupt(const std::string& executable,
         ::_exit(83);
     }
     ::close(pipeFd[1]);
+    // Arm the kill timer only after the worker has acknowledged its first
+    // operation, so slow startup (exec, sanitizers, repository open) cannot
+    // consume the whole delay. The kill then lands at a varying point of a
+    // later operation.
+    std::string received;
+    std::array<char, 4096> chunk{};
+    const std::chrono::steady_clock::time_point startupDeadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (received.find('\n') == std::string::npos) {
+        pollfd ready{pipeFd[0], POLLIN, 0};
+        const int polled = ::poll(&ready, 1, 100);
+        if (polled < 0 && errno == EINTR) continue;
+        require(polled >= 0, "acknowledgement pipe poll failed");
+        require(std::chrono::steady_clock::now() < startupDeadline,
+                "worker did not acknowledge its first operation");
+        if (polled == 0) continue;
+        const ssize_t amount = ::read(pipeFd[0], chunk.data(), chunk.size());
+        if (amount < 0 && errno == EINTR) continue;
+        require(amount > 0, "worker exited before its first acknowledgement");
+        received.append(chunk.data(), static_cast<std::size_t>(amount));
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
     require(::kill(child, SIGKILL) == 0, "SIGKILL failed");
     int status = 0;
     require(::waitpid(child, &status, 0) == child, "waitpid failed");
     require(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
             "child was not killed by SIGKILL");
-    std::string received;
-    std::array<char, 4096> chunk{};
     while (true) {
         const ssize_t amount = ::read(pipeFd[0], chunk.data(), chunk.size());
         if (amount == 0) break;
@@ -156,7 +179,7 @@ std::vector<std::string> interrupt(const std::string& executable,
 void writeKillDrill(const std::string& executable, const fs::path& root) {
     const fs::path repositoryPath = root / "write-repository";
     {
-        Repository repository(repositoryPath);
+        ProjectRepository repository(repositoryPath);
         repository.createBranch("main");
         (void)repository.commit("main", {Change{key(), counterValue(0)}});
     }
@@ -175,7 +198,7 @@ void writeKillDrill(const std::string& executable, const fs::path& root) {
         }
         // A completed publication might not yet have been acknowledged.
         // Such a revision is valid, but cannot advance by more than one.
-        Repository recovered(repositoryPath);
+        ProjectRepository recovered(repositoryPath);
         const std::uint64_t durable = readCounter(recovered);
         require(durable >= acknowledged, "acknowledged commit disappeared after SIGKILL");
         require(durable <= acknowledged + 1, "unexpected unacknowledged revision sequence");
@@ -187,7 +210,7 @@ void writeKillDrill(const std::string& executable, const fs::path& root) {
     }
     require(acknowledgedCommits > 0, "writer never completed a commit before interruption");
     {
-        Repository repository(repositoryPath);
+        ProjectRepository repository(repositoryPath);
         const std::uint64_t before = readCounter(repository);
         (void)repository.commit("main", {Change{key(), counterValue(before + 1)}});
         require(readCounter(repository) == before + 1, "write after repeated SIGKILL failed");
@@ -201,12 +224,12 @@ void exportKillDrill(const std::string& executable, const fs::path& root) {
     const fs::path repositoryPath = root / "export-repository";
     const fs::path output = root / "exports";
     fs::create_directories(output);
-    Hash head{};
+    RevisionId head = RevisionId::generate();
     {
-        Repository repository(repositoryPath);
+        ProjectRepository repository(repositoryPath);
         repository.createBranch("main");
         (void)repository.commit("main", {Change{key(), counterValue(7)}});
-        head = repository.head("main").id;
+        head = repository.head("main");
     }
     unsigned acknowledgedExports = 0;
     for (unsigned round = 0; round != 8U; ++round) {
@@ -225,8 +248,9 @@ void exportKillDrill(const std::string& executable, const fs::path& root) {
             if (entry.path().extension() != ".bundle") continue;
             const fs::path imported = root / "verify-import";
             {
-                Repository destination(imported);
-                const auto result = destination.importBranchBundle(entry.path(), "main");
+                ProjectRepository destination(imported);
+                const aowis::dvmdb::RevisionBundleImport result =
+                    destination.importBundle(entry.path(), "main");
                 require(result.head == head, "completed export has wrong head");
                 destination.verifyRepository();
             }
@@ -235,8 +259,8 @@ void exportKillDrill(const std::string& executable, const fs::path& root) {
             ++verified;
         }
         require(verified >= acknowledgedExports, "not all acknowledged bundles verified");
-        Repository source(repositoryPath);
-        require(source.head("main").id == head, "export changed source head");
+        ProjectRepository source(repositoryPath);
+        require(source.head("main") == head, "export changed source head");
         source.verifyRepository();
     }
     require(acknowledgedExports > 0, "no bundle exported before interruption");

@@ -4,6 +4,7 @@
 // already stored locally as verified boundaries. Forged bundles that graft
 // local objects into the wrong position must still be rejected.
 #include "aowis/dvmdb/native_store.h"
+#include "project_repository.h"
 
 #include <algorithm>
 #include <chrono>
@@ -24,8 +25,10 @@
 #include <vector>
 
 namespace {
+using aowis::dvmdb::RevisionId;
+using aowis::dvmdb::test::ProjectRepository;
 using aowis::dvmdb::BundleImportProfile;
-using aowis::dvmdb::BundleImportResult;
+using aowis::dvmdb::RevisionBundleImport;
 using aowis::dvmdb::BundleImportStatus;
 using aowis::dvmdb::Bytes;
 using aowis::dvmdb::Change;
@@ -36,7 +39,8 @@ using aowis::dvmdb::MergeStatus;
 using aowis::dvmdb::ModelChange;
 using aowis::dvmdb::ModelRecord;
 using aowis::dvmdb::Repository;
-using aowis::dvmdb::Revision;
+using aowis::dvmdb::ProjectId;
+using aowis::dvmdb::test::CommittedRevision;
 using aowis::dvmdb::StorageError;
 using aowis::dvmdb::StorageErrorKind;
 
@@ -108,7 +112,7 @@ Bytes readFile(const std::filesystem::path& path) {
 }
 
 std::uint64_t bundleObjectCount(const std::filesystem::path& bundle) {
-    return readU64(readFile(bundle), 40);
+    return aowis::dvmdb::test::bundleLayout(bundle).objects;
 }
 
 // Stored payload of `hash`, located through its pack record header
@@ -125,15 +129,31 @@ Bytes storedObject(const std::filesystem::path& repository, const Hash& hash) {
                  pack.begin() + static_cast<std::ptrdiff_t>(offset + 45 + size));
 }
 
-Bytes revisionObject(const Hash& root, const Hash& referencesRoot, bool model,
-                     const std::vector<Hash>& parents) {
-    Bytes bytes{'S'};
-    bytes.insert(bytes.end(), root.begin(), root.end());
-    bytes.insert(bytes.end(), referencesRoot.begin(), referencesRoot.end());
-    bytes.push_back(model ? 1 : 0);
-    bytes.push_back(static_cast<std::uint8_t>(parents.size()));
-    for (const Hash& parent : parents) bytes.insert(bytes.end(), parent.begin(), parent.end());
-    return bytes;
+// A forged revision record (UUIDv7, frozen 'T',2 layout) and its identity.
+struct ForgedRevision {
+    RevisionId id;
+    Bytes bytes;
+};
+
+ForgedRevision revisionObject(const ProjectId& project, const Hash& root, const Hash& referencesRoot,
+                              bool model, const std::vector<std::pair<RevisionId, Hash>>& parents) {
+    ForgedRevision result{RevisionId::generate(), Bytes{'T', 2}};
+    for (const aowis::dvmdb::UuidV7* uuid : {&result.id.uuid(), &project.uuid()})
+        result.bytes.insert(result.bytes.end(), uuid->bytes.begin(), uuid->bytes.end());
+    result.bytes.insert(result.bytes.end(), root.begin(), root.end());
+    result.bytes.insert(result.bytes.end(), referencesRoot.begin(), referencesRoot.end());
+    result.bytes.push_back(model ? 1 : 0);
+    result.bytes.push_back(static_cast<std::uint8_t>(parents.size()));
+    for (const std::pair<RevisionId, Hash>& parent : parents) {
+        result.bytes.insert(result.bytes.end(), parent.first.uuid().bytes.begin(),
+                            parent.first.uuid().bytes.end());
+        result.bytes.insert(result.bytes.end(), parent.second.begin(), parent.second.end());
+    }
+    return result;
+}
+
+std::pair<RevisionId, Hash> parentOf(const CommittedRevision& revision) {
+    return {revision.id, revision.recordHash};
 }
 
 Bytes leafObject(const Key& leafKey, const Hash& value) {
@@ -174,16 +194,20 @@ unsigned nibble(const Key& value, unsigned position) {
     return (position % 2U) == 0U ? (byte >> 4U) : (byte & 0x0fU);
 }
 
-// An incremental bundle with arbitrary (hash-valid) objects.
-void writeBundle(const std::filesystem::path& path, const Hash& tip, const Hash& base,
+// An incremental (AOWREV22) bundle with arbitrary (hash-valid) objects.
+void writeBundle(const std::filesystem::path& path, const ProjectId& project,
+                 const ForgedRevision& tip, const CommittedRevision& base,
                  const std::vector<Bytes>& objects, const aowis::dvmdb::BranchId& branchId) {
     std::map<Hash, Bytes> sorted;
     for (const Bytes& object : objects) sorted.emplace(aowis::dvmdb::sha256(object), object);
-    Bytes bundle{'A', 'O', 'W', 'S', 'Y', 'N', 'C', '4'};
-    bundle.insert(bundle.end(), tip.begin(), tip.end());
+    const Hash tipHash = aowis::dvmdb::sha256(tip.bytes);
+    Bytes bundle{'A', 'O', 'W', 'R', 'E', 'V', '2', '2'};
+    for (const aowis::dvmdb::UuidV7* uuid : {&project.uuid(), &branchId.uuid(), &tip.id.uuid()})
+        bundle.insert(bundle.end(), uuid->bytes.begin(), uuid->bytes.end());
+    bundle.insert(bundle.end(), tipHash.begin(), tipHash.end());
     appendU64(bundle, sorted.size());
-    bundle.insert(bundle.end(), base.begin(), base.end());
-    bundle.insert(bundle.end(), branchId.uuid().bytes.begin(), branchId.uuid().bytes.end());
+    bundle.insert(bundle.end(), base.id.uuid().bytes.begin(), base.id.uuid().bytes.end());
+    bundle.insert(bundle.end(), base.recordHash.begin(), base.recordHash.end());
     for (const std::pair<const Hash, Bytes>& entry : sorted) {
         bundle.insert(bundle.end(), entry.first.begin(), entry.first.end());
         appendU64(bundle, entry.second.size());
@@ -197,27 +221,27 @@ void writeBundle(const std::filesystem::path& path, const Hash& tip, const Hash&
 // Exports main relative to the recipient's head and imports it; checks the
 // recipient ends with exactly the source's state.
 struct Transfer {
-    BundleImportResult result;
+    RevisionBundleImport result{BundleImportStatus::UpToDate, RevisionId::generate(), 0};
     BundleImportProfile profile;
     std::uint64_t objects = 0;
 };
 
-Transfer synchronize(Repository& source, Repository& recipient, const std::filesystem::path& bundle,
+Transfer synchronize(ProjectRepository& source, ProjectRepository& recipient, const std::filesystem::path& bundle,
                      std::string_view branch = "main") {
     std::error_code ignored;
     std::filesystem::remove(bundle, ignored);
-    source.exportIncrementalBranchBundle(branch, recipient.head(branch).id, bundle);
-    Transfer transfer{};
+    source.exportIncrementalBundle(branch, recipient.head(branch), bundle);
+    Transfer transfer;
     transfer.objects = bundleObjectCount(bundle);
-    transfer.result = recipient.importBranchBundle(bundle, branch, {}, &transfer.profile);
-    expect(recipient.head(branch).id == source.head(branch).id, "recipient head differs after import");
+    transfer.result = recipient.importBundle(bundle, branch, {}, &transfer.profile);
+    expect(recipient.head(branch) == source.head(branch), "recipient head differs after import");
     expect(recipient.scan(branch) == source.scan(branch), "recipient content differs after import");
     return transfer;
 }
 
 // 2000 model records (every seventh refers to its predecessor), then
 // `historyLength` commits of three record updates each.
-void buildModelHistory(Repository& repository, unsigned historyLength) {
+void buildModelHistory(ProjectRepository& repository, unsigned historyLength) {
     repository.createBranch("main");
     std::vector<ModelChange> initial;
     for (std::uint32_t i = 1; i <= 2000; ++i) {
@@ -239,11 +263,11 @@ void testWorkIndependentOfHistory() {
     std::vector<std::uint64_t> sizes;
     for (unsigned historyLength : {50U, 400U}) {
         TestDirectory directory("history-" + std::to_string(historyLength));
-        Repository source(directory.path / "source");
+        ProjectRepository source(directory.path / "source");
         buildModelHistory(source, historyLength);
-        source.exportBranchBundle("main", directory.path / "full.bundle");
-        Repository recipient(directory.path / "recipient");
-        recipient.importBranchBundle(directory.path / "full.bundle", "main");
+        source.exportBundle("main", directory.path / "full.bundle");
+        ProjectRepository recipient(directory.path / "recipient");
+        recipient.importBundle(directory.path / "full.bundle", "main");
         // One updated record, one new record with a new reference.
         source.commitModel("main", {put(5, 9999), put(5000, 0, {key(5)})});
         const Transfer transfer = synchronize(source, recipient, directory.path / "delta.bundle");
@@ -251,7 +275,7 @@ void testWorkIndependentOfHistory() {
         reads.push_back(transfer.profile.localObjectReads);
         sizes.push_back(transfer.objects);
         const aowis::dvmdb::VerificationReport report = recipient.verifyRepository();
-        expect(report.revisions == historyLength + 3U, "verification after delta import incomplete");
+        expect(report.revisions == historyLength + 2U, "verification after delta import incomplete");
     }
     std::cout << "  delta import local reads " << reads[0] << " (50 commits), " << reads[1]
               << " (400 commits); bundle objects " << sizes[0] << ", " << sizes[1] << '\n';
@@ -270,14 +294,14 @@ void testWorkIndependentOfHistory() {
 // omit an object the recipient lacks.
 void testTrieShapeChanges() {
     TestDirectory directory("shapes");
-    Repository source(directory.path / "source");
+    ProjectRepository source(directory.path / "source");
     source.createBranch("main");
     std::vector<Change> initial;
     for (std::uint32_t i = 1; i <= 600; ++i) initial.push_back(Change{key(i), payload(i, 0)});
     source.commit("main", initial);
-    source.exportBranchBundle("main", directory.path / "full.bundle");
-    Repository recipient(directory.path / "recipient");
-    recipient.importBranchBundle(directory.path / "full.bundle", "main");
+    source.exportBundle("main", directory.path / "full.bundle");
+    ProjectRepository recipient(directory.path / "recipient");
+    recipient.importBundle(directory.path / "full.bundle", "main");
 
     // Two keys sharing a long prefix force a deep new branch.
     Key first{};
@@ -353,17 +377,17 @@ void testRandomModelHistories() {
     for (unsigned seed = 1; seed <= 6; ++seed) {
         TestDirectory directory("random-" + std::to_string(seed));
         std::mt19937 random(seed);
-        Repository source(directory.path / "source");
+        ProjectRepository source(directory.path / "source");
         source.createBranch("main");
         // Anchors are never deleted; other records may refer to them.
         std::vector<ModelChange> anchors;
         for (std::uint32_t i = 1; i <= 40; ++i) anchors.push_back(put(i, 0));
         source.commitModel("main", anchors);
-        source.exportBranchBundle("main", directory.path / "full.bundle");
-        Repository eager(directory.path / "eager");
-        Repository lagging(directory.path / "lagging");
-        eager.importBranchBundle(directory.path / "full.bundle", "main");
-        lagging.importBranchBundle(directory.path / "full.bundle", "main");
+        source.exportBundle("main", directory.path / "full.bundle");
+        ProjectRepository eager(directory.path / "eager");
+        ProjectRepository lagging(directory.path / "lagging");
+        eager.importBundle(directory.path / "full.bundle", "main");
+        lagging.importBundle(directory.path / "full.bundle", "main");
 
         std::set<std::uint32_t> live;
         std::uint32_t version = 0;
@@ -401,7 +425,7 @@ void testRandomModelHistories() {
                     changes = randomChanges(100, 500);
                     if (!changes.empty()) source.commitModel("main", changes);
                 }
-                const MergeResult merged = source.mergeBranches("main", feature);
+                const MergeResult merged = source.merge("main", feature);
                 expect(merged.status == MergeStatus::Merged, "random merge failed");
             } else {
                 const std::vector<ModelChange> changes = randomChanges(100, 500);
@@ -420,30 +444,31 @@ void testRandomModelHistories() {
 // branch "other" = A -> C. All forged objects below graft LOCAL objects.
 struct ForgeFixture {
     explicit ForgeFixture(const std::filesystem::path& root) : directory(root / "recipient") {
-        Repository repository(this->directory);
+        ProjectRepository repository(this->directory);
         repository.createBranch("main");
-        this->a = repository.commitModel("main", {put(1, 0)});
+        this->a = repository.revision(repository.commitModel("main", {put(1, 0)}));
         repository.createBranch("other", std::string_view("main"));
-        this->b = repository.commitModel("main", {put(2, 0, {key(1)})});
-        this->c = repository.commitModel("other", {put(3, 0)});
+        this->b = repository.revision(repository.commitModel("main", {put(2, 0, {key(1)})}));
+        this->c = repository.revision(repository.commitModel("other", {put(3, 0)}));
+        this->project = repository.project();
     }
     std::filesystem::path directory;
-    Revision a;
-    Revision b;
-    Revision c;
+    CommittedRevision a{RevisionId::generate()};
+    CommittedRevision b{RevisionId::generate()};
+    CommittedRevision c{RevisionId::generate()};
+    ProjectId project = ProjectId::generate();
 };
 
 void expectForgedRejected(const ForgeFixture& fixture, const std::filesystem::path& bundle,
-                          const std::string& label, const Hash& base, const Bytes& tipRevision,
-                          std::vector<Bytes> objects,
+                          const std::string& label, const CommittedRevision& base,
+                          const ForgedRevision& tipRevision, std::vector<Bytes> objects,
                           StorageErrorKind expected = StorageErrorKind::InvalidInput) {
-    objects.push_back(tipRevision);
-    Repository recipient(fixture.directory);
-    writeBundle(bundle, aowis::dvmdb::sha256(tipRevision), base, objects,
-                *recipient.branchId("main"));
+    objects.push_back(tipRevision.bytes);
+    ProjectRepository recipient(fixture.directory);
+    writeBundle(bundle, fixture.project, tipRevision, base, objects, *recipient.branchId("main"));
     const std::uint64_t before = recipient.objectCount();
-    expectKind(expected, label, [&] { (void)recipient.importBranchBundle(bundle, "main"); });
-    expect(recipient.objectCount() == before && recipient.head("main").id == fixture.b.id,
+    expectKind(expected, label, [&] { (void)recipient.importBundle(bundle, "main"); });
+    expect(recipient.objectCount() == before && recipient.head("main") == fixture.b.id,
            label + ": rejected import changed the repository");
 }
 
@@ -451,7 +476,8 @@ void testForgedBoundaryGrafts() {
     TestDirectory directory("forged");
     const ForgeFixture fixture(directory.path);
     const std::filesystem::path bundle = directory.path / "forged.bundle";
-    const Revision& b = fixture.b;
+    const CommittedRevision& b = fixture.b;
+    const ProjectId& project = fixture.project;
     const Hash referrers = aowis::dvmdb::sha256(referrersValue({key(2)}));
     expect(storedObject(fixture.directory, referrers) == referrersValue({key(2)}),
            "fixture reverse index differs from the expected encoding");
@@ -460,19 +486,19 @@ void testForgedBoundaryGrafts() {
     (void)storedObject(fixture.directory, aowis::dvmdb::sha256(recordTwoLeaf));
 
     // A local reverse-index trie (INR1 values) used as a raw content tree.
-    expectForgedRejected(fixture, bundle, "local reference trie as raw tree", b.id,
-                         revisionObject(b.referencesRoot, Hash{}, false, {b.id}), {});
+    expectForgedRejected(fixture, bundle, "local reference trie as raw tree", b,
+                         revisionObject(project, b.referencesRoot, Hash{}, false, {parentOf(b)}), {});
     // ... as a model tree: the semantic phase decodes every changed leaf.
-    expectForgedRejected(fixture, bundle, "local reference trie as model tree", b.id,
-                         revisionObject(b.referencesRoot, Hash{}, true, {b.id}), {});
+    expectForgedRejected(fixture, bundle, "local reference trie as model tree", b,
+                         revisionObject(project, b.referencesRoot, Hash{}, true, {parentOf(b)}), {});
     // A local model trie used as the reverse-reference index.
-    expectForgedRejected(fixture, bundle, "local model trie as reference index", b.id,
-                         revisionObject(b.root, b.root, true, {b.id}), {});
+    expectForgedRejected(fixture, bundle, "local model trie as reference index", b,
+                         revisionObject(project, b.root, b.root, true, {parentOf(b)}), {});
     // A new bundled leaf whose model value is a local INR1 object.
     {
         const Bytes leaf = leafObject(key(7), referrers);
-        expectForgedRejected(fixture, bundle, "bundled leaf with local reference value", b.id,
-                             revisionObject(aowis::dvmdb::sha256(leaf), Hash{}, true, {b.id}), {leaf});
+        expectForgedRejected(fixture, bundle, "bundled leaf with local reference value", b,
+                             revisionObject(project, aowis::dvmdb::sha256(leaf), Hash{}, true, {parentOf(b)}), {leaf});
     }
     // A local leaf placed in a slot that does not match its key.
     {
@@ -485,8 +511,8 @@ void testForgedBoundaryGrafts() {
         const Bytes otherLeaf = leafObject(other, aowis::dvmdb::sha256(otherValue));
         const Bytes branch = branchObject(0, Key{}, {{(correct + 1U) % 16U, localLeaf},
                                                      {(correct + 2U) % 16U, aowis::dvmdb::sha256(otherLeaf)}});
-        expectForgedRejected(fixture, bundle, "local leaf in the wrong slot", b.id,
-                             revisionObject(aowis::dvmdb::sha256(branch), Hash{}, false, {b.id}),
+        expectForgedRejected(fixture, bundle, "local leaf in the wrong slot", b,
+                             revisionObject(project, aowis::dvmdb::sha256(branch), Hash{}, false, {parentOf(b)}),
                              {branch, otherLeaf, otherValue});
     }
     // A bundled branch whose local child branch is not deeper than itself.
@@ -509,25 +535,26 @@ void testForgedBoundaryGrafts() {
         const Bytes value = modelValue(ModelRecord{1, {}, payload(11, 0)});
         const Bytes leaf = leafObject(sibling, aowis::dvmdb::sha256(value));
         const Bytes branch = branchObject(depth, prefix, {{0U, b.root}, {siblingSlot, aowis::dvmdb::sha256(leaf)}});
-        expectForgedRejected(fixture, bundle, "local branch not deeper than its parent", b.id,
-                             revisionObject(aowis::dvmdb::sha256(branch), Hash{}, false, {b.id}),
+        expectForgedRejected(fixture, bundle, "local branch not deeper than its parent", b,
+                             revisionObject(project, aowis::dvmdb::sha256(branch), Hash{}, false, {parentOf(b)}),
                              {branch, leaf, value});
     }
     // A local tree node or value used as a parent revision.
-    expectForgedRejected(fixture, bundle, "local tree node as parent revision", b.id,
-                         revisionObject(b.root, b.referencesRoot, true, {b.id, b.root}), {});
+    expectForgedRejected(fixture, bundle, "local tree node as parent revision", b,
+                         revisionObject(project, b.root, b.referencesRoot, true,
+                                        {parentOf(b), {RevisionId::generate(), b.root}}), {});
     // The header base must be an ancestor: this tip descends from C only.
-    expectForgedRejected(fixture, bundle, "base not an ancestor", b.id,
-                         revisionObject(fixture.c.root, fixture.c.referencesRoot, true, {fixture.c.id}), {});
+    expectForgedRejected(fixture, bundle, "base not an ancestor", b,
+                         revisionObject(project, fixture.c.root, fixture.c.referencesRoot, true,
+                                        {parentOf(fixture.c)}), {});
 
     // Positive control: grafting a local model trie as a raw tree is valid
     // (raw values are any 'V' objects), and the import is complete.
     {
-        const Bytes revision = revisionObject(b.root, Hash{}, false, {b.id});
-        Repository recipient(fixture.directory);
-        writeBundle(bundle, aowis::dvmdb::sha256(revision), b.id, {revision},
-                    *recipient.branchId("main"));
-        const BundleImportResult result = recipient.importBranchBundle(bundle, "main");
+        const ForgedRevision revision = revisionObject(project, b.root, Hash{}, false, {parentOf(b)});
+        ProjectRepository recipient(fixture.directory);
+        writeBundle(bundle, project, revision, b, {revision.bytes}, *recipient.branchId("main"));
+        const RevisionBundleImport result = recipient.importBundle(bundle, "main");
         expect(result.status == BundleImportStatus::FastForward && result.objectsImported == 1,
                "valid graft of a local raw-compatible trie rejected");
         recipient.verifyRepository();
@@ -536,54 +563,66 @@ void testForgedBoundaryGrafts() {
 
 void testBranchRelations() {
     TestDirectory directory("branches");
-    Repository source(directory.path / "source");
+    ProjectRepository source(directory.path / "source");
     source.createBranch("main");
-    const Hash a = source.commitModel("main", {put(1, 0)}).id;
-    const Hash b = source.commitModel("main", {put(2, 0, {key(1)})}).id;
-    source.exportBranchBundle("main", directory.path / "b.bundle");
-    const Hash c = source.commitModel("main", {put(3, 0)}).id;
-    source.exportIncrementalBranchBundle("main", b, directory.path / "c.bundle");
-    const Hash d = source.commitModel("main", {put(4, 0, {key(3)})}).id;
-    source.exportIncrementalBranchBundle("main", c, directory.path / "d.bundle");
+    const RevisionId a = source.commitModel("main", {put(1, 0)});
+    const RevisionId b = source.commitModel("main", {put(2, 0, {key(1)})});
+    source.exportBundle("main", directory.path / "b.bundle");
+    const RevisionId c = source.commitModel("main", {put(3, 0)});
+    source.exportIncrementalBundle("main", b, directory.path / "c.bundle");
+    const RevisionId d = source.commitModel("main", {put(4, 0, {key(3)})});
+    source.exportIncrementalBundle("main", c, directory.path / "d.bundle");
 
-    // Recipient main at B, "other" at C. The delta C -> D fast-forwards main
-    // although B is no boundary of that bundle (found below boundary C).
-    Repository recipient(directory.path / "recipient");
-    recipient.importBranchBundle(directory.path / "b.bundle", "main");
+    // A delta applies to exactly the HEAD it was cut against. Recipient main
+    // at B also holds C (on "side"), yet the delta C -> D is refused for main.
+    ProjectRepository recipient(directory.path / "recipient");
+    recipient.importBundle(directory.path / "b.bundle", "main");
     // The same UUIDv7 cannot be imported as an alias under another name.
     expectKind(StorageErrorKind::Conflict, "duplicate branch UUID alias", [&] {
-        (void)recipient.importBranchBundle(directory.path / "b.bundle", "other");
+        (void)recipient.importBundle(directory.path / "b.bundle", "other");
     });
     // Import C through its own independently named source branch, so the
     // recipient knows that immutable revision without advancing main from B.
-    source.createBranchAtRevision("side", "main", c);
-    source.exportBranchBundle("side", directory.path / "side.bundle");
-    expect(recipient.importBranchBundle(directory.path / "side.bundle", "side").head == c,
+    source.createBranchAt("side", "main", c);
+    source.exportBundle("side", directory.path / "side.bundle");
+    expect(recipient.importBundle(directory.path / "side.bundle", "side").head == c,
            "side branch did not transfer boundary C");
-    const BundleImportResult forward = recipient.importBranchBundle(directory.path / "d.bundle", "main");
-    expect(forward.status == BundleImportStatus::FastForward && forward.head == d &&
-           recipient.head("main").id == d, "fast-forward below a boundary failed");
-    expect(recipient.importBranchBundle(directory.path / "d.bundle", "main").status ==
+    expectKind(StorageErrorKind::Conflict, "delta cut against a held non-HEAD base", [&] {
+        (void)recipient.importBundle(directory.path / "d.bundle", "main");
+    });
+    expect(recipient.head("main") == b, "refused delta moved main");
+    // B -> C, then C -> D, applied in order, fast-forward main to D.
+    expect(recipient.importBundle(directory.path / "c.bundle", "main").head == c &&
+           recipient.importBundle(directory.path / "d.bundle", "main").status ==
+               BundleImportStatus::FastForward && recipient.head("main") == d,
+           "chained deltas did not fast-forward");
+    expect(recipient.importBundle(directory.path / "d.bundle", "main").status ==
            BundleImportStatus::UpToDate, "repeated import not up to date");
-    expect(recipient.importBranchBundle(directory.path / "c.bundle", "main").status ==
-           BundleImportStatus::UpToDate, "older delta not up to date");
+    expectKind(StorageErrorKind::Conflict, "older delta against a moved HEAD", [&] {
+        (void)recipient.importBundle(directory.path / "c.bundle", "main");
+    });
     recipient.verifyRepository();
 
     // Local work after B diverges from the delta B -> C.
-    Repository diverged(directory.path / "diverged");
-    diverged.importBranchBundle(directory.path / "b.bundle", "main");
+    ProjectRepository diverged(directory.path / "diverged");
+    diverged.importBundle(directory.path / "b.bundle", "main");
     diverged.commitModel("main", {put(9, 0)});
     expectKind(StorageErrorKind::Conflict, "divergent incremental import",
-               [&] { (void)diverged.importBranchBundle(directory.path / "c.bundle", "main"); });
-    // A base the recipient lacks.
-    Repository behind(directory.path / "behind");
-    source.exportIncrementalBranchBundle("main", a, directory.path / "from-a.bundle");
-    behind.importBranchBundle(directory.path / "b.bundle", "main");
-    expect(behind.importBranchBundle(directory.path / "from-a.bundle", "main").head == d,
-           "delta from an older held base failed");
+               [&] { (void)diverged.importBundle(directory.path / "c.bundle", "main"); });
+    // A delta from an older revision the recipient holds is not its HEAD.
+    ProjectRepository behind(directory.path / "behind");
+    source.exportIncrementalBundle("main", a, directory.path / "from-a.bundle");
+    behind.importBundle(directory.path / "b.bundle", "main");
+    expectKind(StorageErrorKind::Conflict, "delta from an older held base",
+               [&] { (void)behind.importBundle(directory.path / "from-a.bundle", "main"); });
+    expectKind(StorageErrorKind::NotFound, "export from an unknown base",
+               [&] { source.exportIncrementalBundle("main", RevisionId::generate(),
+                                                    directory.path / "bad.bundle"); });
+    source.createBranchAt("unrelated", "main", a);
+    const RevisionId unrelated = source.commitModel("unrelated", {put(8, 0)});
     expectKind(StorageErrorKind::Conflict, "export base not an ancestor",
-               [&] { source.exportIncrementalBranchBundle("main", aowis::dvmdb::sha256(Bytes{1}),
-                                                          directory.path / "bad.bundle"); });
+               [&] { source.exportIncrementalBundle("main", unrelated,
+                                                    directory.path / "bad.bundle"); });
 }
 
 } // namespace

@@ -1,4 +1,5 @@
 #include "aowis/dvmdb/native_store.h"
+#include "../tests/project_repository.h"
 
 #include <chrono>
 #include <cstdint>
@@ -15,10 +16,10 @@
 namespace {
 
 using aowis::dvmdb::Bytes;
-using aowis::dvmdb::Hash;
+using aowis::dvmdb::RevisionId;
 using aowis::dvmdb::Key;
 using aowis::dvmdb::MergeStatus;
-using aowis::dvmdb::Repository;
+using Repository = aowis::dvmdb::test::ProjectRepository;
 
 Key key(std::uint32_t sequence) {
     Key result{};
@@ -70,7 +71,7 @@ int main(int argc, char** argv) {
         for (std::uint32_t index = 1; index <= shared; ++index) {
             commit(repository, "main", index, "shared");
         }
-        const Hash expectedBase = repository.head("main").id;
+        const RevisionId expectedBase = repository.head("main");
         repository.createBranch("feature", "main");
         const std::uint32_t firstDivergent = shared + 1U;
         // Update a distinct UUID per commit on each side, apart from the
@@ -85,17 +86,17 @@ int main(int argc, char** argv) {
         commit(repository, "main", conflictKey, "main-version");
         commit(repository, "feature", conflictKey, "feature-version");
 
-        const Hash targetBefore = repository.head("main").id;
-        const Hash sourceBefore = repository.head("feature").id;
+        const RevisionId targetBefore = repository.head("main");
+        const RevisionId sourceBefore = repository.head("feature");
         const std::chrono::steady_clock::time_point start =
             std::chrono::steady_clock::now();
-        const aowis::dvmdb::MergeResult result = repository.mergeBranches("main", "feature");
+        const aowis::dvmdb::MergeResult result = repository.merge("main", "feature");
         const std::chrono::steady_clock::time_point finish =
             std::chrono::steady_clock::now();
         if (result.status != MergeStatus::Conflicts || result.base != expectedBase ||
             result.conflicts.size() != 1 ||
-            repository.head("main").id != targetBefore ||
-            repository.head("feature").id != sourceBefore) {
+            repository.head("main") != targetBefore ||
+            repository.head("feature") != sourceBefore) {
             throw std::runtime_error("merge benchmark violated correctness invariants");
         }
         struct rusage resources{};

@@ -453,7 +453,7 @@ void testPersistencePaths() {
     try {
         native::Repository repository(directory / "repo");
         const native::ProjectId project = native::ProjectId::generate();
-        const native::RevisionId unbornHead = repository.createBranchV2(project, "main");
+        const native::RevisionId unbornHead = repository.createBranch(project, "main");
         NetworkHydraulic network;
         network.uuid = QUuid::createUuid();
         HydraulicNodeReservoir reservoir; reservoir.uuid = QUuid::createUuid(); reservoir.hydraulic_head_m = 120;
@@ -500,7 +500,7 @@ void testPersistencePaths() {
                     (void)hydraulic::editHydraulicNetwork(repository, project, "main", network.uuid,
                         {{id, std::move(entity)}}, saved, &diagnostics);
                 });
-                expect(repository.headV2(project, "main") == saved,
+                expect(repository.head(project, "main") == saved,
                        label + ": repository changed");
             };
         // Physical fast path (valves, pumps, tanks, reservoirs).
@@ -534,7 +534,7 @@ void testPersistencePaths() {
             repository, project, "main", network.uuid,
             {{goodValve.uuid, hydraulic::HydraulicEntity{goodValve}}}, saved, &diagnostics);
         expect(edited != saved && diagnostics.indexedPhysicalFastPath &&
-                   repository.headV2(project, "main") == edited,
+                   repository.head(project, "main") == edited,
                "valid physical edit not on its fast path");
         (void)repository.verifyRepository();
     } catch (...) {
