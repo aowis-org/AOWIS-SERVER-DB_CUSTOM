@@ -66,6 +66,29 @@ paths:
                         projectId: {type: string, format: uuid}
                         branchId: {type: string, format: uuid}
                         observedHeadRevisionId: {type: [string, 'null'], format: uuid}
+  /repository/role:
+    post:
+      operationId: configureRepositoryRole
+      description: |
+        Explicitly set the durable repository role once, or repeat an identical
+        assignment idempotently. The caller must supply the UUIDv7 discovered
+        from this repository. Changing an already configured role returns 409.
+        This is deployment configuration, not authentication or authorization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedRepositoryId, role]
+              properties:
+                expectedRepositoryId: {type: string, format: uuid}
+                role: {type: string, enum: [private, shared]}
+      responses:
+        '200': {description: Role configured or already matching, with repositoryId and role}
+        '400': {description: Invalid request or unsupported role}
+        '409': {description: Repository UUID mismatch or existing conflicting role}
   /ready:
     get:
       operationId: readiness
@@ -113,6 +136,23 @@ paths:
       responses:
         '200': {description: Working-copy metadata and full candidate overlay}
         '404': {$ref: '#/components/responses/NotFound'}
+  /working-copies/{draftId}/networks/{networkId}:
+    parameters:
+      - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}
+      - {name: networkId, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: hydratePrivateHydraulicDraftNetwork
+      description: |
+        Read one canonical NetworkHydraulic aggregate from a consistent saved
+        draft candidate generation over its immutable pinned base. The server
+        validates native manifest/chunk membership, typed entity payloads and
+        canonical dependency references before returning bytes. This is a
+        read-only operation; it neither leases the draft nor changes its HEAD.
+      responses:
+        '200': {description: 'JSON {draftId, generation (decimal string), networkId, payloadBase64 (canonical MODEL network)}'}
+        '400': {description: Invalid UUIDv7 network identity}
+        '404': {description: Draft or network absent}
+        '413': {description: Canonical response exceeds 8 MiB}
   /working-copies/{draftId}/lease:
     parameters:
       - {name: draftId, in: path, required: true, schema: {type: string, format: uuid}}

@@ -35,6 +35,14 @@ struct DraftMembershipIntent final {
 // No external caller should manufacture kind-100 manifest bytes itself.
 ModelChange emptyDraftHydraulicNetworkRoot(const QUuid& networkId, const QString& name);
 
+// Read one consistent working-copy view (immutable committed base overlaid by
+// the draft's complete candidate record map). Never reads a mutable HEAD.
+// Validates native chunks, canonical entity payloads and typed dependencies.
+std::optional<NetworkHydraulic> loadDraftHydraulicNetwork(
+    const std::function<std::optional<ModelRecord>(const Key&)>& readCurrent,
+    const QUuid& networkId);
+
+
 // Add native root/chunk ModelChanges for a bounded batch of validated logical
 // membership intents. `readCurrent` returns the draft BEFORE the incoming
 // batch (candidate overlay first, immutable base second); `changes` initially

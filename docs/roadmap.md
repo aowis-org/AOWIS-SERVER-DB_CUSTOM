@@ -84,11 +84,22 @@ an end-to-end checkout/edit/reopen/commit test against a real personal DVMDB.
 | Area | Available in the checked source | Not yet accepted end to end |
 |---|---|---|
 | Project and branch history (VC-01/02) | Unborn project creation, nullable committed HEAD, immutable branch fork provenance, native/REST readers, corresponding GUI graph/inspector tests | Real multiclient history/graph acceptance across all deployment modes |
-| Personal repository identity and checkout (VC-03/04) | Persistent repository UUID/roles, tracking metadata, private working-copy CRUD and fenced generation-checked saves; committed REST bundle transfer and identity-preserving unborn root checkout to a private clone target | Hydrate pinned base plus persisted candidate; embedded and remaining deployment modes |
-| Hydraulic editing (VC-04) | MODEL-owned canonical codec and reversible transactions; GUI event-save membership transport, durable event queue, typed record/membership adapter; native atomic journal and DVMDB-owned membership materialization; private-draft empty network initialization endpoint (pending test run) | GUI-driven first-network initialization, genuine editor session binding, restart/reload verification, global mutation coverage |
+| Personal repository identity and checkout (VC-03/04) | Persistent repository UUID/roles, tracking metadata, private working-copy CRUD and fenced generation-checked saves; committed REST bundle transfer and identity-preserving unborn root checkout to a private clone target | Full editor activation and embedded/remaining deployment modes |
+| Hydraulic editing (VC-04) | MODEL-owned canonical codec and reversible transactions; GUI event-save membership transport, durable event queue, typed record/membership adapter; native atomic journal and DVMDB-owned membership materialization; private-draft empty network initialization endpoint (prior targeted DVMDB suite: 3/3 passed) | GUI-driven first-network initialization, genuine editor session binding, restart/reload verification, global mutation coverage |
 | Local Commit (VC-05) | Immutable revision and model persistence primitives | Working-copy-to-revision CAS, recoverable operation ID/status, usable Projects-tab Commit |
 | Collaboration (VC-06–08) | History transfer, import, revision DAG and domain merge primitives | Unified user-facing Fetch/Publish/reconciliation acceptance using independent private repositories |
 | Presentation and qualification (VC-09–11) | Graph and inspector regression coverage; extensive DVMDB durability/sync tests | Integrated GUI/Standalone/browser scenarios and complete release evidence |
+
+**Draft hydraulic hydration contract:** `GET /dvmdb/v1/working-copies/:draft/networks/:network`
+reads the immutable pinned base plus one saved candidate-overlay snapshot (no
+working branch HEAD lookup), reconstructs server-owned membership chunks,
+and validates the resulting complete canonical hydraulic model before returning
+`draftId`, decimal `generation`, `networkId` and canonical `payloadBase64`.
+The read is lease-free and never changes a revision. Backend HTTP regression
+coverage includes empty unborn roots, saved entity insertion, restart,
+committed bases, membership removal and a preserved branch HEAD. The GUI
+client decodes and verifies the canonical MODEL bytes; the draft inspector
+can preview a candidate-root network but editing/autosave is not yet connected.
 
 **First-network bootstrap contract:** `POST /dvmdb/v1/working-copies/:draft/initialize-network`
 accepts `sessionId`, `fencingToken`, decimal-string `expectedGeneration`,
@@ -98,13 +109,13 @@ persists it using the existing fenced candidate write, and leaves HEAD null.
 A same-writer retry at exactly the next generation returns the identical
 saved root without another write. Conflicting retries and later attempts
 return 409. The following `save-events` request can add members to that
-root through atomic membership materialization. This is a source checkpoint,
-not yet a claim of passing compiled tests or actual GUI editor integration.
+root through atomic membership materialization. The targeted DVMDB first-network tests previously passed 3/3; the draft
+network hydration extension requires a new compiled test run. Actual editor
+integration remains open.
 
 **Next actionable work (in order):** (1) connect first-network bootstrap to the
-actual editor workflow; (2) hydrate
-the selected pinned base plus persisted candidate and establish a
-real `HydraulicData` editor session; (3) capture/queue/flush supported edits,
+actual editor workflow; (2) bind the now-implemented validated draft hydration
+read to a real `HydraulicData` editor session; (3) capture/queue/flush supported edits,
 including creation/deletion, over interrupted network and restart; (4) add
 local working-copy Commit with expected local HEAD and idempotent status;
 (5) integrate the Commit action and prove first unborn commit end to end.

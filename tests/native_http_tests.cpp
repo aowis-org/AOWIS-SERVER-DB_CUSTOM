@@ -1712,6 +1712,34 @@ void exerciseUnbornProjectHttp() {
           emptyTracking.json.value("remotes").toArray().isEmpty() &&
           emptyTracking.json.value("tracking").toArray().isEmpty(),
           "HTTP tracking metadata did not report an unconfigured repository");
+    // The same identity discovered by Projects can be configured private
+    // without requiring an out-of-band native call or manual UUID entry.
+    const QString roleRoute = QStringLiteral("/dvmdb/v1/repository/role");
+    const QString localRepositoryId = repository.json.value("repositoryId").toString();
+    const QJsonObject privateRole{{"expectedRepositoryId", localRepositoryId}, {"role", "private"}};
+    check(client.call("POST", roleRoute, QJsonObject{{"role", "private"}}).status == 400,
+          "HTTP role configuration accepted missing expected repository identity");
+    check(client.call("POST", roleRoute,
+                      QJsonObject{{"expectedRepositoryId", QString::fromStdString(native::UuidV7::generate().toString())},
+                                  {"role", "private"}}).status == 409,
+          "HTTP role configuration accepted a different repository identity");
+    check(client.call("POST", roleRoute,
+                      QJsonObject{{"expectedRepositoryId", localRepositoryId},
+                                  {"role", "unconfigured"}}).status == 400,
+          "HTTP role configuration accepted unconfigured as an explicit role");
+    const Response configuredRole = client.call("POST", roleRoute, privateRole);
+    check(configuredRole.status == 200 &&
+          configuredRole.json.value("repositoryId").toString() == localRepositoryId &&
+          configuredRole.json.value("role").toString() == QStringLiteral("private") &&
+          service.repositoryRoleV1() == native::RepositoryRoleV1::Private,
+          "HTTP could not configure discovered repository as private");
+    check(client.call("POST", roleRoute, privateRole).status == 200,
+          "HTTP private role configuration is not idempotent");
+    check(client.call("POST", roleRoute,
+                      QJsonObject{{"expectedRepositoryId", localRepositoryId},
+                                  {"role", "shared"}}).status == 409 &&
+          service.repositoryRoleV1() == native::RepositoryRoleV1::Private,
+          "HTTP role configuration allowed an irreversible role change");
     const std::string remoteId = native::UuidV7::generate().toString();
     const std::string trackedProject = native::ProjectId::generate().toString();
     const std::string trackedBranch = native::BranchId::generate().toString();
@@ -2409,6 +2437,19 @@ void exerciseUnbornNetworkInitializationHttp() {
               initialized.json.value("events").toArray().isEmpty() &&
               !service.optionalHeadV2(project.id, "main").has_value(),
               "first network changed committed HEAD or did not save root in unborn draft");
+        const Response firstView = client.call("GET", path + "/networks/" + networkId);
+        const QByteArray firstPayload = QByteArray::fromBase64(
+            firstView.json.value("payloadBase64").toString().toLatin1());
+        const std::optional<NetworkHydraulic> firstNetwork =
+            native::ModelCodec<NetworkHydraulic>::decode(firstPayload);
+        check(firstView.status == 200 && firstView.json.value("generation") == "1" &&
+              firstView.json.value("draftId") == QString::fromStdString(draftId) &&
+              firstNetwork && firstNetwork->uuid == networkUuid &&
+              firstNetwork->nodes_junctions.isEmpty(),
+              "unborn draft first network could not be hydrated");
+        check(client.call("GET", path + "/networks/" + junctionId).status == 404 &&
+              client.call("GET", path + "/networks/not-a-uuid").status == 400,
+              "draft hydration accepted missing or malformed network identity");
         const Response replay = client.call("POST", path + "/initialize-network", request);
         check(replay.status == 200 && replay.json.value("generation") == QStringLiteral("1"),
               "first network retry duplicated initialization");
@@ -2442,6 +2483,17 @@ void exerciseUnbornNetworkInitializationHttp() {
         check(saved.status == 200 && saved.json.value("generation") == QStringLiteral("2") &&
               !service.optionalHeadV2(project.id, "main").has_value(),
               "first hydraulic member could not be saved into unborn draft");
+        const Response populatedView = client.call("GET", path + "/networks/" + networkId);
+        const QByteArray populatedPayload = QByteArray::fromBase64(
+            populatedView.json.value("payloadBase64").toString().toLatin1());
+        const std::optional<NetworkHydraulic> populatedNetwork =
+            native::ModelCodec<NetworkHydraulic>::decode(populatedPayload);
+        check(populatedView.status == 200 && populatedView.json.value("generation") == "2" &&
+              populatedNetwork && populatedNetwork->nodes_junctions.size() == 1 &&
+              populatedNetwork->nodes_junctions.first().uuid == junctionUuid &&
+              populatedNetwork->nodes_junctions.first().elevation_m == 12 &&
+              !service.optionalHeadV2(project.id, "main").has_value(),
+              "saved membership did not hydrate canonical draft network");
         const Response after = client.call("POST", path + "/initialize-network", request);
         check(after.status == 409, "initialization replay was accepted after later edit");
         server.stop();
@@ -2453,6 +2505,18 @@ void exerciseUnbornNetworkInitializationHttp() {
               draft.candidateChanges.size() >= 3 &&
               !reopened.optionalHeadV2(projectId, "main").has_value(),
               "first hydraulic network and member did not survive service restart");
+        TestServer server(reopened, native::BundleLimits{4ULL * 1024ULL * 1024ULL,
+                                                        10000ULL, 1024ULL * 1024ULL});
+        Client client(server.port());
+        const Response recovered = client.call("GET", QStringLiteral("/dvmdb/v1/working-copies/")
+            + QString::fromStdString(draftId) + "/networks/" + networkId);
+        const std::optional<NetworkHydraulic> restored = native::ModelCodec<NetworkHydraulic>::decode(
+            QByteArray::fromBase64(recovered.json.value("payloadBase64").toString().toLatin1()));
+        check(recovered.status == 200 && recovered.json.value("generation") == "2" &&
+              restored && restored->nodes_junctions.size() == 1 &&
+              restored->nodes_junctions.first().uuid == junctionUuid,
+              "restart failed to hydrate saved unborn hydraulic draft");
+        server.stop();
     }
 }
 
@@ -2501,6 +2565,13 @@ void exerciseHydraulicDraftMembershipHttp() {
                     {"sessionId", session}});
     check(created.status == 201, "hydraulic draft checkout failed");
     const QString path = listPath + "/" + created.json.value("id").toString();
+    const Response baseView = client.call("GET", path + "/networks/" + networkId);
+    const std::optional<NetworkHydraulic> baseNetwork = native::ModelCodec<NetworkHydraulic>::decode(
+        QByteArray::fromBase64(baseView.json.value("payloadBase64").toString().toLatin1()));
+    check(baseView.status == 200 && baseView.json.value("generation") == "0" &&
+          baseNetwork && baseNetwork->nodes_junctions.size() == 1 &&
+          baseNetwork->nodes_junctions.first().uuid == oldUuid,
+          "pinned committed base did not hydrate into draft");
     const Response leased = client.call("POST", path + "/lease",
                                         QJsonObject{{"sessionId", session}, {"seconds", 60}});
     check(leased.status == 200, "hydraulic draft lease failed");
@@ -2571,6 +2642,14 @@ void exerciseHydraulicDraftMembershipHttp() {
     check(saved.status == 200 && saved.json.value("generation") == QStringLiteral("1") &&
           saved.json.value("eventCount") == QStringLiteral("1"),
           "hydraulic entity and membership did not save atomically");
+    const Response combinedView = client.call("GET", path + "/networks/" + networkId);
+    const std::optional<NetworkHydraulic> combinedNetwork = native::ModelCodec<NetworkHydraulic>::decode(
+        QByteArray::fromBase64(combinedView.json.value("payloadBase64").toString().toLatin1()));
+    check(combinedView.status == 200 && combinedView.json.value("generation") == "1" &&
+          combinedNetwork && combinedNetwork->nodes_junctions.size() == 2 &&
+          combinedNetwork->nodes_junctions.first().uuid == oldUuid &&
+          combinedNetwork->nodes_junctions.last().uuid == newUuid,
+          "pinned base plus membership overlay did not hydrate");
     const Response replay = client.call("POST", path + "/save-events", first);
     check(replay.status == 200 && replay.json.value("generation") == QStringLiteral("1"),
           "hydraulic membership lost-response replay duplicated event");
@@ -2601,6 +2680,13 @@ void exerciseHydraulicDraftMembershipHttp() {
           client.call("GET", path).json.value("generation") == QStringLiteral("2") &&
           service.optionalHeadV2(project.id, "main") == base,
           "hydraulic deletion or replay modified committed HEAD");
+    const Response finalView = client.call("GET", path + "/networks/" + networkId);
+    const std::optional<NetworkHydraulic> finalNetwork = native::ModelCodec<NetworkHydraulic>::decode(
+        QByteArray::fromBase64(finalView.json.value("payloadBase64").toString().toLatin1()));
+    check(finalView.status == 200 && finalView.json.value("generation") == "2" &&
+          finalNetwork && finalNetwork->nodes_junctions.size() == 1 &&
+          finalNetwork->nodes_junctions.first().uuid == newUuid,
+          "deleted pinned-base member was resurrected during draft hydration");
     server.stop();
     const native::WorkingCopyInfoV1 persisted = service.workingCopyV1(
         created.json.value("id").toString().toStdString());

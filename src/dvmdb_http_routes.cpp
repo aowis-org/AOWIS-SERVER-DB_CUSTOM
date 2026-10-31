@@ -56,6 +56,7 @@ constexpr std::size_t maxHttpEntityIds = 10000;
 
 // Exact route patterns (also used to select per-route JSON body limits).
 const char* const routeProjects = "/dvmdb/v1/projects";
+const char* const routeRepositoryRole = "/dvmdb/v1/repository/role";
 const char* const routeWorkingCopies = "/dvmdb/v1/working-copies";
 const char* const routeWorkingCopySave = "/dvmdb/v1/working-copies/:draft/save";
 const char* const routeWorkingCopyInitializeNetwork = "/dvmdb/v1/working-copies/:draft/initialize-network";
@@ -726,7 +727,7 @@ std::optional<std::size_t> jsonBodyLimit(const httplib::Request& request) {
     if (request.method != "POST") return std::nullopt;
     const std::string& route = request.matched_route;
     if (route == routeProjects || route == routeBranches ||
-        route == routeWorkingCopies || route == routeWorkingCopyLease ||
+        route == routeRepositoryRole || route == routeWorkingCopies || route == routeWorkingCopyLease ||
         route == routeWorkingCopyInitializeNetwork ||
         route == routeWorkingCopyRelease) return maxJsonSmallBytes;
     if (route == routeWorkingCopySave || route == routeWorkingCopyEventSave) return maxJsonModelBytes;
@@ -1136,6 +1137,31 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
                 {"role", roleName}, {"remotes", remotes}, {"tracking", tracked}}};
         });
     });
+    // One-time, idempotent repository-role configuration for an explicitly
+    // selected personal/shared database. The caller must echo the identity it
+    // just read; this prevents re-targeting an unrelated repository by mistake.
+    // Role changes from private to shared (or vice versa) remain forbidden.
+    server.Post(routeRepositoryRole, [&service](const httplib::Request& request,
+                                                        httplib::Response& response) {
+        guarded(response, [&]() {
+            const QJsonObject body = parseBody(request, maxJsonSmallBytes);
+            requireKeys(body, {"expectedRepositoryId", "role"});
+            const std::string expectedId = requiredString(body, QStringLiteral("expectedRepositoryId"));
+            requireInput(UuidV7::parse(expectedId).has_value(),
+                         "expectedRepositoryId must be a UUIDv7");
+            const std::string name = requiredString(body, QStringLiteral("role"));
+            requireInput(name == "private" || name == "shared",
+                         "role must be private or shared");
+            if (expectedId != service.repositoryId())
+                throw ProjectError(ProjectErrorKind::Conflict, "repository identity changed");
+            const RepositoryRoleV1 requested = name == "private"
+                ? RepositoryRoleV1::Private : RepositoryRoleV1::Shared;
+            service.configureRepositoryRoleV1(requested);
+            return Reply{200, QJsonObject{
+                {"repositoryId", QString::fromStdString(service.repositoryId())},
+                {"role", QString::fromStdString(name)}}};
+        });
+    });
     server.Get("/dvmdb/v1/ready", [&service](const httplib::Request&, httplib::Response& response) {
         guarded(response, [&]() {
             (void)service.listProjects();
@@ -1181,6 +1207,45 @@ void registerRoutes(httplib::Server& server, ProjectService& service,
             return Reply{200, workingCopyJson(service.workingCopyV1(pathParam(request, "draft")))};
         });
     });
+#ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
+    // Rehydrate one pinned draft candidate without publishing a revision.
+    // Read the entire candidate once: no writer can mix generations inside
+    // this response, and base records always come from its immutable revision.
+    server.Get("/dvmdb/v1/working-copies/:draft/networks/:network",
+               [&service](const httplib::Request& request, httplib::Response& response) {
+        guarded(response, [&]() {
+            const WorkingCopyInfoV1 draft = service.workingCopyV1(pathParam(request, "draft"));
+            const std::string networkText = pathParam(request, "network");
+            requireInput(UuidV7::parse(networkText).has_value(), "networkId must be UUIDv7");
+            const QUuid network(QString::fromStdString(networkText));
+            std::map<Key, std::optional<ModelRecord>> overlay;
+            for (const ModelChange& change : draft.candidateChanges)
+                requireInput(overlay.emplace(change.key, change.record).second,
+                             "duplicate draft candidate model record");
+            const std::function<std::optional<ModelRecord>(const Key&)> reader =
+                [&service, &draft, &overlay](const Key& key) -> std::optional<ModelRecord> {
+                const std::map<Key, std::optional<ModelRecord>>::const_iterator found = overlay.find(key);
+                if (found != overlay.end()) return found->second;
+                if (!draft.baseRevision) return std::nullopt;
+                return service.getModelAtRevisionV2(draft.projectId, *draft.baseRevision, key);
+            };
+            const std::optional<NetworkHydraulic> result =
+                hydraulic::loadDraftHydraulicNetwork(reader, network);
+            if (!result)
+                throw ProjectError(ProjectErrorKind::NotFound, "hydraulic network not found in draft");
+            const QByteArray payload = ModelCodec<NetworkHydraulic>::encode(*result);
+            if (payload.size() > static_cast<qsizetype>(8 * 1024 * 1024))
+                throw StorageError(StorageErrorKind::LimitExceeded,
+                                   "draft hydraulic network exceeds HTTP payload limit");
+            return Reply{200, QJsonObject{
+                {"draftId", QString::fromStdString(draft.id)},
+                {"generation", QString::number(static_cast<qulonglong>(draft.generation))},
+                {"networkId", QString::fromStdString(networkText)},
+                {"payloadBase64", encodePayload(payload)}
+            }};
+        });
+    });
+#endif
     server.Post(routeWorkingCopyLease, [&service](const httplib::Request& request,
                                                   httplib::Response& response) {
         guarded(response, [&]() {

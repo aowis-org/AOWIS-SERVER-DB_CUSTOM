@@ -72,7 +72,10 @@ read; these operations are **not themselves a verification protocol**.
 `GET /dvmdb/v1/repository` remains backward compatible.
 `GET /dvmdb/v1/repository/tracking` supplies repository UUID, role, remote
 registry and qualified observed refs (including explicit JSON null for unborn
-HEADs). It is read-only: no HTTP route can change this metadata yet. Publishing
+HEADs). `POST /dvmdb/v1/repository/role` allows an explicitly selected database
+to set its role exactly once (or retry an identical setting). The request must
+echo the repository UUID just discovered from the tracking endpoint; changing
+a configured role returns a conflict. No separate manual UUID input is needed. Publishing
 these endpoints without authentication can reveal deployment metadata; use
 controlled/isolated deployments. Future access control is tracked only in
 [separate security notes](security-permissions-design.md).

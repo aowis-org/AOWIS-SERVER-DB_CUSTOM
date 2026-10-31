@@ -1453,6 +1453,54 @@ ModelChange emptyDraftHydraulicNetworkRoot(const QUuid& networkId, const QString
     return ModelChange{keyFromUuid(networkId), std::move(root)};
 }
 
+std::optional<NetworkHydraulic> loadDraftHydraulicNetwork(
+    const std::function<std::optional<ModelRecord>(const Key&)>& readCurrent,
+    const QUuid& networkId) {
+    if (networkId.isNull())
+        throw StorageError(StorageErrorKind::InvalidInput, "hydraulic network UUID is null");
+    const std::optional<ModelRecord> root = readCurrent(keyFromUuid(networkId));
+    if (!root || root->kind != hydraulicNetworkKind) return std::nullopt;
+    Manifest manifest = decodeManifest(qByteArrayFromBytes(root->payload));
+    if (manifest.metadata.uuid != networkId)
+        throw StorageError(StorageErrorKind::Corruption, "draft network root UUID mismatch");
+    checkRoot(manifest, *root);
+    loadMembersUsing(readCurrent, manifest);
+    const std::set<Key> members = memberKeys(manifest);
+    NetworkHydraulic network = std::move(manifest.metadata);
+    DependencyIndex storedReferences;
+    std::size_t ordinal = 0;
+#define RESTORE_DRAFT(name, type, entityKind) \
+    for (const QUuid& uuid : manifest.members[ordinal]) { \
+        const std::optional<ModelRecord> record = readCurrent(keyFromUuid(uuid)); \
+        if (!record || record->kind != static_cast<std::uint16_t>(entityKind)) \
+            throw StorageError(StorageErrorKind::Corruption, "missing or wrong-type draft hydraulic entity"); \
+        QString error; \
+        const std::optional<type> entity = ModelCodec<type>::decode(qByteArrayFromBytes(record->payload), &error); \
+        if (!entity || entity->uuid != uuid || \
+            ModelCodec<type>::encode(*entity) != qByteArrayFromBytes(record->payload)) \
+            throw StorageError(StorageErrorKind::Corruption, "invalid draft hydraulic entity: " + error.toStdString()); \
+        for (const Key& target : record->references) \
+            storedReferences.emplace_back(keyFromUuid(uuid), target); \
+        network.name.append(*entity); \
+    } \
+    ++ordinal;
+    AOWIS_DVMDB_HYDRAULIC_COLLECTIONS(RESTORE_DRAFT)
+#undef RESTORE_DRAFT
+    const aowis::dvmdb::HydraulicDependencyValidation validated =
+        aowis::dvmdb::validateHydraulicNetworkWithDependencies(network);
+    if (!validated.report.valid())
+        throw StorageError(StorageErrorKind::Corruption,
+                           "draft hydraulic network invalid: " + validated.report.summary().toStdString());
+    const DependencyIndex canonicalReferences = indexedDependencies(validated.dependencies, members);
+    std::sort(storedReferences.begin(), storedReferences.end());
+    storedReferences.erase(std::unique(storedReferences.begin(), storedReferences.end()),
+                           storedReferences.end());
+    if (storedReferences != canonicalReferences)
+        throw StorageError(StorageErrorKind::Corruption,
+                           "draft hydraulic dependencies disagree with canonical model");
+    return network;
+}
+
 void materializeDraftMembership(
     const std::function<std::optional<ModelRecord>(const Key&)>& readCurrent,
     const std::vector<DraftMembershipIntent>& intents,
