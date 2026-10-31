@@ -50,16 +50,19 @@ Their write interfaces require a pinned expected committed HEAD; an unborn
 project is edited through a private draft rather than by inventing a commit.
 
 The committed UUIDv7 edit implementation performs bounded indexed updates
-for whitelisted scalar changes, physical/operating values of existing
-reservoirs, tanks, pumps and valves, and updates to existing catalogue
-records. These paths pin a UUIDv7 revision, check entity ownership and
-canonical value/reference constraints, preserve the membership manifest,
-and atomically compare the branch HEAD. Other edits currently reconstruct
-and validate the full network. The older SHA-revision indexed-edit suite
-still tests topology, dependent-reference and structural membership paths;
-those optimizations must be ported and qualified before the SHA implementation
-is removed. Full-network save and targeted edit must ultimately share one
-validated candidate/write engine without losing indexed-update behavior.
+for existing scalar values, physical/operating values, catalogue records,
+eligible pipe endpoint rewiring, dependent-reference changes and structural
+membership insertions/removals. Every indexed path pins the same immutable
+revision, verifies applicable ownership and MODEL value/reference constraints,
+and checks the expected branch HEAD atomically. Mixed or ineligible edits use
+complete canonical-network reconstruction and validation. Structural changes
+update only affected 256-member chunks and rewrite the network root only when
+chunk descriptors change. All 18 top-level hydraulic collections can also be
+stored and restored via whole-network persistence.
+
+There is **one** committed hydraulic C++ API: project-scoped UUIDv7 revisions.
+SHA-256 continues to verify immutable content but is never a hydraulic revision
+identifier. No SHA-based hydraulic compatibility functions remain.
 
 ## Commit and concurrency
 

@@ -86,25 +86,23 @@ names have no version suffix: `saveHydraulicNetwork`, `editHydraulicNetwork`,
 Commit remain separate operations; no SHA-identified commits or synthetic
 initial revisions are introduced.
 
-**Acceptance prerequisites before deleting the previous SHA code:**
+**Consolidation acceptance criteria:**
 
 1. Port the existing hydraulic persistence qualification suite, value-rule
    tests, HTTP fixtures and edit benchmarks to project-scoped UUIDv7 projects,
    branches and immutable revisions. Preserve the assertions for every one of
    the 18 entity collections, physical/topological validation, cross-entity
    references, stale-HEAD rejection, restart recovery and corrupt-data reads.
-2. Transfer the proven *indexed* edit engine (scalar, topology, physical,
-   dependencies, catalogue and bounded membership) to the UUIDv7 revision
-   storage API. Some whitelisted paths now use indexed commits, but the
-   remaining edits still reconstruct and re-save the aggregate; deleting the
-   SHA engine early would lose tested behavior and performance baselines.
+2. Retain indexed scalar, topology, physical, dependency, catalogue and bounded
+   membership paths in UUIDv7, with safe fallback to full-network validation
+   for ineligible operations.
 3. Carry over the full hydraulic merge matrix: concurrent inserts/deletes,
    field/object choices, stale pins, invalid candidates, fast-forward
    validation, two-parent ancestry and unchanged source branches.
 4. Unify the encoder/manifest and validator helpers shared by draft and
    committed persistence. Keep project-qualified immutable readers and their
    record-identity checks. No fallback to SHA IDs or old repository branches.
-5. Remove the SHA-only functions, selectors, diagnostics and obsolete test
+5. Remove the SHA-only hydraulic entry points, helper paths and obsolete test
    fixtures. Check **all** code, tests, benchmarks, HTTP routes, headers and
    docs for leftover old signatures or `*V2` hydraulic names. No compatibility
    wrappers remain in the released API.
@@ -112,56 +110,26 @@ initial revisions are introduced.
    merge tests, plus relevant benchmark comparisons, to pass after the old
    implementation is gone. Re-run full DVMDB qualification before VC-05.
 
-**Current source checkpoint:** the project-scoped entry points have their
-canonical unsuffixed names, and the SHA-based test/benchmark calls carry a
-`Legacy` suffix to keep the two architectures distinguishable during test
-migration. This is an intermediate code state, **not completed consolidation**:
-the SHA implementation still exists solely to preserve extensive qualification
-coverage. The canonical UUIDv7 edit path now uses the immutable revision index
-for whitelisted existing-member scalar updates (pipe hydraulic scalars,
-junction elevations and map-label text), physical/operating updates to
-reservoirs, tanks, pumps and valves, existing catalogue payload updates,
-independent existing-pipe endpoint rewires, and typed reference updates for
-existing demand points and controls. The bounded structural membership engine
-is now shared by the SHA-only qualification adapter and the UUIDv7 API; eligible
-insertions and dependent removals use immutable revision-pinned entity,
-reverse-reference and membership-chunk reads, with one atomic project-scoped
-commit of changed entity records, chunks and network root. The insertion path
-runs MODEL physical-value checks before committing.
-These paths preserve MODEL value rules, canonical references where applicable,
-immutable-revision ownership and expected HEAD. Nonstructural indexed edits
-preserve the membership manifest and return the existing revision on no-op.
-Ineligible or mixed structural edits still take complete-network validation.
-The additional UUIDv7 structural tests cover same-batch references, cascaded
-removal, invalid targets, stale HEAD, unchanged source branch and compaction /
-reopen recovery; the focused hydraulic-network suite passed after the test
-fixture fixes (2026-10-31, 1/1). The UUIDv7 merge qualification is now being
-expanded to cover concurrent same-chunk append/delete, simultaneous first-chunk
-creation, reordered membership conflicts, two-parent ancestry and compaction /
-reopen recovery; that targeted UUIDv7 merge suite passed on 2026-10-31 (1/1).
-The canonical hydraulic edit benchmark and its CTest workload-smoke runner
-now use UUIDv7 revision IDs, immutable base reads, expected-HEAD commits and
-project-qualified revision diffs/merges. The migrated benchmark compiled successfully and its four targeted workload /
-hydraulic tests passed on 2026-10-31. A direct performance comparison with
-the prior SHA implementation remains outstanding; its former results are not
-automatically equivalent UUIDv7 performance baselines. UUIDv7 merge-choice
-qualification now covers pinned target-side field resolution, rejection of
-stale/duplicate/unused field choices, delete-vs-modify whole-object choices
-on either side, immutable two-parent ancestry, and compaction/reopen recovery.
-The field/object merge-choice regression passed on 2026-10-31 (1/1).
-The UUIDv7 caller-pinned write and concurrent immutable snapshot-read
-qualifications passed the hydraulic-network test on 2026-10-31 (1/1).
-UUIDv7 qualification now also includes the 256-member chunk-boundary
-regression (chunk retirement, ordered listing, compaction/reopen) and successful
-fast-forward/up-to-date merge behavior; the focused hydraulic-network test
-passed on 2026-10-31 (1/1). The project-scoped value-rule qualification now
-uses the canonical UUIDv7 save/edit API, including rejected physical,
-scalar, dependent, catalogue and membership edits, pinned HEADs and an indexed
-successful edit. Inactive SHA-revision HTTP fixture blocks have been removed;
-they were never enabled by CMake and must not be mistaken for active coverage.
-Remaining SHA-only hydraulic-network test migration and removal of old
-implementation helpers are required. Do not add production callers to the SHA API
-or declare the gate satisfied until those requirements and SHA removal pass.
+**Current source checkpoint (2026-10-31):** the obsolete SHA-revision
+hydraulic public functions, their dedicated helpers, and the redundant
+SHA-only hydraulic test block have been removed. All committed hydraulic entry
+points use project-scoped UUIDv7 revisions, with immutable expected-HEAD
+checks and no version suffix. The implementation retains the canonical
+MODEL codec, bounded membership engine, indexed scalar/physical/catalogue,
+pipe-rewiring, dependent-reference and structural-membership paths, full
+validation fallback and merge-choice reconciliation.
+
+Replacement UUIDv7 tests cover all 18 persisted entity collections,
+structural membership and 256-member chunk boundaries, stale pins,
+no-op edits, physical and reference validation, merge choices and ancestry,
+fast-forward, concurrent immutable snapshots, compaction and reopening.
+The hydraulic edit benchmark and workload qualification tools also use UUIDv7.
+Before this removal the focused hydraulic network, value-rule and HTTP suite
+passed 3/3 on 2026-10-31; the benchmark workload suite passed 4/4.
+**Post-removal C++ compilation and full test qualification are still required.**
+Do not treat the source cleanup as acceptance until those tests pass. A direct
+performance comparison against earlier SHA-era results remains unavailable;
+record a new UUIDv7 baseline rather than claiming numerical equivalence.
 
 ## Current implementation state and immediate delivery priority
 
