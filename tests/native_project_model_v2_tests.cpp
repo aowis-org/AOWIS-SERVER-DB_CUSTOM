@@ -1,7 +1,9 @@
 #include "aowis/dvmdb/project_service.h"
 #include "aowis/dvmdb/revision_record_v2.h"
 
+#include <atomic>
 #include <filesystem>
+#include <thread>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -143,11 +145,99 @@ void testV2ModelWorkflow() {
         });
     }
 }
+
+void testStrictLocalCommitHeadPin() {
+    Temporary temp;
+    fs::create_directories(temp.path);
+    std::string projectId;
+    RevisionId first = RevisionId::generate();
+    RevisionId second = RevisionId::generate();
+    const Key created = key(61);
+    const Key later = key(62);
+    {
+        ProjectService service(temp.path);
+        const ProjectInfo project = service.createUnbornProjectV2("strict local commit CAS");
+        projectId = project.id;
+        check(!service.optionalHeadV2(projectId, "main"),
+              "new project must start with unborn HEAD");
+        rejects([&] {
+            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+                    {{created, record(1)}}, std::nullopt);
+        }, ProjectErrorKind::Conflict, "local commit accepted an unconfigured repository");
+        service.configureRepositoryRoleV1(RepositoryRoleV1::Private);
+        rejects([&] {
+            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+                    {{created, record(1)}}, RevisionId::generate());
+        }, ProjectErrorKind::Conflict, "born expected HEAD accepted on unborn branch");
+        check(!service.optionalHeadV2(projectId, "main") &&
+              service.revisionGraphV2(projectId).revisions.empty(),
+              "rejected unborn commit wrote revision or HEAD");
+
+        // Two sessions both pinning explicit null must not each create an
+        // independent first revision. The repository lock owns the CAS.
+        std::atomic<int> successes{0};
+        std::atomic<int> conflicts{0};
+        std::atomic<bool> unexpected{false};
+        const auto attempt = [&]() {
+            try {
+                (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+                         {{created, record(42)}}, std::nullopt);
+                ++successes;
+            } catch (const ProjectError& error) {
+                if (error.kind() == ProjectErrorKind::Conflict) ++conflicts;
+                else unexpected = true;
+            } catch (...) { unexpected = true; }
+        };
+        std::thread writerA(attempt);
+        std::thread writerB(attempt);
+        writerA.join();
+        writerB.join();
+        check(!unexpected && successes == 1 && conflicts == 1,
+              "concurrent first commits did not enforce exact unborn HEAD");
+        const std::optional<RevisionId> committed = service.optionalHeadV2(projectId, "main");
+        check(committed.has_value() &&
+              service.getModelAtRevisionV2(projectId, *committed, created)->payload == Bytes{42},
+              "strict first commit lost its model data");
+        first = *committed;
+        rejects([&] {
+            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+                     {{later, record(43)}}, std::nullopt);
+        }, ProjectErrorKind::Conflict, "stale explicit-null commit advanced born HEAD");
+        rejects([&] {
+            (void)service.commitModelAtExpectedHeadV2(projectId, "main",
+                     {{later, record(43)}}, RevisionId::generate());
+        }, ProjectErrorKind::Conflict, "wrong committed HEAD pin was accepted");
+        check(service.optionalHeadV2(projectId, "main") == first,
+              "rejected local commit moved HEAD");
+        second = service.commitModelAtExpectedHeadV2(projectId, "main",
+                     {{later, record(43)}}, first);
+        check(second != first && service.optionalHeadV2(projectId, "main") == second,
+              "correct expected HEAD did not advance local branch");
+        const ProjectId nativeProject = *ProjectId::parse(projectId);
+        service.withRepository(projectId, [&](Repository& repository) {
+            const RevisionRecordV2 initial = decodeRevisionRecordV2(
+                    *repository.readRevisionV2(nativeProject, first));
+            const RevisionRecordV2 advanced = decodeRevisionRecordV2(
+                    *repository.readRevisionV2(nativeProject, second));
+            check(initial.parents.empty() && advanced.parents.size() == 1 &&
+                  advanced.parents.front().id == first,
+                  "strict local CAS created incorrect immutable ancestry");
+        });
+    }
+    {
+        ProjectService reopened(temp.path);
+        check(reopened.optionalHeadV2(projectId, "main") == second &&
+              reopened.getModelAtRevisionV2(projectId, second, created)->payload == Bytes{42} &&
+              reopened.getModelAtRevisionV2(projectId, second, later)->payload == Bytes{43},
+              "strict local commit did not survive reopen");
+    }
+}
 }
 
 int main() {
     try {
         testV2ModelWorkflow();
+        testStrictLocalCommitHeadPin();
         std::cout << "UUIDv7 project model commit, fork, references and reopen passed\n";
         return 0;
     } catch (const std::exception& error) {

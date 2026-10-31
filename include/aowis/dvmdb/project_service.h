@@ -190,6 +190,13 @@ public:
     RevisionId commitModelV2(std::string_view projectId, std::string_view branch,
                              std::vector<ModelChange> changes,
                              std::optional<RevisionId> expectedHead = std::nullopt);
+    // Strict expected-local-HEAD CAS for VC-05 on a private repository.
+    // Unlike commitModelV2(), nullopt means the branch MUST still be unborn.
+    // Does not consume a draft
+    // or provide operation-ID replay yet; only use under a commit coordinator.
+    RevisionId commitModelAtExpectedHeadV2(std::string_view projectId,
+        std::string_view branch, std::vector<ModelChange> changes,
+        std::optional<RevisionId> expectedLocalHead);
     std::optional<ModelRecord> getModelAtRevisionV2(std::string_view projectId,
                                                    const RevisionId& revision, const Key& key);
     // Persistent identity of this DVMDB catalogue / repository root (UUIDv7).

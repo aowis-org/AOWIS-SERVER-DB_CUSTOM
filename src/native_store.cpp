@@ -4561,7 +4561,8 @@ Revision Repository::commitModel(std::string_view branch, std::vector<ModelChang
 
 RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view branch,
                                       std::vector<ModelChange> changes,
-                                      std::optional<RevisionId> expectedHead) {
+                                      std::optional<RevisionId> expectedHead,
+                                      bool requireExactHead) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -4570,8 +4571,18 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
     const bool unborn = !starting->revisionV2 && isZero(starting->head);
     const std::optional<RevisionRecordV2> previous = unborn ? std::nullopt :
         std::optional<RevisionRecordV2>(branchRevisionV2Locked(project, branch));
-    require(Err::Conflict, !expectedHead || (previous && previous->id == *expectedHead),
-            "branch HEAD changed since model edit was prepared");
+    // Local Commit pins an exact HEAD, including null for unborn branches.
+    // The check occurs after acquiring the repository lock and refreshing its
+    // index; a competing first commit cannot be silently overwritten.
+    if (requireExactHead) {
+        require(Err::Conflict,
+                previous.has_value() == expectedHead.has_value() &&
+                (!previous || previous->id == *expectedHead),
+                "branch HEAD changed since model edit was prepared");
+    } else {
+        require(Err::Conflict, !expectedHead || (previous && previous->id == *expectedHead),
+                "branch HEAD changed since model edit was prepared");
+    }
     require(Err::InvalidInput, !previous || previous->modelIndexed || isZero(previous->root),
             "cannot enable model indexing on a populated raw branch");
     const PreparedModelCommit prepared = prepareModelCommitLocked(

@@ -126,8 +126,11 @@ fast-forward, concurrent immutable snapshots, compaction and reopening.
 The hydraulic edit benchmark and workload qualification tools also use UUIDv7.
 Before this removal the focused hydraulic network, value-rule and HTTP suite
 passed 3/3 on 2026-10-31; the benchmark workload suite passed 4/4.
-**Post-removal C++ compilation and full test qualification are still required.**
-Do not treat the source cleanup as acceptance until those tests pass. A direct
+**Post-removal qualification verified on 2026-10-31:** the focused
+hydraulic/value/HTTP suite passed 3/3, then the full DVMDB suite passed
+**71/71**; Release DVMDB built and launched on `127.0.0.1:8755`.
+The SHA-based hydraulic API consolidation gate is closed. These results
+precede the subsequent VC-05 CAS-preparation patch. A direct
 performance comparison against earlier SHA-era results remains unavailable;
 record a new UUIDv7 baseline rather than claiming numerical equivalence.
 
@@ -298,6 +301,17 @@ overwrite another session; committed history never changes on Save.
 ### VC-05 — Atomic local Commit and operation-result recovery
 
 **Dependency:** VC-04, DG-03. **Lead:** DVMDB.
+
+**Implementation checkpoint (2026-10-31):** a strictly pinned UUIDv7
+model-commit primitive now distinguishes an *explicit null* expected HEAD
+(unborn) from the existing general-purpose unpinned `commitModelV2` call.
+Native CAS and concurrent-first-commit/reopen regression coverage are the
+first building block, not a completed VC-05 implementation. Still required:
+atomically committing the **persisted draft candidate**, model/hydraulic
+validation, durable operation UUID and payload digest, authoritative status
+lookup and crash/retry recovery, and the GUI Commit action. Do not expose
+this primitive as a draft-Commit endpoint before those requirements hold.
+
 
 - Implement Commit from an identified *persisted working copy*, including
   expected **local** HEAD UUID/null, chosen parent ordering and operation

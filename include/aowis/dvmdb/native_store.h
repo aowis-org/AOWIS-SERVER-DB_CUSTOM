@@ -370,9 +370,13 @@ public:
                         std::optional<RevisionId> expectedHead = std::nullopt);
     // Native UUIDv7 model-indexed commit, including reverse-reference checks.
     // A failed preflight never advances HEAD or publishes a revision.
+    // Existing unpinned writes may omit expectedHead. VC-05 local Commit must
+    // requireExactHead=true so an explicit null pins an unborn branch instead
+    // of silently accepting a concurrently published first commit.
     RevisionId commitModelV2(const ProjectId& project, std::string_view branch,
                              std::vector<ModelChange> changes,
-                             std::optional<RevisionId> expectedHead = std::nullopt);
+                             std::optional<RevisionId> expectedHead = std::nullopt,
+                             bool requireExactHead = false);
     // Read a model object by a pinned UUIDv7 revision, not a moving branch ref.
     std::optional<ModelRecord> getModelAtRevisionV2(const ProjectId& project,
                                                    const RevisionId& revisionId, const Key& key);

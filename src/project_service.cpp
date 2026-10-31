@@ -1567,6 +1567,31 @@ RevisionId ProjectService::commitModelV2(std::string_view projectId,
     return committed;
 }
 
+RevisionId ProjectService::commitModelAtExpectedHeadV2(
+        std::string_view projectId, std::string_view branch,
+        std::vector<ModelChange> changes,
+        std::optional<RevisionId> expectedLocalHead) {
+    {
+        std::lock_guard<std::mutex> guard(this->mutex_);
+        ensureHealthy();
+        if (this->repository_role_ != RepositoryRoleV1::Private)
+            throw ProjectError(ProjectErrorKind::Conflict,
+                               "local commit requires a private repository");
+    }
+    if (!validBranchName(branch))
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid branch name");
+    const std::optional<ProjectId> project = ProjectId::parse(projectId);
+    if (!project) throw ProjectError(ProjectErrorKind::InvalidInput, "UUIDv7 project required");
+    RevisionId committed = RevisionId::generate();
+    withRepository(projectId, [&](Repository& repository) {
+        committed = translated<RevisionId>([&]() {
+            return repository.commitModelV2(*project, branch,
+                                            std::move(changes), expectedLocalHead, true);
+        });
+    });
+    return committed;
+}
+
 std::optional<ModelRecord> ProjectService::getModelAtRevisionV2(
         std::string_view projectId, const RevisionId& revisionId, const Key& key) {
     const std::optional<ProjectId> project = ProjectId::parse(projectId);
