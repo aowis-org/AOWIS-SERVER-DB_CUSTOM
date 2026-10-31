@@ -21,8 +21,9 @@ The authoritative design is
   its origin branch and exact immutable fork revision are retained.
 - Editors use **independent private working copies**. The intended local
   Commit creates a new immutable revision and conditionally moves only the
-  personal branch HEAD; the complete draft-to-Commit workflow is still an
-  outstanding integration milestone.
+  personal branch HEAD; a native working-copy Commit coordinator with durable
+  operation-ID recovery now exists, while hydraulic validation and GUI/HTTP
+  integration remain outstanding.
 - The required stale-commit behavior rejects the write and preserves the draft
   for explicit comparison/reconciliation. Creating a branch from a committed
   revision never manufactures another revision.

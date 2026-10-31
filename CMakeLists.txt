@@ -280,6 +280,13 @@ if(BUILD_TESTING)
         COMMAND aowis-dvmdb-working-copy-v1-tests)
     set_tests_properties(aowis-dvmdb-working-copy-v1-tests PROPERTIES
         LABELS "aowis;working-copy" TIMEOUT 30)
+    add_executable(aowis-dvmdb-local-commit-v1-tests
+        tests/native_local_commit_v1_tests.cpp)
+    target_link_libraries(aowis-dvmdb-local-commit-v1-tests PRIVATE aowis-dvmdb-project-service Threads::Threads)
+    add_test(NAME aowis-dvmdb-local-commit-v1-tests
+        COMMAND aowis-dvmdb-local-commit-v1-tests)
+    set_tests_properties(aowis-dvmdb-local-commit-v1-tests PROPERTIES
+        LABELS "aowis;working-copy;durability;identity" TIMEOUT 30)
     add_executable(aowis-dvmdb-canonical-project-service-tests
         tests/native_canonical_project_service_tests.cpp)
     target_link_libraries(aowis-dvmdb-canonical-project-service-tests PRIVATE aowis-dvmdb-project-service)
@@ -421,7 +428,7 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-dvmdb-store-tests PRIVATE aowis-dvmdb-store)
     add_test(NAME aowis-dvmdb-store-tests COMMAND aowis-dvmdb-store-tests)
     set_tests_properties(aowis-dvmdb-store-tests PROPERTIES LABELS "aowis")
-    add_custom_target(aowis-dvmdb-tests DEPENDS aowis-dvmdb-working-copy-v1-tests aowis-dvmdb-canonical-project-service-tests aowis-dvmdb-revision-bundle-v2-large-tests aowis-dvmdb-revision-bundle-v2-tests aowis-dvmdb-revision-graph-v2-tests aowis-dvmdb-merge-v2-tests aowis-dvmdb-project-model-v2-tests aowis-dvmdb-packed-revision-v2-tests aowis-dvmdb-revision-resolver-v2-tests aowis-dvmdb-revision-record-v2-tests aowis-dvmdb-branch-id-tests aowis-dvmdb-object-id-tests aowis-dvmdb-revision-graph-tests aowis-dvmdb-vm-powercut-worker aowis-dvmdb-sigkill-restart-tests aowis-dvmdb-physical-enospc-tests aowis-dvmdb-offline-backup-tests aowis-dvmdb-transfer-staging-budget-tests aowis-dvmdb-index-scaling-benchmark aowis-dvmdb-pack-operational-stress-tests aowis-dvmdb-bundle-import-profile-tests aowis-dvmdb-replication-scaling-benchmark aowis-dvmdb-bundle-revision-marks-tests aowis-dvmdb-bundle-disk-index-tests aowis-dvmdb-merge-ancestry-tests aowis-dvmdb-bundle-limit-tests aowis-dvmdb-project-service-tests aowis-dvmdb-project-concurrency-tests aowis-dvmdb-recovery-tests aowis-dvmdb-scratch-tests aowis-dvmdb-error-kind-tests aowis-dvmdb-repository-verify-tests aowis-dvmdb-model-import-integrity-tests aowis-dvmdb-merkle-integrity-tests aowis-dvmdb-store-tests aowis-dvmdb-diff-scope-tests aowis-dvmdb-incremental-sync-tests aowis-dvmdb-sync-tests aowis-dvmdb-sync-cli-tests aowis-dvmdb-access-tests)
+    add_custom_target(aowis-dvmdb-tests DEPENDS aowis-dvmdb-local-commit-v1-tests aowis-dvmdb-working-copy-v1-tests aowis-dvmdb-canonical-project-service-tests aowis-dvmdb-revision-bundle-v2-large-tests aowis-dvmdb-revision-bundle-v2-tests aowis-dvmdb-revision-graph-v2-tests aowis-dvmdb-merge-v2-tests aowis-dvmdb-project-model-v2-tests aowis-dvmdb-packed-revision-v2-tests aowis-dvmdb-revision-resolver-v2-tests aowis-dvmdb-revision-record-v2-tests aowis-dvmdb-branch-id-tests aowis-dvmdb-object-id-tests aowis-dvmdb-revision-graph-tests aowis-dvmdb-vm-powercut-worker aowis-dvmdb-sigkill-restart-tests aowis-dvmdb-physical-enospc-tests aowis-dvmdb-offline-backup-tests aowis-dvmdb-transfer-staging-budget-tests aowis-dvmdb-index-scaling-benchmark aowis-dvmdb-pack-operational-stress-tests aowis-dvmdb-bundle-import-profile-tests aowis-dvmdb-replication-scaling-benchmark aowis-dvmdb-bundle-revision-marks-tests aowis-dvmdb-bundle-disk-index-tests aowis-dvmdb-merge-ancestry-tests aowis-dvmdb-bundle-limit-tests aowis-dvmdb-project-service-tests aowis-dvmdb-project-concurrency-tests aowis-dvmdb-recovery-tests aowis-dvmdb-scratch-tests aowis-dvmdb-error-kind-tests aowis-dvmdb-repository-verify-tests aowis-dvmdb-model-import-integrity-tests aowis-dvmdb-merkle-integrity-tests aowis-dvmdb-store-tests aowis-dvmdb-diff-scope-tests aowis-dvmdb-incremental-sync-tests aowis-dvmdb-sync-tests aowis-dvmdb-sync-cli-tests aowis-dvmdb-access-tests)
 endif()
 
 # Canonical AOWIS model serialization lives in AOWIS-SERVER-MODEL.

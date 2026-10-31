@@ -84,6 +84,24 @@ struct WorkingCopyInfoV1 {
     std::uint64_t leaseExpiresAtMs = 0;
 };
 
+// VC-05 local Commit operation. The reserved revision UUID is durable before
+// HEAD publication. Pending means the caller must query/retry with the SAME ID;
+// it does not mean that the commit definitely failed.
+enum class LocalCommitStateV1 { Pending, Succeeded, Rejected };
+struct LocalCommitInfoV1 {
+    std::string id;
+    std::string repositoryId;
+    std::string projectId;
+    std::string branchId;
+    std::string draftId;
+    std::optional<RevisionId> expectedHead;
+    std::string reservedRevisionId;
+    std::uint64_t expectedGeneration = 0;
+    std::string payloadDigest;
+    LocalCommitStateV1 state = LocalCommitStateV1::Pending;
+    std::string rejection;
+};
+
 struct WorkingCopyLeaseV1 {
     std::string token;                // UUIDv7, changes on every acquisition
     std::uint64_t expiresAtMs = 0;   // UTC epoch milliseconds
@@ -259,6 +277,18 @@ public:
         // membership writes. Remains stable across dropped responses even
         // though native chunk records are derived from the previous draft.
         std::optional<std::string> logicalRequestFingerprint = std::nullopt);
+    // Commit a saved working-copy overlay to one private local branch. The
+    // request is bound to its UUIDv7 operation ID, draft generation, writer
+    // fencing token and exact expected local HEAD (null means unborn).
+    // Replays of an accepted request return the same immutable revision UUID.
+    LocalCommitInfoV1 commitWorkingCopyV1(
+        std::string_view operationId, std::string_view draftId,
+        std::string_view sessionId, std::string_view fencingToken,
+        std::uint64_t expectedGeneration,
+        std::optional<RevisionId> expectedLocalHead);
+    // Durable status query. A pending record is reconciled against committed
+    // ancestry before returning, including after a process restart.
+    LocalCommitInfoV1 localCommitStatusV1(std::string_view operationId);
     void releaseWorkingCopyLeaseV1(
         std::string_view draftId, std::string_view sessionId,
         std::string_view fencingToken);

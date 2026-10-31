@@ -129,8 +129,10 @@ passed 3/3 on 2026-10-31; the benchmark workload suite passed 4/4.
 **Post-removal qualification verified on 2026-10-31:** the focused
 hydraulic/value/HTTP suite passed 3/3, then the full DVMDB suite passed
 **71/71**; Release DVMDB built and launched on `127.0.0.1:8755`.
-The SHA-based hydraulic API consolidation gate is closed. These results
-precede the subsequent VC-05 CAS-preparation patch. A direct
+The SHA-based hydraulic API consolidation gate is closed. The later clean
+rebuild without optional MODEL submodule tests passed **66/66**, and the
+VC-05 strict nullable-HEAD CAS patch passed its **3/3** targeted tests.
+These results precede the new native working-copy Commit coordinator. A direct
 performance comparison against earlier SHA-era results remains unavailable;
 record a new UUIDv7 baseline rather than claiming numerical equivalence.
 
@@ -145,7 +147,7 @@ an end-to-end checkout/edit/reopen/commit test against a real personal DVMDB.
 | Project and branch history (VC-01/02) | Unborn project creation, nullable committed HEAD, immutable branch fork provenance, native/REST readers, corresponding GUI graph/inspector tests | Real multiclient history/graph acceptance across all deployment modes |
 | Personal repository identity and checkout (VC-03/04) | Persistent repository UUID/roles, tracking metadata, private working-copy CRUD and fenced generation-checked saves; committed REST bundle transfer and identity-preserving unborn root checkout to a private clone target | Full editor activation and embedded/remaining deployment modes |
 | Hydraulic editing (VC-04) | MODEL-owned canonical codec and reversible transactions; GUI event-save membership transport, durable event queue, typed record/membership adapter; native atomic journal and DVMDB-owned membership materialization; private-draft empty network initialization endpoint (prior targeted DVMDB suite: 3/3 passed) | GUI-driven first-network initialization, genuine editor session binding, restart/reload verification, global mutation coverage |
-| Local Commit (VC-05) | Immutable revision and model persistence primitives | Working-copy-to-revision CAS, recoverable operation ID/status, usable Projects-tab Commit |
+| Local Commit (VC-05) | Strict nullable-HEAD CAS plus native working-copy-to-revision coordinator, reserved immutable UUIDv7, durable idempotency/status lookup and restart recovery | Complete hydraulic-domain validation, HTTP Commit/status endpoints and usable Projects-tab Commit |
 | Collaboration (VC-06–08) | History transfer, import, revision DAG and domain merge primitives | Unified user-facing Fetch/Publish/reconciliation acceptance using independent private repositories |
 | Presentation and qualification (VC-09–11) | Graph and inspector regression coverage; extensive DVMDB durability/sync tests | Integrated GUI/Standalone/browser scenarios and complete release evidence |
 
@@ -305,12 +307,18 @@ overwrite another session; committed history never changes on Save.
 **Implementation checkpoint (2026-10-31):** a strictly pinned UUIDv7
 model-commit primitive now distinguishes an *explicit null* expected HEAD
 (unborn) from the existing general-purpose unpinned `commitModelV2` call.
-Native CAS and concurrent-first-commit/reopen regression coverage are the
-first building block, not a completed VC-05 implementation. Still required:
-atomically committing the **persisted draft candidate**, model/hydraulic
-validation, durable operation UUID and payload digest, authoritative status
-lookup and crash/retry recovery, and the GUI Commit action. Do not expose
-this primitive as a draft-Commit endpoint before those requirements hold.
+Native CAS and concurrent-first-commit/reopen regression coverage were the
+first building block. The native `commitWorkingCopyV1` coordinator now
+snapshots the persisted candidate, durably reserves an operation ID and
+revision UUIDv7, and performs strict-HEAD immutable model publication.
+`localCommitStatusV1` recovers interrupted results using verified committed
+ancestry. The pending/succeeded/rejected request-digest record survives restart;
+identical replays cannot invent another revision. Native tests cover stale
+unborn HEADs, two concurrent first commits, immutable parents, retry and
+reopening. **This is not yet a completed VC-05 workflow**: full hydraulic
+model/domain validation, the HTTP Commit/status protocol and the GUI Commit
+action remain required. Do not expose the native coordinator as a GUI-facing
+Commit endpoint before those requirements hold.
 
 
 - Implement Commit from an identified *persisted working copy*, including

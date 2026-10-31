@@ -106,14 +106,55 @@ Reopening after restart uses the same persisted draft UUID; stale generations
 and stale tokens are rejected, never silently rebased. No draft operation
 changes a committed HEAD or creates a revision.
 
+## Durable local Commit coordinator (VC-05 native foundation)
+
+`ProjectService::commitWorkingCopyV1(operationId, draftId, sessionId,
+fencingToken, expectedGeneration, expectedLocalHead)` snapshots a saved,
+nonempty candidate from a private repository only. It requires the exact
+fenced writer, generation and pinned draft base (including explicit null for
+an unborn branch). The target branch is resolved by its **UUIDv7**, not its
+renamable label. `localCommitStatusV1(operationId)` reads the authoritative
+result and reconciles an interrupted publication against actual committed
+ancestry. This is a **native C++ API**, not yet an HTTP route or GUI button.
+
+Each caller-supplied operation UUIDv7 names one permanently retained record in
+`local-commits/` with format `AOWIS-LOCAL-COMMIT-1`. It contains the repository,
+project, branch and draft UUIDs, generation and expected local HEAD/null,
+request and payload SHA-256 digests, a frozen sorted snapshot of candidate
+records, a reserved **revision UUIDv7** and one of `pending`, `succeeded`, or
+`rejected`. The request fingerprint includes the original fencing token, but
+the token itself is not stored. A repeated ID with changed request fields is
+a conflict, while an identical replay returns the same terminal outcome.
+The committed immutable revision and branch HEAD are never rolled back merely
+because the status reply or persistence fails.
+
+The full pending intent and reserved revision UUID are fsynced before any
+revision publication. Immutable revision publication may be retried with that
+**same UUIDv7** and the same frozen candidate, so a crash after writing a
+revision binding but before advancing HEAD cannot create another revision.
+After a crash following the HEAD update but before the success status update,
+status recovery checks that the reserved revision is in the **target branch's
+committed ancestry**. An orphan immutable revision is not mistaken for a
+successful Commit. If HEAD has advanced in an ambiguous way, the operation
+remains pending and requires manual resolution rather than a blind replay.
+No pending operation is silently discarded. Success leaves the saved draft
+intact; stale or rejected Commit likewise never destroys the candidate.
+
+**Remaining integration gate:** the native coordinator currently checks the
+MODEL record/index constraints enforced by `Repository::commitModelV2`, but
+does **not yet run the complete canonical hydraulic-network/domain validator**
+on the assembled candidate. It must not be wired directly to GUI Commit until
+full hydraulic validation is implemented, the HTTP transport exposes the
+status/retry contract, and end-to-end GUI/Standalone acceptance passes.
+
 ## Integration boundary
 
 The native and HTTP Save paths are durable and fenced, but do not yet implement
 historical checkout, materialization/verification of the entire base model,
-semantic validation of the assembled candidate, candidate discard, or the
-GUI editor workflow. These are integration prerequisites before enabling
-unrestricted GUI editing. A local Commit is a separate operation that has not
-been accepted end to end.
+semantic validation of the assembled hydraulic candidate, candidate discard,
+or the GUI editor workflow. The native local Commit coordinator and durable
+operation recovery exist, but full hydraulic validation, HTTP transport and
+GUI acceptance have not yet been completed.
 
 ## Provisioning a first-clone project for committed revisions
 

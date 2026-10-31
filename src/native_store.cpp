@@ -3441,7 +3441,8 @@ RevisionId Repository::writeRevisionV2(const ProjectId& project, const Hash& roo
 
 RevisionId Repository::writeRevisionV2Locked(const ProjectId& project, const Hash& root,
                                              const Hash& referencesRoot, bool modelIndexed,
-                                             const std::vector<RevisionId>& parents) {
+                                             const std::vector<RevisionId>& parents,
+                                             std::optional<RevisionId> reservedRevisionId) {
     require(Err::InvalidInput, modelIndexed || isZero(referencesRoot),
             "raw v2 revision cannot contain a reference index");
     require(Err::InvalidInput, parents.size() <= 2, "v2 revision has too many parents");
@@ -3454,7 +3455,8 @@ RevisionId Repository::writeRevisionV2Locked(const ProjectId& project, const Has
         if (!containsIndex(digest)) return std::nullopt;
         return load(digest);
     };
-    RevisionRecordV2 record{RevisionId::generate(), project, root, referencesRoot, modelIndexed, {}};
+    RevisionRecordV2 record{(reservedRevisionId ? *reservedRevisionId : RevisionId::generate()),
+                            project, root, referencesRoot, modelIndexed, {}};
     for (const RevisionId& parentId : parents) {
         const std::optional<ResolvedRevisionV2> parent = resolver.resolve(parentId, readObject);
         require(Err::NotFound, parent.has_value(), "v2 parent revision UUID was not found");
@@ -4562,7 +4564,8 @@ Revision Repository::commitModel(std::string_view branch, std::vector<ModelChang
 RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view branch,
                                       std::vector<ModelChange> changes,
                                       std::optional<RevisionId> expectedHead,
-                                      bool requireExactHead) {
+                                      bool requireExactHead,
+                                      std::optional<RevisionId> reservedRevisionId) {
     std::lock_guard<std::mutex> guarded(this->mutex_);
     ScopedFileLock locked(this->lockFd_);
     refreshIndex();
@@ -4589,7 +4592,9 @@ RevisionId Repository::commitModelV2(const ProjectId& project, std::string_view 
         previous ? previous->root : Hash{}, previous ? previous->referencesRoot : Hash{}, std::move(changes));
     const Hash newRoot = applyEncodedChangesLocked(previous ? previous->root : Hash{}, prepared.encoded);
     const RevisionId revisionId = writeRevisionV2Locked(
-        project, newRoot, prepared.referencesRoot, true, previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{});
+        project, newRoot, prepared.referencesRoot, true,
+        previous ? std::vector<RevisionId>{previous->id} : std::vector<RevisionId>{},
+        reservedRevisionId);
     RevisionResolverV2 resolver(this->directory_, project);
     const RevisionObjectReaderV2 reader = [this](const Hash& digest) -> std::optional<Bytes> {
         if (!containsIndex(digest)) return std::nullopt;

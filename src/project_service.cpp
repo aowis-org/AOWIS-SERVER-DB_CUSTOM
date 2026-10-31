@@ -754,6 +754,234 @@ void createWorkingCopyRecord(const std::filesystem::path& root,
     }
 }
 
+// One durable private-local operation record owns its UUIDv7, request
+// fingerprint, snapshot of candidate changes and reserved revision UUID.
+// The pending record is fsynced before any immutable object or HEAD is written.
+constexpr std::string_view localCommitMarker = "AOWIS-LOCAL-COMMIT-1\n";
+constexpr std::size_t localCommitMaxBytes = 8 * 1024 * 1024 + 2048;
+
+struct PersistedLocalCommit {
+    LocalCommitInfoV1 info;
+    std::string requestDigest;
+    std::vector<ModelChange> changes;
+};
+
+std::filesystem::path localCommitDirectory(const std::filesystem::path& root) {
+    return root / "local-commits";
+}
+
+std::string localDigest(std::string_view input) {
+    const Bytes bytes(input.begin(), input.end());
+    const Hash hash = sha256(bytes);
+    return hexBytes(hash.data(), hash.size());
+}
+
+std::string localRequestDigest(std::string_view repositoryId,
+                               std::string_view draftId, std::string_view sessionId,
+                               std::string_view token, std::uint64_t generation,
+                               const std::optional<RevisionId>& expected) {
+    // Explicit null and UUIDv7 HEAD have distinct canonical encodings.
+    return localDigest(std::string("AOWIS-LOCAL-COMMIT-REQUEST-1\n") +
+        std::string(repositoryId) + "\n" + std::string(draftId) + "\n" +
+        std::string(sessionId) + "\n" + std::string(token) + "\n" +
+        std::to_string(generation) + "\n" +
+        (expected ? expected->toString() : "-") + "\n");
+}
+
+std::string localStateToken(LocalCommitStateV1 state) {
+    switch (state) {
+    case LocalCommitStateV1::Pending: return "pending";
+    case LocalCommitStateV1::Succeeded: return "succeeded";
+    case LocalCommitStateV1::Rejected: return "rejected";
+    }
+    throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local commit state");
+}
+
+std::string localCommitBody(const PersistedLocalCommit& operation) {
+    const LocalCommitInfoV1& info = operation.info;
+    std::string body = std::string(localCommitMarker) +
+        "repository\t" + info.repositoryId + "\n" +
+        "project\t" + info.projectId + "\n" +
+        "branch\t" + info.branchId + "\n" +
+        "draft\t" + info.draftId + "\n" +
+        "generation\t" + std::to_string(info.expectedGeneration) + "\n" +
+        "expected\t" + (info.expectedHead ? info.expectedHead->toString() : "-") + "\n" +
+        "reserved\t" + info.reservedRevisionId + "\n" +
+        "request-digest\t" + operation.requestDigest + "\n" +
+        "payload-digest\t" + info.payloadDigest + "\n" +
+        "state\t" + localStateToken(info.state) + "\n" +
+        "rejection\t" + (info.rejection.empty() ? "-" : info.rejection) + "\n" +
+        "changes\t" + std::to_string(operation.changes.size()) + "\n";
+    check(operation.changes.size() <= workingCopyMaxChanges,
+          "local commit has too many changes", StorageErrorKind::InvalidInput);
+    std::optional<Key> lastKey;
+    for (const ModelChange& change : operation.changes) {
+        check(!lastKey || *lastKey < change.key, "unordered local commit changes",
+              StorageErrorKind::InvalidInput);
+        lastKey = change.key;
+        const Bytes record = change.record ? encodeModelRecord(*change.record) : Bytes{};
+        body += "change\t" + hexBytes(change.key.data(), change.key.size()) + "\t" +
+            (change.record ? hexBytes(record.data(), record.size()) : "-") + "\n";
+        check(body.size() <= localCommitMaxBytes, "local commit record exceeds size limit",
+              StorageErrorKind::InvalidInput);
+    }
+    return body;
+}
+
+PersistedLocalCommit readLocalCommit(const std::filesystem::path& path) {
+    check(!std::filesystem::is_symlink(path) && std::filesystem::is_regular_file(path) &&
+          std::filesystem::file_size(path) <= localCommitMaxBytes,
+          "unsafe or oversized local commit record");
+    const std::string id = path.filename().string();
+    check(UuidV7::parse(id).has_value(), "invalid local commit operation ID");
+    std::ifstream input(path, std::ios::binary);
+    check(input.good(), "cannot read local commit record");
+    const std::string body((std::istreambuf_iterator<char>(input)),
+                            std::istreambuf_iterator<char>());
+    check(body.starts_with(localCommitMarker) && body.ends_with('\n'),
+          "invalid local commit record marker");
+    std::istringstream lines(body.substr(localCommitMarker.size()));
+    const std::function<std::string(std::string_view)> nextField =
+        [&](std::string_view key) -> std::string {
+            std::string line;
+            check(static_cast<bool>(std::getline(lines, line)) &&
+                  line.starts_with(std::string(key) + "\t"),
+                  "invalid local commit field: " + std::string(key));
+            return line.substr(key.size() + 1);
+        };
+    PersistedLocalCommit result;
+    LocalCommitInfoV1& info = result.info;
+    info.id = id;
+    info.repositoryId = nextField("repository");
+    info.projectId = nextField("project");
+    info.branchId = nextField("branch");
+    info.draftId = nextField("draft");
+    info.expectedGeneration = decimalField(nextField("generation"));
+    const std::string expected = nextField("expected");
+    info.reservedRevisionId = nextField("reserved");
+    result.requestDigest = nextField("request-digest");
+    info.payloadDigest = nextField("payload-digest");
+    const std::string state = nextField("state");
+    if (state == "pending") info.state = LocalCommitStateV1::Pending;
+    else if (state == "succeeded") info.state = LocalCommitStateV1::Succeeded;
+    else if (state == "rejected") info.state = LocalCommitStateV1::Rejected;
+    else check(false, "invalid local commit status");
+    const std::string rejection = nextField("rejection");
+    if (rejection != "-") info.rejection = rejection;
+    const std::uint64_t count = decimalField(nextField("changes"));
+    check(count > 0 && count <= workingCopyMaxChanges,
+          "invalid local commit candidate count");
+    std::optional<Key> lastKey;
+    for (std::uint64_t index = 0; index < count; ++index) {
+        const std::string row = nextField("change");
+        const std::size_t split = row.find('\t');
+        check(split == 32 && row.find('\t', split + 1) == std::string::npos,
+              "invalid local commit candidate row");
+        const Bytes keyBytes = unhexBytes(std::string_view(row).substr(0, split));
+        check(keyBytes.size() == Key{}.size(), "invalid local commit model UUID");
+        ModelChange change;
+        std::copy(keyBytes.begin(), keyBytes.end(), change.key.begin());
+        check(!lastKey || *lastKey < change.key, "unsorted local commit candidate");
+        lastKey = change.key;
+        const std::string_view value = std::string_view(row).substr(split + 1);
+        if (value != "-") change.record = decodeModelRecord(unhexBytes(value));
+        result.changes.push_back(std::move(change));
+    }
+    std::string extra;
+    check(!std::getline(lines, extra) && lines.eof(), "trailing local commit fields");
+    check(UuidV7::parse(info.repositoryId).has_value() &&
+          ProjectId::parse(info.projectId).has_value() &&
+          BranchId::parse(info.branchId).has_value() &&
+          UuidV7::parse(info.draftId).has_value() &&
+          RevisionId::parse(info.reservedRevisionId).has_value(),
+          "invalid local commit UUID identity");
+    if (expected != "-") {
+        info.expectedHead = RevisionId::parse(expected);
+        check(info.expectedHead.has_value(), "invalid expected local HEAD");
+    }
+    const std::function<bool(const std::string&)> validDigest = [](const std::string& value) {
+        return value.size() == 64 &&
+            std::all_of(value.begin(), value.end(), [](char ch) {
+                return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+            });
+    };
+    check(validDigest(result.requestDigest) && validDigest(info.payloadDigest) &&
+          info.payloadDigest == localDigest(result.requestDigest + "\n" +
+              saveBatchFingerprint(result.changes, {}) + "\n"),
+          "local commit payload digest mismatch");
+    check((info.state == LocalCommitStateV1::Rejected) == !info.rejection.empty() &&
+          (info.rejection.empty() || info.rejection == "conflict" ||
+           info.rejection == "invalid-input" || info.rejection == "not-found"),
+          "invalid local commit rejection");
+    return result;
+}
+
+void persistLocalCommit(const std::filesystem::path& root,
+                        const PersistedLocalCommit& operation, bool initial) {
+    const std::filesystem::path directory = localCommitDirectory(root);
+    if (!std::filesystem::exists(directory)) {
+        syscallChecked(std::filesystem::create_directory(directory),
+                       "create local commit operation directory");
+        syncDirectory(root);
+    }
+    check(!std::filesystem::is_symlink(directory) && std::filesystem::is_directory(directory),
+          "unsafe local commit directory");
+    const std::filesystem::path published = directory / operation.info.id;
+    const std::filesystem::path staging = directory /
+        (std::string(initial ? ".creating-" : ".updating-") +
+         UuidV7::generate().toString());
+    const std::string body = localCommitBody(operation);
+    const int fd = ::open(staging.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    syscallChecked(fd >= 0, "stage local commit operation");
+    try {
+        std::size_t written = 0;
+        while (written < body.size()) {
+            const ssize_t amount = ::write(fd, body.data() + written, body.size() - written);
+            if (amount < 0 && errno == EINTR) continue;
+            syscallChecked(amount > 0, "write local commit operation");
+            written += static_cast<std::size_t>(amount);
+        }
+        syscallChecked(::fsync(fd) == 0, "sync local commit operation");
+    } catch (...) {
+        ::close(fd);
+        (void)::unlink(staging.c_str());
+        throw;
+    }
+    syscallChecked(::close(fd) == 0, "close local commit operation");
+    try {
+        if (initial) {
+            syscallChecked(::link(staging.c_str(), published.c_str()) == 0,
+                           "publish new local commit operation");
+            syncDirectory(directory);
+            syscallChecked(::unlink(staging.c_str()) == 0,
+                           "remove local commit staging record");
+            syncDirectory(directory);
+        } else {
+            syscallChecked(::rename(staging.c_str(), published.c_str()) == 0,
+                           "publish local commit operation outcome");
+            syncDirectory(directory);
+        }
+    } catch (...) {
+        (void)::unlink(staging.c_str());
+        throw;
+    }
+}
+
+// Reconcile an ambiguous crash after the immutable revision and/or HEAD was
+// written. Never treat the presence of an orphan revision as proof of Commit:
+// the reserved UUID must be reachable from this branch's current HEAD.
+bool recoverLocalCommit(Repository& repository, const PersistedLocalCommit& operation) {
+    if (operation.info.state != LocalCommitStateV1::Pending) return false;
+    const std::optional<ProjectId> project = ProjectId::parse(operation.info.projectId);
+    const std::optional<BranchId> branch = BranchId::parse(operation.info.branchId);
+    const std::optional<RevisionId> revision = RevisionId::parse(operation.info.reservedRevisionId);
+    const std::optional<RevisionGraphHeadV2> head = repository.branchByIdV2(*project, *branch);
+    if (!head || !head->revision) return false;
+    return *head->revision == *revision ||
+           repository.revisionReachableFromV2(*project, *head->revision, *revision);
+}
+
+
 } // namespace
 
 ProjectService::Operation::Operation(std::shared_ptr<Project> project) noexcept
@@ -1321,6 +1549,188 @@ WorkingCopyInfoV1 ProjectService::saveWorkingCopyTransactionsV1(
     try { replaceWorkingCopyRecord(this->root_, draft); }
     catch (...) { this->uncertain_ = true; throw; }
     return draft;
+}
+
+LocalCommitInfoV1 ProjectService::commitWorkingCopyV1(
+        std::string_view operationId, std::string_view draftId,
+        std::string_view sessionId, std::string_view fencingToken,
+        std::uint64_t expectedGeneration,
+        std::optional<RevisionId> expectedLocalHead) {
+    if (!UuidV7::parse(operationId).has_value() ||
+        !UuidV7::parse(draftId).has_value() ||
+        !UuidV7::parse(sessionId).has_value() ||
+        !UuidV7::parse(fencingToken).has_value())
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local commit operation identity");
+    const std::filesystem::path operationPath = localCommitDirectory(this->root_) /
+        std::string(operationId);
+    std::string projectId;
+    {
+        std::lock_guard<std::mutex> guard(this->mutex_);
+        ensureHealthy();
+        if (this->repository_role_ != RepositoryRoleV1::Private)
+            throw ProjectError(ProjectErrorKind::Conflict,
+                               "local Commit requires a private repository");
+        if (std::filesystem::exists(operationPath) || std::filesystem::is_symlink(operationPath)) {
+            projectId = readLocalCommit(operationPath).info.projectId;
+        } else {
+            const std::filesystem::path draftPath = workingCopyDirectory(this->root_) /
+                std::string(draftId);
+            if (!std::filesystem::exists(draftPath) && !std::filesystem::is_symlink(draftPath))
+                throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
+            projectId = readWorkingCopy(draftPath).projectId;
+        }
+    }
+    const std::string requestDigest = localRequestDigest(
+        this->repository_id_, draftId, sessionId, fencingToken,
+        expectedGeneration, expectedLocalHead);
+    LocalCommitInfoV1 outcome;
+    // Keep the project's operation mutex across the complete intent/commit/
+    // outcome sequence, and the catalogue mutex across draft+ledger access.
+    // No concurrent Save can replace the candidate during local Commit.
+    withRepository(projectId, [&](Repository& repository) {
+        std::lock_guard<std::mutex> guard(this->mutex_);
+        ensureHealthy();
+        if (this->repository_role_ != RepositoryRoleV1::Private)
+            throw ProjectError(ProjectErrorKind::Conflict, "not a private repository");
+        const bool exists = std::filesystem::exists(operationPath) ||
+                            std::filesystem::is_symlink(operationPath);
+        PersistedLocalCommit operation;
+        if (exists) {
+            operation = readLocalCommit(operationPath);
+            if (operation.info.repositoryId != this->repository_id_ ||
+                operation.info.draftId != draftId ||
+                operation.requestDigest != requestDigest)
+                throw ProjectError(ProjectErrorKind::Conflict,
+                                   "local Commit UUIDv7 reused with a different request");
+        } else {
+            const std::filesystem::path draftPath = workingCopyDirectory(this->root_) /
+                std::string(draftId);
+            if (!std::filesystem::exists(draftPath) && !std::filesystem::is_symlink(draftPath))
+                throw ProjectError(ProjectErrorKind::NotFound, "working copy not found");
+            const WorkingCopyInfoV1 draft = readWorkingCopy(draftPath);
+            if (draft.projectId != projectId || draft.sessionId != sessionId ||
+                draft.baseRevision != expectedLocalHead ||
+                !draft.leaseSessionId || *draft.leaseSessionId != sessionId ||
+                !draft.leaseToken || *draft.leaseToken != fencingToken ||
+                draft.leaseExpiresAtMs <= nowEpochMs() ||
+                draft.generation != expectedGeneration)
+                throw ProjectError(ProjectErrorKind::Conflict,
+                                   "local Commit draft/base/lease/generation changed");
+            if (!draft.dirty || draft.candidateChanges.empty())
+                throw ProjectError(ProjectErrorKind::InvalidInput,
+                                   "local Commit requires a saved dirty candidate");
+            const std::optional<ProjectId> project = ProjectId::parse(projectId);
+            const std::optional<BranchId> branch = BranchId::parse(draft.branchId);
+            if (!project || !branch)
+                throw ProjectError(ProjectErrorKind::InvalidInput,
+                                   "local Commit requires UUIDv7 project and branch");
+            const std::optional<RevisionGraphHeadV2> current =
+                translated<std::optional<RevisionGraphHeadV2>>([&]() {
+                    return repository.branchByIdV2(*project, *branch);
+                });
+            // HEAD is checked again below, after durable intent creation.
+            // Even a stale valid request gets a permanent rejected outcome.
+            operation.info.id = std::string(operationId);
+            operation.info.repositoryId = this->repository_id_;
+            operation.info.projectId = draft.projectId;
+            operation.info.branchId = draft.branchId;
+            operation.info.draftId = draft.id;
+            operation.info.expectedHead = expectedLocalHead;
+            operation.info.expectedGeneration = expectedGeneration;
+            operation.info.reservedRevisionId = RevisionId::generate().toString();
+            operation.requestDigest = requestDigest;
+            operation.changes = draft.candidateChanges;
+            operation.info.payloadDigest = localDigest(requestDigest + "\n" +
+                saveBatchFingerprint(operation.changes, {}) + "\n");
+            // Persist the complete candidate snapshot and reserved UUID first.
+            try { persistLocalCommit(this->root_, operation, true); }
+            catch (...) { this->uncertain_ = true; throw; }
+        }
+        if (operation.info.state == LocalCommitStateV1::Pending &&
+            translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
+            operation.info.state = LocalCommitStateV1::Succeeded;
+            try { persistLocalCommit(this->root_, operation, false); }
+            catch (...) { this->uncertain_ = true; throw; }
+        }
+        if (operation.info.state != LocalCommitStateV1::Pending) {
+            outcome = operation.info;
+            return;
+        }
+        const std::optional<ProjectId> project = ProjectId::parse(operation.info.projectId);
+        const std::optional<BranchId> branch = BranchId::parse(operation.info.branchId);
+        const std::optional<RevisionId> reserved =
+            RevisionId::parse(operation.info.reservedRevisionId);
+        const std::optional<RevisionGraphHeadV2> current =
+            translated<std::optional<RevisionGraphHeadV2>>([&]() {
+                return repository.branchByIdV2(*project, *branch);
+            });
+        // If HEAD has moved to something other than the expected base, do not
+        // reapply an ambiguous pending write. The same ID remains queryable.
+        if (!current || current->revision != operation.info.expectedHead) {
+            if (exists)
+                throw ProjectError(ProjectErrorKind::Conflict,
+                                   "local Commit pending; branch advanced without this revision");
+            operation.info.state = LocalCommitStateV1::Rejected;
+            operation.info.rejection = current ? "conflict" : "not-found";
+            try { persistLocalCommit(this->root_, operation, false); }
+            catch (...) { this->uncertain_ = true; throw; }
+            outcome = operation.info;
+            return;
+        }
+        try {
+            (void)repository.commitModelV2(*project, current->name, operation.changes,
+                                           operation.info.expectedHead, true, reserved);
+            operation.info.state = LocalCommitStateV1::Succeeded;
+        } catch (const StorageError& error) {
+            if (error.kind() == StorageErrorKind::Conflict ||
+                error.kind() == StorageErrorKind::InvalidInput ||
+                error.kind() == StorageErrorKind::NotFound) {
+                operation.info.state = LocalCommitStateV1::Rejected;
+                operation.info.rejection = error.kind() == StorageErrorKind::Conflict ? "conflict" :
+                    (error.kind() == StorageErrorKind::InvalidInput ? "invalid-input" : "not-found");
+            } else {
+                // I/O or integrity failure may occur AFTER HEAD publication.
+                // Leave the durable operation pending for authoritative recovery.
+                throw;
+            }
+        }
+        try { persistLocalCommit(this->root_, operation, false); }
+        catch (...) { this->uncertain_ = true; throw; }
+        outcome = operation.info;
+    });
+    return outcome;
+}
+
+LocalCommitInfoV1 ProjectService::localCommitStatusV1(std::string_view operationId) {
+    if (!UuidV7::parse(operationId).has_value())
+        throw ProjectError(ProjectErrorKind::InvalidInput, "invalid local Commit operation ID");
+    const std::filesystem::path path = localCommitDirectory(this->root_) /
+        std::string(operationId);
+    std::string projectId;
+    {
+        std::lock_guard<std::mutex> guard(this->mutex_);
+        ensureHealthy();
+        if (!std::filesystem::exists(path) && !std::filesystem::is_symlink(path))
+            throw ProjectError(ProjectErrorKind::NotFound, "local Commit operation not found");
+        projectId = readLocalCommit(path).info.projectId;
+    }
+    LocalCommitInfoV1 outcome;
+    withRepository(projectId, [&](Repository& repository) {
+        std::lock_guard<std::mutex> guard(this->mutex_);
+        ensureHealthy();
+        PersistedLocalCommit operation = readLocalCommit(path);
+        if (operation.info.repositoryId != this->repository_id_)
+            throw ProjectError(ProjectErrorKind::Conflict,
+                               "local Commit belongs to another repository");
+        if (operation.info.state == LocalCommitStateV1::Pending &&
+            translated<bool>([&]() { return recoverLocalCommit(repository, operation); })) {
+            operation.info.state = LocalCommitStateV1::Succeeded;
+            try { persistLocalCommit(this->root_, operation, false); }
+            catch (...) { this->uncertain_ = true; throw; }
+        }
+        outcome = operation.info;
+    });
+    return outcome;
 }
 
 void ProjectService::releaseWorkingCopyLeaseV1(

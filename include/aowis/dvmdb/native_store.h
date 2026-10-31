@@ -376,7 +376,8 @@ public:
     RevisionId commitModelV2(const ProjectId& project, std::string_view branch,
                              std::vector<ModelChange> changes,
                              std::optional<RevisionId> expectedHead = std::nullopt,
-                             bool requireExactHead = false);
+                             bool requireExactHead = false,
+                             std::optional<RevisionId> reservedRevisionId = std::nullopt);
     // Read a model object by a pinned UUIDv7 revision, not a moving branch ref.
     std::optional<ModelRecord> getModelAtRevisionV2(const ProjectId& project,
                                                    const RevisionId& revisionId, const Key& key);
@@ -647,7 +648,8 @@ private:
     bool revisionReachableFrom(const Hash& tip, const Hash& candidate);
     RevisionId writeRevisionV2Locked(const ProjectId& project, const Hash& root,
                                      const Hash& referencesRoot, bool modelIndexed,
-                                     const std::vector<RevisionId>& parents);
+                                     const std::vector<RevisionId>& parents,
+                                     std::optional<RevisionId> reservedRevisionId = std::nullopt);
     void exportRevisionBundleV2Locked(const ProjectId& project, std::string_view branch,
                                       std::optional<RevisionId> base, int fd,
                                       BundleLimits limits);
