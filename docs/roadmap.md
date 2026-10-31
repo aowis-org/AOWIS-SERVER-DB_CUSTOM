@@ -151,11 +151,16 @@ on either side, immutable two-parent ancestry, and compaction/reopen recovery.
 The field/object merge-choice regression passed on 2026-10-31 (1/1).
 The UUIDv7 caller-pinned write and concurrent immutable snapshot-read
 qualifications passed the hydraulic-network test on 2026-10-31 (1/1).
-UUIDv7 qualification now also includes the legacy 256-member chunk-boundary
+UUIDv7 qualification now also includes the 256-member chunk-boundary
 regression (chunk retirement, ordered listing, compaction/reopen) and successful
-fast-forward/up-to-date merge behavior. These two new cases await their C++
-acceptance run. Remaining SHA-only test-suite migration is required. Do not add
-production callers to the SHA API
+fast-forward/up-to-date merge behavior; the focused hydraulic-network test
+passed on 2026-10-31 (1/1). The project-scoped value-rule qualification now
+uses the canonical UUIDv7 save/edit API, including rejected physical,
+scalar, dependent, catalogue and membership edits, pinned HEADs and an indexed
+successful edit. Inactive SHA-revision HTTP fixture blocks have been removed;
+they were never enabled by CMake and must not be mistaken for active coverage.
+Remaining SHA-only hydraulic-network test migration and removal of old
+implementation helpers are required. Do not add production callers to the SHA API
 or declare the gate satisfied until those requirements and SHA removal pass.
 
 ## Current implementation state and immediate delivery priority

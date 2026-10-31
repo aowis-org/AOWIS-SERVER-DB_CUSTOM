@@ -452,7 +452,8 @@ void testPersistencePaths() {
     const std::filesystem::path directory = temporaryDirectory();
     try {
         native::Repository repository(directory / "repo");
-        repository.createBranch("main");
+        const native::ProjectId project = native::ProjectId::generate();
+        const native::RevisionId unbornHead = repository.createBranchV2(project, "main");
         NetworkHydraulic network;
         network.uuid = QUuid::createUuid();
         HydraulicNodeReservoir reservoir; reservoir.uuid = QUuid::createUuid(); reservoir.hydraulic_head_m = 120;
@@ -483,22 +484,24 @@ void testPersistencePaths() {
         NetworkHydraulic broken = network;
         broken.links_pipes[0].diameter_mm = -5;
         expectInvalidInput("save with negative diameter",
-                           [&] { (void)hydraulic::saveHydraulicNetworkLegacy(repository, "main", broken); });
+                           [&] { (void)hydraulic::saveHydraulicNetwork(repository, project, "main", broken, unbornHead); });
         broken = network;
         broken.options_hydraulic.accuracy = 0;
         expectInvalidInput("save with zero accuracy",
-                           [&] { (void)hydraulic::saveHydraulicNetworkLegacy(repository, "main", broken); });
-        const native::Revision saved = hydraulic::saveHydraulicNetworkLegacy(repository, "main", network);
+                           [&] { (void)hydraulic::saveHydraulicNetwork(repository, project, "main", broken, unbornHead); });
+        const native::RevisionId saved = hydraulic::saveHydraulicNetwork(
+            repository, project, "main", network, unbornHead);
 
         const std::function<void(const std::string&, hydraulic::HydraulicEntity)> rejected =
             [&](const std::string& label, hydraulic::HydraulicEntity entity) {
                 const QUuid id = std::visit([](const auto& value) { return value.uuid; }, entity);
                 hydraulic::HydraulicEditDiagnostics diagnostics;
                 expectInvalidInput(label, [&] {
-                    (void)hydraulic::editHydraulicNetworkLegacy(repository, "main", network.uuid,
-                                                          {{id, std::move(entity)}}, &diagnostics);
+                    (void)hydraulic::editHydraulicNetwork(repository, project, "main", network.uuid,
+                        {{id, std::move(entity)}}, saved, &diagnostics);
                 });
-                expect(repository.head("main").id == saved.id, label + ": repository changed");
+                expect(repository.headV2(project, "main") == saved,
+                       label + ": repository changed");
             };
         // Physical fast path (valves, pumps, tanks, reservoirs).
         HydraulicLinkValve badValve = valve; badValve.diameter_mm = -1;
@@ -527,9 +530,12 @@ void testPersistencePaths() {
         // Valid edits still take their fast paths.
         HydraulicLinkValve goodValve = valve; goodValve.diameter_mm = 200;
         hydraulic::HydraulicEditDiagnostics diagnostics;
-        const native::Revision edited = hydraulic::editHydraulicNetworkLegacy(
-            repository, "main", network.uuid, {{goodValve.uuid, hydraulic::HydraulicEntity{goodValve}}}, &diagnostics);
-        expect(edited.id != saved.id && diagnostics.indexedPhysicalFastPath, "valid physical edit not on its fast path");
+        const native::RevisionId edited = hydraulic::editHydraulicNetwork(
+            repository, project, "main", network.uuid,
+            {{goodValve.uuid, hydraulic::HydraulicEntity{goodValve}}}, saved, &diagnostics);
+        expect(edited != saved && diagnostics.indexedPhysicalFastPath &&
+                   repository.headV2(project, "main") == edited,
+               "valid physical edit not on its fast path");
         (void)repository.verifyRepository();
     } catch (...) {
         std::error_code ignored;

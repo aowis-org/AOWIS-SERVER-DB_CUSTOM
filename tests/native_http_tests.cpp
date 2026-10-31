@@ -1,8 +1,5 @@
 #include "model_edit_event_fixture.h"
 #include "aowis/dvmdb/dvmdb_http_routes.h"
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
-#include "aowis/dvmdb/hydraulic_network_persistence.h"
-#endif
 #ifdef AOWIS_DVMDB_HTTP_WITH_HYDRAULIC
 #include "aowis/dvmdb/hydraulic_network_persistence.h"
 #include <aowis/model/edit/model_edit_transaction.h>
@@ -233,300 +230,6 @@ private:
     quint16 port_ = 0;
 };
 
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
-void exerciseHydraulicApi(Client& client, aowis::dvmdb::ProjectService& service,
-                          const QString& projectId, const QString& otherProject,
-                          const QString& rawHead) {
-    namespace native = aowis::dvmdb;
-    const QString prefix = QStringLiteral("/dvmdb/v1/projects/") + projectId;
-    const QString main = prefix + "/branches/main";
-    const QUuid networkUuid = QUuid::createUuid();
-    const QUuid junctionUuid = QUuid::createUuid();
-    const QString networkId = networkUuid.toString(QUuid::WithoutBraces);
-    const QString junctionId = junctionUuid.toString(QUuid::WithoutBraces);
-    const QString networkRoute = main + "/networks/" + networkId;
-
-    check(client.call("GET", networkRoute).status == 404,
-          "untouched branch must have no hydraulic network");
-    NetworkHydraulic network;
-    network.uuid = networkUuid;
-    network.id = QStringLiteral("api-test");
-    HydraulicNodeJunction junction;
-    junction.uuid = junctionUuid;
-    junction.id = QStringLiteral("J1");
-    junction.elevation_m = 123;
-    network.nodes_junctions.append(junction);
-    const QString payload = QString::fromLatin1(native::ModelCodec<NetworkHydraulic>::encode(network).toBase64());
-    check(client.call("POST", main + "/networks",
-         QJsonObject{{"expectedHead", rawHead}, {"payloadBase64", "!base64!"}}).status == 400,
-          "invalid base64 network accepted");
-    check(client.call("POST", main + "/networks",
-         QJsonObject{{"payloadBase64", payload}}).status == 400,
-          "save without expectedHead accepted");
-    const Response created = client.call("POST", main + "/networks",
-        QJsonObject{{"expectedHead", rawHead}, {"payloadBase64", payload}});
-    check(created.status == 201, "first hydraulic HTTP save failed");
-    const QString createdHead = created.json.value("id").toString();
-    check(createdHead.size() == 64 && createdHead != rawHead,
-          "hydraulic HTTP save did not advance revision");
-    check(client.call("POST", main + "/networks",
-        QJsonObject{{"expectedHead", rawHead}, {"payloadBase64", payload}}).status == 409,
-          "stale network save accepted");
-    NetworkHydraulic invalid = network;
-    invalid.nodes_junctions.append(junction); // duplicate UUID must be rejected by hydraulic semantics
-    check(client.call("POST", main + "/networks",
-        QJsonObject{{"expectedHead", createdHead},
-                    {"payloadBase64", QString::fromLatin1(
-                        native::ModelCodec<NetworkHydraulic>::encode(invalid).toBase64())}}).status == 400,
-          "invalid duplicate-UUID network accepted");
-    check(client.call("GET", main + "/head").json.value("id").toString() == createdHead,
-          "semantic validation failure changed branch head");
-    check(client.call("GET", "/dvmdb/v1/projects/" + otherProject +
-                      "/branches/main/networks/" + networkId).status == 404,
-          "hydraulic network leaked across projects");
-
-    const Response read = client.call("GET", networkRoute);
-    check(read.status == 200 && read.json.value("revision").toString() == createdHead,
-          "network GET revision differs from saved head");
-    const QByteArray readBytes = QByteArray::fromBase64(read.json.value("payloadBase64").toString().toLatin1());
-    QString codecError;
-    const std::optional<NetworkHydraulic> recovered =
-        native::ModelCodec<NetworkHydraulic>::decode(readBytes, &codecError);
-    check(recovered && recovered->uuid == networkUuid && recovered->nodes_junctions.size() == 1,
-          "HTTP canonical network payload failed to roundtrip");
-    const Response ids = client.call("GET", networkRoute + "/entities?type=9");
-    check(ids.status == 200 && ids.json.value("uuids").toArray().size() == 1 &&
-          ids.json.value("uuids").toArray().first().toString() == junctionId,
-          "HTTP membership listing incorrect");
-    check(client.call("GET", networkRoute + "/entities?type=18").status == 400,
-          "invalid entity type accepted");
-    const Response item = client.call("GET", networkRoute + "/entities/" + junctionId);
-    check(item.status == 200 && item.json.value("type").toInt() == 9,
-          "targeted HTTP entity read failed");
-    check(client.call("GET", networkRoute + "/entities/" + QUuid::createUuid().toString(QUuid::WithoutBraces)).status == 404,
-          "nonmember entity returned from network");
-    check(client.call("GET", networkRoute + "?revision=" + rawHead).status == 404,
-          "network appeared before initial save");
-    check(client.call("GET", networkRoute + "?revision=" + createdHead).status == 200,
-          "historical network read failed");
-    // Typed errors (review F2): a UUID owned by another model entity is not a
-    // network (404, formerly 500); editing a missing network is 404 (formerly 400).
-    check(client.call("GET", main + "/networks/" + junctionId).status == 404,
-          "non-network UUID was not reported as a missing network");
-    const Response missingEdit = client.call("POST", main + "/networks/" +
-        QUuid::createUuid().toString(QUuid::WithoutBraces) + "/edits",
-        QJsonObject{{"expectedHead", createdHead},
-                    {"changes", QJsonArray{QJsonObject{{"uuid", junctionId}, {"delete", true}}}}});
-    check(missingEdit.status == 404 &&
-          missingEdit.json.value("error").toObject().value("code").toString() == "not_found",
-          "edit of a missing network was not 404 not_found");
-
-    junction.elevation_m = 456;
-    const QString changed = QString::fromLatin1(native::ModelCodec<HydraulicNodeJunction>::encode(junction).toBase64());
-    const QJsonObject update{{"uuid", junctionId}, {"type", 9}, {"payloadBase64", changed}};
-    check(client.call("POST", networkRoute + "/edits",
-          QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{QJsonObject{
-              {"uuid", QUuid::createUuid().toString(QUuid::WithoutBraces)}, {"type", 9},
-              {"payloadBase64", changed}}}}}).status == 400,
-          "mismatching UUID payload accepted");
-    // Review F8: impossible values and non-finite numbers are 400.
-    {
-        HydraulicNodeJunction impossible = junction;
-        impossible.emitter.coefficient = -1;
-        const Response rejected = client.call("POST", networkRoute + "/edits",
-            QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{QJsonObject{
-                {"uuid", junctionId}, {"type", 9},
-                {"payloadBase64", QString::fromLatin1(native::ModelCodec<HydraulicNodeJunction>::encode(impossible).toBase64())}}}}});
-        check(rejected.status == 400 &&
-              rejected.json.value("error").toObject().value("message").toString().contains("emitter.coefficient"),
-              "negative emitter coefficient accepted over HTTP");
-        // A NaN elevation cannot be encoded; patch it into valid bytes.
-        HydraulicNodeJunction patched = junction;
-        patched.elevation_m = 2.0;
-        QByteArray bytes = native::ModelCodec<HydraulicNodeJunction>::encode(patched);
-        patched.elevation_m = -2.0;
-        const QByteArray negative = native::ModelCodec<HydraulicNodeJunction>::encode(patched);
-        qsizetype start = 0;
-        while (bytes[start] == negative[start]) ++start;
-        const char nanBytes[8] = {0x7f, static_cast<char>(0xf8), 0, 0, 0, 0, 0, 0};
-        bytes.replace(start, 8, nanBytes, 8);
-        check(client.call("POST", networkRoute + "/edits",
-            QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{QJsonObject{
-                {"uuid", junctionId}, {"type", 9}, {"payloadBase64", QString::fromLatin1(bytes.toBase64())}}}}}).status == 400,
-              "NaN elevation accepted over HTTP");
-        NetworkHydraulic impossibleNetwork = network;
-        impossibleNetwork.options_hydraulic.specific_gravity = 0;
-        check(client.call("POST", main + "/networks", QJsonObject{{"expectedHead", createdHead},
-            {"payloadBase64", QString::fromLatin1(native::ModelCodec<NetworkHydraulic>::encode(impossibleNetwork).toBase64())}}).status == 400,
-              "network with zero specific gravity accepted over HTTP");
-        check(client.call("GET", main + "/head").json.value("id").toString() == createdHead,
-              "rejected value edit changed the branch");
-    }
-    const Response edited = client.call("POST", networkRoute + "/edits",
-        QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{update}}});
-    check(edited.status == 200, "atomic HTTP entity edit failed");
-    const QString editedHead = edited.json.value("revision").toObject().value("id").toString();
-    check(editedHead.size() == 64 && editedHead != createdHead,
-          "entity edit did not publish a revision");
-    check(client.call("POST", networkRoute + "/edits",
-        QJsonObject{{"expectedHead", createdHead}, {"changes", QJsonArray{update}}}).status == 409,
-          "stale entity edit accepted");
-    const Response historical = client.call("GET", networkRoute + "/entities/" + junctionId +
-                                            "?revision=" + createdHead);
-    check(historical.status == 200 &&
-          historical.json.value("payloadBase64").toString() == item.json.value("payloadBase64").toString(),
-          "historical entity payload changed");
-    const Response current = client.call("GET", networkRoute + "/entities/" + junctionId);
-    check(current.status == 200 && current.json.value("payloadBase64").toString() == changed,
-          "entity edit payload was not retained");
-    const Response diff = client.call("GET", prefix + "/diff?from=" + createdHead + "&to=" + editedHead);
-    check(diff.status == 200 && !diff.json.value("changes").toArray().isEmpty(),
-          "revision diff omitted entity update");
-    check(client.call("GET", prefix + "/diff?from=bad&to=" + editedHead).status == 400,
-          "malformed revision diff accepted");
-    check(client.call("GET", prefix + "/diff?from=" + QString(64, QChar('f')) +
-                      "&to=" + editedHead).status == 404,
-          "unknown diff base revision was not reported as missing");
-    check(client.call("GET", networkRoute + "?revision=" + QString(64, QChar('f'))).status == 404,
-          "unknown historical hydraulic revision was not reported as missing");
-
-    const Response fork = client.call("POST", prefix + "/branches",
-        QJsonObject{{"name", "http_feature"}, {"fromBranch", "main"}});
-    check(fork.status == 201 && fork.json.value("id").toString() == editedHead,
-          "hydraulic feature fork failed");
-    const QString feature = prefix + "/branches/http_feature/networks/" + networkId;
-    const Response unchanged = client.call("POST", feature + "/edits",
-        QJsonObject{{"expectedHead", editedHead}, {"changes", QJsonArray{}}});
-    check(unchanged.status == 200 &&
-          unchanged.json.value("revision").toObject().value("id").toString() == editedHead,
-          "empty edit batch changed revision");
-    // An already incorporated feature must report up-to-date and not create a new revision.
-    const Response merge = client.call("POST", prefix + "/merges",
-        QJsonObject{{"target", "main"}, {"source", "http_feature"},
-                    {"expectedTargetHead", editedHead}, {"expectedSourceHead", editedHead}});
-    check(merge.status == 200 && merge.json.value("status").toString() == "up_to_date",
-          "equal-tip hydraulic merge failed");
-    check(client.call("POST", prefix + "/merges",
-        QJsonObject{{"target", "main"}, {"source", "http_feature"},
-                    {"expectedTargetHead", createdHead}, {"expectedSourceHead", editedHead}}).status == 409,
-          "stale merge tip accepted");
-    // HTTP fast-forwards must validate source records even when they were
-    // committed through the generic native library instead of hydraulic APIs.
-    check(client.call("POST", prefix + "/branches",
-        QJsonObject{{"name", "http-ff-target"}, {"fromBranch", "main"}}).status == 201,
-        "cannot create HTTP fast-forward target");
-    check(client.call("POST", prefix + "/branches",
-        QJsonObject{{"name", "http-ff-source"}, {"fromBranch", "main"}}).status == 201,
-        "cannot create HTTP fast-forward source");
-    HydraulicNodeJunction ffJunction = junction;
-    ffJunction.elevation_m = 527;
-    const QString ffPayload = QString::fromLatin1(
-        native::ModelCodec<HydraulicNodeJunction>::encode(ffJunction).toBase64());
-    const Response ffEdit = client.call("POST",
-        prefix + "/branches/http-ff-source/networks/" + networkId + "/edits",
-        QJsonObject{{"expectedHead", editedHead}, {"changes", QJsonArray{QJsonObject{
-            {"uuid", junctionId}, {"type", 9}, {"payloadBase64", ffPayload}}}}});
-    check(ffEdit.status == 200, "cannot prepare valid hydraulic HTTP fast-forward");
-    const QString ffTip = ffEdit.json.value("revision").toObject().value("id").toString();
-    check(ffTip.size() == 64 && ffTip != editedHead,
-          "valid hydraulic HTTP fast-forward source did not advance");
-    check(client.call("POST", prefix + "/merges", QJsonObject{
-        {"target", "http-ff-target"}, {"source", "http-ff-source"},
-        {"expectedTargetHead", editedHead}, {"expectedSourceHead", editedHead}}).status == 409,
-        "stale HTTP fast-forward source pin accepted");
-    const Response ffMerge = client.call("POST", prefix + "/merges", QJsonObject{
-        {"target", "http-ff-target"}, {"source", "http-ff-source"},
-        {"expectedTargetHead", editedHead}, {"expectedSourceHead", ffTip}});
-    check(ffMerge.status == 200 && ffMerge.json.value("status").toString() == "fast_forward" &&
-          client.call("GET", prefix + "/branches/http-ff-target/head")
-              .json.value("id").toString() == ffTip,
-          "valid hydraulic HTTP fast-forward failed");
-    check(client.call("POST", prefix + "/merges", QJsonObject{
-        {"target", "http-ff-target"}, {"source", "http-ff-source"},
-        {"expectedTargetHead", ffTip}, {"expectedSourceHead", ffTip}})
-          .json.value("status").toString() == "up_to_date",
-          "equal-tip HTTP fast-forward was not a no-op");
-
-    check(client.call("POST", prefix + "/branches",
-        QJsonObject{{"name", "http-bad-target"}, {"fromBranch", "main"}}).status == 201,
-        "cannot create invalid HTTP fast-forward target");
-    check(client.call("POST", prefix + "/branches",
-        QJsonObject{{"name", "http-bad-source"}, {"fromBranch", "main"}}).status == 201,
-        "cannot create invalid HTTP fast-forward source");
-    QString invalidTip;
-    std::uint64_t invalidBytes = 0;
-    service.withRepository(projectId.toStdString(), [&](native::Repository& repository) {
-        const std::optional<native::ModelRecord> record = repository.getModel(
-            "http-bad-source", native::hydraulic::keyFromUuid(junctionUuid));
-        check(record.has_value(), "missing network member for invalid HTTP merge fixture");
-        const native::Key orphan = native::hydraulic::keyFromUuid(QUuid::createUuid());
-        invalidTip = QString::fromStdString(native::toHex(repository.commitModel(
-            "http-bad-source", {{orphan, *record}}).id));
-        invalidBytes = repository.packSize();
-    });
-    check(client.call("POST", prefix + "/merges", QJsonObject{
-        {"target", "http-bad-target"}, {"source", "http-bad-source"},
-        {"expectedTargetHead", ffTip}, {"expectedSourceHead", invalidTip}}).status == 409,
-        "stale HTTP fast-forward target pin accepted");
-    const Response badMerge = client.call("POST", prefix + "/merges", QJsonObject{
-        {"target", "http-bad-target"}, {"source", "http-bad-source"},
-        {"expectedTargetHead", editedHead}, {"expectedSourceHead", invalidTip}});
-    check(badMerge.status == 409 && badMerge.json.value("status").toString() == "conflicts" &&
-          !badMerge.json.value("conflicts").toArray().isEmpty() &&
-          client.call("GET", prefix + "/branches/http-bad-target/head")
-              .json.value("id").toString() == editedHead &&
-          client.call("GET", prefix + "/branches/http-bad-source/head")
-              .json.value("id").toString() == invalidTip,
-          "invalid hydraulic HTTP fast-forward advanced a branch");
-    service.withRepository(projectId.toStdString(), [&](native::Repository& repository) {
-        check(repository.packSize() == invalidBytes,
-              "rejected HTTP fast-forward appended pack objects");
-    });
-    // Divergent edits to the same canonical field must remain conflicts until
-    // a client explicitly selects one side. Neither branch moves on conflict.
-    junction.elevation_m = 101;
-    const QString targetPayload = QString::fromLatin1(
-        native::ModelCodec<HydraulicNodeJunction>::encode(junction).toBase64());
-    const Response targetEdit = client.call("POST", networkRoute + "/edits",
-        QJsonObject{{"expectedHead", editedHead}, {"changes", QJsonArray{
-            QJsonObject{{"uuid", junctionId}, {"type", 9}, {"payloadBase64", targetPayload}}}}});
-    check(targetEdit.status == 200, "target-side divergent edit failed");
-    const QString targetRevision = targetEdit.json.value("revision").toObject().value("id").toString();
-    junction.elevation_m = 202;
-    const QString sourcePayload = QString::fromLatin1(
-        native::ModelCodec<HydraulicNodeJunction>::encode(junction).toBase64());
-    const Response sourceEdit = client.call("POST", feature + "/edits",
-        QJsonObject{{"expectedHead", editedHead}, {"changes", QJsonArray{
-            QJsonObject{{"uuid", junctionId}, {"type", 9}, {"payloadBase64", sourcePayload}}}}});
-    check(sourceEdit.status == 200, "source-side divergent edit failed");
-    const QString sourceRevision = sourceEdit.json.value("revision").toObject().value("id").toString();
-    const QJsonObject mergeRequest{{"target", "main"}, {"source", "http_feature"},
-        {"expectedTargetHead", targetRevision}, {"expectedSourceHead", sourceRevision}};
-    const Response conflicted = client.call("POST", prefix + "/merges", mergeRequest);
-    check(conflicted.status == 409 &&
-          conflicted.json.value("status").toString() == "conflicts" &&
-          !conflicted.json.value("conflicts").toArray().isEmpty(),
-          "divergent canonical field edit was not reported as a conflict");
-    check(client.call("GET", main + "/head").json.value("id").toString() == targetRevision &&
-          client.call("GET", prefix + "/branches/http_feature/head").json.value("id").toString() == sourceRevision,
-          "conflicting merge unexpectedly advanced a branch");
-    QJsonObject resolvedRequest = mergeRequest;
-    resolvedRequest.insert("fieldChoices", QJsonArray{QJsonObject{
-        {"entityUuid", junctionId}, {"field", "elevation_m"}, {"side", "source"}}});
-    const Response resolved = client.call("POST", prefix + "/merges", resolvedRequest);
-    check(resolved.status == 200 && resolved.json.value("status").toString() == "merged",
-          "explicit field conflict resolution failed");
-    check(resolved.json.value("revision").toObject().value("parents").toArray().size() == 2,
-          "merge did not preserve both parents");
-    const Response resolvedRead = client.call("GET", networkRoute + "/entities/" + junctionId);
-    check(resolvedRead.status == 200 &&
-          resolvedRead.json.value("payloadBase64").toString() == sourcePayload,
-          "merge field choice was not applied");
-    service.withRepository(projectId.toStdString(), [](native::Repository& repository) {
-        (void)repository.verifyRepository();
-    });
-}
-#endif
 
 // Real TCP bundle transfer: full/incremental between independent repositories, corrupt/truncated,
 // stale/divergent branches, transfer limits, and idempotent retry.
@@ -756,59 +459,6 @@ void exerciseBoundsAndScoping(Client& client, aowis::dvmdb::ProjectService& serv
           tooLarge.json.value("error").toObject().value("code").toString() == "limit_exceeded",
           "diff with 1001 records was not rejected with 413 limit_exceeded");
 
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
-    // Branch scoping is checked before any model access: a revision of another
-    // branch is 404; the branch's own ancestor passes scoping and then fails the
-    // (raw) model check with 400.
-    const QString anyNetwork = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString side = QString::fromStdString(native::toHex(sideOnly));
-    const QString main = QString::fromStdString(native::toHex(mainOnly));
-    const Response foreign = client.call("GET", prefix + "/branches/main/networks/" + anyNetwork +
-                                         "?revision=" + side);
-    check(foreign.status == 404 &&
-          foreign.json.value("error").toObject().value("code").toString() == "not_found",
-          "revision of another branch was served on a branch-scoped route");
-    check(client.call("GET", prefix + "/branches/main/networks/" + anyNetwork + "/entities?type=9&revision=" +
-                      side).status == 404, "entity listing served another branch's revision");
-    check(client.call("GET", prefix + "/branches/main/networks/" + anyNetwork + "/entities/" + anyNetwork +
-                      "?revision=" + side).status == 404, "entity read served another branch's revision");
-    check(client.call("GET", prefix + "/branches/side/networks/" + anyNetwork + "?revision=" + main)
-              .status == 400, "ancestor revision was not accepted by branch scoping");
-
-    // Entity listings: exactly 10000 UUIDs are returned, 10001 are 413.
-    const QUuid networkUuid = QUuid::createUuid();
-    QUuid removable;
-    native::Hash bigHead{};
-    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
-        repository.createBranch("large");
-        NetworkHydraulic network;
-        network.uuid = networkUuid;
-        network.id = QStringLiteral("large");
-        for (int i = 0; i < 10001; ++i) {
-            HydraulicNodeJunction junction;
-            junction.uuid = QUuid::createUuid();
-            junction.id = QStringLiteral("J%1").arg(i);
-            network.nodes_junctions.append(junction);
-        }
-        removable = network.nodes_junctions.last().uuid;
-        bigHead = native::hydraulic::saveHydraulicNetworkLegacy(repository, "large", network).id;
-    });
-    const QString listing = prefix + "/branches/large/networks/" +
-                            networkUuid.toString(QUuid::WithoutBraces) + "/entities?type=9";
-    const Response overList = client.call("GET", listing);
-    check(overList.status == 413 &&
-          overList.json.value("error").toObject().value("code").toString() == "limit_exceeded",
-          "10001-entity listing was not rejected with 413 limit_exceeded");
-    service.withRepository(id.toStdString(), [&](native::Repository& repository) {
-        native::hydraulic::editHydraulicNetworkLegacy(repository, "large", networkUuid,
-            {native::hydraulic::HydraulicEntityChange{removable, std::nullopt}}, nullptr, bigHead);
-    });
-    const Response fullList = client.call("GET", listing);
-    check(fullList.status == 200 && fullList.json.value("uuids").toArray().size() == 10000,
-          "10000-entity listing was not returned completely");
-    check(client.call("GET", listing + "&revision=" + QString::fromStdString(native::toHex(bigHead)))
-              .status == 413, "historical 10001-entity listing was not bounded");
-#endif
 }
 
 // Phase 5 (cpp-httplib): limits are enforced before bodies are read, uploads
@@ -1138,44 +788,6 @@ void exerciseConcurrency() {
     check(client.call("POST", aPrefix + "/branches", QJsonObject{{"name", "late"}}).status == 201,
           "project still busy after its queue drained");
 
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
-    // Racing hydraulic saves with one expectedHead: one 201, one 409.
-    {
-        const QString head = client.call("GET", aPrefix + "/branches/main/head").json.value("id").toString();
-        const std::function<QString()> payload = [] {
-            NetworkHydraulic network;
-            network.uuid = QUuid::createUuid();
-            network.id = QStringLiteral("race");
-            return QString::fromLatin1(aowis::dvmdb::ModelCodec<NetworkHydraulic>::encode(network).toBase64());
-        };
-        const QString one = payload();
-        const QString two = payload();
-        int firstStatus = 0;
-        int secondStatus = 0;
-        std::thread first;
-        std::thread second;
-        const Joiner joinFirst(first);
-        const Joiner joinSecond(second);
-        {
-            ProjectHold hold(service, a.toStdString());
-            first = std::thread([&] {
-                Client own(server.port());
-                firstStatus = own.call("POST", aPrefix + "/branches/main/networks",
-                    QJsonObject{{"expectedHead", head}, {"payloadBase64", one}}).status;
-            });
-            second = std::thread([&] {
-                Client own(server.port());
-                secondStatus = own.call("POST", aPrefix + "/branches/main/networks",
-                    QJsonObject{{"expectedHead", head}, {"payloadBase64", two}}).status;
-            });
-            waitForPending(service, a, 3);
-        }
-        first.join();
-        second.join();
-        check((firstStatus == 201 && secondStatus == 409) || (firstStatus == 409 && secondStatus == 201),
-              "racing hydraulic saves not exactly one 201 and one 409");
-    }
-#endif
 
     // Stress: 8 clients, mixed reads and writes over three projects. Every
     // answer is a success or a 503 for a full queue; nothing else.
@@ -1299,9 +911,6 @@ void exercise() {
               "branch listing wrong");
         check(client.call("GET", "/dvmdb/v1/projects/" + second.json.value("id").toString() + "/branches")
                    .json.value("branches").toArray().size() == 1, "branch leaked to another project");
-#ifdef AOWIS_HTTP_WITH_HYDRAULIC
-        exerciseHydraulicApi(client, service, firstId, second.json.value("id").toString(), firstRevision);
-#endif
         {
             // Review F6: bundle spools and exports use repository scratch files,
             // so the whole transfer API works without a usable TMPDIR.
@@ -2702,11 +2311,9 @@ int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     try {
         check(argc == 2, "expected path to aowis-server-dvmdb executable");
-        // Canonical HTTP routes accept UUIDv7 revisions only. The historical
-        // SHA-revision HTTP fixtures above are intentionally not executed:
-        // they exercised removed endpoints and must not force legacy routes
-        // back into the public API. Native SHA storage fixtures remain in
-        // their dedicated lower-level regression suites until service cutover.
+        // Exercise the canonical UUIDv7 HTTP routes. SHA-era hydraulic HTTP
+        // fixtures for removed endpoints have been deleted rather than kept
+        // behind an inactive preprocessor flag.
         exerciseTransferStagingBudget();
         exerciseRevisionBundleV2Http();
         exerciseUnbornProjectHttp();
